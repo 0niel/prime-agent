@@ -30,7 +30,7 @@ const IPYTHON_CONTROL_PROMPT = [
 	"",
 	"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, IPython kernel, and native call interface exposed to the model.",
 	"",
-	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
+	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 ].join("\n");
 
 export interface ChildAgentDoctrineOptions {
@@ -60,6 +60,8 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
 export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const { cwd, skillsDir, messagesPath } = options;
 	const installedSkills = options.installedSkills ?? [];
+	const hasAgentMessage = installedSkills.includes("agent_message");
+	const hasAgentObserve = installedSkills.includes("agent_observe");
 	const allowRecursion = options.allowRecursion ?? true;
 	const depth = options.depth ?? 0;
 	const activeTools = options.activeTools ?? [];
@@ -110,6 +112,16 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	if (skillLines.length > 0) {
 		parts.push("", ...skillLines);
 	}
+	if (hasAgentMessage) {
+		parts.push(
+			"Agent messaging is restricted to your parent, siblings, and direct children; roots are siblings, and deeper communication relays through the intermediate child.",
+		);
+	}
+	if (hasAgentObserve) {
+		parts.push(
+			"Agent observation is restricted to your parent, siblings, and direct children; roots are siblings, and deeper inspection relays through the intermediate child.",
+		);
+	}
 
 	if (allowRecursion && hasIpython) {
 		parts.push(
@@ -117,8 +129,23 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"A callable `rlm` is already in your global namespace. `await rlm('sub-task')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.",
 			"Choose a stable child name with `await rlm('sub-task', name='api-reviewer')`; names must be unique among siblings. If omitted, the host generates a readable unique name.",
 			"A child inherits your model. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`.",
-			"Children reply explicitly with `await agent_message.send(message, receiver_role='parent')` when an answer is needed. Replies and follow-ups arrive as ordinary agent messages; not every task requires a reply.",
-			"Use `await agent_message.roster()` to discover family and `await rlm.list_subagents()` to recover direct child handles. Inspect a child's rollout with `agent_observe` or read files it wrote; use `agent_message.send(..., receiver_role='child', receiver_name=child.name)` for follow-ups.",
+		);
+		if (hasAgentMessage) {
+			parts.push(
+				"Children reply explicitly with `await agent_message.send(message, receiver_role='parent')` when an answer is needed. Replies and follow-ups arrive as ordinary agent messages; not every task requires a reply.",
+				"Use `await agent_message.list_agents()` to discover family and `await rlm.list_subagents()` to recover direct child handles. Use `agent_message.send(..., receiver_role='child', receiver_name=child.name)` for follow-ups.",
+			);
+		} else {
+			parts.push("Use `await rlm.list_subagents()` to recover direct child handles after admission.");
+		}
+		if (hasAgentObserve) {
+			parts.push(
+				"Use `agent_observe` to inspect a child's rollout. Observation is restricted to your parent, siblings, and direct children; relay through the intermediate child for deeper descendants.",
+			);
+		} else {
+			parts.push("Inspect files a child wrote when you need to collect its work without an observation capability.");
+		}
+		parts.push(
 			"Spawn independent children in separate calls and end your turn instead of awaiting completion. Multiple replies may arrive over multiple turns. Delete a direct child explicitly with `await rlm.delete_subagent(child)` when it is no longer needed.",
 		);
 	}
@@ -144,15 +171,27 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
  * uses. The subagent-spec menu itself renders just after this, inside the
  * harness-state block.
  */
-export function buildSubagentGuidance(options: { includeRefineExamples?: boolean } = {}): string {
+export function buildSubagentGuidance(
+	options: { includeRefineExamples?: boolean; hasAgentMessage?: boolean; hasAgentObserve?: boolean } = {},
+): string {
 	const lines = [
 		"# Delegating to sub-agents",
 		"",
-		"Spawn independent, self-contained work with `handle = await rlm('task', name='worker')`. This returns at admission, not completion; keep the handle to observe, message, stop, or inspect the child later.",
-		"Ask for an explicit reply when needed. A child replies with `await agent_message.send(message, receiver_role='parent')`; parent follow-ups use `receiver_role='child'` plus the child's name or id. Not every message needs a reply.",
-		"Use `await rlm.list_subagents()` after kernel restart or compaction. Use `agent_observe` for bounded transcript inspection, or have children write files and read those files for fan-in.",
-		"Delegate parallel context-heavy research or independent implementation; do a single known lookup, edit, or command inline.",
+		"Spawn independent, self-contained work with `handle = await rlm('task', name='worker')`. This returns at admission, not completion; keep the handle to stop or inspect the child later.",
 	];
+	if (options.hasAgentMessage) {
+		lines.push(
+			"Ask for an explicit reply when needed. A child replies with `await agent_message.send(message, receiver_role='parent')`; parent follow-ups use `receiver_role='child'` plus the child's name or id. Not every message needs a reply.",
+		);
+	}
+	lines.push("Use `await rlm.list_subagents()` after kernel restart or compaction.");
+	if (options.hasAgentObserve) {
+		lines.push("Use `agent_observe` for bounded transcript inspection.");
+	}
+	lines.push(
+		"Have children write files and read those files for fan-in.",
+		"Delegate parallel context-heavy research or independent implementation; do a single known lookup, edit, or command inline.",
+	);
 	if (options.includeRefineExamples ?? true) {
 		lines.push("Persist genuinely reusable delegation patterns with `await refine.run()`.");
 	}

@@ -39,6 +39,28 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(subagents[0].status, "completed")
         host_request.assert_awaited_once_with("rlm.list_subagents")
 
+
+    def test_lists_failed_subagents_from_host(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "subagents": [
+                    {
+                        "rlm_child_id": "sub-failed",
+                        "active_session_id": None,
+                        "session_id": None,
+                        "session_name": "failed-worker",
+                        "session_dir": "/tmp/parent/sub-failed",
+                        "status": "error",
+                    }
+                ]
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            subagents = asyncio.run(rlm_module.rlm.list_subagents())
+
+        self.assertEqual(subagents[0].status, "error")
+
     def test_forwards_orchestrator_chosen_name_and_model_to_host(self) -> None:
         host_request = AsyncMock(
             return_value={

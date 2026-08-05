@@ -60,7 +60,7 @@ export interface AgentObserveMessagePreview {
 }
 
 export interface AgentObserveController {
-	listAgents(): AgentObserveListResult;
+	listAgents(): AgentObserveListResult | Promise<AgentObserveListResult>;
 	getAgent(target: string): AgentObserveAgentSnapshot | Promise<AgentObserveAgentSnapshot>;
 	recentMessages(
 		input: AgentObserveRecentMessagesInput,

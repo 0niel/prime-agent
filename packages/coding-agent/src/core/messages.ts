@@ -31,6 +31,8 @@ export const IPYTHON_STATE_RESTORED_CUSTOM_TYPE = "ipython_state_restored";
 export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
 export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
 export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
+export const RLM_CHILD_FAILURE_CUSTOM_TYPE = "rlm_child_failure";
+export const RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE = "rlm_child_terminal_notice";
 
 export interface SessionSlashCommandDetails {
 	command: SessionSlashCommand;
@@ -69,6 +71,58 @@ export interface CompactionOutcomeMessage extends CustomMessage<CompactionOutcom
 	customType: typeof COMPACTION_OUTCOME_CUSTOM_TYPE;
 	content: string;
 	details: CompactionOutcomeDetails;
+}
+
+export interface RlmChildFailureDetails {
+	childId: string;
+	sessionName: string;
+	error: string;
+}
+
+export type RlmChildTerminalNoticeDetails =
+	| {
+			kind: "cancelled";
+			childId: string;
+			sessionName: string;
+			reason?: string;
+	  }
+	| {
+			kind: "completed_without_reply";
+			childId: string;
+			sessionName: string;
+			lastAssistantTextPreview?: string;
+	  };
+
+export function createRlmChildFailureMessage(
+	details: RlmChildFailureDetails,
+	timestamp = Date.now(),
+): CustomMessage<RlmChildFailureDetails> {
+	return {
+		role: "custom",
+		customType: RLM_CHILD_FAILURE_CUSTOM_TYPE,
+		content: `RLM child ${details.sessionName} (${details.childId}) failed: ${details.error}`,
+		display: true,
+		details,
+		timestamp,
+	};
+}
+
+export function createRlmChildTerminalNoticeMessage(
+	details: RlmChildTerminalNoticeDetails,
+	timestamp = Date.now(),
+): CustomMessage<RlmChildTerminalNoticeDetails> {
+	const content =
+		details.kind === "cancelled"
+			? `RLM child ${details.sessionName} (${details.childId}) was cancelled${details.reason ? `: ${details.reason}` : ""}`
+			: `RLM child ${details.sessionName} (${details.childId}) completed without sending a reply${details.lastAssistantTextPreview ? `. Last assistant text: ${details.lastAssistantTextPreview}` : ""}`;
+	return {
+		role: "custom",
+		customType: RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
+		content,
+		display: true,
+		details,
+		timestamp,
+	};
 }
 
 /**

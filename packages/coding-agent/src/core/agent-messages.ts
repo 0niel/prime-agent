@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { HostRequestHandler } from "./kernel/index.js";
 import type { CustomMessage } from "./messages.js";
+import { canonicalSessionPath } from "./session-lease.js";
 
 export const AGENT_MESSAGE_CUSTOM_TYPE = "agent_message";
 export const AGENT_MESSAGE_SKILL_NAME = "agent-message";
@@ -18,6 +19,8 @@ export type AgentSessionMessageDeliveryStatus = "delivered" | "queued";
 export type AgentSessionMessageRuntimeKind = "top-level" | "subagent";
 export type AgentFamilyStatus = "running" | "idle" | "inactive";
 export type AgentFamilyRelationship = "parent" | "sibling" | "child";
+
+export const AGENT_FAMILY_REACH_ERROR = "Agent reach is limited to parent, siblings, and children";
 
 export interface AgentSessionMessageEndpoint {
 	activeSessionId: string;
@@ -61,6 +64,7 @@ export interface AgentSessionMessageAgentSummary extends AgentSessionMessageEndp
 	parentSessionPath?: string;
 	rlmDepth?: number;
 	status?: AgentFamilyStatus;
+	rlmChildRegistryStatus?: "running" | "completed" | "deleted";
 }
 
 export interface AgentSessionMessageListResult {
@@ -166,6 +170,28 @@ export interface AgentSessionMessageSafetyStatus {
 	maxPendingPerSession: number;
 	rateLimitCapacity: number;
 	rateLimitRefillMs: number;
+}
+
+/**
+ * Structural reservation key for sibling-scoped session names. JSON encoding keeps
+ * parent paths and names containing delimiter characters from colliding into one key;
+ * the worker- and supervisor-side reservation maps must never diverge in encoding.
+ */
+export function sessionNameReservationKey(input: {
+	name: string;
+	depth: number;
+	parentSessionId?: string;
+	parentSessionPath?: string;
+}): string {
+	const [parentType, parentValue] =
+		input.depth === 0
+			? ["root", ""]
+			: input.parentSessionPath
+				? ["path", canonicalSessionPath(input.parentSessionPath)]
+				: input.parentSessionId
+					? ["id", input.parentSessionId]
+					: ["root", ""];
+	return JSON.stringify([input.depth, parentType, parentValue, input.name]);
 }
 
 export function formatAgentSessionNameUnavailable(name: string, depth: number): string {
@@ -279,6 +305,27 @@ function isAgentFamilyParent(parent: AgentFamilyCatalogEntry, child: AgentFamily
 		(child.parentSessionPath !== undefined && child.parentSessionPath === parent.sessionPath) ||
 		(child.parentSessionId !== undefined && child.parentSessionId === parent.id)
 	);
+}
+
+/** Pure nuclear-family policy over persisted parent-edge snapshots. */
+export function agentFamilyRelationship(
+	current: AgentFamilyCatalogEntry,
+	target: AgentFamilyCatalogEntry,
+): AgentFamilyRelationship | undefined {
+	if (current.id === target.id) return undefined;
+	if (isAgentFamilyParent(target, current)) return "parent";
+	if (isAgentFamilyParent(current, target)) return "child";
+	if (current.depth === target.depth && sameAgentFamilyParent(current, target, [current, target])) return "sibling";
+	return undefined;
+}
+
+export function assertAgentFamilyReach(
+	current: AgentFamilyCatalogEntry,
+	target: AgentFamilyCatalogEntry,
+): AgentFamilyRelationship {
+	const relationship = agentFamilyRelationship(current, target);
+	if (!relationship) throw new Error(AGENT_FAMILY_REACH_ERROR);
+	return relationship;
 }
 
 export function createAgentSessionMessageId(): string {
@@ -504,11 +551,10 @@ export class AgentSessionMessageRateLimiter {
 }
 
 export function createAgentMessageHostHandlers(
-	controller: AgentSessionMessageController,
+	controller: Pick<AgentSessionMessageController, "roster" | "sendAgentMessage" | "awaitPendingChildPublication">,
 ): Record<string, HostRequestHandler> {
 	return {
-		"agent_message.list": async () => (await controller.listAgents()) as unknown as Record<string, unknown>,
-		"agent_message.roster": async () => {
+		"agent_message.list_agents": async () => {
 			if (!controller.roster) throw new Error("agent family roster is not available in this session");
 			return (await controller.roster()) as unknown as Record<string, unknown>;
 		},
@@ -518,30 +564,35 @@ export function createAgentMessageHostHandlers(
 			}
 			let target: string;
 			if (typeof payload.target === "string") {
-				target = payload.target;
-				if (target.trim().toLowerCase() === "all") {
-					if (!controller.roster) throw new Error("agent family roster is not available in this session");
-					const roster = await controller.roster();
-					const results = await Promise.allSettled(
-						roster.entries.map((entry) =>
-							controller.sendAgentMessage({
-								target: entry.id,
-								message: payload.message as string,
-								deliveryMode: normalizeAgentSessionMessageDeliveryMode(payload.mode),
-								receiverRole: entry.relationship,
-							}),
-						),
+				if (payload.target !== "all") {
+					throw new Error(
+						"positional agent_message.send targets are not supported; use receiver_role and receiver_name",
 					);
-					const receipts = results.map((result, index) =>
-						result.status === "fulfilled"
-							? result.value
-							: {
-									target: roster.entries[index]!.id,
-									error: result.reason instanceof Error ? result.reason.message : String(result.reason),
-								},
-					);
-					return { receipts } as unknown as Record<string, unknown>;
 				}
+				if (payload.receiver_role !== undefined || payload.receiver_name !== undefined) {
+					throw new Error("agent_message.send broadcast cannot be combined with receiver_role/receiver_name");
+				}
+				if (!controller.roster) throw new Error("agent family roster is not available in this session");
+				const roster = await controller.roster();
+				const results = await Promise.allSettled(
+					roster.entries.map((entry) =>
+						controller.sendAgentMessage({
+							target: entry.id,
+							message: payload.message as string,
+							deliveryMode: normalizeAgentSessionMessageDeliveryMode(payload.mode),
+							receiverRole: entry.relationship,
+						}),
+					),
+				);
+				const receipts = results.map((result, index) =>
+					result.status === "fulfilled"
+						? result.value
+						: {
+								target: roster.entries[index]!.id,
+								error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+							},
+				);
+				return { receipts } as unknown as Record<string, unknown>;
 			} else {
 				const role = payload.receiver_role;
 				if (role !== "parent" && role !== "sibling" && role !== "child") {
@@ -579,9 +630,7 @@ export function createAgentMessageHostHandlers(
 				target,
 				message: payload.message,
 				deliveryMode: normalizeAgentSessionMessageDeliveryMode(payload.mode),
-				...(typeof payload.target === "string"
-					? {}
-					: { receiverRole: payload.receiver_role as AgentFamilyRelationship }),
+				receiverRole: payload.receiver_role as AgentFamilyRelationship,
 			})) as unknown as Record<string, unknown>;
 		},
 	};

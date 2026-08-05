@@ -260,15 +260,18 @@ describe("ENG-4649 subagent model selection", () => {
 		try {
 			harness.session.setThinkingLevel("high");
 			const seenModels: string[] = [];
+			const respond =
+				(text: string) => (_context: unknown, _options: unknown, _state: unknown, model: { id: string }) => {
+					seenModels.push(model.id);
+					return fauxAssistantMessage(text);
+				};
+			// The child completes without replying, so the parent receives a
+			// host-injected terminal notice that consumes one parent-model turn.
 			harness.setResponses([
-				(_context, _options, _state, model) => {
-					seenModels.push(model.id);
-					return fauxAssistantMessage("initial child answer");
-				},
-				(_context, _options, _state, model) => {
-					seenModels.push(model.id);
-					return fauxAssistantMessage("follow-up child answer");
-				},
+				respond("initial child answer"),
+				respond("terminal notice ack"),
+				respond("follow-up child answer"),
+				respond("terminal notice ack"),
 			]);
 
 			const result = await harness.session.runRlmChild("inspect the API", {
@@ -287,7 +290,9 @@ describe("ENG-4649 subagent model selection", () => {
 			await child!.prompt("check the follow-up", { expandPromptTemplates: false, source: "extension" });
 			await child!.agent.waitForIdle();
 
-			expect(seenModels).toEqual(["child-model", "child-model"]);
+			const childTurns = seenModels.filter((id) => id === "child-model");
+			expect(childTurns).toHaveLength(2);
+			expect(seenModels.filter((id) => id !== "child-model").every((id) => id.endsWith("parent-model"))).toBe(true);
 			expect(child?.model?.id).toBe("child-model");
 			expect(result.session_dir).not.toBeNull();
 			const childSessions = await SessionManager.list(harness.tempDir, result.session_dir!);

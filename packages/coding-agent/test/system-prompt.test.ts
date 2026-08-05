@@ -80,7 +80,7 @@ describe("buildRlmPrompt", () => {
 				"",
 				"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, IPython kernel, and native call interface exposed to the model.",
 				"",
-				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
+				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 				"",
 				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 			].join("\n"),
@@ -139,6 +139,54 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("`<skill> --help`");
 		expect(prompt).not.toContain("Installed Python skill modules (pre-imported)");
 		expect(prompt).not.toContain("Read each skill's SKILL.md for its API");
+	});
+
+	test("gates agent messaging and observation doctrine on installed Python skills", () => {
+		const withoutCapabilities = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			activeTools: ["ipython"],
+			allowRecursion: true,
+			depth: 1,
+		});
+		expect(withoutCapabilities).not.toContain("agent_message.send");
+		expect(withoutCapabilities).not.toContain("agent_message.list_agents");
+		expect(withoutCapabilities).not.toContain("agent_observe");
+
+		const systemPromptWithoutCapabilities = buildSystemPrompt({
+			selectedTools: ["ipython"],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+		});
+		expect(systemPromptWithoutCapabilities).not.toContain("agent_message.send");
+		expect(systemPromptWithoutCapabilities).not.toContain("agent_observe");
+
+		const withCapabilities = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			installedSkills: ["agent_message", "agent_observe"],
+			activeTools: ["ipython"],
+			allowRecursion: true,
+			depth: 1,
+		});
+		expect(withCapabilities).toContain("agent_message.send");
+		expect(withCapabilities).toContain("agent_message.list_agents");
+		expect(withCapabilities).toContain("agent_observe");
+		expect(withCapabilities).toContain("restricted to your parent, siblings, and direct children");
+	});
+
+	test("does not prescribe kernel-only child replies without ipython", () => {
+		const prompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/session.jsonl",
+			installedSkills: ["agent_message"],
+			activeTools: ["bash"],
+			depth: 1,
+		});
+
+		expect(prompt).toContain("You are a child agent");
+		expect(prompt).not.toContain("When a task calls for an answer, reply explicitly with `await agent_message.send");
 	});
 
 	test("exposes the automatic child registry independently of observation skills", () => {
@@ -301,7 +349,7 @@ describe("buildSystemPrompt", () => {
 		const prompt = buildSystemPrompt({
 			selectedTools: ["ipython"],
 			contextFiles: [],
-			skills: [pythonSkill("refine")],
+			skills: [pythonSkill("refine"), pythonSkill("agent-message"), pythonSkill("agent-observe")],
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
 			harnessState,
@@ -387,7 +435,7 @@ describe("buildSystemPrompt", () => {
 		const prompt = buildSystemPrompt({
 			selectedTools: ["ipython"],
 			contextFiles: [],
-			skills: [pythonSkill("refine")],
+			skills: [pythonSkill("refine"), pythonSkill("agent-message"), pythonSkill("agent-observe")],
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
 		});
@@ -397,7 +445,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Conversation log: /repo/.pi/sessions/session.jsonl");
 		expect(prompt).toContain("await rlm('sub-task')");
 		expect(prompt).toContain("returns at admission, not completion");
-		expect(prompt).toContain("Results arrive only through explicit `agent_message` replies or files");
+		expect(prompt).toContain("Results arrive only through an available messaging capability or files");
 		expect(prompt).toContain("recover direct child handles");
 		expect(prompt).toContain("kernel restart or compaction");
 		expect(prompt).toContain("rlm.list_subagents");
@@ -406,6 +454,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("name='api-reviewer'");
 		expect(prompt).toContain("session_dir");
 		expect(prompt).toContain("agent_observe");
+		expect(prompt).toContain("restricted to your parent, siblings, and direct children");
 	});
 
 	test("omits ipython-only subagent guidance when ipython is inactive", () => {

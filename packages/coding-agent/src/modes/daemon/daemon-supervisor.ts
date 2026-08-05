@@ -16,8 +16,10 @@ import {
 import {
 	type AgentFamilyCatalogEntry,
 	type AgentSessionMessageAgentSummary,
+	assertAgentFamilyReach,
 	assertAgentSessionNameAvailable,
 	formatAgentSessionNameUnavailable,
+	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
@@ -39,7 +41,7 @@ import {
 	type WorkerEvictionSnapshot,
 } from "../../core/session-action-store.js";
 import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
-import type { SessionInfo } from "../../core/session-manager.js";
+import { readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { SettingsManager } from "../../core/settings-manager.js";
 import { signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
@@ -603,7 +605,7 @@ export class DaemonSupervisor {
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
 	private agentPeerSyncQueue: Promise<void> = Promise.resolve();
-	private readonly pendingRootSessionNames = new Set<string>();
+	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
 	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
@@ -1747,13 +1749,21 @@ export class DaemonSupervisor {
 				const match = await this.findWorkerForClient(client, command.activeSessionId);
 				return this.forwardToWorker(match.worker, command);
 			}
-			case "rename_saved_session":
-				await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, command.name.trim());
-				if (!command.activeSessionId) {
-					await this.catalog.rename(command.sessionPath, command.name);
-					return success(command.id, command.type);
-				}
-				break;
+			case "rename_saved_session": {
+				const target = await this.savedSessionNameReservationInput(command.sessionPath, command.name.trim());
+				return await this.withSessionNameReservation(target, async () => {
+					await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name);
+					if (!command.activeSessionId) {
+						await this.catalog.rename(command.sessionPath, command.name);
+						return success(command.id, command.type);
+					}
+					const match = await this.findWorkerForClient(client, command.activeSessionId);
+					return await this.forwardToWorker(match.worker, {
+						...command,
+						activeSessionId: match.summary.activeSessionId ?? match.summary.id,
+					});
+				});
+			}
 			case "delete_saved_session":
 				if (!command.activeSessionId) {
 					const active = this.findWorkerBySessionFile(command.sessionPath);
@@ -1767,6 +1777,7 @@ export class DaemonSupervisor {
 		}
 
 		if (command.type === "send_message") {
+			// agentOrigin without fromActiveSessionId is trusted only at the direct socket-client boundary.
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
 				: undefined;
@@ -1791,6 +1802,14 @@ export class DaemonSupervisor {
 					}
 					throw error;
 				}
+				if (source && command.agentOrigin === true) {
+					const targetInfo = await readSessionInfo(sessionPath);
+					if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
+					assertAgentFamilyReach(
+						this.familyCatalogEntry(source.summary),
+						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
+					);
+				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
 					type: "create",
 					sessionPath,
@@ -1803,6 +1822,9 @@ export class DaemonSupervisor {
 				target = { worker, summary };
 			}
 			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
+			if (source && command.agentOrigin === true) {
+				assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
+			}
 			if (source) {
 				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
 					throw new Error("Agent messaging cannot target the sending session");
@@ -1841,7 +1863,12 @@ export class DaemonSupervisor {
 		try {
 			throwIfAdmissionCancelled(admission);
 			const match = await waitForPromptAdmission(
-				this.findWorkerForClient(client, command.activeSessionId),
+				command.type === "set_session_name" && command.workerToken !== undefined
+					? this.findWorker(
+							command.activeSessionId,
+							(worker) => worker.descriptor.authenticationToken === command.workerToken,
+						)
+					: this.findWorkerForClient(client, command.activeSessionId),
 				admission?.controller.signal,
 			);
 			throwIfAdmissionCancelled(admission);
@@ -1858,12 +1885,19 @@ export class DaemonSupervisor {
 				command.type === "kill" &&
 				(match.summary.activeSessionId ?? match.summary.id) === match.worker.descriptor.rootActiveSessionId;
 			if (!isRootKill) {
+				const forward = async () => {
+					const response = await this.forwardToWorker(match.worker, resolvedCommand);
+					if (admission && response.success) admission.status = "owned";
+					return response;
+				};
 				if (command.type === "rename" || command.type === "set_session_name") {
-					await this.assertSupervisorSessionNameAvailable(match.summary, command.name.trim());
+					const reservation = this.summaryNameReservationInput(match.summary, command.name.trim());
+					return await this.withSessionNameReservation(reservation, async () => {
+						await this.assertSupervisorSessionNameAvailable(match.summary, reservation.name);
+						return forward();
+					});
 				}
-				const response = await this.forwardToWorker(match.worker, resolvedCommand);
-				if (admission && response.success) admission.status = "owned";
-				return response;
+				return await forward();
 			}
 			this.persistWorkerStopTombstone(match.worker, true);
 			let response: DaemonResponse;
@@ -1987,32 +2021,27 @@ export class DaemonSupervisor {
 		if (pending) {
 			return pending;
 		}
-		let reservedRootName: string | undefined;
-		if (createCommand.name) {
+		const opening = (async () => {
+			if (!createCommand.name) return this.launchWorker(createCommand, undefined, ownerClientId);
 			const savedSiblings = createCommand.sessionPath ? await this.catalog.siblings(createCommand.sessionPath) : [];
 			const target = savedSiblings.find(
 				(session) => canonicalSessionPath(session.path) === canonicalSessionPath(createCommand.sessionPath!),
 			);
 			const targetSummary = target ? summaryForInactiveSession(target) : { sessionId: "new-root", rlmDepth: 0 };
-			if (target?.parentSessionPath && (target.rlmDepth ?? 0) > 0) {
-				this.assertSavedSiblingNameAvailable(savedSiblings, target, createCommand.name);
-			} else {
-				await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name);
-			}
-			if ((targetSummary.rlmDepth ?? 0) === 0) {
-				if (this.pendingRootSessionNames.has(createCommand.name)) {
-					throw new Error(formatAgentSessionNameUnavailable(createCommand.name, 0));
+			const reservation = this.summaryNameReservationInput(targetSummary, createCommand.name);
+			return this.withSessionNameReservation(reservation, async () => {
+				if (target?.parentSessionPath && (target.rlmDepth ?? 0) > 0) {
+					this.assertSavedSiblingNameAvailable(savedSiblings, target, createCommand.name!);
+				} else {
+					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!);
 				}
-				reservedRootName = createCommand.name;
-				this.pendingRootSessionNames.add(reservedRootName);
-			}
-		}
-		const opening = this.launchWorker(createCommand, undefined, ownerClientId);
+				return this.launchWorker(createCommand, undefined, ownerClientId);
+			});
+		})();
 		this.openingWorkers.set(key, opening);
 		try {
 			return await opening;
 		} finally {
-			if (reservedRootName) this.pendingRootSessionNames.delete(reservedRootName);
 			if (this.openingWorkers.get(key) === opening) {
 				this.openingWorkers.delete(key);
 			}
@@ -2914,15 +2943,25 @@ export class DaemonSupervisor {
 				(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
 				!activePaths.has(canonicalSessionPath(info.path)),
 		);
-		return [...active, ...savedRoots.map((info) => summaryForInactiveSession(info))].map((summary) => ({
-			id: summary.sessionId,
-			...(summary.sessionName ? { name: summary.sessionName } : {}),
-			depth: summary.rlmDepth ?? 0,
-			status: classifySessionRosterStatus(summary),
-			...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
-			...(summary.parentSessionPath ? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) } : {}),
-			...(summary.sessionFile ? { sessionPath: canonicalSessionPath(summary.sessionFile) } : {}),
-		}));
+		return [...active, ...savedRoots.map((info) => summaryForInactiveSession(info))].map((summary) =>
+			this.familyCatalogEntry(summary),
+		);
+	}
+
+	private async withSessionNameReservation<T>(
+		input: { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string },
+		action: () => Promise<T>,
+	): Promise<T> {
+		const key = sessionNameReservationKey(input);
+		if (this.pendingSessionNames.has(key)) {
+			throw new Error(formatAgentSessionNameUnavailable(input.name, input.depth));
+		}
+		this.pendingSessionNames.add(key);
+		try {
+			return await action();
+		} finally {
+			this.pendingSessionNames.delete(key);
+		}
 	}
 
 	private async assertSupervisorSessionNameAvailable(
@@ -2936,6 +2975,38 @@ export class DaemonSupervisor {
 			parentSessionPath: target.parentSessionPath ? canonicalSessionPath(target.parentSessionPath) : undefined,
 			ignoreSessionId: target.sessionId,
 		});
+	}
+
+	private async savedSessionNameReservationInput(
+		sessionPath: string,
+		name: string,
+	): Promise<{ name: string; depth: number; parentSessionId?: string; parentSessionPath?: string }> {
+		const targetPath = canonicalSessionPath(sessionPath);
+		const active = [...this.workers.values()]
+			.flatMap((worker) => [...worker.summaries.values()])
+			.find((summary) => summary.sessionFile && canonicalSessionPath(summary.sessionFile) === targetPath);
+		if (active) return this.summaryNameReservationInput(active, name);
+		const siblings = await this.catalog.siblings(sessionPath);
+		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
+		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
+		return {
+			name,
+			depth: saved.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0,
+			parentSessionPath: saved.parentSessionPath,
+		};
+	}
+
+	private summaryNameReservationInput(
+		target: Pick<SessionSummary, "rlmDepth" | "parentSessionId" | "parentSessionPath">,
+		name: string,
+	): { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string } {
+		const depth = target.rlmDepth ?? (target.parentSessionPath ? 1 : 0);
+		return {
+			name,
+			depth,
+			...(depth > 0 && target.parentSessionId ? { parentSessionId: target.parentSessionId } : {}),
+			...(depth > 0 && target.parentSessionPath ? { parentSessionPath: target.parentSessionPath } : {}),
+		};
 	}
 
 	private async assertSupervisorSavedSessionNameAvailable(sessionPath: string, name: string): Promise<void> {
@@ -2955,13 +3026,14 @@ export class DaemonSupervisor {
 	}
 
 	private assertSavedSiblingNameAvailable(siblings: SessionInfo[], target: SessionInfo, name: string): void {
+		const setDepth = target.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0;
 		assertAgentSessionNameAvailable(
 			siblings.map((info) => {
 				const summary = summaryForInactiveSession(info);
 				return {
 					id: summary.sessionId,
 					...(summary.sessionName ? { name: summary.sessionName } : {}),
-					depth: summary.rlmDepth ?? 0,
+					depth: setDepth,
 					status: classifySessionRosterStatus(summary),
 					...(summary.parentSessionPath
 						? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
@@ -2970,7 +3042,7 @@ export class DaemonSupervisor {
 			}),
 			{
 				name,
-				depth: target.rlmDepth ?? 0,
+				depth: setDepth,
 				parentSessionPath: target.parentSessionPath ? canonicalSessionPath(target.parentSessionPath) : undefined,
 				ignoreSessionId: target.id,
 			},
@@ -2992,9 +3064,10 @@ export class DaemonSupervisor {
 						const peers = [
 							...readyWorkers
 								.filter((candidate) => candidate !== worker)
-								.flatMap((candidate) =>
-									[...candidate.summaries.values()].map((summary) => this.agentPeerSummary(summary)),
-								),
+								.flatMap((candidate) => {
+									const root = candidate.summaries.get(candidate.descriptor.rootActiveSessionId);
+									return root ? [this.agentPeerSummary(root)] : [];
+								}),
 						];
 						const response = await worker.client.requestWorker({ type: "worker_sync_agent_peers", peers }, 5000);
 						if (!response.success) {
@@ -3009,6 +3082,21 @@ export class DaemonSupervisor {
 
 	private isVisibleWorker(worker: ResidentWorker): boolean {
 		return worker.descriptor.ownerClientId === undefined;
+	}
+
+	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
+		const depth = summary.rlmDepth ?? (summary.parentSessionPath ? 1 : 0);
+		return {
+			id: summary.sessionId,
+			...(summary.sessionName ? { name: summary.sessionName } : {}),
+			depth,
+			status: classifySessionRosterStatus(summary),
+			...(depth > 0 && summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
+			...(depth > 0 && summary.parentSessionPath
+				? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
+				: {}),
+			...(summary.sessionFile ? { sessionPath: canonicalSessionPath(summary.sessionFile) } : {}),
+		};
 	}
 
 	private agentPeerSummary(summary: SessionSummary): AgentSessionMessageAgentSummary {

@@ -98,10 +98,9 @@ describe("createAgentSessionFromServices", () => {
 		});
 
 		try {
-			expect(session.handleAgentMessageHostRequest("agent_message.list")).toMatchObject({
-				current: { activeSessionId: "current" },
-				agents: [{ activeSessionId: "worker" }],
-			});
+			expect(() => session.handleAgentMessageHostRequest("agent_message.list")).toThrow(
+				"unknown agent message request",
+			);
 			expect(
 				(
 					session as unknown as {

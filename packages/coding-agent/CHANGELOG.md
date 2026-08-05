@@ -9,6 +9,7 @@
 - Fixed daemon startup failing permanently when an interrupted supervisor owner directory contained only stray files.
 - Fixed agents-view fallback notices and scoped live sessions surviving transient refresh failures across chat returns.
 - Fixed stopping completed subagents deleting their retained sessions.
+- Fixed silent or cancelled RLM children leaving parents without a terminal status notice.
 
 ## [0.5.1] - 2026-08-04
 

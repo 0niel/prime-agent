@@ -127,7 +127,14 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	// menu, so the model reads when/why to delegate and then sees the concrete subagent
 	// specs it can match against — the same ordering as Claude Code's Agent tool.
 	if ((allowRecursion ?? true) && hasIpython) {
-		prompt += `\n\n${buildSubagentGuidance({ includeRefineExamples: hasRefineSkill })}`;
+		const visiblePythonSkillNames = new Set(
+			getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),
+		);
+		prompt += `\n\n${buildSubagentGuidance({
+			includeRefineExamples: hasRefineSkill,
+			hasAgentMessage: visiblePythonSkillNames.has("agent_message"),
+			hasAgentObserve: visiblePythonSkillNames.has("agent_observe"),
+		})}`;
 	}
 
 	if (harnessState) {

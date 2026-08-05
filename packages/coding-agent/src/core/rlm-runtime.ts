@@ -18,7 +18,7 @@ export interface RlmSpawnHandle {
 	model: string;
 }
 
-export type RlmSubagentRegistryStatus = "running" | "completed";
+export type RlmSubagentRegistryStatus = "running" | "completed" | "error";
 
 export interface RlmSubagentRegistryEntry {
 	rlm_child_id: string;

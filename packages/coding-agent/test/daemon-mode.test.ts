@@ -1,11 +1,16 @@
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import { type AgentSessionMessageController, DEFAULT_AGENT_MESSAGE_MAX_CHARS } from "../src/core/agent-messages.js";
+import {
+	AGENT_FAMILY_REACH_ERROR,
+	type AgentSessionMessageController,
+	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
+	sessionNameReservationKey,
+} from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
@@ -14,6 +19,7 @@ import {
 	createDefaultRlmSubagentSessionName,
 	type SubagentRuntimeHost,
 } from "../src/core/rlm-runtime.js";
+import { canonicalSessionPath } from "../src/core/session-lease.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
@@ -77,6 +83,51 @@ describe("daemon mode helpers", () => {
 		expect(setSessionName).toHaveBeenCalledWith("normalized");
 		await expect(internals.setStateSessionName(state, "   ")).rejects.toThrow("Session name cannot be empty");
 		expect(setSessionName).toHaveBeenCalledOnce();
+	});
+
+	it("treats a depth-zero fork as a sibling of another root", () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-fork-family.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const fork = makeState("fork");
+		fork.runtime = {
+			...fork.runtime,
+			metadata: {
+				kind: "top-level",
+				createdAt: 1,
+				parentSessionId: "fork-origin",
+				parentSessionFile: "/tmp/fork-origin.jsonl",
+			},
+			session: {
+				sessionId: "session-fork",
+				sessionFile: "/tmp/fork.jsonl",
+				rlmDepth: 0,
+				sessionManager: { getHeader: () => ({ parentSession: "/tmp/fork-origin.jsonl" }) },
+			},
+		} as never;
+		const root = makeState("root");
+		root.runtime = {
+			...root.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: {
+				sessionId: "session-root",
+				sessionFile: "/tmp/root.jsonl",
+				rlmDepth: 0,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			agentFamilyEntry(state: ActiveSessionState): {
+				parentSessionId?: string;
+				parentSessionPath?: string;
+			};
+			isAgentFamilyReachable(current: ActiveSessionState, target: ActiveSessionState): boolean;
+		};
+
+		expect(internals.agentFamilyEntry(fork)).not.toHaveProperty("parentSessionId");
+		expect(internals.agentFamilyEntry(fork)).not.toHaveProperty("parentSessionPath");
+		expect(internals.isAgentFamilyReachable(root, fork)).toBe(true);
+		expect(internals.isAgentFamilyReachable(fork, root)).toBe(true);
 	});
 
 	it("finds only direct child active sessions", () => {
@@ -228,10 +279,14 @@ describe("daemon mode helpers", () => {
 			},
 		} as never;
 		const internals = daemon as unknown as {
-			cronStore: { getHeartbeat(activeSessionId: string): AgentCronJob | undefined };
+			cronStore: {
+				getHeartbeat(activeSessionId: string): AgentCronJob | undefined;
+				listRlmHeartbeats(activeSessionId: string): AgentCronJob[];
+			};
 			createAgentMessageAgentSummary(state: ActiveSessionState): { status?: string };
 		};
 		const getHeartbeat = vi.spyOn(internals.cronStore, "getHeartbeat").mockReturnValue(undefined);
+		const listRlmHeartbeats = vi.spyOn(internals.cronStore, "listRlmHeartbeats").mockReturnValue([]);
 
 		expect(internals.createAgentMessageAgentSummary(state).status).toBe("running");
 		hasRunningChildren = false;
@@ -242,6 +297,148 @@ describe("daemon mode helpers", () => {
 		expect(internals.createAgentMessageAgentSummary(state).status).toBe("idle");
 		getHeartbeat.mockReturnValue({ status: "active" } as AgentCronJob);
 		expect(internals.createAgentMessageAgentSummary(state).status).toBe("running");
+		getHeartbeat.mockReturnValue(undefined);
+		listRlmHeartbeats.mockReturnValue([{ status: "active" } as AgentCronJob]);
+		expect(internals.createAgentMessageAgentSummary(state).status).toBe("running");
+	});
+
+	it("reserves a session name across equivalent session-relative parent headers", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-name-reservation.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const first = makeState("first");
+		const second = makeState("second");
+		first.runtime = {
+			...first.runtime,
+			session: {
+				sessionId: "first-session",
+				sessionFile: "/tmp/children/first.jsonl",
+				rlmDepth: 1,
+				sessionManager: { getHeader: vi.fn(() => ({ parentSession: "../parent.jsonl" })) },
+				setSessionName: vi.fn(),
+			},
+		} as never;
+		second.runtime = {
+			...second.runtime,
+			session: {
+				sessionId: "second-session",
+				sessionFile: "/tmp/children/nested/second.jsonl",
+				rlmDepth: 1,
+				sessionManager: { getHeader: vi.fn(() => ({ parentSession: "../../parent.jsonl" })) },
+				setSessionName: vi.fn(),
+			},
+		} as never;
+		let releaseValidation!: () => void;
+		const validationGate = new Promise<void>((resolve) => {
+			releaseValidation = resolve;
+		});
+		const internals = daemon as unknown as {
+			assertStateSessionNameAvailable: ReturnType<typeof vi.fn>;
+			setStateSessionName(state: ActiveSessionState, name: string): Promise<void>;
+		};
+		internals.assertStateSessionNameAvailable = vi.fn(async () => validationGate);
+
+		const firstRename = internals.setStateSessionName(first, "shared");
+		await expect(internals.setStateSessionName(second, "shared")).rejects.toThrow(
+			"an agent of that name already exists at depth 1 under this parent",
+		);
+		releaseValidation();
+		await expect(firstRename).resolves.toBeUndefined();
+		expect(first.runtime.session.setSessionName).toHaveBeenCalledWith("shared");
+		expect(second.runtime.session.setSessionName).not.toHaveBeenCalled();
+	});
+
+	it("allows concurrent same-name renames under different parents", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-scoped-name-reservation.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const first = makeState("first", "parent-a");
+		const second = makeState("second", "parent-b");
+		first.runtime = {
+			...first.runtime,
+			metadata: { ...first.runtime.metadata, parentSessionId: "parent-session-a" },
+			session: {
+				sessionId: "first-session",
+				rlmDepth: 1,
+				sessionManager: { getHeader: vi.fn(() => undefined) },
+				setSessionName: vi.fn(),
+			},
+		} as never;
+		second.runtime = {
+			...second.runtime,
+			metadata: { ...second.runtime.metadata, parentSessionId: "parent-session-b" },
+			session: {
+				sessionId: "second-session",
+				rlmDepth: 1,
+				sessionManager: { getHeader: vi.fn(() => undefined) },
+				setSessionName: vi.fn(),
+			},
+		} as never;
+		let releaseValidation!: () => void;
+		const validationGate = new Promise<void>((resolve) => {
+			releaseValidation = resolve;
+		});
+		const internals = daemon as unknown as {
+			assertStateSessionNameAvailable: ReturnType<typeof vi.fn>;
+			setStateSessionName(state: ActiveSessionState, name: string): Promise<void>;
+		};
+		internals.assertStateSessionNameAvailable = vi.fn(async () => validationGate);
+
+		const firstRename = internals.setStateSessionName(first, "worker");
+		const secondRename = internals.setStateSessionName(second, "worker");
+		await vi.waitFor(() => expect(internals.assertStateSessionNameAvailable).toHaveBeenCalledTimes(2));
+		releaseValidation();
+
+		await expect(Promise.all([firstRename, secondRename])).resolves.toEqual([undefined, undefined]);
+		expect(first.runtime.session.setSessionName).toHaveBeenCalledWith("worker");
+		expect(second.runtime.session.setSessionName).toHaveBeenCalledWith("worker");
+	});
+
+	it("scopes a switched child rename from its session-relative persisted parent header", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-switched-child-name-"));
+		try {
+			const parentPath = join(tempDir, "parent.jsonl");
+			const childDir = join(tempDir, "child");
+			const childPath = join(childDir, "child.jsonl");
+			mkdirSync(childDir);
+			writeFileSync(parentPath, "");
+			const state = makeState("switched-child");
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					sessionId: "session-child",
+					sessionFile: childPath,
+					rlmDepth: 1,
+					sessionManager: { getHeader: () => ({ parentSession: "../parent.jsonl" }) },
+				},
+			} as never;
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const internals = daemon as unknown as {
+				createAgentFamilyCatalog: ReturnType<typeof vi.fn>;
+				assertStateSessionNameAvailable(state: ActiveSessionState, name: string): Promise<void>;
+			};
+			internals.createAgentFamilyCatalog = vi.fn(async () => [
+				{
+					id: "sibling",
+					name: "taken",
+					depth: 1,
+					status: "idle",
+					parentSessionPath: canonicalSessionPath(parentPath),
+				},
+			]);
+
+			await expect(internals.assertStateSessionNameAvailable(state, "taken")).rejects.toThrow(
+				"an agent of that name already exists at depth 1 under this parent",
+			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("keeps fresh local rows over stale synced peers in the family catalog", async () => {
@@ -285,6 +482,81 @@ describe("daemon mode helpers", () => {
 			);
 		} finally {
 			listAll.mockRestore();
+		}
+	});
+
+	it("canonicalizes symlinked paths in the family catalog and name reservations", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-family-catalog-paths-"));
+		try {
+			const realDir = join(tempDir, "real");
+			const aliasDir = join(tempDir, "alias");
+			mkdirSync(realDir);
+			symlinkSync(realDir, aliasDir, "dir");
+			const parentPath = join(realDir, "parent.jsonl");
+			writeFileSync(parentPath, "");
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const parent = makeState("parent");
+			parent.runtime = {
+				...parent.runtime,
+				cwd: tempDir,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					sessionId: "session-parent",
+					sessionName: "parent",
+					sessionFile: parentPath,
+					sessionManager: { getSessionArtifactDir: () => undefined },
+					rlmDepth: 0,
+					isStreaming: false,
+					isSessionActive: false,
+					unfinishedActionCount: 0,
+					hasRunningRlmChildren: () => false,
+				},
+			} as never;
+			const child = {
+				activeSessionId: "child-active",
+				sessionId: "session-child",
+				sessionName: "child",
+				runtimeKind: "subagent",
+				cwd: tempDir,
+				isStreaming: false,
+				unfinishedActionCount: 0,
+				parentSessionPath: join(aliasDir, "parent.jsonl"),
+				rlmDepth: 1,
+				status: "idle",
+			};
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				remoteAgentPeers: Map<string, typeof child>;
+				createAgentFamilyRoster(state: ActiveSessionState): Promise<{ entries: Array<{ id: string }> }>;
+			};
+			internals.sessions.set(parent.activeSessionId, parent);
+			internals.remoteAgentPeers.set(child.activeSessionId, child);
+			const listAll = vi.spyOn(SessionManager, "listAll").mockResolvedValue([]);
+			try {
+				expect(await internals.createAgentFamilyRoster(parent)).toMatchObject({
+					entries: [expect.objectContaining({ id: "session-child" })],
+				});
+				expect(
+					sessionNameReservationKey({
+						name: "worker",
+						depth: 1,
+						parentSessionPath: parentPath,
+					}),
+				).toBe(
+					sessionNameReservationKey({
+						name: "worker",
+						depth: 1,
+						parentSessionPath: join(aliasDir, "parent.jsonl"),
+					}),
+				);
+			} finally {
+				listAll.mockRestore();
+			}
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
 
@@ -378,7 +650,7 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("report current progress");
 	});
 
-	it("closes a released hosted child through daemon session bookkeeping", async () => {
+	it("closes a hosted child through the release hook and persists cancellation", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-daemon-release-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: vi.fn(),
@@ -392,7 +664,8 @@ describe("daemon mode helpers", () => {
 		});
 		let internals: {
 			sessions: Map<string, ActiveSessionState>;
-			closeSession: (state: ActiveSessionState, reason: "completed") => Promise<void>;
+			closeSession: (state: ActiveSessionState, reason: "completed" | "killed") => Promise<void>;
+			recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<void>;
 			createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
 		};
 		const closeSession = vi.fn(async (state: ActiveSessionState) => {
@@ -402,6 +675,8 @@ describe("daemon mode helpers", () => {
 		internals.sessions.set(parentState.activeSessionId, parentState);
 		internals.sessions.set(childState.activeSessionId, childState);
 		internals.closeSession = closeSession;
+		const recordDeletion = vi.fn(async () => undefined);
+		internals.recordRlmSubagentDeletion = recordDeletion;
 
 		await internals
 			.createSubagentRuntimeHost(parentState)
@@ -411,7 +686,36 @@ describe("daemon mode helpers", () => {
 				"error",
 			);
 
+		expect(recordDeletion).not.toHaveBeenCalled();
 		expect(closeSession).toHaveBeenCalledWith(childState, "completed");
+		internals.sessions.set(childState.activeSessionId, childState);
+		await internals
+			.createSubagentRuntimeHost(parentState)
+			.releaseRlmSubagentRuntime?.(
+				{ session: childState.runtime.session },
+				{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
+				"cancelled",
+			);
+		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1");
+		expect(recordDeletion.mock.invocationCallOrder[0]).toBeLessThan(closeSession.mock.invocationCallOrder[1]!);
+		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
+		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
+
+		// A registry failure must not strand the cancelled child as a stale resident session.
+		internals.sessions.set(childState.activeSessionId, childState);
+		internals.recordRlmSubagentDeletion = vi.fn(async () => {
+			throw new Error("registry write failed");
+		});
+		await expect(
+			internals
+				.createSubagentRuntimeHost(parentState)
+				.releaseRlmSubagentRuntime?.(
+					{ session: childState.runtime.session },
+					{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
+					"cancelled",
+				),
+		).rejects.toThrow("registry write failed");
+		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
 
@@ -511,6 +815,34 @@ describe("daemon mode helpers", () => {
 			expect(listed).toContainEqual(
 				expect.objectContaining({ sessionFile: childState.runtime.session.sessionFile, rlmChildId: "child-1" }),
 			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("discovers a non-resident child left running in the persisted registry", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-orphan-running-child-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const entry = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			entry.status = "running";
+			writeFileSync(registryPath, `${JSON.stringify(entry)}\n`);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				listPassiveRlmSubagents(): Promise<Array<{ entry: { childId: string } }>>;
+				createAgentMessageController(
+					getCurrentState: () => ActiveSessionState | undefined,
+				): AgentSessionMessageController;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+
+			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry.childId)).toContain(
+				fixture.childId,
+			);
+			await expect(internals.createAgentMessageController(() => parentState).roster?.()).resolves.toMatchObject({
+				entries: [expect.objectContaining({ relationship: "child", name: "renamed-worker" })],
+			});
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -1219,6 +1551,87 @@ describe("daemon mode helpers", () => {
 			} else {
 				process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
 			}
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("routes worker-local session renames through the supervisor", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-worker-rename-"));
+		const socketPath = join(tempDir, "s");
+		let receivedCommand: Record<string, unknown> | undefined;
+		let releaseResponse: () => void = () => {};
+		const responseGate = new Promise<void>((resolve) => {
+			releaseResponse = resolve;
+		});
+		const server = createServer((socket) => {
+			socket.write(
+				`${JSON.stringify({
+					type: "daemon_hello",
+					socketPath,
+					protocol: DAEMON_PROTOCOL_INFO,
+					schemaRevision: DAEMON_SCHEMA_REVISION,
+					serverCapabilities: [],
+					clientId: "worker-rename-test",
+				})}\n`,
+			);
+			let buffered = "";
+			socket.on("data", (chunk: Buffer) => {
+				buffered += chunk.toString("utf8");
+				const newline = buffered.indexOf("\n");
+				if (newline < 0 || receivedCommand) return;
+				const wire = JSON.parse(buffered.slice(0, newline)) as Record<string, unknown>;
+				receivedCommand = (wire.command as Record<string, unknown> | undefined) ?? wire;
+				void responseGate.then(() => {
+					socket.write(
+						`${JSON.stringify({
+							id: wire.id,
+							type: "response",
+							command: "set_session_name",
+							success: true,
+						})}\n`,
+					);
+				});
+			});
+		});
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		try {
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(socketPath, resolve);
+			});
+			process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "token" },
+			});
+			const setSessionName = vi.fn((_name: string) => undefined);
+			const state = makeState("active");
+			Object.assign(state.runtime, { session: { setSessionName } });
+			const controller = (
+				daemon as unknown as {
+					createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
+				}
+			).createAgentMessageController(() => state);
+
+			const rename = controller.setSessionName?.("shared-root");
+			// Workers and supervisors ship in one process tree, so no capability gate is needed; the
+			// optional field remains compatible with old supervisors because envelope parsing preserves extra fields.
+			await vi.waitFor(() =>
+				expect(receivedCommand).toMatchObject({
+					type: "set_session_name",
+					activeSessionId: "active",
+					name: "shared-root",
+					workerToken: "token",
+				}),
+			);
+			expect(setSessionName).not.toHaveBeenCalled();
+			releaseResponse();
+			await expect(rename).resolves.toBeUndefined();
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
 			await new Promise<void>((resolve) => server.close(() => resolve()));
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -1981,7 +2394,7 @@ describe("daemon mode helpers", () => {
 		expect((await internals.createAgentMessageListResult(targetState)).agents[0]?.unfinishedActionCount).toBe(3);
 	});
 
-	it("reports non-streaming busy sessions as active in agent-observe summaries", () => {
+	it("reports non-streaming busy sessions as active in agent-observe summaries", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -2016,17 +2429,366 @@ describe("daemon mode helpers", () => {
 		} as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
-			createAgentObserveListResult(current: ActiveSessionState): { current: { status: string } };
+			createAgentObserveListResult(current: ActiveSessionState): Promise<{ current: { status: string } }>;
 		};
 		internals.sessions.set(targetState.activeSessionId, targetState);
 
-		expect(internals.createAgentObserveListResult(targetState).current.status).toBe("busy");
+		expect((await internals.createAgentObserveListResult(targetState)).current.status).toBe("busy");
 
 		(targetState.runtime.session as { isCompacting: boolean; unfinishedActionCount: number }).isCompacting = true;
 		(targetState.runtime.session as { isCompacting: boolean; unfinishedActionCount: number }).unfinishedActionCount =
 			0;
 
-		expect(internals.createAgentObserveListResult(targetState).current.status).toBe("compacting");
+		expect((await internals.createAgentObserveListResult(targetState)).current.status).toBe("compacting");
+	});
+
+	it("canonicalizes symlinked family paths before comparison", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-family-paths-"));
+		try {
+			const realDir = join(tempDir, "real");
+			const aliasDir = join(tempDir, "alias");
+			mkdirSync(realDir);
+			symlinkSync(realDir, aliasDir, "dir");
+			const daemon = new AgentDaemon("/tmp/prime-agent-family-paths.sock", {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const parent = makeState("parent");
+			const child = makeState("child", "parent");
+			parent.runtime = {
+				...parent.runtime,
+				metadata: { ...parent.runtime.metadata, kind: "top-level" },
+				session: { sessionId: "session-parent", sessionFile: join(realDir, "parent.jsonl") },
+			} as never;
+			child.runtime = {
+				...child.runtime,
+				metadata: {
+					...child.runtime.metadata,
+					parentSessionId: "session-parent",
+					parentSessionFile: join(aliasDir, "parent.jsonl"),
+				},
+				session: { sessionId: "session-child", sessionFile: join(realDir, "child.jsonl") },
+			} as never;
+			const internals = daemon as unknown as {
+				assertAgentFamilyReachable(current: ActiveSessionState, target: ActiveSessionState): void;
+			};
+
+			expect(() => internals.assertAgentFamilyReachable(parent, child)).not.toThrow();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a reopened child's persisted header parent relative to its session file", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-header-family-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const parent = makeState("parent");
+			const child = makeState("reopened-child");
+			const otherRoot = makeState("other-root");
+			parent.runtime = {
+				...parent.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					sessionId: "session-parent",
+					sessionFile: join(tempDir, "parent.jsonl"),
+					sessionManager: { getHeader: () => ({ parentSession: undefined }) },
+				},
+			} as never;
+			child.runtime = {
+				...child.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					sessionId: "session-child",
+					sessionFile: join(tempDir, "children", "child.jsonl"),
+					rlmDepth: 1,
+					sessionManager: { getHeader: () => ({ parentSession: "../parent.jsonl" }) },
+				},
+			} as never;
+			otherRoot.runtime = {
+				...otherRoot.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					sessionId: "session-other",
+					sessionFile: join(tempDir, "other.jsonl"),
+					sessionManager: { getHeader: () => ({ parentSession: undefined }) },
+				},
+			} as never;
+			const internals = daemon as unknown as {
+				assertAgentFamilyReachable(current: ActiveSessionState, target: ActiveSessionState): void;
+			};
+
+			expect(() => internals.assertAgentFamilyReachable(child, parent)).not.toThrow();
+			expect(() => internals.assertAgentFamilyReachable(child, otherRoot)).toThrow(AGENT_FAMILY_REACH_ERROR);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses the persisted header parent after a runtime session replacement", () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-applied-family.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const originalParent = makeState("original-parent");
+		const persistedParent = makeState("persisted-parent");
+		const child = makeState("child");
+		originalParent.runtime = {
+			...originalParent.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: { sessionId: "session-original", sessionFile: "/tmp/original-parent.jsonl" },
+		} as never;
+		persistedParent.runtime = {
+			...persistedParent.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: { sessionId: "session-persisted", sessionFile: "/tmp/persisted-parent.jsonl" },
+		} as never;
+		child.runtime = {
+			...child.runtime,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentSessionId: "session-original",
+				parentSessionFile: "/tmp/original-parent.jsonl",
+			},
+			session: {
+				sessionId: "session-child",
+				sessionFile: "/tmp/child.jsonl",
+				rlmDepth: 1,
+				sessionManager: { getHeader: () => ({ parentSession: "/tmp/persisted-parent.jsonl" }) },
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			assertAgentFamilyReachable(current: ActiveSessionState, target: ActiveSessionState): void;
+		};
+
+		expect(() => internals.assertAgentFamilyReachable(child, persistedParent)).not.toThrow();
+		expect(() => internals.assertAgentFamilyReachable(child, originalParent)).toThrow(AGENT_FAMILY_REACH_ERROR);
+	});
+
+	it("labels a reopened header-linked child and parent consistently with family reach", () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-header-relationship.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeState("parent");
+		const child = makeState("reopened-child");
+		parent.runtime = {
+			...parent.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: {
+				sessionId: "session-parent",
+				sessionFile: "/tmp/parent.jsonl",
+				sessionManager: { getHeader: () => ({ parentSession: undefined }) },
+			},
+		} as never;
+		child.runtime = {
+			...child.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: {
+				sessionId: "session-child",
+				sessionFile: "/tmp/children/child.jsonl",
+				rlmDepth: 1,
+				sessionManager: { getHeader: () => ({ parentSession: "../parent.jsonl" }) },
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			agentMessageRelationship(from: ActiveSessionState, target: ActiveSessionState): string | undefined;
+		};
+
+		expect(internals.agentMessageRelationship(child, parent)).toBe("child");
+		expect(internals.agentMessageRelationship(parent, child)).toBe("parent");
+	});
+
+	it("limits agent send and observation to the nuclear family", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-family-reach.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const states = [
+			makeState("root"),
+			makeState("child", "root"),
+			makeState("sibling", "root"),
+			makeState("grandchild", "child"),
+			makeState("cousin", "sibling"),
+		];
+		const sessionIds = new Map(states.map((state) => [state.activeSessionId, `session-${state.activeSessionId}`]));
+		for (const state of states) {
+			const parentActiveSessionId = state.runtime.metadata.parentActiveSessionId;
+			state.runtime = {
+				...state.runtime,
+				cwd: "/tmp",
+				diagnostics: [],
+				modelFallbackMessage: undefined,
+				metadata: {
+					...state.runtime.metadata,
+					kind: parentActiveSessionId ? "subagent" : "top-level",
+					...(parentActiveSessionId
+						? {
+								parentSessionId: sessionIds.get(parentActiveSessionId),
+								parentSessionFile: `/tmp/${parentActiveSessionId}.jsonl`,
+							}
+						: {}),
+				},
+				session: {
+					sessionId: sessionIds.get(state.activeSessionId),
+					sessionName: state.activeSessionId,
+					sessionFile: `/tmp/${state.activeSessionId}.jsonl`,
+					sessionManager: {
+						getCwd: () => "/tmp",
+						getHeader: () => ({ created: new Date(0).toISOString() }),
+						getSessionArtifactDir: () => undefined,
+					},
+					runtimeKind: parentActiveSessionId ? "subagent" : "top-level",
+					rlmDepth: parentActiveSessionId
+						? state.activeSessionId === "grandchild" || state.activeSessionId === "cousin"
+							? 2
+							: 1
+						: 0,
+					isStreaming: false,
+					isCompacting: false,
+					isBashRunning: false,
+					isRetrying: false,
+					isSessionActive: false,
+					hasAcceptedPromptInFlight: false,
+					unfinishedActionCount: 0,
+					messages: [],
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				},
+			} as never;
+		}
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
+			createAgentObserveController(getCurrentState: () => ActiveSessionState): AgentObserveController;
+		};
+		for (const state of states) internals.sessions.set(state.activeSessionId, state);
+		const child = states[1]!;
+		const messaging = internals.createAgentMessageController(() => child);
+		const observe = internals.createAgentObserveController(() => child);
+
+		expect((await observe.listAgents()).agents.map((agent) => agent.activeSessionId)).toEqual([
+			"root",
+			"child",
+			"sibling",
+			"grandchild",
+		]);
+		await expect(observe.getAgent("cousin")).rejects.toThrow(
+			"Agent reach is limited to parent, siblings, and children",
+		);
+		await expect(observe.recentMessages({ target: "cousin" })).rejects.toThrow(
+			"Agent reach is limited to parent, siblings, and children",
+		);
+		await expect(messaging.sendAgentMessage({ target: "cousin", message: "no" })).rejects.toThrow(
+			"Agent reach is limited to parent, siblings, and children",
+		);
+	});
+
+	it("resolves a duplicate session name to the only family-reachable agent", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-family-name-resolution.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const observer = makeAgentFamilyState("observer", "observer");
+		const familyHelper = makeAgentFamilyState("family-helper", "helper", observer.state);
+		const otherRoot = makeAgentFamilyState("other-root", "other-root");
+		const unrelatedHelper = makeAgentFamilyState("unrelated-helper", "helper", otherRoot.state);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentMessageController(
+				getCurrentState: () => ActiveSessionState | undefined,
+			): AgentSessionMessageController;
+			createAgentObserveController(getCurrentState: () => ActiveSessionState | undefined): AgentObserveController;
+		};
+		for (const fixture of [observer, familyHelper, otherRoot, unrelatedHelper]) {
+			internals.sessions.set(fixture.state.activeSessionId, fixture.state);
+		}
+
+		const observe = internals.createAgentObserveController(() => observer.state);
+		await expect(observe.getAgent("helper")).resolves.toMatchObject({
+			agent: { activeSessionId: familyHelper.state.activeSessionId },
+		});
+		await expect(observe.recentMessages({ target: "helper" })).resolves.toMatchObject({
+			agent: { activeSessionId: familyHelper.state.activeSessionId },
+		});
+		await expect(
+			internals
+				.createAgentMessageController(() => observer.state)
+				.sendAgentMessage({ target: "helper", message: "report progress" }),
+		).resolves.toMatchObject({ target: { activeSessionId: familyHelper.state.activeSessionId } });
+		expect(familyHelper.acceptAgentMessagePrompt).toHaveBeenCalledOnce();
+		expect(unrelatedHelper.acceptAgentMessagePrompt).not.toHaveBeenCalled();
+	});
+
+	it("keeps a session ID ambiguous when a reachable agent uses it as its name", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-family-id-ambiguity.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeAgentFamilyState("parent", "parent");
+		const observer = makeAgentFamilyState("observer", "observer", parent.state);
+		const sibling = makeAgentFamilyState("sibling", parent.state.runtime.session.sessionId, parent.state);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentMessageController(
+				getCurrentState: () => ActiveSessionState | undefined,
+			): AgentSessionMessageController;
+			createAgentObserveController(getCurrentState: () => ActiveSessionState | undefined): AgentObserveController;
+		};
+		for (const fixture of [parent, observer, sibling]) {
+			internals.sessions.set(fixture.state.activeSessionId, fixture.state);
+		}
+		const expectedError = `Ambiguous active session "${parent.state.runtime.session.sessionId}"`;
+
+		await expect(
+			internals.createAgentObserveController(() => observer.state).getAgent(parent.state.runtime.session.sessionId),
+		).rejects.toThrow(expectedError);
+		await expect(
+			internals
+				.createAgentMessageController(() => observer.state)
+				.sendAgentMessage({ target: parent.state.runtime.session.sessionId, message: "report progress" }),
+		).rejects.toThrow(expectedError);
+		expect(parent.acceptAgentMessagePrompt).not.toHaveBeenCalled();
+		expect(sibling.acceptAgentMessagePrompt).not.toHaveBeenCalled();
+	});
+
+	it("keeps a duplicate session name ambiguous when two family agents are reachable", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-family-name-ambiguity.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeAgentFamilyState("parent", "helper");
+		const observer = makeAgentFamilyState("observer", "observer", parent.state);
+		const sibling = makeAgentFamilyState("sibling", "helper", parent.state);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentMessageController(
+				getCurrentState: () => ActiveSessionState | undefined,
+			): AgentSessionMessageController;
+			createAgentObserveController(getCurrentState: () => ActiveSessionState | undefined): AgentObserveController;
+		};
+		for (const fixture of [parent, observer, sibling]) {
+			internals.sessions.set(fixture.state.activeSessionId, fixture.state);
+		}
+		const expectedError = 'Ambiguous active session "helper"';
+
+		await expect(internals.createAgentObserveController(() => observer.state).getAgent("helper")).rejects.toThrow(
+			expectedError,
+		);
+		await expect(
+			internals
+				.createAgentMessageController(() => observer.state)
+				.sendAgentMessage({ target: "helper", message: "report progress" }),
+		).rejects.toThrow(expectedError);
+		expect(parent.acceptAgentMessagePrompt).not.toHaveBeenCalled();
+		expect(sibling.acceptAgentMessagePrompt).not.toHaveBeenCalled();
 	});
 
 	it("serializes concurrent agent messages to an idle target", async () => {
@@ -3978,15 +4740,19 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("makes daemon host controllers available during session_start extension binding", async () => {
+	it("uses the binding session as its own list and roster context", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-controller-race-"));
 		try {
 			let listedAgentsDuringBind = 0;
 			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
 				const session = makeRuntimeSession(options.sessionManager);
 				session.bindExtensions = vi.fn(async () => {
-					const result = await options.sessionOptions?.agentMessageController?.listAgents();
+					const controller = options.sessionOptions?.agentMessageController;
+					const result = await controller?.listAgents();
 					expect(result?.current?.activeSessionId).toBeTruthy();
+					await expect(controller?.roster?.()).resolves.toMatchObject({
+						current: { id: session.sessionId },
+					});
 					listedAgentsDuringBind++;
 				});
 				return {
@@ -4010,9 +4776,10 @@ describe("daemon mode helpers", () => {
 				}
 			).createRuntime.bind(daemon);
 
-			await create({ type: "create", sessionPath: join(tempDir, "session.jsonl") });
+			await create({ type: "create", sessionPath: join(tempDir, "session-1.jsonl") });
+			await create({ type: "create", sessionPath: join(tempDir, "session-2.jsonl") });
 
-			expect(listedAgentsDuringBind).toBe(1);
+			expect(listedAgentsDuringBind).toBe(2);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -4350,7 +5117,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("reopens a parent with completed children without creating child runtimes and lists them as passive", async () => {
+	it("reports failed passive children as errors without creating child runtimes", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-lazy-rlm-list-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
@@ -4363,6 +5130,10 @@ describe("daemon mode helpers", () => {
 				lines[0] = JSON.stringify(header);
 				writeFileSync(sessionFile, lines.join("\n"));
 			}
+			const parentRegistry = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const failedEntry = JSON.parse(readFileSync(parentRegistry, "utf8").trim()) as Record<string, unknown>;
+			// Failed children retain their last "running" registry row after the runtime is released.
+			writeFileSync(parentRegistry, `${JSON.stringify({ ...failedEntry, status: "running" })}\n`);
 			const internals = fixture.daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
@@ -4386,7 +5157,7 @@ describe("daemon mode helpers", () => {
 			expect(children).toEqual([
 				expect.objectContaining({
 					id: fixture.childId,
-					status: "done",
+					status: "error",
 				}),
 				expect.objectContaining({
 					id: fixture.grandchildId,
@@ -4397,7 +5168,8 @@ describe("daemon mode helpers", () => {
 			expect(children.every((child) => child.activeSessionId === undefined)).toBe(true);
 			// Snapshotting must reuse the passive registry walk without hydrating children.
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
-			expect((await internals.createAgentMessageController(() => parentState).listAgents()).agents).toContainEqual(
+			const listedAgents = await internals.createAgentMessageController(() => parentState).listAgents();
+			expect(listedAgents.agents).toContainEqual(
 				expect.objectContaining({
 					activeSessionId: expect.any(String),
 					sessionId: expect.any(String),
@@ -4406,16 +5178,35 @@ describe("daemon mode helpers", () => {
 					parentActiveSessionId: parentState.activeSessionId,
 					status: "inactive",
 					rlmChildId: fixture.childId,
+					rlmChildRegistryStatus: "running",
 				}),
 			);
-			expect((await internals.createAgentMessageController(() => parentState).listAgents()).agents).toContainEqual(
+			expect(listedAgents.agents).toContainEqual(
 				expect.objectContaining({
-					activeSessionId: expect.any(String),
 					sessionName: "nested-worker",
 					status: "inactive",
 					rlmChildId: fixture.grandchildId,
+					rlmChildRegistryStatus: "completed",
 				}),
 			);
+			const observeController = (
+				fixture.daemon as unknown as {
+					createAgentObserveController(getCurrentState: () => ActiveSessionState): AgentObserveController;
+				}
+			).createAgentObserveController(() => parentState);
+			const observedAgents = await observeController.listAgents();
+			expect(observedAgents.agents).toContainEqual(
+				expect.objectContaining({
+					activeSessionId: expect.any(String),
+					sessionName: "renamed-worker",
+					runtimeKind: "subagent",
+					status: "idle",
+					messageCount: 1,
+					rlmChildId: fixture.childId,
+				}),
+			);
+			expect(fixture.createRuntime).toHaveBeenCalledOnce();
+
 			const messageController = internals.createAgentMessageController(() => parentState);
 			await expect(messageController.roster?.()).resolves.toMatchObject({
 				current: { id: parentState.runtime.session.sessionId, depth: 0 },
@@ -4943,7 +5734,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("hydrates only the ancestor chain when a nested passive child is messaged", async () => {
+	it("rejects direct messages to nested passive grandchildren without hydrating them", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-lazy-nested-message-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
@@ -4953,23 +5744,28 @@ describe("daemon mode helpers", () => {
 				createAgentMessageController(
 					getCurrentState: () => ActiveSessionState | undefined,
 				): AgentSessionMessageController;
+				createAgentObserveController(getCurrentState: () => ActiveSessionState | undefined): AgentObserveController;
 			};
 			const parentState = await internals.createRuntime({
 				type: "create",
 				sessionPath: fixture.parentSessionFile,
 			});
+			const reachError = "Agent reach is limited to parent, siblings, and children";
 
-			await internals
-				.createAgentMessageController(() => parentState)
-				.sendAgentMessage({
-					target: "nested-worker",
-					message: "report nested progress",
-				});
+			await expect(
+				internals
+					.createAgentMessageController(() => parentState)
+					.sendAgentMessage({
+						target: "nested-worker",
+						message: "report nested progress",
+					}),
+			).rejects.toThrow(reachError);
+			const observe = internals.createAgentObserveController(() => parentState);
+			await expect(observe.getAgent("nested-worker")).rejects.toThrow(reachError);
+			await expect(observe.recentMessages({ target: "nested-worker" })).rejects.toThrow(reachError);
 
-			expect(fixture.createRuntime).toHaveBeenCalledTimes(3);
-			expect([...internals.sessions.values()].map((state) => state.runtime.metadata.rlmChildId)).toEqual(
-				expect.arrayContaining([fixture.childId, fixture.grandchildId]),
-			);
+			expect([...internals.sessions.values()]).toEqual([parentState]);
+			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -6561,6 +7357,36 @@ describe("daemon mode helpers", () => {
 			).rejects.toThrow();
 			expect(parentState.runtime.session.getRlmChildRunStatus).toHaveBeenCalledWith("cancelled-child");
 			expect(internals.sessions.size).toBe(sessionsBeforeCancelledStartup);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("disposes a newly opened runtime when its requested root name collides", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-root-name-failure-"));
+		try {
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
+				session: makeRuntimeSession(options.sessionManager),
+				extensionsResult: { extensions: [], errors: [], runtime: {} } as never,
+				services: { cwd: options.cwd, agentDir: options.agentDir } as never,
+				diagnostics: [],
+			}));
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: tempDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			};
+			await internals.createRuntime({ type: "create", sessionPath: join(tempDir, "first.jsonl"), name: "taken" });
+			await expect(
+				internals.createRuntime({ type: "create", sessionPath: join(tempDir, "second.jsonl"), name: "taken" }),
+			).rejects.toThrow("an agent of that name already exists at depth 0 under this parent");
+
+			const failedSession = createRuntime.mock.results[1]?.value
+				? (await createRuntime.mock.results[1].value).session
+				: undefined;
+			expect(failedSession?.disposeAsync).toHaveBeenCalledOnce();
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -8983,6 +9809,54 @@ function makeRuntimeSession(
 		disposeAsync: vi.fn(async () => {}),
 		abort: vi.fn(async () => {}),
 	} as unknown as Awaited<ReturnType<CreateAgentSessionRuntimeFactory>>["session"];
+}
+
+function makeAgentFamilyState(
+	activeSessionId: string,
+	sessionName: string,
+	parent?: ActiveSessionState,
+): { state: ActiveSessionState; acceptAgentMessagePrompt: ReturnType<typeof vi.fn> } {
+	const state = makeState(activeSessionId, parent?.activeSessionId);
+	const acceptAgentMessagePrompt = vi.fn(
+		(_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
+			options?.preflightResult?.(true);
+			return Promise.resolve();
+		},
+	);
+	const parentSessionId = parent?.runtime.session.sessionId;
+	state.runtime = {
+		...state.runtime,
+		cwd: "/tmp",
+		diagnostics: [],
+		metadata: {
+			kind: parent ? "subagent" : "top-level",
+			createdAt: 1,
+			...(parent ? { parentActiveSessionId: parent.activeSessionId, parentSessionId } : {}),
+		},
+		session: {
+			sessionId: `session-${activeSessionId}`,
+			sessionName,
+			runtimeKind: parent ? "subagent" : "top-level",
+			rlmDepth: parent ? (parent.runtime.session.rlmDepth ?? 0) + 1 : 0,
+			isStreaming: false,
+			isCompacting: false,
+			isBashRunning: false,
+			isRetrying: false,
+			isSessionActive: false,
+			hasAcceptedPromptInFlight: false,
+			unfinishedActionCount: 0,
+			messages: [],
+			state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getHeader: () => ({ created: new Date(0).toISOString() }),
+			},
+			hasRunningRlmChildren: () => false,
+			getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+			acceptAgentMessagePrompt,
+		},
+	} as never;
+	return { state, acceptAgentMessagePrompt };
 }
 
 function makeState(activeSessionId: string, parentActiveSessionId?: string): ActiveSessionState {

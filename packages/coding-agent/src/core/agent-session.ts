@@ -180,6 +180,8 @@ import {
 	type CustomMessage,
 	createCompactionOutcomeMessage,
 	createHeartbeatPromptMessage,
+	createRlmChildFailureMessage,
+	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
@@ -939,6 +941,8 @@ interface RlmChildRun {
 	publication: AgentMessageDeferred;
 	/** Child session, once its runtime exists. Used to cancel nested child runs. */
 	session?: AgentSession;
+	/** True once the detached run task has finished its catch and cleanup paths. */
+	settled: boolean;
 	/** Selector snapshot for a delete admitted while runtime startup was still pending. */
 	detachedDeletion?: RlmSubagentRegistryEntry;
 	/** Re-emits the run's rlm_child_update snapshot with its current status. */
@@ -1205,6 +1209,7 @@ export class AgentSession {
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
+	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
 	private _pendingRlmSubagentSessionNames = new Set<string>();
@@ -3059,9 +3064,7 @@ export class AgentSession {
 			throw new Error("agent messaging is not available in this session");
 		}
 		switch (type) {
-			case "agent_message.list":
-				return this._agentMessageController.listAgents();
-			case "agent_message.roster":
+			case "agent_message.list_agents":
 				if (!this._agentMessageController.roster)
 					throw new Error("agent family roster is not available in this session");
 				return this._agentMessageController.roster();
@@ -3091,7 +3094,7 @@ export class AgentSession {
 		| AgentObserveListResult
 		| AgentObserveAgentSnapshot
 		| AgentObserveRecentMessagesResult
-		| Promise<AgentObserveAgentSnapshot | AgentObserveRecentMessagesResult> {
+		| Promise<AgentObserveListResult | AgentObserveAgentSnapshot | AgentObserveRecentMessagesResult> {
 		const controller = this._agentObserveController;
 		if (!controller) {
 			throw new Error("agent observation is not available in this session");
@@ -4455,7 +4458,7 @@ export class AgentSession {
 	async acceptAgentMessagePrompt(text: string, options?: PromptOptions): Promise<void> {
 		const customMessage =
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
-		return this._prompt(text, {
+		await this._prompt(text, {
 			...options,
 			expandPromptTemplates: false,
 			skipInputHandlers: true,
@@ -4464,6 +4467,7 @@ export class AgentSession {
 			agentMessageId: options?.agentMessageId ?? customMessage?.details.id ?? parseAgentSessionMessagePromptId(text),
 			customMessage,
 		});
+		if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 	}
 
 	async queueAgentMessagePrompt(
@@ -4477,12 +4481,15 @@ export class AgentSession {
 				agentMessageId,
 				message: customMessage,
 			});
+			if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 			return true;
 		}
-		return this._queuePreparedPrompt("followUp", text, undefined, {
+		const queued = await this._queuePreparedPrompt("followUp", text, undefined, {
 			agentMessageId,
 			message: customMessage,
 		});
+		if (queued && customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
+		return queued;
 	}
 
 	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<void> {
@@ -8702,10 +8709,8 @@ export class AgentSession {
 			Object.assign(
 				handlers,
 				createAgentMessageHostHandlers({
-					listAgents: async () =>
-						(await this.handleAgentMessageHostRequest("agent_message.list")) as AgentSessionMessageListResult,
 					roster: async () =>
-						(await this.handleAgentMessageHostRequest("agent_message.roster")) as AgentFamilyRosterResult,
+						(await this.handleAgentMessageHostRequest("agent_message.list_agents")) as AgentFamilyRosterResult,
 					awaitPendingChildPublication: (selector) => this._awaitPendingRlmChildPublication(selector),
 					sendAgentMessage: async (input) => {
 						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
@@ -8716,14 +8721,21 @@ export class AgentSession {
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";
 							if (input.receiverRole === undefined && this._agentMessageController?.roster) {
-								const roster = await this._agentMessageController.roster();
-								addressedParent = roster.entries.some(
-									(entry) =>
-										entry.relationship === "parent" &&
-										(entry.id === input.target || entry.name === input.target),
-								);
+								try {
+									const roster = await this._agentMessageController.roster();
+									addressedParent = roster.entries.some(
+										(entry) =>
+											entry.relationship === "parent" &&
+											(entry.id === input.target || entry.name === input.target),
+									);
+								} catch {
+									addressedParent = false;
+								}
 							}
-							if (addressedParent) this._repliedToParentSinceTask = true;
+							if (addressedParent) {
+								this._repliedToParentSinceTask = true;
+								this._parentReplyCount += 1;
+							}
 						}
 						return receipt;
 					},
@@ -9042,7 +9054,10 @@ export class AgentSession {
 
 	private async _awaitPendingRlmChildPublication(selector: string): Promise<string | undefined> {
 		const run = [...this._activeRlmChildRuns.values()].find(
-			(candidate) => candidate.id === selector || candidate.sessionName === selector,
+			(candidate) =>
+				(candidate.status === "queued" || candidate.status === "running" || candidate.status === "done") &&
+				!candidate.detachedDeletion &&
+				(candidate.id === selector || candidate.sessionName === selector),
 		);
 		if (!run) return undefined;
 		await run.publication.promise;
@@ -9072,7 +9087,7 @@ export class AgentSession {
 		const subagents: RlmListSubagentsResult["subagents"] = [];
 		const recorded = new Set<string>();
 		for (const run of this._activeRlmChildRuns.values()) {
-			if (this._deletingRlmChildren.has(run.id) || run.status === "error" || run.status === "cancelled") {
+			if (this._deletingRlmChildren.has(run.id) || run.detachedDeletion || run.status === "cancelled") {
 				continue;
 			}
 			const daemonChild = daemonChildren.get(run.id);
@@ -9082,7 +9097,7 @@ export class AgentSession {
 				session_id: daemonChild?.sessionId ?? run.session?.sessionId ?? null,
 				session_name: daemonChild?.sessionName ?? run.session?.sessionName ?? run.sessionName,
 				session_dir: run.sessionDir,
-				status: run.status === "done" ? "completed" : "running",
+				status: run.status === "done" ? "completed" : run.status === "error" ? "error" : "running",
 			});
 			recorded.add(run.id);
 		}
@@ -9126,7 +9141,7 @@ export class AgentSession {
 				session_id: daemonChild.sessionId,
 				session_name: daemonChild.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: daemonChild.sessionDir,
-				status: "completed",
+				status: daemonChild.rlmChildRegistryStatus === "completed" ? "completed" : "error",
 			});
 		}
 		return { subagents };
@@ -9328,6 +9343,11 @@ export class AgentSession {
 				this._emitRlmSubagentRemoval(subagent);
 			}
 			const liveSession = run.session;
+			if (run.status === "error" && !liveSession && run.settled) {
+				this._deletedRlmChildIds.add(childId);
+				this._removeRlmSubagentTracking(childId, run);
+				return { subagent };
+			}
 			if (liveSession) {
 				try {
 					await this._deleteRlmSubagentSession(childId, liveSession);
@@ -9617,6 +9637,7 @@ export class AgentSession {
 			sessionName,
 			sessionDir: childSessionDir,
 			status: "queued",
+			settled: false,
 			abort: noopRlmChildAbort,
 			publication: createAgentMessageDeferred(),
 		};
@@ -9669,6 +9690,15 @@ export class AgentSession {
 			onSessionPublished: publishChildSession,
 		};
 
+		const injectTerminalMessage = async (message: CustomMessage): Promise<void> => {
+			await this._promptInjectedMessage(message.content as string, message, {
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				returnAfterAccepted: true,
+				suppressAutonomousContinuation: true,
+			}).catch(() => undefined);
+		};
+
 		// Runtime startup and the task run are deliberately detached. The public
 		// spawn resolves at admission, while this task owns live tracking, usage,
 		// retention, cancellation, and late-startup cleanup.
@@ -9677,6 +9707,7 @@ export class AgentSession {
 			try {
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
+				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);
 				publishChildSession(child);
 				throwIfCancelled();
@@ -9759,6 +9790,7 @@ export class AgentSession {
 					timestamp: Date.now(),
 				};
 				throwIfCancelled();
+				const parentReplyCountBeforeRun = child._parentReplyCount;
 				await child.promptAndWait(content, {
 					expandPromptTemplates: false,
 					source: "extension",
@@ -9769,6 +9801,17 @@ export class AgentSession {
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
+				if (!run.detachedDeletion && child._parentReplyCount === parentReplyCountBeforeRun) {
+					const lastAssistantText = child.getLastAssistantText();
+					await injectTerminalMessage(
+						createRlmChildTerminalNoticeMessage({
+							kind: "completed_without_reply",
+							childId: run.id,
+							sessionName,
+							lastAssistantTextPreview: lastAssistantText ? compactRlmText(lastAssistantText) : undefined,
+						}),
+					);
+				}
 				if (!this.registerRlmChildSession(run.id, child)) {
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
@@ -9789,15 +9832,47 @@ export class AgentSession {
 				activity = undefined;
 				emitChildUpdate();
 				if (!run.detachedDeletion) {
+					if (run.status === "error") {
+						await injectTerminalMessage(
+							createRlmChildFailureMessage({
+								childId: run.id,
+								sessionName,
+								error: run.error ?? "unknown error",
+							}),
+						);
+					} else if (run.status === "cancelled") {
+						await injectTerminalMessage(
+							createRlmChildTerminalNoticeMessage({
+								kind: "cancelled",
+								childId: run.id,
+								sessionName,
+								reason: run.error,
+							}),
+						);
+					}
+				}
+				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
+					try {
+						await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
+							childRuntime ?? { session: childSession },
+							subagentOptions,
+							run.status === "cancelled" ? "cancelled" : "error",
+						);
+						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
+							this._deletedRlmChildIds.add(run.id);
+							this._removeRlmSubagentTracking(run.id);
+						}
+					} catch {
+						await childSession?.disposeAsync().catch(() => undefined);
+					}
+				} else if (!run.detachedDeletion) {
 					try {
 						if (childRuntime && this._subagentRuntimeHost) {
 							await this._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
 						} else if (childSession) {
 							await childSession.disposeAsync();
-						} else {
-							return;
 						}
-						if (!this._disposed && !this._disposing) {
+						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
 							this._deletedRlmChildIds.add(run.id);
 							this._removeRlmSubagentTracking(run.id);
 						}
@@ -9823,12 +9898,16 @@ export class AgentSession {
 						run.abort = noopRlmChildAbort;
 						run.unsubscribe = undefined;
 						run.session = undefined;
-					} else {
+					} else if (run.status !== "error" || run.detachedDeletion) {
 						this._removeRlmSubagentTracking(run.id, run);
+					} else {
+						run.unsubscribe?.();
+						run.abort = noopRlmChildAbort;
+						run.unsubscribe = undefined;
 					}
 				}
+				run.settled = true;
 			}
-			// Follow-up: deliver post-admission startup failures to the parent over a2a.
 		})().catch(() => undefined);
 
 		return {

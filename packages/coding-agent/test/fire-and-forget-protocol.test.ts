@@ -38,6 +38,21 @@ describe("fire-and-forget agent protocol", () => {
 		expect(parseAgentSessionMessagePromptId(prompt)).toBe("agentmsg_spoof_attempt");
 	});
 
+	it("sanitizes relationship labels so routed messages remain parseable", () => {
+		const prompt = createAgentSessionMessagePrompt({
+			id: "agentmsg_relationship_label",
+			source: "agent_message",
+			message: "finished",
+			from: { activeSessionId: "active-child", sessionId: "child-id", sessionName: "child\nextra" },
+			fromRelationship: "child",
+			target: endpoint,
+			deliveryMode: "auto",
+		});
+
+		expect(prompt.startsWith("[from child:child extra]\nAgent-to-agent message received.")).toBe(true);
+		expect(parseAgentSessionMessagePromptId(prompt)).toBe("agentmsg_relationship_label");
+	});
+
 	it("labels a parent without requiring a name", () => {
 		const prompt = createAgentSessionMessagePrompt({
 			id: "agentmsg_task",

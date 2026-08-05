@@ -17,48 +17,33 @@ _MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json"
 
 
 async def list_agents() -> dict[str, Any]:
-    """List active daemon sessions addressable by agent_message.send()."""
-    return await host_request("agent_message.list")
-
-
-async def roster() -> dict[str, Any]:
     """List this agent's parent, siblings, and children, including inactive family."""
-    return await host_request("agent_message.roster")
+    return await host_request("agent_message.list_agents")
 
 
 async def send(
     message: str,
-    *legacy_args: str,
+    broadcast_message: str | None = None,
+    *,
     receiver_role: ReceiverRole | str | None = None,
     receiver_name: str | None = None,
     mode: MessageMode = "auto",
 ) -> dict[str, Any]:
-    """Send one direct message, preferably using a nuclear-family role.
-
-    New form: ``send(message, receiver_role="parent" | "sibling" | "child",
-    receiver_name=...)``. A name or id is required for siblings and children and
-    must be omitted for the unique parent. The legacy positional
-    ``send(target, message, mode)`` form remains available during migration.
-    """
+    """Send one direct role-addressed message or broadcast to ``"all"``."""
     roles = ("parent", "sibling", "child")
-    payload: dict[str, Any]
-    if legacy_args:
-        if receiver_role is not None or receiver_name is not None:
+    if broadcast_message is not None:
+        if message != "all":
             raise TypeError(
-                "legacy agent_message.send cannot combine positional target/message "
-                "with receiver_role or receiver_name"
+                "positional agent_message.send targets are not supported; "
+                "use receiver_role and receiver_name"
             )
-        if len(legacy_args) > 2:
-            raise TypeError("legacy agent_message.send accepts target, message, and optional mode")
-        target = message
-        legacy_message = legacy_args[0]
-        if len(legacy_args) == 2:
-            mode = legacy_args[1]  # type: ignore[assignment]
-        if not isinstance(target, str):
-            raise TypeError(f"target must be str, got {type(target).__name__}")
-        if not isinstance(legacy_message, str):
-            raise TypeError("legacy agent_message.send requires target and message strings")
-        payload = {"target": target, "message": legacy_message, "mode": mode}
+        if receiver_role is not None or receiver_name is not None:
+            raise TypeError("broadcast cannot be combined with receiver_role/receiver_name")
+        payload: dict[str, Any] = {
+            "target": "all",
+            "message": broadcast_message,
+            "mode": mode,
+        }
     else:
         if receiver_role not in roles:
             raise ValueError('receiver_role must be "parent", "sibling", or "child"')
@@ -78,7 +63,13 @@ async def send(
     if mode not in ("auto", "follow_up", "steer"):
         raise ValueError('mode must be "auto", "follow_up", or "steer"')
     receipt = await host_request("agent_message.send", payload)
-    _emit_sent_message(receipt, receiver_role)
+    receipts = receipt.get("receipts") if isinstance(receipt, dict) else None
+    if isinstance(receipts, list):
+        for item in receipts:
+            if isinstance(item, dict) and "deliveryStatus" in item:
+                _emit_sent_message(item)
+    else:
+        _emit_sent_message(receipt, receiver_role)
     return receipt
 
 

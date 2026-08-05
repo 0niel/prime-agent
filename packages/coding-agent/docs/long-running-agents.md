@@ -81,8 +81,9 @@ From the IPython kernel, use the preloaded `agent_message` Python skill:
 ```python
 roster = await agent_message.list_agents()
 receipt = await agent_message.send(
-    "api-reviewer",
     "Recheck the endpoint after the latest edit",
+    receiver_role="sibling",
+    receiver_name="api-reviewer",
     mode="auto",
 )
 print(receipt["deliveryStatus"])
@@ -93,7 +94,11 @@ For the current parent's direct RLM children, prefer the parent-scoped registry:
 ```python
 children = await rlm.list_subagents()
 child = next(item for item in children if item.session_name == "api-reviewer")
-await agent_message.send(child.session_name, "Continue with the updated diff")
+await agent_message.send(
+    "Continue with the updated diff",
+    receiver_role="child",
+    receiver_name=child.session_name,
+)
 ```
 
 Delivery modes are:
@@ -102,7 +107,7 @@ Delivery modes are:
 - `steer`: intentionally inject the message into active work; and
 - `follow_up`: wait until the target's current work finishes.
 
-A receipt is `delivered` when it reached an idle target's context or `queued` when accepted for later delivery. Messaging is direct only; broadcasts are not supported. The daemon derives sender identity and enforces message-size, rate, and pending-queue limits.
+A receipt is `delivered` when it reached an idle target's context or `queued` when accepted for later delivery. `agent_message.send("all", message)` broadcasts only within the family roster. The daemon derives sender identity and enforces message-size, rate, and pending-queue limits.
 
 ## Heartbeats and Scheduled Prompts
 
