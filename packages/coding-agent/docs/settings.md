@@ -166,6 +166,14 @@ When a provider requests a retry delay longer than `retry.provider.maxRetryDelay
 
 Normally the package manager's global modules location is queried using `root -g`. As a special case, if the first element of `npmCommand` is `"bun"`, the modules location will instead be queried with `pm bin -g`.
 
+### Daemon
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
+
+`idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold.
+
 ### Sessions
 
 | Setting | Type | Default | Description |
