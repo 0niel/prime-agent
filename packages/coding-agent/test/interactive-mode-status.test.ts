@@ -822,7 +822,7 @@ describe("InteractiveMode submit handling", () => {
 	});
 
 	test("ignores an obsolete stale response after a newer authoritative revision", async () => {
-		const editorText = "newer editor";
+		let editorText = "edited";
 		const navigation = new PendingMessageNavigation();
 		const queue = {
 			steering: [],
@@ -836,14 +836,19 @@ describe("InteractiveMode submit handling", () => {
 			pendingMessageNavigation: navigation,
 			connectionQueue: queue,
 			agentConnection: {
-				mutateQueueItem: vi.fn(async () => ({
-					status: "stale" as const,
-					queue: { steering: [], followUp: ["selected"], revision: 8, items: queue.items },
-				})),
+				mutateQueueItem: vi.fn(async () => {
+					editorText = "newer editor";
+					return {
+						status: "stale" as const,
+						queue: { steering: [], followUp: ["selected"], revision: 8, items: queue.items },
+					};
+				}),
 			},
 			collectImagesFor: () => [],
 			queueMutationImages: () => [],
-			setEditorFromPendingNavigation: vi.fn(),
+			setEditorFromPendingNavigation: vi.fn((value: string) => {
+				editorText = value;
+			}),
 			showWarning: vi.fn(),
 		};
 		await expect(
@@ -854,7 +859,7 @@ describe("InteractiveMode submit handling", () => {
 			),
 		).resolves.toBe(false);
 		expect(fakeThis.connectionQueue).toBe(queue);
-		expect(fakeThis.setEditorFromPendingNavigation).toHaveBeenCalledWith("edited");
+		expect(fakeThis.setEditorFromPendingNavigation).not.toHaveBeenCalled();
 		expect(fakeThis.showWarning).not.toHaveBeenCalled();
 		expect(navigation.selected?.id).toBe("selected");
 		expect(navigation.draftText).toBe("draft");
@@ -870,12 +875,20 @@ describe("InteractiveMode submit handling", () => {
 			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
 		};
 		navigation.select(selectedQueue, "draft", selectedQueue.items[0]!);
-		const setEditor = vi.fn();
+		let editorText = "edited";
+		const setEditor = vi.fn((value: string) => {
+			editorText = value;
+		});
 		const fakeThis = {
-			editor: { getText: () => "edited" },
+			editor: { getText: () => editorText },
 			pendingMessageNavigation: navigation,
 			connectionQueue: { steering: [], followUp: ["external"], revision: 9, items: [] },
-			agentConnection: { mutateQueueItem: vi.fn(async () => ({ status: "stale" as const, queue: selectedQueue })) },
+			agentConnection: {
+				mutateQueueItem: vi.fn(async () => {
+					editorText = "newer editor";
+					return { status: "stale" as const, queue: selectedQueue };
+				}),
+			},
 			queueMutationImages: () => [],
 			setEditorFromPendingNavigation: setEditor,
 			showWarning: vi.fn(),
@@ -886,7 +899,8 @@ describe("InteractiveMode submit handling", () => {
 			"edited",
 		);
 		expect(navigation.selected).toBeUndefined();
-		expect(setEditor).toHaveBeenCalledWith("draft");
+		expect(setEditor).not.toHaveBeenCalled();
+		expect(editorText).toBe("newer editor");
 	});
 
 	test.each([

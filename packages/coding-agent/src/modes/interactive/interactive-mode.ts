@@ -7026,10 +7026,8 @@ export class InteractiveMode {
 			if (stillPending) {
 				this.pendingMessageNavigation.restore(checkpoint);
 				this.pendingMessageNavigation.reconcile(this.connectionQueue, selected.id);
-				this.setEditorFromPendingNavigation(text);
 			} else {
 				this.pendingMessageNavigation.reset();
-				this.setEditorFromPendingNavigation(checkpoint.draft);
 			}
 			return false;
 		}
