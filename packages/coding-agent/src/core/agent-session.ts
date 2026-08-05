@@ -9690,7 +9690,22 @@ export class AgentSession {
 			onSessionPublished: publishChildSession,
 		};
 
-		const injectTerminalMessage = async (message: CustomMessage): Promise<void> => {
+		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
+			const childController = childSession?._agentMessageController;
+			if (childController) {
+				try {
+					// deliveryMode is deliberately omitted: the "auto" default steers into
+					// a busy parent, whereas "follow_up" parks a child's last signal in the
+					// when-run-idle lane, which drains only once the steer lane empties.
+					await childController.sendAgentMessage({
+						target: this.sessionId,
+						message: message.content as string,
+					});
+					return;
+				} catch {
+					// An unattributed notice beats silence, so fall through to the injected path.
+				}
+			}
 			await this._promptInjectedMessage(message.content as string, message, {
 				streamingBehavior: "followUp",
 				queueIfBusy: true,
@@ -9803,7 +9818,7 @@ export class AgentSession {
 				emitChildUpdate();
 				if (!run.detachedDeletion && child._parentReplyCount === parentReplyCountBeforeRun) {
 					const lastAssistantText = child.getLastAssistantText();
-					await injectTerminalMessage(
+					await deliverTerminalMessageToParent(
 						createRlmChildTerminalNoticeMessage({
 							kind: "completed_without_reply",
 							childId: run.id,
@@ -9833,7 +9848,7 @@ export class AgentSession {
 				emitChildUpdate();
 				if (!run.detachedDeletion) {
 					if (run.status === "error") {
-						await injectTerminalMessage(
+						await deliverTerminalMessageToParent(
 							createRlmChildFailureMessage({
 								childId: run.id,
 								sessionName,
@@ -9841,7 +9856,7 @@ export class AgentSession {
 							}),
 						);
 					} else if (run.status === "cancelled") {
-						await injectTerminalMessage(
+						await deliverTerminalMessageToParent(
 							createRlmChildTerminalNoticeMessage({
 								kind: "cancelled",
 								childId: run.id,
