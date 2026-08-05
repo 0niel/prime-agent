@@ -493,4 +493,28 @@ describe("SettingsManager", () => {
 			expect(servers?.shared).toEqual({ type: "http", url: "https://project.shared/mcp" });
 		});
 	});
+	describe("idle worker eviction", () => {
+		it("defaults to 90 minutes and treats none as off", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getIdleEvictionMinutes()).toBe(90);
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ idleEvictionMinutes: "none" }));
+			const disabled = SettingsManager.create(projectDir, agentDir);
+			expect(disabled.getIdleEvictionMinutes()).toBe("off");
+		});
+
+		it("reads and writes the global daemon policy without project overrides", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ idleEvictionMinutes: 60 }));
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({ idleEvictionMinutes: 30 }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getIdleEvictionMinutes()).toBe(60);
+
+			manager.setIdleEvictionMinutes("off");
+			await manager.flush();
+			expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")).idleEvictionMinutes).toBe("off");
+		});
+	});
 });

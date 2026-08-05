@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
 	type ActionLifecycle,
 	ActionStore,
+	canEvictWorker,
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type RuntimeActivity,
@@ -228,5 +229,63 @@ describe("scheduler capabilities", () => {
 		]) {
 			expect(canSelectSessionAction(activity(blocked))).toBe(false);
 		}
+	});
+});
+
+describe("whole-tree eviction capability", () => {
+	const now = Date.parse("2026-08-01T12:00:00.000Z");
+	const idleSession = {
+		isSessionActive: false,
+		attachedClients: 0,
+		hasRegisteredHeartbeat: false,
+		hasRegisteredCronJob: false,
+		lastActivityAt: now - 90 * 60_000,
+	};
+	const idleWorker = {
+		lifecycle: "ready" as const,
+		isConnected: true,
+		isStopping: false,
+		hasOwnerClient: false,
+		isPreparingUpdateRestart: false,
+		sessions: [idleSession],
+	};
+
+	it("evicts only when every session has reached the inclusive idle threshold", () => {
+		expect(canEvictWorker(idleWorker, 90, now)).toBe(true);
+		expect(
+			canEvictWorker(
+				{ ...idleWorker, sessions: [idleSession, { ...idleSession, lastActivityAt: now - 89 * 60_000 }] },
+				90,
+				now,
+			),
+		).toBe(false);
+	});
+
+	it.each([
+		["active session", { sessions: [{ ...idleSession, isSessionActive: true }] }],
+		[
+			"parent session with a running child and stale timestamps",
+			// The supervisor's canonical busy projection sets isSessionActive for this snapshot.
+			{ sessions: [{ ...idleSession, isSessionActive: true }] },
+		],
+		["attached client", { sessions: [{ ...idleSession, attachedClients: 1 }] }],
+		["heartbeat", { sessions: [{ ...idleSession, hasRegisteredHeartbeat: true }] }],
+		["cron job", { sessions: [{ ...idleSession, hasRegisteredCronJob: true }] }],
+		["missing activity timestamp", { sessions: [{ ...idleSession, lastActivityAt: Number.NaN }] }],
+		["owner client", { hasOwnerClient: true }],
+		["update preparation", { isPreparingUpdateRestart: true }],
+		["disconnected worker", { isConnected: false }],
+		["stopping worker", { isStopping: true }],
+		["starting worker", { lifecycle: "starting" as const }],
+		["recovering worker", { lifecycle: "recovering" as const }],
+		["empty worker", { sessions: [] }],
+	])("rejects a pinned or unavailable %s", (_name, overrides) => {
+		expect(canEvictWorker({ ...idleWorker, ...overrides }, 90, now)).toBe(false);
+	});
+
+	it("treats off and invalid thresholds as disabled", () => {
+		expect(canEvictWorker(idleWorker, "off", now)).toBe(false);
+		expect(canEvictWorker(idleWorker, 0, now)).toBe(false);
+		expect(canEvictWorker(idleWorker, Number.NaN, now)).toBe(false);
 	});
 });

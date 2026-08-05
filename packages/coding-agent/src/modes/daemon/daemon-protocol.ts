@@ -54,8 +54,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 9 publishes persisted RLM spawn depth on passive session rows.
 // Revision 10 publishes persisted RLM spawn depth on all session catalog rows.
 // Revision 11 adds immediate get/set commands for active-session RLM max depth.
-export const DAEMON_SCHEMA_REVISION = 11;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-11-5bd6b0b12204";
+// Revision 12 publishes idle-residency metadata on session summary rows.
+export const DAEMON_SCHEMA_REVISION = 12;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-12-5bd6b0b12204";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

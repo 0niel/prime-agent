@@ -7195,6 +7195,7 @@ export class InteractiveMode {
 			const selector = new SettingsSelectorComponent(
 				{
 					autoCompact: state.autoCompactionEnabled,
+					idleEvictionMinutes: this.settingsManager.getIdleEvictionMinutes(),
 					showImages: this.settingsManager.getShowImages(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
 					blockImages: this.settingsManager.getBlockImages(),
@@ -7225,6 +7226,9 @@ export class InteractiveMode {
 							this.showError(error instanceof Error ? error.message : String(error));
 						});
 						this.footer.setAutoCompactEnabled(enabled);
+					},
+					onIdleEvictionMinutesChange: (value) => {
+						this.settingsManager.setIdleEvictionMinutes(value);
 					},
 					onShowImagesChange: (enabled) => {
 						this.settingsManager.setShowImages(enabled);

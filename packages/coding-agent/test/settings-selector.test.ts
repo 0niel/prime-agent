@@ -10,6 +10,7 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 const config: SettingsConfig = {
 	autoCompact: true,
+	idleEvictionMinutes: 90,
 	showImages: true,
 	autoResizeImages: true,
 	blockImages: false,
@@ -36,6 +37,7 @@ const config: SettingsConfig = {
 
 const callbacks: SettingsCallbacks = {
 	onAutoCompactChange: () => {},
+	onIdleEvictionMinutesChange: () => {},
 	onShowImagesChange: () => {},
 	onAutoResizeImagesChange: () => {},
 	onBlockImagesChange: () => {},
@@ -72,6 +74,8 @@ describe("SettingsSelectorComponent", () => {
 
 			expect(rendered).toContain("Show image metadata");
 			expect(rendered).toContain("Auto-resize images");
+			for (const character of "idle") component.getSettingsList().handleInput(character);
+			expect(stripAnsi(component.render(120).join("\n"))).toContain("Idle worker eviction");
 		} finally {
 			resetCapabilitiesCache();
 		}

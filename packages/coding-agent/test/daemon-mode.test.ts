@@ -1,11 +1,11 @@
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import type { Socket } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import type { AgentSessionMessageController } from "../src/core/agent-messages.js";
+import { type AgentSessionMessageController, DEFAULT_AGENT_MESSAGE_MAX_CHARS } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
@@ -31,11 +31,14 @@ import {
 } from "../src/modes/daemon/daemon-mode.js";
 import {
 	createDaemonCommandEnvelope,
+	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_ID,
 	type DaemonAttachResult,
 	type DaemonCommand,
 	type DaemonOutbound,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon mode helpers", () => {
 	it("preserves envelope client identity while registering prompt admission", () => {
@@ -925,7 +928,7 @@ describe("daemon mode helpers", () => {
 		);
 	});
 
-	it("fails unknown local agent-message targets without worker remote retries", async () => {
+	it("routes nonresident agent-message targets through the supervisor wake path", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -944,7 +947,9 @@ describe("daemon mode helpers", () => {
 				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 			},
 		} as never;
-		const sendRemoteAgentSessionMessage = vi.fn();
+		const sendRemoteAgentSessionMessage = vi
+			.fn()
+			.mockRejectedValue(new Error("Unknown active session: deleted-child"));
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			sendRemoteAgentSessionMessage: typeof sendRemoteAgentSessionMessage;
@@ -966,7 +971,124 @@ describe("daemon mode helpers", () => {
 				origin: "agent",
 			}),
 		).rejects.toThrow("Unknown active session: deleted-child");
+		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "deleted-child", "continue", undefined);
+	});
+
+	it("rejects invalid nonresident agent messages before remote fallback", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+			worker: { authenticationToken: "worker-token" },
+		});
+		const source = makeState("source");
+		const sendRemoteAgentSessionMessage = vi.fn();
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendRemoteAgentSessionMessage: typeof sendRemoteAgentSessionMessage;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState: ActiveSessionState;
+				origin: "agent";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(source.activeSessionId, source);
+		internals.sendRemoteAgentSessionMessage = sendRemoteAgentSessionMessage;
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: "nonresident-target",
+				message: " ",
+				fromState: source,
+				origin: "agent",
+			}),
+		).rejects.toThrow("Agent session message cannot be empty");
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: "nonresident-target",
+				message: "x".repeat(DEFAULT_AGENT_MESSAGE_MAX_CHARS + 1),
+				fromState: source,
+				origin: "agent",
+			}),
+		).rejects.toThrow("Agent session message is too long");
 		expect(sendRemoteAgentSessionMessage).not.toHaveBeenCalled();
+	});
+
+	it("does not retry supervisor agent-message rejections", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-msg-"));
+		const socketPath = join(tempDir, "d.sock");
+		let connectionCount = 0;
+		const server: Server = createServer((socket) => {
+			connectionCount++;
+			socket.on("error", () => undefined);
+			socket.write(
+				`${JSON.stringify({
+					type: "daemon_hello",
+					socketPath,
+					protocol: DAEMON_PROTOCOL_INFO,
+					schemaId: DAEMON_SCHEMA_ID,
+					clientId: "supervisor",
+					serverCapabilities: [],
+				})}\n`,
+			);
+			let buffer = "";
+			socket.on("data", (chunk) => {
+				buffer += chunk.toString();
+				const newline = buffer.indexOf("\n");
+				if (newline === -1) return;
+				const wire = JSON.parse(buffer.slice(0, newline)) as {
+					id: string;
+					command?: { type: string };
+					type: string;
+				};
+				const command = wire.command ?? wire;
+				socket.write(
+					`${JSON.stringify({
+						type: "response",
+						id: wire.id,
+						command: command.type,
+						success: false,
+						error: "Target session has too many pending messages",
+					})}\n`,
+				);
+			});
+		});
+		const previousSupervisorSocket = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		try {
+			await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+			process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				worker: { authenticationToken: "worker-token" },
+			});
+			const sendRemoteAgentSessionMessage = (
+				daemon as unknown as {
+					sendRemoteAgentSessionMessage(
+						fromState: ActiveSessionState,
+						targetSelector: string,
+						message: string,
+					): Promise<unknown>;
+				}
+			).sendRemoteAgentSessionMessage.bind(daemon);
+
+			await expect(sendRemoteAgentSessionMessage(makeState("source"), "remote", "continue")).rejects.toThrow(
+				"Target session has too many pending messages",
+			);
+			expect(connectionCount).toBe(1);
+		} finally {
+			if (previousSupervisorSocket === undefined) {
+				delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			} else {
+				process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
+			}
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("reports queued status when a direct accept races into the queue", async () => {

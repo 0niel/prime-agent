@@ -4426,15 +4426,6 @@ export class AgentDaemon {
 		};
 	}
 
-	private findRemoteAgentPeer(selector: string): AgentSessionMessageAgentSummary | undefined {
-		for (const peer of this.remoteAgentPeers.values()) {
-			if (peer.activeSessionId === selector || peer.sessionId === selector || peer.sessionName === selector) {
-				return peer;
-			}
-		}
-		return undefined;
-	}
-
 	// Half-bound sessions are hidden from other sessions' listings; the current
 	// session stays visible to itself (controllers run during its own bind).
 	private listTargetableSessionStates(current: ActiveSessionState): ActiveSessionState[] {
@@ -4527,6 +4518,7 @@ export class AgentDaemon {
 			throw new Error("Agent messaging is paused");
 		}
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
+		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
 		let targetState: ActiveSessionState;
 		try {
 			targetState = this.getBoundSessionState(targetSelector);
@@ -4544,11 +4536,13 @@ export class AgentDaemon {
 					);
 					if (hydratingChild) {
 						targetState = await this.waitForBoundSession(hydratingChild);
-					} else if (this.options.worker && options.fromState && this.findRemoteAgentPeer(targetSelector)) {
+					} else if (this.options.worker && options.fromState) {
+						// The supervisor can resolve and wake a saved worker even when it is no longer
+						// present in this worker's resident peer snapshot.
 						return this.sendRemoteAgentSessionMessage(
 							options.fromState,
 							targetSelector,
-							options.message,
+							message,
 							options.deliveryMode,
 						);
 					} else {
@@ -4560,7 +4554,6 @@ export class AgentDaemon {
 		if (options.fromState?.activeSessionId === targetState.activeSessionId) {
 			throw new Error("Agent messaging cannot target the sending session");
 		}
-		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
 		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
 		const senderKey =
 			options.senderKey ?? options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
@@ -4620,6 +4613,7 @@ export class AgentDaemon {
 		let lastError: unknown;
 		while (Date.now() < deadline && !this.shuttingDown) {
 			const client = new DaemonClient(supervisorSocketPath);
+			let receivedResponse = false;
 			try {
 				await client.connect(1000);
 				await client.waitForHello(1000);
@@ -4633,6 +4627,7 @@ export class AgentDaemon {
 					},
 					30_000,
 				);
+				receivedResponse = true;
 				if (!response.success) {
 					throw deserializeDaemonError(response);
 				}
@@ -4641,10 +4636,10 @@ export class AgentDaemon {
 				}
 				return response.data as AgentSessionMessageReceipt;
 			} catch (error) {
-				lastError = error;
-				if (error instanceof Error && error.message.startsWith("Unknown active session:")) {
+				if (receivedResponse) {
 					throw error;
 				}
+				lastError = error;
 			} finally {
 				client.close();
 			}

@@ -61,7 +61,54 @@ describe("buildSessionList", () => {
 		const first = summaryForActiveSession(state);
 		const second = summaryForActiveSession(state);
 		expect(first.created).toBe("2026-05-01T00:00:00.000Z");
+		expect(first.lastActivityAt).toBe("2026-05-01T00:00:00.000Z");
 		expect(second.created).toBe(first.created);
+	});
+
+	it("takes last activity from custom messages and tool results", () => {
+		const oldMessage = {
+			role: "user",
+			content: "old",
+			timestamp: Date.parse("2026-05-02T00:00:00.000Z"),
+		} as AgentMessage;
+		const customTimestamp = Date.parse("2026-05-03T00:00:00.000Z");
+		const customMessage = {
+			role: "custom",
+			customType: "activity",
+			content: "newer",
+			display: false,
+			timestamp: customTimestamp,
+		} as AgentMessage;
+		const toolResultTimestamp = Date.parse("2026-05-04T00:00:00.000Z");
+		const toolResult = {
+			role: "toolResult",
+			toolCallId: "tool-1",
+			toolName: "example",
+			content: [],
+			isError: false,
+			timestamp: toolResultTimestamp,
+		} as AgentMessage;
+
+		expect(
+			summaryForActiveSession(makeState({ activeSessionId: "custom-active", messages: [oldMessage, customMessage] }))
+				.lastActivityAt,
+		).toBe(new Date(customTimestamp).toISOString());
+		expect(
+			summaryForActiveSession(makeState({ activeSessionId: "tool-active", messages: [oldMessage, toolResult] }))
+				.lastActivityAt,
+		).toBe(new Date(toolResultTimestamp).toISOString());
+	});
+
+	it("ignores message timestamps outside the valid Date range", () => {
+		const validTimestamp = Date.parse("2026-05-04T00:00:00.000Z");
+		const messages = [
+			{ role: "user", content: "valid", timestamp: validTimestamp },
+			{ role: "assistant", content: "corrupt", timestamp: 8.64e15 + 1 },
+		] as AgentMessage[];
+
+		const summary = summaryForActiveSession(makeState({ activeSessionId: "invalid-timestamp", messages }));
+
+		expect(summary.lastActivityAt).toBe(new Date(validTimestamp).toISOString());
 	});
 
 	it("keeps a session working while background subagents run", () => {
@@ -89,7 +136,7 @@ describe("buildSessionList", () => {
 		const activeSessionIds = ["heartbeat", "rlm-heartbeat", "paused-heartbeat", "cron"];
 		const entries = buildSessionList(
 			activeSessionIds.map((activeSessionId) => makeState({ activeSessionId, messages, summaryState })),
-			[],
+			[makeSessionInfo({ id: "passive", path: "/tmp/passive.jsonl" })],
 			[
 				makeCronJob({ id: "heartbeat-job", activeSessionId: "heartbeat", source: "heartbeat" }),
 				makeCronJob({ id: "rlm-job", activeSessionId: "rlm-heartbeat", source: "rlm_heartbeat" }),
@@ -100,6 +147,12 @@ describe("buildSessionList", () => {
 					status: "paused",
 				}),
 				makeCronJob({ id: "cron-job", activeSessionId: "cron", source: "cron" }),
+				makeCronJob({
+					id: "passive-job",
+					activeSessionId: "old-passive-active-id",
+					sessionFile: "/tmp/passive.jsonl",
+					source: "rlm_heartbeat",
+				}),
 			],
 		);
 
@@ -108,6 +161,21 @@ describe("buildSessionList", () => {
 			"rlm-heartbeat": true,
 			"paused-heartbeat": undefined,
 			cron: undefined,
+			passive: undefined,
+		});
+		expect(Object.fromEntries(entries.map((entry) => [entry.id, entry.hasRegisteredHeartbeat]))).toEqual({
+			heartbeat: true,
+			"rlm-heartbeat": true,
+			"paused-heartbeat": undefined,
+			cron: undefined,
+			passive: true,
+		});
+		expect(Object.fromEntries(entries.map((entry) => [entry.id, entry.hasRegisteredCronJob]))).toEqual({
+			heartbeat: undefined,
+			"rlm-heartbeat": undefined,
+			"paused-heartbeat": undefined,
+			cron: true,
+			passive: undefined,
 		});
 	});
 
@@ -676,7 +744,7 @@ function makeCronJob(overrides: Pick<AgentCronJob, "id" | "activeSessionId"> & P
 		source: overrides.source,
 		activeSessionId: overrides.activeSessionId,
 		sessionId: `session-${overrides.activeSessionId}`,
-		sessionFile: `/tmp/${overrides.activeSessionId}.jsonl`,
+		sessionFile: overrides.sessionFile ?? `/tmp/${overrides.activeSessionId}.jsonl`,
 		cwd: "/tmp/project",
 		prompt: "Check for follow-up work",
 		schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },

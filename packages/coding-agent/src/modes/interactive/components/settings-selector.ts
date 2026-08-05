@@ -10,6 +10,7 @@ import {
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
+import type { IdleEvictionMinutes } from "../../../core/session-action-store.js";
 import type { WarningSettings } from "../../../core/settings-manager.js";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
@@ -31,6 +32,7 @@ const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 
 export interface SettingsConfig {
 	autoCompact: boolean;
+	idleEvictionMinutes: IdleEvictionMinutes;
 	showImages: boolean;
 	autoResizeImages: boolean;
 	blockImages: boolean;
@@ -57,6 +59,7 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
+	onIdleEvictionMinutesChange: (value: IdleEvictionMinutes) => void;
 	onShowImagesChange: (enabled: boolean) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
 	onBlockImagesChange: (blocked: boolean) => void;
@@ -208,6 +211,13 @@ export class SettingsSelectorComponent extends Container {
 				description: "Automatically compact context when it gets too large",
 				currentValue: config.autoCompact ? "true" : "false",
 				values: ["true", "false"],
+			},
+			{
+				id: "idle-eviction-minutes",
+				label: "Idle worker eviction",
+				description: "Stop fully idle agent trees after this many minutes (global daemon policy)",
+				currentValue: String(config.idleEvictionMinutes),
+				values: ["off", "30", "60", "90", "180", "360"],
 			},
 			{
 				id: "steering-mode",
@@ -439,6 +449,9 @@ export class SettingsSelectorComponent extends Container {
 				switch (id) {
 					case "autocompact":
 						callbacks.onAutoCompactChange(newValue === "true");
+						break;
+					case "idle-eviction-minutes":
+						callbacks.onIdleEvictionMinutesChange(newValue === "off" ? "off" : parseInt(newValue, 10));
 						break;
 					case "show-images":
 						callbacks.onShowImagesChange(newValue === "true");

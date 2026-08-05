@@ -309,6 +309,56 @@ export interface RuntimeActivity {
 	disposing: boolean;
 }
 
+export type IdleEvictionMinutes = number | "off";
+
+export interface SessionEvictionSnapshot {
+	isSessionActive: boolean;
+	attachedClients: number;
+	hasRegisteredHeartbeat: boolean;
+	hasRegisteredCronJob: boolean;
+	lastActivityAt: number;
+}
+
+export interface WorkerEvictionSnapshot {
+	lifecycle: "starting" | "ready" | "recovering" | "failed";
+	isConnected: boolean;
+	isStopping: boolean;
+	hasOwnerClient: boolean;
+	isPreparingUpdateRestart: boolean;
+	sessions: readonly SessionEvictionSnapshot[];
+}
+
+/** Pure whole-tree residency policy. Callers must supply supervisor-owned attachment state. */
+export function canEvictWorker(
+	worker: WorkerEvictionSnapshot,
+	idleEvictionMinutes: IdleEvictionMinutes,
+	now = Date.now(),
+): boolean {
+	if (
+		idleEvictionMinutes === "off" ||
+		!Number.isFinite(idleEvictionMinutes) ||
+		idleEvictionMinutes <= 0 ||
+		worker.lifecycle !== "ready" ||
+		!worker.isConnected ||
+		worker.isStopping ||
+		worker.hasOwnerClient ||
+		worker.isPreparingUpdateRestart ||
+		worker.sessions.length === 0
+	) {
+		return false;
+	}
+	const idleThresholdMs = idleEvictionMinutes * 60_000;
+	return worker.sessions.every(
+		(session) =>
+			!session.isSessionActive &&
+			session.attachedClients === 0 &&
+			!session.hasRegisteredHeartbeat &&
+			!session.hasRegisteredCronJob &&
+			Number.isFinite(session.lastActivityAt) &&
+			now - session.lastActivityAt >= idleThresholdMs,
+	);
+}
+
 export function canSelectSessionAction(activity: RuntimeActivity): boolean {
 	return (
 		!activity.lowerAgentRun &&

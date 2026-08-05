@@ -28,8 +28,14 @@ import {
 	readActiveOrphanProcesses,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
+import {
+	canEvictWorker,
+	type IdleEvictionMinutes,
+	type WorkerEvictionSnapshot,
+} from "../../core/session-action-store.js";
 import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionInfo } from "../../core/session-manager.js";
+import { SettingsManager } from "../../core/settings-manager.js";
 import { signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
@@ -118,6 +124,9 @@ const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
+const IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS = 5 * 60_000;
+const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
+const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
 
@@ -466,6 +475,14 @@ function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): strin
 	return join(agentDir, "daemon-workers", descriptorKey(socketPath));
 }
 
+export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMinutes): number {
+	if (idleEvictionMinutes === "off") return IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS;
+	return Math.max(
+		IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS,
+		Math.min(IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS, (idleEvictionMinutes * 60_000) / 3),
+	);
+}
+
 function workerSocketPath(supervisorSocketPath: string, workerId: string): string {
 	const key = descriptorKey(supervisorSocketPath);
 	if (process.platform === "win32") {
@@ -575,6 +592,10 @@ export class DaemonSupervisor {
 	private readonly compactCatchupInProgress = new Set<string>();
 	private agentPeerSyncQueue: Promise<void> = Promise.resolve();
 	private readonly catalog: DaemonCatalogClient;
+	private readonly settingsManager: SettingsManager;
+	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
+	private idleEvictionSweep?: Promise<void>;
+	private idleEvictionFence?: Promise<void>;
 
 	constructor(
 		private readonly socketPath: string,
@@ -594,6 +615,7 @@ export class DaemonSupervisor {
 		this.defaultSessionConfig = this.loadPersistedSupervisorConfig() ?? options.defaultSessionConfig;
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
+		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
 	}
 
 	async start(): Promise<void> {
@@ -666,6 +688,7 @@ export class DaemonSupervisor {
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
+			this.scheduleIdleEvictionSweep();
 			await this.ownership.updatePhase("owner");
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
 			this.markReady();
@@ -697,6 +720,121 @@ export class DaemonSupervisor {
 		console.error(message);
 		structuredLog.warn(message, { socketPath: this.socketPath });
 		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] supervisor: ${message}`);
+	}
+
+	private clearIdleEvictionTimer(): void {
+		if (!this.idleEvictionTimer) return;
+		clearTimeout(this.idleEvictionTimer);
+		this.idleEvictionTimer = undefined;
+	}
+
+	private scheduleIdleEvictionSweep(): void {
+		if (this.shuttingDown || this.idleEvictionTimer || this.idleEvictionSweep) return;
+		const delayMs = idleEvictionSweepIntervalMs(this.settingsManager.getIdleEvictionMinutes());
+		this.idleEvictionTimer = setTimeout(() => {
+			this.idleEvictionTimer = undefined;
+			const sweep = this.runIdleEvictionSweep()
+				.catch((error) => this.log(`Idle eviction sweep failed: ${String(error)}`))
+				.finally(() => {
+					if (this.idleEvictionSweep === sweep) this.idleEvictionSweep = undefined;
+					this.scheduleIdleEvictionSweep();
+				});
+			this.idleEvictionSweep = sweep;
+		}, delayMs);
+		this.idleEvictionTimer.unref();
+	}
+
+	private workerEvictionSnapshot(worker: ResidentWorker): WorkerEvictionSnapshot {
+		return {
+			lifecycle: worker.descriptor.lifecycle,
+			isConnected: worker.client !== undefined,
+			isStopping: worker.intentionalStop || worker.descriptor.stopRequestedAt !== undefined,
+			hasOwnerClient: worker.descriptor.ownerClientId !== undefined,
+			isPreparingUpdateRestart:
+				this.updateRestartPhase !== undefined || worker.updateRestartPrepareClient !== undefined,
+			sessions: [...worker.summaries.values()].map((summary) => {
+				const activeSessionId = summary.activeSessionId ?? summary.id;
+				return {
+					// Use the canonical busy projection: a parent remains active for
+					// residency purposes while any of its RLM descendants is running.
+					isSessionActive: isSessionSummaryBusy(summary),
+					attachedClients: [...this.clients].filter((client) =>
+						client.attachedActiveSessionIds.has(activeSessionId),
+					).length,
+					hasRegisteredHeartbeat: summary.hasRegisteredHeartbeat === true,
+					hasRegisteredCronJob: summary.hasRegisteredCronJob === true,
+					lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
+				};
+			}),
+		};
+	}
+
+	private async runIdleEvictionSweep(now = Date.now()): Promise<void> {
+		if (this.shuttingDown || this.updateRestartPhase !== undefined || this.idleEvictionFence) return;
+		await this.settingsManager.reload();
+		if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+		const idleEvictionMinutes = this.settingsManager.getIdleEvictionMinutes();
+		if (idleEvictionMinutes === "off") return;
+
+		const refreshed = new Set<ResidentWorker>();
+		await Promise.all(
+			[...this.workers.values()].map(async (worker) => {
+				try {
+					await this.refreshWorkerSummaries(worker);
+					refreshed.add(worker);
+				} catch {
+					// A disconnected or transitioning worker is never an eviction candidate.
+				}
+			}),
+		);
+		const candidates = [...refreshed].filter((worker) =>
+			canEvictWorker(this.workerEvictionSnapshot(worker), idleEvictionMinutes, now),
+		);
+		if (candidates.length === 0 || this.shuttingDown || this.updateRestartPhase !== undefined) return;
+
+		let releaseFence: () => void = () => {};
+		const fence = new Promise<void>((resolveFence) => {
+			releaseFence = resolveFence;
+		});
+		this.idleEvictionFence = fence;
+		try {
+			await this.mutationDrain.waitForDrain(
+				0,
+				AbortSignal.timeout(IDLE_EVICTION_DRAIN_TIMEOUT_MS),
+				"Timed out draining daemon mutations for idle eviction",
+			);
+			if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+			await Promise.all(
+				candidates.map((worker) => this.refreshWorkerSummaries(worker).catch(() => refreshed.delete(worker))),
+			);
+			if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+			const evictable = candidates.filter(
+				(worker) =>
+					refreshed.has(worker) &&
+					this.workers.get(worker.descriptor.workerId) === worker &&
+					canEvictWorker(this.workerEvictionSnapshot(worker), idleEvictionMinutes, now),
+			);
+			// Promise.all may reject and release the fence while sibling stops are still
+			// finishing. That is safe: a racing mutation either reaches a live worker or
+			// gets a clean disconnected/unknown-session error.
+			await Promise.all(
+				evictable.map(async (worker) => {
+					if (this.shuttingDown || this.updateRestartPhase !== undefined) return;
+					const snapshot = this.workerEvictionSnapshot(worker);
+					const idleMinutes = Math.floor(
+						Math.min(...snapshot.sessions.map((session) => now - session.lastActivityAt)) / 60_000,
+					);
+					const root = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+					await this.stopWorker(worker, true);
+					this.log(
+						`Evicted idle worker ${worker.descriptor.workerId} root=${root?.sessionId ?? worker.descriptor.rootSessionId ?? worker.descriptor.rootActiveSessionId} idleMinutes=${idleMinutes} sessions=${snapshot.sessions.length}`,
+					);
+				}),
+			);
+		} finally {
+			if (this.idleEvictionFence === fence) this.idleEvictionFence = undefined;
+			releaseFence();
+		}
 	}
 
 	private async assertCurrentOwnership(): Promise<void> {
@@ -1160,6 +1298,13 @@ export class DaemonSupervisor {
 			}
 		}
 
+		if (mutation && !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)) {
+			const idleEvictionFence = this.idleEvictionFence;
+			if (idleEvictionFence) await idleEvictionFence;
+		}
+		// Attach is intentionally read-only and is not fence-gated. If eviction wins
+		// the race, attach fails cleanly with "Session worker is not connected" and
+		// the client retries through the saved-session path instead of mutating state.
 		if (mutation) this.mutationDrain.begin();
 		try {
 			const response = await this.handleCommand(client, command, cancellationAdmission);
@@ -1584,18 +1729,53 @@ export class DaemonSupervisor {
 		}
 
 		if (command.type === "send_message") {
-			const target = await this.findWorkerForClient(client, command.targetActiveSessionId);
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
 				: undefined;
-			if (source && source.worker !== target.worker) {
+			let target: WorkerMatch;
+			try {
+				target = await this.findWorkerForClient(client, command.targetActiveSessionId);
+			} catch (error) {
+				if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
+				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
+				let sessionPath: string;
+				try {
+					sessionPath = await this.catalog.resolve(
+						command.targetActiveSessionId,
+						cwd,
+						source?.worker.descriptor.createCommand.config?.sessionDir ?? this.defaultSessionConfig.sessionDir,
+					);
+				} catch (catalogError) {
+					// Preserve selector ambiguity so a2a senders can distinguish it from
+					// the original unknown-active-session lookup failure.
+					if (catalogError instanceof Error && catalogError.message.startsWith("Ambiguous session selector")) {
+						throw catalogError;
+					}
+					throw error;
+				}
+				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
+					type: "create",
+					sessionPath,
+					continueRecent: false,
+				});
+				const summary =
+					this.findSummaryInWorker(worker, sessionPath) ??
+					worker.summaries.get(worker.descriptor.rootActiveSessionId);
+				if (!summary) throw new Error("Woken session worker has no target session");
+				target = { worker, summary };
+			}
+			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
+			if (source) {
+				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
+					throw new Error("Agent messaging cannot target the sending session");
+				}
 				if (!target.worker.client) {
 					throw new Error("Target session worker is not connected");
 				}
 				const response = await target.worker.client.requestWorker(
 					{
 						type: "worker_deliver_message",
-						targetActiveSessionId: target.summary.activeSessionId ?? target.summary.id,
+						targetActiveSessionId,
 						message: command.message,
 						sender: {
 							activeSessionId: source.summary.activeSessionId ?? source.summary.id,
@@ -1610,7 +1790,7 @@ export class DaemonSupervisor {
 				);
 				return { ...response, id: command.id, command: command.type };
 			}
-			return this.forwardToWorker(target.worker, command);
+			return this.forwardToWorker(target.worker, { ...command, targetActiveSessionId });
 		}
 
 		if (!("activeSessionId" in command) || typeof command.activeSessionId !== "string") {
@@ -4271,6 +4451,8 @@ export class DaemonSupervisor {
 
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
 		this.shuttingDown = true;
+		this.clearIdleEvictionTimer();
+		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
 			await this.runCleanupStep("signal handler", cleanup);
 		}
@@ -4368,6 +4550,8 @@ export class DaemonSupervisor {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		this.clearIdleEvictionTimer();
+		await this.idleEvictionSweep?.catch(() => undefined);
 		if (closingReason) {
 			for (const client of this.clients) {
 				this.write(client, { type: "daemon_closing", reason: closingReason });
