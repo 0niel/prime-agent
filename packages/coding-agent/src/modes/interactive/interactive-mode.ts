@@ -2486,6 +2486,23 @@ export class InteractiveMode {
 		}
 	}
 
+	private applyQueueActionSnapshot(actions: AgentConnectionState["sessionActions"]): void {
+		const revision = actions.revision;
+		if (revision !== undefined && revision < (this.connectionQueue.revision ?? -1)) return;
+		const nextQueue: AgentConnectionQueueState = {
+			steering: [...actions.steering],
+			followUp: [...actions.followUps],
+			...(revision !== undefined ? { revision } : {}),
+			...(actions.items ? { items: [...actions.items] } : {}),
+		};
+		this.queueEventGeneration++;
+		const draft = this.pendingMessageNavigation.sync(nextQueue);
+		if (draft !== undefined) this.setEditorFromPendingNavigation(draft);
+		this.connectionQueue = nextQueue;
+		this.updatePendingMessagesDisplay();
+		this.ui.requestRender();
+	}
+
 	private async refreshConnectionQueue(): Promise<void> {
 		const generation = this.queueEventGeneration;
 		const queue = await this.agentConnection.getQueue();
@@ -5318,23 +5335,9 @@ export class InteractiveMode {
 				this.ui.requestRender();
 				break;
 
-			case "session_action_update": {
-				const revision = event.actions.revision;
-				if (revision !== undefined && revision < (this.connectionQueue.revision ?? -1)) break;
-				const nextQueue: AgentConnectionQueueState = {
-					steering: [...event.actions.steering],
-					followUp: [...event.actions.followUps],
-					...(revision !== undefined ? { revision } : {}),
-					...(event.actions.items ? { items: [...event.actions.items] } : {}),
-				};
-				this.queueEventGeneration++;
-				const draft = this.pendingMessageNavigation.sync(nextQueue);
-				if (draft !== undefined) this.setEditorFromPendingNavigation(draft);
-				this.connectionQueue = nextQueue;
-				this.updatePendingMessagesDisplay();
-				this.ui.requestRender();
+			case "session_action_update":
+				this.applyQueueActionSnapshot(event.actions);
 				break;
-			}
 
 			case "session_info_changed":
 				this.updateTerminalTitle();
@@ -6991,6 +6994,7 @@ export class InteractiveMode {
 		const checkpoint = this.pendingMessageNavigation.checkpoint();
 		const change = this.pendingMessageNavigation.change(kind, text);
 		if (!change) return false;
+		const changedState = this.pendingMessageNavigation.checkpoint();
 		const mutation =
 			kind === "delete"
 				? { type: "delete" as const }
@@ -7024,6 +7028,7 @@ export class InteractiveMode {
 			}
 			return false;
 		}
+		this.pendingMessageNavigation.restore(changedState);
 		this.pendingMessageNavigation.reconcile(result.queue, change.selected?.id);
 		this.connectionQueue = result.queue;
 		this.setEditorFromPendingNavigation(change.selected ? text : change.draft);

@@ -777,9 +777,11 @@ describe("InteractiveMode submit handling", () => {
 				{ id: "f3", lane: "followUp" as const, index: 2, text: "f3" },
 			],
 		};
-		navigation.select(initial, "original draft", initial.items[1]!);
+		navigation.browse(initial, "original draft", -1); // f3
+		navigation.browse(initial, "f3 edited", -1); // f2
 		navigation.capture(editorText);
 		const calls: number[] = [];
+		const holder: { value?: unknown } = {};
 		const fakeThis = {
 			editor: { getText: () => editorText },
 			pendingMessageNavigation: navigation,
@@ -793,7 +795,10 @@ describe("InteractiveMode submit handling", () => {
 						revision === 7
 							? [{ ...initial.items[1]!, index: 0 }, { ...initial.items[0]!, index: 1 }, initial.items[2]!]
 							: [initial.items[0]!, initial.items[1]!, initial.items[2]!];
-					return { status: "applied" as const, queue: { ...initial, revision: nextRevision, items } };
+					const followUp = revision === 7 ? ["f2", "f1", "f3"] : initial.followUp;
+					const actions = { queuedCount: 3, steering: [], followUps: followUp, revision: nextRevision, items };
+					Reflect.get(InteractiveMode.prototype, "applyQueueActionSnapshot").call(holder.value, actions);
+					return { status: "applied" as const, queue: { ...initial, followUp, revision: nextRevision, items } };
 				}),
 			},
 			collectImagesFor: () => [],
@@ -804,6 +809,7 @@ describe("InteractiveMode submit handling", () => {
 			ui: { requestRender: vi.fn() },
 			applySelectedPendingMessageChange: Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange"),
 		};
+		holder.value = fakeThis;
 		const mutate = Reflect.get(InteractiveMode.prototype, "changeSelectedPendingMessage");
 		await mutate.call(fakeThis, "earlier", editorText);
 		await mutate.call(fakeThis, "later", editorText);
@@ -811,6 +817,7 @@ describe("InteractiveMode submit handling", () => {
 		expect(navigation.selected?.id).toBe("f2");
 		expect(navigation.draftText).toBe("original draft");
 		expect(editorText).toBe("f2 edited");
+		expect(navigation.browse(fakeThis.connectionQueue, editorText, 1)).toBe("f3 edited");
 	});
 
 	test("ignores an obsolete stale response after a newer authoritative revision", async () => {
