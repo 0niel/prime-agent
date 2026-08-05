@@ -7313,6 +7313,8 @@ export class InteractiveMode {
 		options: { abort?: boolean } = {},
 	): Promise<{ steering: string[]; followUp: string[] }> {
 		const navigation = this.pendingMessageNavigation?.checkpoint();
+		const queueEventGeneration = this.queueEventGeneration;
+		const connectionQueue = this.connectionQueue;
 		this.pendingMessageNavigation?.reset();
 		let cleared: { steering: string[]; followUp: string[] };
 		try {
@@ -7320,7 +7322,16 @@ export class InteractiveMode {
 				? await this.agentConnection.abortAndClearQueue()
 				: await this.agentConnection.clearQueue();
 		} catch (error) {
-			if (navigation) this.pendingMessageNavigation?.restore(navigation);
+			if (
+				navigation &&
+				this.queueEventGeneration === queueEventGeneration &&
+				this.connectionQueue === connectionQueue
+			) {
+				this.pendingMessageNavigation?.restore(navigation);
+			} else if (navigation) {
+				const selectedId = navigation.queue?.items?.[navigation.cursor]?.id;
+				if (selectedId) this.pendingMessageNavigation?.reconcile(this.connectionQueue, selectedId);
+			}
 			throw error;
 		}
 		const { steering, followUp } = cleared;
