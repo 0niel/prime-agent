@@ -53,14 +53,6 @@ curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
 
 The installer downloads a versioned release, verifies its SHA-256 checksum, installs the `prime-agent` command, and can prepare the IPython runtime used by the agent.
 
-To try the latest beta built from `main`:
-
-```bash
-curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh -s -- beta
-```
-
-Use the stable channel for normal work. Beta advances with successful builds from `main`.
-
 Start Prime Agent from the repository or directory you want it to work in:
 
 ```bash
