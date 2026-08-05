@@ -4423,10 +4423,10 @@ export class InteractiveMode {
 	}
 
 	private queueMutationImages(text: string): ImageContent[] | undefined {
-		const markerIds = imageMarkerIds(text);
-		if (markerIds.length === 0) return [];
+		const markerIds = new Set(imageMarkerIds(text));
+		if (markerIds.size === 0) return [];
 		const images = this.collectImagesFor(text);
-		return images?.length === markerIds.length ? images : undefined;
+		return images?.length === markerIds.size ? images : undefined;
 	}
 
 	private hasPastedImagesFor(text: string): boolean {

@@ -1030,17 +1030,29 @@ describe("InteractiveMode submit handling", () => {
 	});
 
 	test.each([
-		["plain text", [], "clear"],
-		["keep [image #1]", undefined, "preserve unresolved marker or non-vision model"],
-		["replace [image #1]", [{ type: "image", data: "new", mimeType: "image/png" }], "replace"],
-	] as const)("uses explicit image semantics for %s (%s)", (text, resolved, _label) => {
+		["plain text", [], [], "clear"],
+		["keep [image #1]", undefined, undefined, "preserve unresolved marker or non-vision model"],
+		[
+			"replace [image #1]",
+			[{ type: "image", data: "new", mimeType: "image/png" }],
+			[{ type: "image", data: "new", mimeType: "image/png" }],
+			"replace",
+		],
+		[
+			"duplicate [image #1] [image #1]",
+			[{ type: "image", data: "new", mimeType: "image/png" }],
+			[{ type: "image", data: "new", mimeType: "image/png" }],
+			"replace duplicate marker once",
+		],
+		["missing [image #1] [image #2]", [{ type: "image", data: "one", mimeType: "image/png" }], undefined, "preserve"],
+	] as const)("uses explicit image semantics for %s (%s)", (text, resolved, expected, _label) => {
 		const result = Reflect.get(InteractiveMode.prototype, "queueMutationImages").call(
 			{
 				collectImagesFor: () => resolved,
 			},
 			text,
 		);
-		expect(result).toEqual(resolved);
+		expect(result).toEqual(expected);
 	});
 
 	test("serializes rapid selected-item mutations", async () => {
