@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../../src/config.js";
@@ -50,8 +51,8 @@ async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<vo
 	throw new Error("timed out waiting for the expected ACP updates");
 }
 
-async function connectAcp(harness: Harness): Promise<AcpFixture> {
-	const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+async function connectAcp(harness: Harness, existing?: InProcessAgentConnection): Promise<AcpFixture> {
+	const connection = existing ?? new InProcessAgentConnection(runtimeHostFor(harness.session));
 	const toAgent = new TransformStream<Uint8Array, Uint8Array>();
 	const toClient = new TransformStream<Uint8Array, Uint8Array>();
 	const updates: any[] = [];
@@ -101,6 +102,46 @@ const ipythonTool = {
 		return { content: [{ type: "text" as const, text: "42" }], details: { code } };
 	},
 };
+
+/**
+ * Wrap a connection so a transcript rebuild runs mid-turn, right after
+ * `promptAndWait` resolves and before the ACP handler inspects the outcome.
+ *
+ * Auto-compaction does exactly this to `state.messages`: it drops older messages
+ * and re-materializes the ones it keeps (`buildSessionContext`, and the filters
+ * and slices around it), so a message the turn appended can end up at a lower
+ * index than the pre-turn message count. Driving a real compaction needs a
+ * token-overflow response from the provider, so the rebuild is simulated here;
+ * what matters is its shape, which is asserted in each test.
+ */
+function withMidTurnRebuild(
+	harness: Harness,
+	rebuild: (messages: AgentMessage[]) => AgentMessage[] | undefined,
+): { connection: InProcessAgentConnection; arm: () => void } {
+	const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+	const promptAndWait = connection.promptAndWait.bind(connection) as (...args: any[]) => Promise<any>;
+	let armed = false;
+	(connection as any).promptAndWait = async (...args: any[]) => {
+		const result = await promptAndWait(...args);
+		if (armed) {
+			armed = false;
+			const rebuilt = rebuild(harness.session.state.messages);
+			if (rebuilt) harness.session.state.messages = rebuilt;
+		}
+		return result;
+	};
+	return {
+		connection,
+		arm: () => {
+			armed = true;
+		},
+	};
+}
+
+/** Copy messages the way a rebuild from persisted entries does: new objects, same fields. */
+function rematerialize(messages: AgentMessage[]): AgentMessage[] {
+	return JSON.parse(JSON.stringify(messages));
+}
 
 describe("ACP mode preserves prime-agent features", () => {
 	it("streams IPython execution as an execute tool call with its cell source", async () => {
@@ -353,11 +394,14 @@ describe("ACP mode preserves prime-agent features", () => {
 		harness.setResponses([fauxAssistantMessage("working on it")]);
 		const fixture = await connectAcp(harness);
 
-		await fixture.agent.request("session/prompt", {
-			sessionId: fixture.sessionId,
-			prompt: [{ type: "text", text: "start" }],
-		});
+		// A seeded goal keeps requesting continuations, so this turn eventually
+		// exhausts the faux queue and fails. The assertion is that goal state
+		// reaches the client, which happens on the first turn either way.
+		const turn = fixture.agent
+			.request("session/prompt", { sessionId: fixture.sessionId, prompt: [{ type: "text", text: "start" }] })
+			.catch(() => undefined);
 		await waitFor(() => fixture.metaOf("goal").length > 0);
+		await turn;
 
 		const goals = fixture.metaOf("goal");
 		expect(goals.length, "goal state must reach the ACP client").toBeGreaterThan(0);
@@ -580,6 +624,126 @@ describe("ACP mode preserves prime-agent features", () => {
 
 		expect(fixture.updates.length, "inbound agent messages must produce ACP updates").toBeGreaterThan(0);
 		expect(streamedText()).toContain("acknowledged the sibling");
+		harness.cleanup();
+	}, 30_000);
+
+	it("fails the prompt turn instead of reporting end_turn when the model errors", async () => {
+		const harness = await createHarness();
+		// A provider failure is the shape verifiers hit in a container: the turn
+		// resolves, streams nothing, and previously answered a clean end_turn.
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." })]);
+		const fixture = await connectAcp(harness);
+
+		await expect(
+			fixture.agent.request("session/prompt", {
+				sessionId: fixture.sessionId,
+				prompt: [{ type: "text", text: "say hi" }],
+			}),
+		).rejects.toThrow();
+		harness.cleanup();
+	}, 30_000);
+
+	it("does not let an earlier failed turn reject a later one", async () => {
+		const harness = await createHarness();
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." })]);
+		const fixture = await connectAcp(harness);
+
+		// First turn fails and must be reported as a failure.
+		await expect(
+			fixture.agent.request("session/prompt", {
+				sessionId: fixture.sessionId,
+				prompt: [{ type: "text", text: "first" }],
+			}),
+		).rejects.toThrow();
+
+		// A slash command is handled without calling the model, so it appends no
+		// assistant message. Scanning the whole transcript would surface the earlier
+		// turn's error and wrongly reject this one.
+		const second = await fixture.agent.request("session/prompt", {
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "text", text: "/compact" }],
+		});
+		expect(second.stopReason).toBe("end_turn");
+		harness.cleanup();
+	}, 30_000);
+
+	it("reports a failure that a mid-turn transcript rebuild moved below the pre-turn message count", async () => {
+		const harness = await createHarness();
+		harness.setResponses([
+			fauxAssistantMessage("first turn done"),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." }),
+		]);
+		let rebuiltLength = 0;
+		const { connection, arm } = withMidTurnRebuild(harness, (messages) => {
+			// Keep only the tail, as compaction does: this turn's error message keeps
+			// its content but moves to a much lower index.
+			const rebuilt = rematerialize(messages.slice(-2));
+			rebuiltLength = rebuilt.length;
+			return rebuilt;
+		});
+		const fixture = await connectAcp(harness, connection);
+
+		const first = await fixture.agent.request("session/prompt", {
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "text", text: "first" }],
+		});
+		expect(first.stopReason).toBe("end_turn");
+
+		const priorMessageCount = harness.session.state.messages.length;
+		expect(priorMessageCount, "the first turn must leave messages behind to compact away").toBeGreaterThan(1);
+		arm();
+
+		const failure = await fixture.agent
+			.request("session/prompt", {
+				sessionId: fixture.sessionId,
+				prompt: [{ type: "text", text: "second" }],
+			})
+			.then(
+				(result: unknown) => ({ resolved: result }),
+				(error: unknown) => ({ error }),
+			);
+		expect(
+			"error" in failure,
+			`a failed turn must not report a clean stop reason (got ${JSON.stringify(failure)})`,
+		).toBe(true);
+		// The client must be told the turn failed, not handed a bare protocol error.
+		expect(JSON.stringify(failure)).toContain("prime-agent turn failed");
+
+		// The point of the test: a pre-turn count watermark would have skipped the
+		// failure, because after the rebuild it sits below that count.
+		expect(rebuiltLength, "the rebuild must shorten the transcript").toBeLessThanOrEqual(priorMessageCount);
+		expect(rebuiltLength - 1, "the failure must land below the pre-turn count").toBeLessThan(priorMessageCount);
+		harness.cleanup();
+	}, 30_000);
+
+	it("does not mistake a rebuilt copy of an earlier failure for this turn's failure", async () => {
+		const harness = await createHarness();
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "Connection error." })]);
+		let rebuiltIdentities = false;
+		const { connection, arm } = withMidTurnRebuild(harness, (messages) => {
+			const rebuilt = rematerialize(messages);
+			rebuiltIdentities = rebuilt.every((message, index) => message !== messages[index]);
+			return rebuilt;
+		});
+		const fixture = await connectAcp(harness, connection);
+
+		await expect(
+			fixture.agent.request("session/prompt", {
+				sessionId: fixture.sessionId,
+				prompt: [{ type: "text", text: "first" }],
+			}),
+		).rejects.toThrow();
+
+		// A rebuild replaces every kept message with a fresh object, so object
+		// identity alone cannot tell the earlier failure from a new one. The turn
+		// below appends no assistant message and must still end cleanly.
+		arm();
+		const handled = await fixture.agent.request("session/prompt", {
+			sessionId: fixture.sessionId,
+			prompt: [{ type: "text", text: "/compact" }],
+		});
+		expect(handled.stopReason).toBe("end_turn");
+		expect(rebuiltIdentities, "the rebuild must replace the message objects").toBe(true);
 		harness.cleanup();
 	}, 30_000);
 

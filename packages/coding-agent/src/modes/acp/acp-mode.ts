@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { VERSION } from "../../config.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
@@ -110,6 +111,82 @@ function autonomousMeta(status: AgentAutonomousStatus | undefined): Record<strin
 			gateFailure: status.lastGateFailure?.exitText,
 		},
 	});
+}
+
+/**
+ * The transcript as it stood before a turn started, recorded so the turn's own
+ * messages can be told apart from everything older.
+ *
+ * A pre-turn message *count* cannot do that job: auto-compaction can fire during
+ * a turn and rebuild `state.messages` (it filters, slices, and re-materializes
+ * persisted entries), so this turn's failure can end up at a lower index than
+ * the count taken before prompting. Membership is tracked by things a rebuild
+ * preserves instead — the message objects themselves, plus a content key for
+ * transports that hand back fresh copies (daemon RPC re-parses JSON, so identity
+ * does not survive it) and for compaction paths that re-materialize a kept
+ * message from its persisted entry with its original timestamp.
+ */
+interface TurnBoundary {
+	identities: WeakSet<object>;
+	keys: Set<string>;
+}
+
+/** Key for a kept message: compaction drops messages, it does not rewrite them. */
+function messageKey(message: unknown): string | undefined {
+	if (typeof message !== "object" || message === null) return undefined;
+	const record = message as { role?: unknown; timestamp?: unknown; stopReason?: unknown; errorMessage?: unknown };
+	if (typeof record.timestamp !== "number") return undefined;
+	return JSON.stringify([
+		record.role ?? null,
+		record.timestamp,
+		record.stopReason ?? null,
+		record.errorMessage ?? null,
+	]);
+}
+
+function turnBoundary(messages: readonly AgentMessage[]): TurnBoundary {
+	const identities = new WeakSet<object>();
+	const keys = new Set<string>();
+	for (const message of messages) {
+		if (typeof message !== "object" || message === null) continue;
+		identities.add(message);
+		const key = messageKey(message);
+		if (key) keys.add(key);
+	}
+	return { identities, keys };
+}
+
+function isPreTurn(message: unknown, boundary: TurnBoundary): boolean {
+	if (typeof message !== "object" || message === null) return false;
+	if (boundary.identities.has(message)) return true;
+	const key = messageKey(message);
+	return key !== undefined && boundary.keys.has(key);
+}
+
+/**
+ * Error text from an assistant message this turn produced, when it failed.
+ *
+ * `promptAndWait` resolves for a failed turn just as it does for a successful
+ * one, so the outcome has to be read off the transcript. Only messages that were
+ * not in the transcript before the turn are considered: scanning the whole
+ * transcript would let an earlier failed turn reject a later turn that never
+ * called the model (a handled slash command, say), reporting a stale error.
+ *
+ * A transcript read that fails is not treated as success — that would restore
+ * the silent-success behavior this exists to prevent.
+ */
+async function turnFailure(connection: AgentConnection, boundary: TurnBoundary): Promise<string | undefined> {
+	const messages = await connection.getMessages();
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role !== "assistant") continue;
+		// The newest assistant message predates the turn, so the turn appended none.
+		if (isPreTurn(message, boundary)) return undefined;
+		const assistant = message as { stopReason?: string; errorMessage?: string };
+		if (assistant.stopReason !== "error") return undefined;
+		return assistant.errorMessage || "the model request failed";
+	}
+	return undefined;
 }
 
 export async function runAcpMode(runtimeHost: AgentSessionRuntime): Promise<never> {
@@ -230,6 +307,10 @@ export async function runAcpModeWithConnection(
 
 			try {
 				const { text, images } = promptContent(params.prompt);
+				// Only this turn's messages may decide its outcome, and compaction can
+				// rebuild the transcript mid-turn, so record the pre-turn messages
+				// themselves rather than how many there were.
+				const priorMessages = turnBoundary(await connection.getMessages());
 				await connection.promptAndWait(text, images.length > 0 ? { images } : undefined);
 				// Autonomous gates continue inside this same prompt turn: the turn is
 				// only over once the gate loop settles.
@@ -242,6 +323,15 @@ export async function runAcpModeWithConnection(
 							update: { sessionUpdate: "session_info_update", _meta: meta },
 						})
 						.catch(() => undefined);
+				}
+				// A turn that failed (provider error, auth, no usable model) must not be
+				// reported as a clean end_turn. Print mode surfaces
+				// `stopReason: "error"` with its errorMessage; ACP previously dropped
+				// that and answered end_turn with no updates at all, which reads to a
+				// client as a successful but empty turn.
+				const failure = await turnFailure(connection, priorMessages);
+				if (failure && !abort.signal.aborted) {
+					throw new Error(`prime-agent turn failed: ${failure}`);
 				}
 				return { stopReason: acpStopReason({ cancelled: abort.signal.aborted, autonomous: status }) };
 			} catch (error) {
