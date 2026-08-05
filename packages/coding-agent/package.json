@@ -43,7 +43,8 @@
 		"test:process-stress": "vitest --run --tagsFilter process-stress test/daemon-supervisor-process.test.ts",
 		"postinstall": "node postinstall.cjs",
 		"prepublishOnly": "npm run clean && npm run build",
-		"bundle": "node scripts/bundle.mjs"
+		"bundle": "node scripts/bundle.mjs",
+		"test:kernel": "vitest --run --tagsFilter kernel-heavy test/acp-kernel-features.test.ts"
 	},
 	"dependencies": {
 		"@agentclientprotocol/sdk": "^1.3.0",

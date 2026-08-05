@@ -79,6 +79,10 @@ jobs:
             package: packages/coding-agent
             command: npm run test:process
             install_uv: true
+          - name: coding-agent kernel
+            package: packages/coding-agent
+            command: npm run test:kernel
+            install_uv: true
     steps:
       - name: Checkout
         uses: actions/checkout@v7
