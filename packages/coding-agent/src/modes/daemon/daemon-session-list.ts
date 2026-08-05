@@ -394,6 +394,7 @@ function rlmChildSnapshotForActiveSession(
 		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
 		: undefined;
 	const status = runStatus ?? (session.isSessionActive ? "running" : "done");
+	const isActive = status === "running" || session.isSessionActive;
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
@@ -407,7 +408,7 @@ function rlmChildSnapshotForActiveSession(
 		tokenCount: session._contextTokensForCurrentMessages(),
 		recap: session.getCurrentRecap(),
 		sessionDir: metadata.sessionDir ?? session.sessionManager.getSessionDir(),
-		activity: status === "running" ? { kind: session.isStreaming ? "writing" : "waiting" } : undefined,
+		activity: isActive ? { kind: session.isStreaming ? "writing" : "waiting" } : undefined,
 	};
 }
 

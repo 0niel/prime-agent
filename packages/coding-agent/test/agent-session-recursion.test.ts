@@ -1390,6 +1390,47 @@ describe("AgentSession rlm recursion", () => {
 		);
 	});
 
+	it("projects retained child follow-up turns into parent child-update activity", async () => {
+		let releaseInitial: () => void = () => {};
+		const initialGate = new Promise<void>((resolve) => {
+			releaseInitial = resolve;
+		});
+		let releaseFollowUp: () => void = () => {};
+		const followUpGate = new Promise<void>((resolve) => {
+			releaseFollowUp = resolve;
+		});
+		const events: Array<{ status: string; activity?: { kind: string } }> = [];
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				void (text === "initial" ? initialGate : followUpGate).then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(`answer: ${text}`) });
+				});
+				return stream;
+			},
+		});
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") {
+				events.push({ status: event.child.status, activity: event.child.activity });
+			}
+		});
+
+		const spawned = await root.runRlmChild("initial");
+		await waitFor(() => events.some((event) => event.status === "running" && event.activity?.kind === "waiting"));
+		releaseInitial();
+		await waitFor(() => root.getRlmChildSession(spawned.rlm_child_id) !== undefined);
+		await waitFor(() => events.at(-1)?.status === "done" && events.at(-1)?.activity === undefined);
+
+		const child = root.getRlmChildSession(spawned.rlm_child_id);
+		if (!child) throw new Error("Missing retained child session");
+		const followUp = child.prompt("follow-up");
+		await waitFor(() => events.at(-1)?.status === "done" && events.at(-1)?.activity?.kind === "waiting");
+		releaseFollowUp();
+		await followUp;
+		await waitFor(() => events.at(-1)?.status === "done" && events.at(-1)?.activity === undefined);
+	});
+
 	it("lists a completed child with its parent-scoped messaging identity until disposal", async () => {
 		let daemonChildId = "";
 		const root = createSession({
