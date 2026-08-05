@@ -635,9 +635,8 @@ type SubmitHandlerHarness = {
 	collectImagesFor: () => unknown[];
 	updatePendingMessagesDisplay: () => void;
 	setEditorFromPendingNavigation: (text: string) => void;
-	pendingMessageNavigation?: {
+	pendingMessageNavigation: {
 		selected?: { lane: "steering" | "followUp"; index: number };
-		draftText?: string;
 		reset(): void;
 	};
 	connectionQueue?: { steering: string[]; followUp: string[] };
@@ -690,6 +689,7 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		flushPendingBashComponents: vi.fn(),
 		collectImagesFor: vi.fn(() => []),
 		updatePendingMessagesDisplay: vi.fn(),
+		pendingMessageNavigation: { reset: vi.fn() },
 		setEditorFromPendingNavigation(text: string) {
 			this.editor.setText(text);
 		},
@@ -843,7 +843,7 @@ describe("InteractiveMode submit handling", () => {
 				pendingMessageNavigation: {
 					selected: { id: "action-1", lane: "followUp", index: 0 },
 					checkpoint: () => ({ marker: true, draft: "draft" }),
-					change: () => ({ queue: { steering: [], followUp: [] }, draft: "draft" }),
+					change: () => ({ draft: "draft" }),
 					restore: vi.fn(),
 					reset: vi.fn(),
 				},
@@ -923,7 +923,7 @@ describe("InteractiveMode submit handling", () => {
 		await mutate.call(fakeThis, "later", editorText);
 		expect(calls).toEqual([7, 8]);
 		expect(navigation.selected?.id).toBe("f2");
-		expect(navigation.draftText).toBe("original draft");
+		expect(navigation.checkpoint().draft).toBe("original draft");
 		expect(editorText).toBe("f2 edited");
 		expect(navigation.browse(fakeThis.connectionQueue, editorText, 1)).toBe("f3 edited");
 	});
@@ -936,7 +936,7 @@ describe("InteractiveMode submit handling", () => {
 			revision: 4,
 			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
 		};
-		navigation.select(initial, "draft", initial.items[0]!);
+		navigation.browse(initial, "draft", -1);
 		let rejectMutation!: (error: Error) => void;
 		const response = new Promise<never>((_resolve, reject) => {
 			rejectMutation = reject;
@@ -961,7 +961,7 @@ describe("InteractiveMode submit handling", () => {
 		rejectMutation(new Error("transport failed"));
 		await expect(mutation).rejects.toThrow("transport failed");
 		expect(navigation.selected).toBeUndefined();
-		expect(navigation.draftText).toBe("");
+		expect(navigation.checkpoint().draft).toBe("");
 	});
 
 	test.each([
@@ -985,7 +985,7 @@ describe("InteractiveMode submit handling", () => {
 				{ id: "selected", lane: "followUp" as const, index: 1, text: "selected" },
 			],
 		};
-		navigation.select(initial, "draft", initial.items[1]!);
+		navigation.browse(initial, "draft", -1);
 		const authoritative =
 			kind === "earlier"
 				? {
@@ -1038,7 +1038,7 @@ describe("InteractiveMode submit handling", () => {
 			revision: 9,
 			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
 		};
-		navigation.select(queue, "draft", queue.items[0]!);
+		navigation.browse(queue, "draft", -1);
 		const fakeThis = {
 			editor: { getText: () => editorText },
 			pendingMessageNavigation: navigation,
@@ -1070,7 +1070,7 @@ describe("InteractiveMode submit handling", () => {
 		expect(fakeThis.setEditorFromPendingNavigation).not.toHaveBeenCalled();
 		expect(fakeThis.showWarning).not.toHaveBeenCalled();
 		expect(navigation.selected?.id).toBe("selected");
-		expect(navigation.draftText).toBe("draft");
+		expect(navigation.checkpoint().draft).toBe("draft");
 		expect(editorText).toBe("newer editor");
 	});
 
@@ -1082,7 +1082,7 @@ describe("InteractiveMode submit handling", () => {
 			revision: 8,
 			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
 		};
-		navigation.select(selectedQueue, "draft", selectedQueue.items[0]!);
+		navigation.browse(selectedQueue, "draft", -1);
 		let editorText = "edited";
 		const setEditor = vi.fn((value: string) => {
 			editorText = value;
@@ -1625,6 +1625,7 @@ describe("InteractiveMode pending bash components", () => {
 			ipythonToolComponents: new Map(),
 			lateIpythonSentAgentMessages: new Map(),
 			resetPendingToolState: vi.fn(),
+			pendingMessageNavigation: { reset: vi.fn() },
 			resetSubagentSummary: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),

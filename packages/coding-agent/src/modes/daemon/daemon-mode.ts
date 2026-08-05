@@ -124,7 +124,11 @@ import {
 	createAgentConnectionState,
 } from "../agent-connection/snapshot.js";
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
-import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
+import type {
+	AgentConnectionHeartbeat,
+	AgentConnectionQueueState,
+	AgentConnectionRlmChildAgentSnapshot,
+} from "../agent-connection/types.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../session-worker/private-framing.js";
@@ -421,6 +425,19 @@ export function isTerminalRemoteAgentMessageError(error: unknown): error is Erro
 			error.message.startsWith("Ambiguous") ||
 			error.message === AGENT_FAMILY_REACH_ERROR)
 	);
+}
+
+function createQueueState(session: AgentSession, editable: boolean): AgentConnectionQueueState {
+	const queue: AgentConnectionQueueState = {
+		steering: [...session.getSteeringMessagePreviews()],
+		followUp: [...session.getFollowUpMessagePreviews()],
+	};
+	if (!editable) return queue;
+	return {
+		...queue,
+		revision: session.queueRevision,
+		items: session.getEditableQueueItems(),
+	};
 }
 
 export class AgentDaemon {
@@ -4179,17 +4196,7 @@ export class AgentDaemon {
 				const supportsMutation = daemonClientCapabilitiesForSession(client, command.activeSessionId).has(
 					"queue_item_mutation",
 				);
-				const items = supportsMutation ? state.runtime.session.getEditableQueueItems() : undefined;
-				return success(command.id, "get_queue", {
-					steering: [...state.runtime.session.getSteeringMessagePreviews()],
-					followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
-					...(items
-						? {
-								revision: state.runtime.session.queueRevision,
-								items,
-							}
-						: {}),
-				});
+				return success(command.id, "get_queue", createQueueState(state.runtime.session, supportsMutation));
 			}
 
 			case "mutate_queue_item": {
@@ -4206,15 +4213,9 @@ export class AgentDaemon {
 						: (mutationResult as unknown) === false
 							? "stale"
 							: mutationResult;
-				const items = state.runtime.session.getEditableQueueItems();
 				return success(command.id, "mutate_queue_item", {
 					status: outcome,
-					queue: {
-						steering: [...state.runtime.session.getSteeringMessagePreviews()],
-						followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
-						revision: state.runtime.session.queueRevision,
-						items,
-					},
+					queue: createQueueState(state.runtime.session, true),
 				});
 			}
 

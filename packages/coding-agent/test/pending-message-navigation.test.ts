@@ -23,40 +23,29 @@ describe("PendingMessageNavigation", () => {
 		expect(state.browse(queue, "f3 edit 2", 1)).toBe("draft");
 	});
 
-	it("selects the next due item with its draft", () => {
+	it("checkpoints the draft while browsing queued items", () => {
 		const state = new PendingMessageNavigation();
-		expect(state.select(queue, "draft", { id: "s1", lane: "steering", index: 0 })).toBe("s1");
-		expect(state.selected).toEqual({ id: "s1", lane: "steering", index: 0 });
-		expect(state.draftText).toBe("draft");
+		expect(state.browse(queue, "draft", -1)).toBe("f3");
+		expect(state.selected).toEqual({ id: "f3", lane: "followUp", index: 2 });
+		expect(state.checkpoint().draft).toBe("draft");
 	});
 
 	it.each([
-		["delete", { id: "f2", lane: "followUp", index: 1 }, "", { steering: ["s1", "s2"], followUp: ["f1", "f3"] }],
-		["steer", { id: "f2", lane: "followUp", index: 1 }, "edited", { steering: ["s1", "s2"], followUp: ["f1", "f3"] }],
-		[
-			"followUp",
-			{ id: "f2", lane: "followUp", index: 1 },
-			"edited",
-			{ steering: ["s1", "s2"], followUp: ["f1", "edited", "f3"] },
-		],
-		[
-			"followUp",
-			{ id: "s1", lane: "steering", index: 0 },
-			"converted",
-			{ steering: ["s2"], followUp: ["f1", "f2", "f3", "converted"] },
-		],
-	] as const)("applies %s to a selected %s item", (kind, selected, text, expected) => {
+		["delete", ""],
+		["steer", "edited"],
+		["followUp", "edited"],
+	] as const)("applies %s to the browsed item", (kind, text) => {
 		const state = new PendingMessageNavigation();
-		state.select(queue, "draft", selected);
+		state.browse(queue, "draft", -1);
 		const changed = state.change(kind, text);
 		expect(changed?.draft).toBe("draft");
-		expect(changed?.queue.items?.some((item) => item.id === selected.id)).toBe(false);
-		expect(expected).toBeDefined();
+		expect(state.selected).toBeUndefined();
 	});
 
 	it("reorders within a lane, keeps the edit selected, and no-ops at boundaries", () => {
 		const state = new PendingMessageNavigation();
-		state.select(queue, "draft", { id: "f2", lane: "followUp", index: 1 });
+		state.browse(queue, "draft", -1);
+		state.browse(queue, "f3", -1);
 		expect(state.change("earlier", "edited")).toMatchObject({
 			selected: { id: "f2", lane: "followUp", index: 0 },
 			draft: "draft",
@@ -70,7 +59,7 @@ describe("PendingMessageNavigation", () => {
 		state.browse(queue, "draft", -1); // f3
 		state.browse(queue, "f3 edited", -1); // f2
 		state.change("earlier", "f2 edited");
-		expect(state.draftText).toBe("draft");
+		expect(state.checkpoint().draft).toBe("draft");
 		const reordered = state.checkpoint().queue!;
 		expect(state.browse(reordered, "f2 edited", 1)).toBe("f1");
 		expect(state.browse(reordered, "f1", 1)).toBe("f3 edited");
