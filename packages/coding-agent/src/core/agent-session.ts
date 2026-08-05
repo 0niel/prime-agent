@@ -792,13 +792,13 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
 	);
 }
 
-/** Queue-visible user turns are editable regardless of which input path admitted them. */
-function isEditableQueuedUserTurn(action: QueuedSessionAction): action is SessionAction<PreparedTurnPayload> {
+/** User-authored queued actions share one editable projection, including session commands. */
+function isEditableQueuedAction(action: QueuedSessionAction): boolean {
 	return (
-		action.payload.kind === "turn" &&
-		action.payload.queueVisible &&
-		!action.payload.acceptedAgentMessage &&
-		action.payload.customMessage === undefined
+		action.payload.kind === "session_command" ||
+		(action.payload.queueVisible &&
+			!action.payload.acceptedAgentMessage &&
+			action.payload.customMessage === undefined)
 	);
 }
 
@@ -6102,31 +6102,15 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
-	getEditableQueueItems(): Array<{
-		id: string;
-		lane: "steering" | "followUp";
-		index: number;
-		text: string;
-	}> {
-		const result: Array<{
-			id: string;
-			lane: "steering" | "followUp";
-			index: number;
-			text: string;
-		}> = [];
+	getEditableQueueItems() {
+		const result: Array<{ id: string; lane: "steering" | "followUp"; index: number; text: string }> = [];
 		for (const [delivery, lane] of [
 			["next_turn_boundary", "steering"],
 			["when_run_idle", "followUp"],
 		] as const) {
-			const editable = this._actionStore.queuedActions(delivery).filter(isEditableQueuedUserTurn);
+			const editable = this._actionStore.queuedActions(delivery).filter(isEditableQueuedAction);
 			for (const [index, action] of editable.entries()) {
-				if (action.payload.kind === "turn")
-					result.push({
-						id: action.id,
-						lane,
-						index,
-						text: action.payload.text,
-					});
+				result.push({ id: action.id, lane, index, text: action.payload.text });
 			}
 		}
 		return result;
@@ -6145,9 +6129,9 @@ export class AgentSession {
 	): "applied" | "noop" | "stale" {
 		if (expectedRevision !== this._queueRevision) return "stale";
 		const action = this._actionStore.queuedActions().find((candidate) => candidate.id === actionId);
-		if (!action || !isEditableQueuedUserTurn(action)) return "stale";
+		if (!action || !isEditableQueuedAction(action)) return "stale";
 		const lane = action.delivery;
-		const laneActions = this._actionStore.queuedActions(lane).filter(isEditableQueuedUserTurn);
+		const laneActions = this._actionStore.queuedActions(lane).filter(isEditableQueuedAction);
 		const index = laneActions.indexOf(action);
 		if (mutation.type === "move_earlier" || mutation.type === "move_later") {
 			const target = index + (mutation.type === "move_earlier" ? -1 : 1);
@@ -6162,24 +6146,34 @@ export class AgentSession {
 			const targetLane: DeliveryPolicy =
 				mutation.type === "replace_steering" ? "next_turn_boundary" : "when_run_idle";
 			const targetIndex = this._actionStore.queuedActions(targetLane).length;
-			action.payload.text = mutation.text;
-			if (mutation.images !== undefined) {
-				action.payload.images = mutation.images.length ? mutation.images.map((image) => ({ ...image })) : undefined;
-				action.payload.content = mutation.images.length
-					? [{ type: "text", text: mutation.text }, ...mutation.images.map((image) => ({ ...image }))]
-					: [{ type: "text", text: mutation.text }];
-			} else if (action.payload.content) {
-				action.payload.content = action.payload.content.map((block) =>
-					block.type === "text" ? { ...block, text: mutation.text } : block,
-				);
-			}
-			action.payload.preview = undefined;
-			action.payload.prepared = undefined;
-			for (const record of action.payload.records) {
-				if (record.role === "primary" && record.message.role === "user") {
-					record.message.content = action.payload.content
-						? action.payload.content.map((block) => ({ ...block }))
-						: mutation.text;
+			if (action.payload.kind === "session_command") {
+				const command = parseSessionSlashCommand(mutation.text);
+				if (!command) return "stale";
+				action.payload.text = mutation.text;
+				action.payload.command = command;
+				action.payload.images = mutation.images;
+			} else {
+				action.payload.text = mutation.text;
+				if (mutation.images !== undefined) {
+					action.payload.images = mutation.images.length
+						? mutation.images.map((image) => ({ ...image }))
+						: undefined;
+					action.payload.content = mutation.images.length
+						? [{ type: "text", text: mutation.text }, ...mutation.images.map((image) => ({ ...image }))]
+						: [{ type: "text", text: mutation.text }];
+				} else if (action.payload.content) {
+					action.payload.content = action.payload.content.map((block) =>
+						block.type === "text" ? { ...block, text: mutation.text } : block,
+					);
+				}
+				action.payload.preview = undefined;
+				action.payload.prepared = undefined;
+				for (const record of action.payload.records) {
+					if (record.role === "primary" && record.message.role === "user") {
+						record.message.content = action.payload.content
+							? action.payload.content.map((block) => ({ ...block }))
+							: mutation.text;
+					}
 				}
 			}
 			if (targetLane !== lane) this._actionStore.moveQueued(action, targetLane, targetIndex);

@@ -202,6 +202,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		await session.prompt("duplicate", { streamingBehavior: "steer", queueIfBusy: true, source: "interactive" });
 		await session.sendUserMessage("extension item", { deliverAs: "steer" });
+		await session.prompt("/compact focus on tools", { streamingBehavior: "steer", queueIfBusy: true });
 		const originalImage: ImageContent = { type: "image", data: "original", mimeType: "image/png" };
 		await session.prompt("duplicate [image #1]", {
 			streamingBehavior: "steer",
@@ -211,15 +212,21 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 		await session.prompt("follow", { streamingBehavior: "followUp", queueIfBusy: true, source: "interactive" });
 		const staleRevision = session.queueRevision - 1;
-		const [first, extension, second, follow] = session.getEditableQueueItems();
-		expect([first?.text, extension?.text, second?.text, follow?.text]).toEqual([
+		const [first, extension, command, second, follow] = session.getEditableQueueItems();
+		expect([first?.text, extension?.text, command?.text, second?.text, follow?.text]).toEqual([
 			"duplicate",
 			"extension item",
+			"/compact focus on tools",
 			"duplicate [image #1]",
 			"follow",
 		]);
 
-		expect(session.getSteeringMessages()).toEqual(["duplicate", "extension item", "duplicate [image #1]"]);
+		expect(session.getSteeringMessages()).toEqual([
+			"duplicate",
+			"extension item",
+			"/compact focus on tools",
+			"duplicate [image #1]",
+		]);
 		const boundaryRevision = session.queueRevision;
 		expect(session.mutateQueuedUserMessage(first!.id, boundaryRevision, { type: "move_earlier" })).toBe("noop");
 		expect(session.queueRevision).toBe(boundaryRevision);
@@ -230,10 +237,25 @@ describe("AgentSession concurrent prompt guard", () => {
 		);
 		expect(session.getEditableQueueItems().map((item) => item.id)).toEqual([
 			first!.id,
-			second!.id,
 			extension!.id,
+			second!.id,
+			command!.id,
 			follow!.id,
 		]);
+		expect(
+			session.mutateQueuedUserMessage(command!.id, session.queueRevision, {
+				type: "replace_steering",
+				text: "/compact revised focus",
+			}),
+		).toBe("applied");
+		const editedCommand = session
+			.getSessionActionRecoverySnapshot()
+			.actions.find((action) => action.id === command!.id);
+		expect(editedCommand?.payload).toMatchObject({
+			kind: "session_command",
+			text: "/compact revised focus",
+			command: { name: "compact", args: "revised focus" },
+		});
 		expect(
 			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
 				type: "replace_steering",
@@ -272,6 +294,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.getEditableQueueItems()).toMatchObject([
 			{ id: first!.id, lane: "steering", text: "duplicate" },
 			{ id: extension!.id, lane: "steering", text: "extension item" },
+			{ id: command!.id, lane: "steering", text: "/compact revised focus" },
 			{ id: follow!.id, lane: "followUp", text: "follow" },
 			{ id: second!.id, lane: "followUp", text: "converted" },
 		]);
