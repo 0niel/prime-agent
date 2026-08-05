@@ -990,6 +990,7 @@ export class InteractiveMode {
 	private pendingMessageMutation: Promise<PendingMessageMutationOutcome> = Promise.resolve("noop");
 	private queueEventGeneration = 0;
 	private isPendingMessageNavigationTextChange = false;
+	private editorChangeGeneration = 0;
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -4166,6 +4167,7 @@ export class InteractiveMode {
 		this.defaultEditor.onMoveBelowPrompt = () => this.focusSubagentSummary();
 
 		this.defaultEditor.onChange = (text: string) => {
+			this.editorChangeGeneration++;
 			if (!this.isPendingMessageNavigationTextChange && this.pendingMessageNavigation?.isAtDraft) {
 				this.pendingMessageNavigation.capture(text);
 			}
@@ -4613,11 +4615,16 @@ export class InteractiveMode {
 
 			try {
 				if (recalledPendingMessage) {
+					const recalledEditorGeneration = this.editorChangeGeneration;
 					try {
 						const outcome = await this.changeSelectedPendingMessage("steer", text);
 						if (outcome === "applied") this.editor.addToHistory?.(text);
 					} catch (error) {
-						if (submissionGeneration === this.inputSubmissionGeneration && this.editor.getText().length === 0) {
+						if (
+							submissionGeneration === this.inputSubmissionGeneration &&
+							recalledEditorGeneration === this.editorChangeGeneration &&
+							this.editor.getText().length === 0
+						) {
 							this.setEditorFromPendingNavigation(text);
 						}
 						this.showError(error instanceof Error ? error.message : String(error));
@@ -7017,6 +7024,7 @@ export class InteractiveMode {
 								text,
 								images: this.queueMutationImages(text),
 							};
+		const editorGeneration = this.editorChangeGeneration;
 		let result: AgentConnectionQueueMutationResult;
 		try {
 			result = await this.agentConnection.mutateQueueItem(selected.id, checkpoint.queue?.revision ?? -1, mutation);
@@ -7038,11 +7046,13 @@ export class InteractiveMode {
 			this.connectionQueue = result.queue;
 			if (result.status === "unsupported") {
 				this.pendingMessageNavigation.restore(checkpoint);
-				this.setEditorFromPendingNavigation(text);
+				if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
 				this.showWarning("Restart or update the daemon to edit queued messages.");
 			} else {
 				this.pendingMessageNavigation.reset();
-				this.setEditorFromPendingNavigation(checkpoint.draft);
+				if (this.editorChangeGeneration === editorGeneration) {
+					this.setEditorFromPendingNavigation(checkpoint.draft);
+				}
 				this.showWarning("That queued message is no longer pending.");
 			}
 			return "retained";
@@ -7050,7 +7060,9 @@ export class InteractiveMode {
 		this.pendingMessageNavigation.restore(changedState);
 		this.pendingMessageNavigation.reconcile(result.queue, change.selected?.id);
 		this.connectionQueue = result.queue;
-		this.setEditorFromPendingNavigation(change.selected ? text : change.draft);
+		if (this.editorChangeGeneration === editorGeneration) {
+			this.setEditorFromPendingNavigation(change.selected ? text : change.draft);
+		}
 		this.updatePendingMessagesDisplay();
 		this.ui.requestRender();
 		return "applied";

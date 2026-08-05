@@ -882,6 +882,71 @@ describe("InteractiveMode submit handling", () => {
 		expect(navigation.browse(fakeThis.connectionQueue, editorText, 1)).toBe("f3 edited");
 	});
 
+	test.each([
+		["followUp", "applied"],
+		["followUp", "unsupported"],
+		["earlier", "applied"],
+	] as const)("preserves newer editor ownership for %s mutation with %s response", async (kind, status) => {
+		let editorText = "edited";
+		let editorChangeGeneration = 0;
+		let resolveMutation!: (result: unknown) => void;
+		const response = new Promise((resolve) => {
+			resolveMutation = resolve;
+		});
+		const navigation = new PendingMessageNavigation();
+		const initial = {
+			steering: [],
+			followUp: ["first", "selected"],
+			revision: 4,
+			items: [
+				{ id: "first", lane: "followUp" as const, index: 0, text: "first" },
+				{ id: "selected", lane: "followUp" as const, index: 1, text: "selected" },
+			],
+		};
+		navigation.select(initial, "draft", initial.items[1]!);
+		const authoritative =
+			kind === "earlier"
+				? {
+						...initial,
+						followUp: ["selected", "first"],
+						revision: 5,
+						items: [
+							{ ...initial.items[1]!, index: 0 },
+							{ ...initial.items[0]!, index: 1 },
+						],
+					}
+				: { ...initial, revision: 5 };
+		const setEditor = vi.fn((value: string) => {
+			editorText = value;
+		});
+		const fakeThis = {
+			editor: { getText: () => editorText },
+			editorChangeGeneration,
+			pendingMessageNavigation: navigation,
+			connectionQueue: initial,
+			agentConnection: { mutateQueueItem: vi.fn(() => response) },
+			queueMutationImages: () => [],
+			setEditorFromPendingNavigation: setEditor,
+			showWarning: vi.fn(),
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+		const mutation = Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
+			fakeThis,
+			kind,
+			editorText,
+		);
+		editorText = "newer typing";
+		fakeThis.editorChangeGeneration = ++editorChangeGeneration;
+		resolveMutation({ status, queue: authoritative });
+		await mutation;
+		expect(editorText).toBe("newer typing");
+		expect(setEditor).not.toHaveBeenCalled();
+		if (status === "applied" && kind === "earlier") {
+			expect(navigation.selected).toMatchObject({ id: "selected", index: 0 });
+		}
+	});
+
 	test("ignores an obsolete stale response after a newer authoritative revision", async () => {
 		let editorText = "edited";
 		const navigation = new PendingMessageNavigation();
