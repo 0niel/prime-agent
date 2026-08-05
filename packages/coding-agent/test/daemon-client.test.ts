@@ -248,6 +248,25 @@ describe("DaemonClient", () => {
 		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
+	it("does not send queue item mutation to an old daemon without the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets.at(-1)!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], DAEMON_SCHEMA_REVISION);
+		await expect(
+			client.request({
+				type: "mutate_queue_item",
+				activeSessionId: "active-1",
+				actionId: "action-1",
+				mutation: { type: "delete" },
+			}),
+		).rejects.toThrow("does not support queue_item_mutation");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("rejects an old daemon before requesting session state", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

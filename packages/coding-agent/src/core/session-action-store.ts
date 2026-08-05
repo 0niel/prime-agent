@@ -230,6 +230,19 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 		transitionSessionAction(action, { state: "queued" }, { rollbackProof: proof });
 	}
 
+	moveQueued(action: TAction, delivery: DeliveryPolicy, index: number): void {
+		if (action.lifecycle.state !== "queued") throw new Error("Only queued actions can be moved");
+		const source = this.list(action.delivery);
+		const sourceIndex = source.indexOf(action);
+		if (sourceIndex < 0) throw new Error(`Session action ${action.id} is not owned by this store`);
+		source.splice(sourceIndex, 1);
+		action.delivery = delivery;
+		const target = this.list(delivery);
+		const queued = target.filter((item) => item.lifecycle.state === "queued");
+		const before = queued[Math.max(0, Math.min(index, queued.length))];
+		target.splice(before ? target.indexOf(before) : target.length, 0, action);
+	}
+
 	queuedActions(policy?: DeliveryPolicy): readonly TAction[] {
 		return this.actions(policy).filter((action) => action.lifecycle.state === "queued");
 	}

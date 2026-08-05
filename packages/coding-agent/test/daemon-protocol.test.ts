@@ -67,6 +67,16 @@ describe("daemon protocol helpers", () => {
 		);
 	});
 
+	it("capability- and schema-gates atomic queue item mutation", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(14);
+		expect(DAEMON_COMMAND_COMPATIBILITY.mutate_queue_item).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 14,
+			capability: "queue_item_mutation",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queue_item_mutation");
+	});
+
 	it("capability-gates explicit subagent deletion instead of schema-gating it", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.delete_rlm_subagent).toEqual({
 			minProtocol: 7,

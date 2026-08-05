@@ -725,6 +725,57 @@ describe("InteractiveMode submit handling", () => {
 		expect(changeSelectedPendingMessage).toHaveBeenCalledWith(expected, ...(expected === "delete" ? [] : ["edited"]));
 	});
 
+	test.each(["unsupported", "stale"] as const)(
+		"keeps the selected edit when atomic mutation is %s",
+		async (status) => {
+			const editorText = "edited";
+			const showWarning = vi.fn();
+			const fakeThis = {
+				editor: { getText: () => editorText },
+				pendingMessageNavigation: {
+					selected: { id: "action-1", lane: "followUp", index: 0 },
+					checkpoint: () => ({ marker: true }),
+					change: () => ({ queue: { steering: [], followUp: [] }, draft: "draft" }),
+					restore: vi.fn(),
+				},
+				agentConnection: {
+					mutateQueueItem: vi.fn(async () => ({ status, queue: { steering: [], followUp: ["old"] } })),
+				},
+				collectImagesFor: () => [],
+				showWarning,
+			};
+			const applied = await Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
+				fakeThis,
+				"followUp",
+				editorText,
+			);
+			expect(applied).toBe(false);
+			expect(editorText).toBe("edited");
+			expect(showWarning).toHaveBeenCalledOnce();
+		},
+	);
+
+	test("serializes rapid selected-item mutations", async () => {
+		const first = createDeferred<boolean>();
+		const order: string[] = [];
+		const fakeThis = {
+			editor: { getText: () => "edited" },
+			pendingMessageMutation: Promise.resolve(false),
+			applySelectedPendingMessageChange: vi.fn((kind: string) => {
+				order.push(kind);
+				return kind === "earlier" ? first.promise : Promise.resolve(true);
+			}),
+		};
+		const mutate = Reflect.get(InteractiveMode.prototype, "changeSelectedPendingMessage");
+		const earlier = mutate.call(fakeThis, "earlier");
+		const later = mutate.call(fakeThis, "later");
+		await Promise.resolve();
+		expect(order).toEqual(["earlier"]);
+		first.resolve(true);
+		await Promise.all([earlier, later]);
+		expect(order).toEqual(["earlier", "later"]);
+	});
+
 	test.each(["normal Enter", "installed custom editor"])("captures exact rich state for %s", async () => {
 		const image = { type: "image", data: "base64", mimeType: "image/png" };
 		const pasteSnapshot = { pastes: [[1, "expanded paste"]] as const, pasteCounter: 2 };
@@ -3133,7 +3184,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				["second", followUp],
 				["second", followUp],
 				["third", followUp],
-				["user", { images: [], streamingBehavior: "steer", queueIfBusy: true }],
+				["user", { images: [], streamingBehavior: "steer", queueIfBusy: true, source: "interactive" }],
 			]);
 			expect(showError.mock.calls).toEqual([
 				["transient failure 1"],

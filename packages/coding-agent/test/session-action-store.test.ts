@@ -104,6 +104,21 @@ describe("ActionStore selection", () => {
 		expect(selectBatch(store, mode)).toEqual([followUp]);
 	});
 
+	it("moves a queued action within and across lanes without replacing its identity or ticket", () => {
+		const store = new ActionStore();
+		const first = turn("first", "next_turn_boundary");
+		const second = turn("second", "next_turn_boundary");
+		const follow = turn("follow", "when_run_idle");
+		for (const action of [first, second, follow]) store.enqueue(action);
+		const ticket = store.ticketFor(second);
+
+		store.moveQueued(second, "next_turn_boundary", 0);
+		expect(store.queuedActions("next_turn_boundary")).toEqual([second, first]);
+		store.moveQueued(second, "when_run_idle", 1);
+		expect(store.queuedActions("when_run_idle")).toEqual([follow, second]);
+		expect(store.ticketFor(second)).toBe(ticket);
+	});
+
 	it("does not let an executing /compact see itself as a queued successor", () => {
 		const store = new ActionStore();
 		const compact = command("/compact");

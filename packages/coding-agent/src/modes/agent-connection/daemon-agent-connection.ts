@@ -60,6 +60,8 @@ import type {
 	AgentConnectionNewSessionOptions,
 	AgentConnectionPromptOptions,
 	AgentConnectionQueueMode,
+	AgentConnectionQueueMutation,
+	AgentConnectionQueueMutationResult,
 	AgentConnectionQueueState,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSavedSessionInfo,
@@ -522,6 +524,21 @@ export class DaemonAgentConnection implements AgentConnection {
 		return this.requestData<AgentConnectionQueueState>({
 			type: "get_queue",
 			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async mutateQueueItem(
+		id: string,
+		mutation: AgentConnectionQueueMutation,
+	): Promise<AgentConnectionQueueMutationResult> {
+		if (!this.client.supportsServerCapability("queue_item_mutation")) {
+			return { status: "unsupported", queue: await this.getQueue() };
+		}
+		return this.requestData<AgentConnectionQueueMutationResult>({
+			type: "mutate_queue_item",
+			activeSessionId: this.activeSessionId,
+			actionId: id,
+			mutation,
 		});
 	}
 

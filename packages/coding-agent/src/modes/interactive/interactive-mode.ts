@@ -142,6 +142,7 @@ import type {
 	AgentConnectionHeartbeat,
 	AgentConnectionModel,
 	AgentConnectionModelCatalog,
+	AgentConnectionQueueMutationResult,
 	AgentConnectionQueueState,
 	AgentConnectionResourceDiagnostic,
 	AgentConnectionResourceSnapshot,
@@ -985,6 +986,8 @@ export class InteractiveMode {
 		followUp: [],
 	};
 	private readonly pendingMessageNavigation = new PendingMessageNavigation();
+	private pendingMessageMutation = Promise.resolve(false);
+	private queueMutationInFlight = false;
 	private isPendingMessageNavigationTextChange = false;
 
 	// Shutdown state
@@ -2485,9 +2488,8 @@ export class InteractiveMode {
 
 	private async refreshConnectionQueue(): Promise<void> {
 		const queue = await this.agentConnection.getQueue();
-		if (this.pendingMessageNavigation.sync(queue)) {
-			this.setEditorFromPendingNavigation(this.editor.getText());
-		}
+		const draft = this.pendingMessageNavigation.sync(queue);
+		if (draft !== undefined) this.setEditorFromPendingNavigation(draft);
 		this.connectionQueue = queue;
 		this.updatePendingMessagesDisplay();
 	}
@@ -4584,15 +4586,13 @@ export class InteractiveMode {
 
 			try {
 				if (recalledPendingMessage) {
-					const images = this.collectImagesFor(text);
-					this.editor.addToHistory?.(text);
-					this.editor.setText("");
-					await this.changeSelectedPendingMessage("steer", text);
-					await this.agentConnection.prompt(text, {
-						streamingBehavior: "steer",
-						queueIfBusy: true,
-						images,
-					});
+					try {
+						if (await this.changeSelectedPendingMessage("steer", text)) this.editor.addToHistory?.(text);
+						else this.setEditorFromPendingNavigation(text);
+					} catch (error) {
+						this.setEditorFromPendingNavigation(text);
+						this.showError(error instanceof Error ? error.message : String(error));
+					}
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 					return;
@@ -4981,6 +4981,7 @@ export class InteractiveMode {
 						streamingBehavior,
 						queueIfBusy: true,
 						images,
+						source: "interactive",
 					});
 				} catch (error) {
 					// Generation guards editor ownership, not draft durability: a stale
@@ -5316,12 +5317,20 @@ export class InteractiveMode {
 				break;
 
 			case "session_action_update": {
-				const nextQueue = {
+				const nextQueue: AgentConnectionQueueState = {
 					steering: [...event.actions.steering],
 					followUp: [...event.actions.followUps],
+					...(this.connectionQueue.items &&
+					this.connectionQueue.steering.every((text, index) => text === event.actions.steering[index]) &&
+					this.connectionQueue.followUp.every((text, index) => text === event.actions.followUps[index])
+						? { items: this.connectionQueue.items }
+						: {}),
 				};
-				this.pendingMessageNavigation.sync(nextQueue);
-				this.connectionQueue = nextQueue;
+				if (!this.queueMutationInFlight) {
+					const draft = this.pendingMessageNavigation.sync(nextQueue);
+					if (draft !== undefined) this.setEditorFromPendingNavigation(draft);
+					this.connectionQueue = nextQueue;
+				}
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				break;
@@ -6964,48 +6973,58 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private async rebuildPendingQueue(queue: AgentConnectionQueueState): Promise<void> {
-		await this.agentConnection.clearQueue();
-		await this.enqueuePendingQueue(queue);
-	}
-
-	private async enqueuePendingQueue(queue: AgentConnectionQueueState): Promise<void> {
-		this.connectionQueue = { steering: [], followUp: [] };
-		for (const text of queue.steering) {
-			await this.agentConnection.prompt(text, {
-				streamingBehavior: "steer",
-				queueIfBusy: true,
-				images: this.collectImagesFor(text),
-			});
-		}
-		for (const text of queue.followUp) {
-			await this.agentConnection.prompt(text, {
-				streamingBehavior: "followUp",
-				queueIfBusy: true,
-				images: this.collectImagesFor(text),
-			});
-		}
-		this.connectionQueue = {
-			steering: [...queue.steering],
-			followUp: [...queue.followUp],
-		};
-		this.updatePendingMessagesDisplay();
-	}
-
-	private async changeSelectedPendingMessage(
+	private changeSelectedPendingMessage(
 		kind: "delete" | "followUp" | "steer" | "earlier" | "later",
 		text = this.editor.getText(),
 	): Promise<boolean> {
+		const run = () => this.applySelectedPendingMessageChange(kind, text);
+		this.pendingMessageMutation = this.pendingMessageMutation.then(run, run);
+		return this.pendingMessageMutation;
+	}
+
+	private async applySelectedPendingMessageChange(
+		kind: "delete" | "followUp" | "steer" | "earlier" | "later",
+		text = this.editor.getText(),
+	): Promise<boolean> {
+		const selected = this.pendingMessageNavigation.selected;
+		if (!selected) return false;
+		const checkpoint = this.pendingMessageNavigation.checkpoint();
 		const change = this.pendingMessageNavigation.change(kind, text);
 		if (!change) return false;
-		await this.rebuildPendingQueue(change.queue);
-		if (change.selected) {
-			this.pendingMessageNavigation.select(change.queue, change.draft, change.selected);
-			this.pendingMessageNavigation.capture(text);
+		const mutation =
+			kind === "delete"
+				? { type: "delete" as const }
+				: kind === "earlier"
+					? { type: "move_earlier" as const }
+					: kind === "later"
+						? { type: "move_later" as const }
+						: {
+								type: kind === "steer" ? ("replace_steering" as const) : ("replace_follow_up" as const),
+								text,
+								images: this.collectImagesFor(text),
+							};
+		this.queueMutationInFlight = true;
+		let result: AgentConnectionQueueMutationResult;
+		try {
+			result = await this.agentConnection.mutateQueueItem(selected.id, mutation);
+		} catch (error) {
+			this.pendingMessageNavigation.restore(checkpoint);
+			throw error;
+		} finally {
+			this.queueMutationInFlight = false;
 		}
+		if (result.status !== "applied") {
+			this.pendingMessageNavigation.restore(checkpoint);
+			this.showWarning(
+				result.status === "unsupported"
+					? "Restart or update the daemon to edit queued messages."
+					: "That queued message is no longer pending.",
+			);
+			return false;
+		}
+		this.connectionQueue = result.queue;
 		this.setEditorFromPendingNavigation(change.selected ? text : change.draft);
-		if (kind === "delete") this.showStatus("Deleted pending message");
-		else if (kind === "followUp") this.showStatus("Updated queued message");
+		this.updatePendingMessagesDisplay();
 		this.ui.requestRender();
 		return true;
 	}

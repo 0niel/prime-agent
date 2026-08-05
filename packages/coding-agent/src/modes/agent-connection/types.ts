@@ -508,9 +508,28 @@ export interface AgentConnectionUserMessage {
 	text: string;
 }
 
+export type AgentConnectionQueueLane = "steering" | "followUp";
+export interface AgentConnectionQueueItem {
+	id: string;
+	lane: AgentConnectionQueueLane;
+	index: number;
+	text: string;
+}
 export interface AgentConnectionQueueState {
 	steering: string[];
 	followUp: string[];
+	/** Present when the connection supports atomic queue-item mutation. */
+	items?: AgentConnectionQueueItem[];
+}
+export type AgentConnectionQueueMutation =
+	| { type: "delete" }
+	| { type: "replace_follow_up"; text: string; images?: ImageContent[] }
+	| { type: "replace_steering"; text: string; images?: ImageContent[] }
+	| { type: "move_earlier" }
+	| { type: "move_later" };
+export interface AgentConnectionQueueMutationResult {
+	status: "applied" | "stale" | "unsupported";
+	queue: AgentConnectionQueueState;
 }
 
 export interface AgentConnectionHeartbeat {
@@ -643,6 +662,7 @@ export interface AgentConnection {
 		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]>;
 	getQueue(): Promise<AgentConnectionQueueState>;
+	mutateQueueItem(id: string, mutation: AgentConnectionQueueMutation): Promise<AgentConnectionQueueMutationResult>;
 	clearQueue(): Promise<AgentConnectionQueueState>;
 	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;

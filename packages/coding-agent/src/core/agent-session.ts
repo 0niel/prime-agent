@@ -6083,6 +6083,66 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
+	getEditableQueueItems(): Array<{ id: string; lane: "steering" | "followUp"; index: number; text: string }> {
+		const result: Array<{ id: string; lane: "steering" | "followUp"; index: number; text: string }> = [];
+		for (const [delivery, lane] of [
+			["next_turn_boundary", "steering"],
+			["when_run_idle", "followUp"],
+		] as const) {
+			for (const [index, action] of this._actionStore.queuedActions(delivery).entries()) {
+				if (action.payload.kind === "turn" && action.payload.queueVisible && action.source === "interactive") {
+					result.push({ id: action.id, lane, index, text: action.payload.text });
+				}
+			}
+		}
+		return result;
+	}
+
+	mutateQueuedUserMessage(
+		actionId: string,
+		mutation:
+			| { type: "delete" | "move_earlier" | "move_later" }
+			| { type: "replace_follow_up" | "replace_steering"; text: string; images?: ImageContent[] },
+	): boolean {
+		const action = this._actionStore.queuedActions().find((candidate) => candidate.id === actionId);
+		if (!action || action.payload.kind !== "turn" || !action.payload.queueVisible || action.source !== "interactive")
+			return false;
+		const lane = action.delivery;
+		const laneActions = this._actionStore.queuedActions(lane);
+		const index = laneActions.indexOf(action);
+		if (mutation.type === "move_earlier" || mutation.type === "move_later") {
+			const target = index + (mutation.type === "move_earlier" ? -1 : 1);
+			if (target < 0 || target >= laneActions.length) return true;
+			this._actionStore.moveQueued(action, lane, target);
+		} else if (mutation.type === "delete") {
+			this._cancelSessionActions(
+				(candidate) => candidate === action,
+				new Error("Queued prompt was deleted before delivery."),
+			);
+		} else if ("text" in mutation) {
+			const targetLane: DeliveryPolicy =
+				mutation.type === "replace_steering" ? "next_turn_boundary" : "when_run_idle";
+			const targetIndex = targetLane === lane ? index : this._actionStore.queuedActions(targetLane).length;
+			action.payload.text = mutation.text;
+			action.payload.images = mutation.images?.map((image) => ({ ...image }));
+			action.payload.content = mutation.images
+				? [{ type: "text", text: mutation.text }, ...mutation.images.map((image) => ({ ...image }))]
+				: undefined;
+			action.payload.preview = undefined;
+			action.payload.prepared = undefined;
+			for (const record of action.payload.records) {
+				if (record.role === "primary" && record.message.role === "user") {
+					record.message.content = mutation.images
+						? [{ type: "text", text: mutation.text }, ...mutation.images.map((image) => ({ ...image }))]
+						: mutation.text;
+				}
+			}
+			this._actionStore.moveQueued(action, targetLane, targetIndex);
+		}
+		this._emitQueueUpdate();
+		return true;
+	}
+
 	get queuedActionCount(): number {
 		return visibleSessionActionProjection(this._actionStore.queuedActions()).length;
 	}

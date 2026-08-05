@@ -2,6 +2,7 @@ import type { AgentConnectionQueueState } from "../agent-connection/types.js";
 
 export type PendingMessageLane = "steering" | "followUp";
 export interface PendingMessageLocation {
+	id: string;
 	lane: PendingMessageLane;
 	index: number;
 }
@@ -11,37 +12,70 @@ export interface PendingMessageChange {
 	selected?: PendingMessageLocation;
 }
 
-type Item = PendingMessageLocation & { text: string };
+type Item = PendingMessageLocation & { id: string; text: string };
 const clone = (queue: AgentConnectionQueueState): AgentConnectionQueueState => ({
 	steering: [...queue.steering],
 	followUp: [...queue.followUp],
+	...(queue.items ? { items: queue.items.map((item) => ({ ...item })) } : {}),
 });
-const items = (queue: AgentConnectionQueueState): Item[] => [
-	...queue.steering.map((text, index) => ({ lane: "steering" as const, index, text })),
-	...queue.followUp.map((text, index) => ({ lane: "followUp" as const, index, text })),
-];
+const items = (queue: AgentConnectionQueueState): Item[] =>
+	queue.items
+		? [...queue.items].sort((a, b) => (a.lane === b.lane ? a.index - b.index : a.lane === "steering" ? -1 : 1))
+		: [
+				...queue.steering.map((text, index) => ({
+					id: `legacy:steering:${index}`,
+					lane: "steering" as const,
+					index,
+					text,
+				})),
+				...queue.followUp.map((text, index) => ({
+					id: `legacy:followUp:${index}`,
+					lane: "followUp" as const,
+					index,
+					text,
+				})),
+			];
 const equal = (a: AgentConnectionQueueState, b: AgentConnectionQueueState): boolean =>
 	a.steering.length === b.steering.length &&
 	a.followUp.length === b.followUp.length &&
 	a.steering.every((text, index) => text === b.steering[index]) &&
-	a.followUp.every((text, index) => text === b.followUp[index]);
+	a.followUp.every((text, index) => text === b.followUp[index]) &&
+	(!a.items ||
+		!b.items ||
+		(a.items.length === b.items.length && a.items.every((item, index) => item.id === b.items![index]?.id)));
 
 /** Pending-message history plus all pure mutations of its selected item. */
 export class PendingMessageNavigation {
 	private queue?: AgentConnectionQueueState;
 	private cursor = 0;
 	private draft = "";
-	private edits = new Map<number, string>();
+	private edits = new Map<string, string>();
 
 	get selected(): PendingMessageLocation | undefined {
 		const item = this.queue && items(this.queue)[this.cursor];
-		return item ? { lane: item.lane, index: item.index } : undefined;
+		return item ? { id: item.id, lane: item.lane, index: item.index } : undefined;
 	}
 	get draftText(): string {
 		return this.draft;
 	}
 	get isAtDraft(): boolean {
 		return !!this.queue && this.cursor === items(this.queue).length;
+	}
+
+	checkpoint(): { queue?: AgentConnectionQueueState; cursor: number; draft: string; edits: Map<string, string> } {
+		return {
+			queue: this.queue && clone(this.queue),
+			cursor: this.cursor,
+			draft: this.draft,
+			edits: new Map(this.edits),
+		};
+	}
+
+	restore(state: ReturnType<PendingMessageNavigation["checkpoint"]>): void {
+		this.queue = state.queue;
+		this.cursor = state.cursor;
+		this.draft = state.draft;
+		this.edits = state.edits;
 	}
 
 	reset(): void {
@@ -51,14 +85,15 @@ export class PendingMessageNavigation {
 		this.edits.clear();
 	}
 
-	sync(queue: AgentConnectionQueueState): boolean {
-		if (!this.queue || equal(this.queue, queue)) return false;
+	sync(queue: AgentConnectionQueueState): string | undefined {
+		if (!this.queue || equal(this.queue, queue)) return undefined;
+		const draft = this.draft;
 		this.reset();
-		return true;
+		return draft;
 	}
 
 	select(queue: AgentConnectionQueueState, draft: string, selected: PendingMessageLocation): string | undefined {
-		const cursor = items(queue).findIndex((item) => item.lane === selected.lane && item.index === selected.index);
+		const cursor = items(queue).findIndex((item) => item.id === selected.id);
 		if (cursor < 0) return undefined;
 		this.queue = clone(queue);
 		this.cursor = cursor;
@@ -81,12 +116,13 @@ export class PendingMessageNavigation {
 	}
 
 	private value(index: number): string {
-		return this.edits.get(index) ?? items(this.queue!)[index]!.text;
+		const item = items(this.queue!)[index]!;
+		return this.edits.get(item.id) ?? item.text;
 	}
 
 	capture(text: string): void {
 		if (!this.queue) return;
-		if (this.cursor < items(this.queue).length) this.edits.set(this.cursor, text);
+		if (this.cursor < items(this.queue).length) this.edits.set(items(this.queue)[this.cursor]!.id, text);
 		else this.draft = text;
 	}
 
@@ -100,12 +136,25 @@ export class PendingMessageNavigation {
 			const lane = queue[selected.lane];
 			if (target < 0 || target >= lane.length) return undefined;
 			[lane[selected.index], lane[target]] = [lane[target]!, lane[selected.index]!];
-			const moved = { lane: selected.lane, index: target };
-			this.select(queue, this.draft, moved);
-			this.edits.set(this.cursor, text);
-			return { queue, draft: text, selected: moved };
+			if (queue.items) {
+				const other = queue.items.find((item) => item.lane === selected.lane && item.index === target);
+				const current = queue.items.find((item) => item.id === selected.id);
+				if (other) other.index = selected.index;
+				if (current) current.index = target;
+			}
+			const moved = { id: selected.id, lane: selected.lane, index: target };
+			this.queue = queue;
+			this.cursor = items(queue).findIndex((item) => item.id === selected.id);
+			this.edits.set(selected.id, text);
+			return { queue, draft: this.draft, selected: moved };
 		}
 		queue[selected.lane].splice(selected.index, 1);
+		if (queue.items)
+			queue.items = queue.items
+				.filter((item) => item.id !== selected.id)
+				.map((item) =>
+					item.lane === selected.lane && item.index > selected.index ? { ...item, index: item.index - 1 } : item,
+				);
 		if (kind === "followUp")
 			queue.followUp.splice(selected.lane === "followUp" ? selected.index : queue.followUp.length, 0, text);
 		const draft = this.draft;

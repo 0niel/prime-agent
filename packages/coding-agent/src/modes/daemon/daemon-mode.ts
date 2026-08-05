@@ -282,6 +282,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_queue",
 	"clear_queue",
 	"abort_and_clear_queue",
+	"mutate_queue_item",
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_manage",
@@ -4175,9 +4176,26 @@ export class AgentDaemon {
 
 			case "get_queue": {
 				const state = this.getSessionState(command.activeSessionId);
+				const supportsMutation = daemonClientCapabilitiesForSession(client, command.activeSessionId).has(
+					"queue_item_mutation",
+				);
 				return success(command.id, "get_queue", {
 					steering: [...state.runtime.session.getSteeringMessagePreviews()],
 					followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
+					...(supportsMutation ? { items: state.runtime.session.getEditableQueueItems() } : {}),
+				});
+			}
+
+			case "mutate_queue_item": {
+				const state = this.getSessionState(command.activeSessionId);
+				const applied = state.runtime.session.mutateQueuedUserMessage(command.actionId, command.mutation);
+				return success(command.id, "mutate_queue_item", {
+					status: applied ? "applied" : "stale",
+					queue: {
+						steering: [...state.runtime.session.getSteeringMessagePreviews()],
+						followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
+						items: state.runtime.session.getEditableQueueItems(),
+					},
 				});
 			}
 

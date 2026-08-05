@@ -181,6 +181,44 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	});
 
+	it("atomically mutates editable queued actions without starting a new turn", async () => {
+		createSession();
+		const firstPrompt = session.prompt("running");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		await session.prompt("duplicate", { streamingBehavior: "steer", queueIfBusy: true, source: "interactive" });
+		await session.prompt("duplicate", { streamingBehavior: "steer", queueIfBusy: true, source: "interactive" });
+		await session.prompt("follow", { streamingBehavior: "followUp", queueIfBusy: true, source: "interactive" });
+		await session.sendUserMessage("extension item", { deliverAs: "followUp" });
+		const [first, second, follow] = session.getEditableQueueItems();
+		expect([first?.text, second?.text, follow?.text]).toEqual(["duplicate", "duplicate", "follow"]);
+
+		expect(session.getFollowUpMessages()).toEqual(["follow", "extension item"]);
+		expect(session.mutateQueuedUserMessage("missing", { type: "delete" })).toBe(false);
+		expect(session.mutateQueuedUserMessage(second!.id, { type: "move_earlier" })).toBe(true);
+		expect(session.getEditableQueueItems().map((item) => item.id)).toEqual([second!.id, first!.id, follow!.id]);
+		const image: ImageContent = { type: "image", data: "encoded", mimeType: "image/png" };
+		expect(
+			session.mutateQueuedUserMessage(second!.id, { type: "replace_follow_up", text: "converted", images: [image] }),
+		).toBe(true);
+		expect(session.getEditableQueueItems()).toMatchObject([
+			{ id: first!.id, lane: "steering", text: "duplicate" },
+			{ id: follow!.id, lane: "followUp", text: "follow" },
+			{ id: second!.id, lane: "followUp", text: "converted" },
+		]);
+		const recovered = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
+		expect(recovered?.payload).toMatchObject({ text: "converted", images: [image] });
+		expect(recovered?.payload.kind === "turn" ? recovered.payload.records[0]?.message.content : undefined).toEqual([
+			{ type: "text", text: "converted" },
+			image,
+		]);
+		expect(session.mutateQueuedUserMessage(second!.id, { type: "delete" })).toBe(true);
+		expect(session.mutateQueuedUserMessage(second!.id, { type: "delete" })).toBe(false);
+		expect(session.isStreaming).toBe(true);
+
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
 	it("should queue extension-origin steering messages while streaming", async () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
