@@ -192,18 +192,24 @@ class McpIntegrationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Bad()
 
-    def _run_open_session_with_transport(self, transport):
+    def _run_open_session_with_transport(self, transport, *, config=None, write_auth=True):
         """Drive the real _open_session against a fake transport callable.
 
         `transport` must declare its real parameters (headers= or http_client=)
         so the signature inspection in _open_session is exercised faithfully.
         """
-        self._write_auth(
-            {"type": "oauth", "access": "tok-xyz", "refresh": "r", "expires": (time.time() + 3600) * 1000}
-        )
+        if write_auth:
+            self._write_auth(
+                {
+                    "type": "oauth",
+                    "access": "tok-xyz",
+                    "refresh": "r",
+                    "expires": (time.time() + 3600) * 1000,
+                }
+            )
 
         async def fake_host_request(req_type, payload):
-            return {}  # no host URL override; _resolve_url falls back to self.url
+            return config or {}  # no URL override by default; fall back to self.url
 
         with mock.patch.object(mcp_base, "host_request", fake_host_request), \
              mock.patch.object(mcp_base, "_resolve_streamable_http", lambda: transport), \
@@ -234,6 +240,27 @@ class McpIntegrationTest(unittest.TestCase):
 
         self._run_open_session_with_transport(transport)
         self.assertEqual(captured["headers"], {"Authorization": "Bearer tok-xyz"})
+
+    def test_open_session_allows_anonymous_server(self):
+        captured = {}
+
+        class _CM:
+            async def __aenter__(self_inner):
+                return ("read", "write", None)
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        def transport(url, headers=None):
+            captured["headers"] = headers
+            return _CM()
+
+        self._run_open_session_with_transport(
+            transport,
+            config={"requiresAuth": False, "headers": {"X-Extra": "1"}},
+            write_auth=False,
+        )
+        self.assertEqual(captured["headers"], {"X-Extra": "1"})
 
     def test_open_session_uses_http_client_signature(self):
         # streamable_http_client(url, *, http_client=...) — must NOT pass headers=

@@ -196,19 +196,30 @@ class McpIntegration:
 
     # -- connection ---------------------------------------------------------
 
-    async def _resolve_config(self) -> tuple[str | None, dict[str, str]]:
-        """Host-resolved (url, extra_headers), honoring a user's mcpServers override.
-        Falls back to the class ``url`` and no extra headers on host error."""
+    async def _resolve_connection_config(
+        self,
+    ) -> tuple[str | None, dict[str, str], bool]:
+        """Resolve URL, headers, and whether the configured server requires auth."""
         try:
             cfg = await host_request("mcp.config", {"server": self.server})
         except RuntimeError:
             cfg = {}
         url = cfg.get("url") if isinstance(cfg, dict) else None
         headers = cfg.get("headers") if isinstance(cfg, dict) else None
+        requires_auth = cfg.get("requiresAuth") if isinstance(cfg, dict) else None
         if not (isinstance(url, str) and url):
             url = self.url
         extra = headers if isinstance(headers, dict) else {}
-        return url, {str(k): str(v) for k, v in extra.items()}
+        return (
+            url,
+            {str(k): str(v) for k, v in extra.items()},
+            requires_auth if isinstance(requires_auth, bool) else True,
+        )
+
+    async def _resolve_config(self) -> tuple[str | None, dict[str, str]]:
+        """Host-resolved URL and headers, honoring a user's mcpServers override."""
+        url, headers, _ = await self._resolve_connection_config()
+        return url, headers
 
     async def _open_session(self, stack: AsyncExitStack):
         """Open an initialized MCP ClientSession bound to ``stack``.
@@ -221,24 +232,25 @@ class McpIntegration:
 
         from mcp import ClientSession  # noqa: PLC0415
 
-        url, extra_headers = await self._resolve_config()
+        url, headers, requires_auth = await self._resolve_connection_config()
         if not url:
             raise ValueError(
                 f"{type(self).__name__} must set `url` or override `_open_session`"
             )
-        token = await self._resolve_token()
+        if requires_auth:
+            token = await self._resolve_token()
+            # Extra configured headers first, Authorization last so it always wins.
+            headers = {**headers, "Authorization": f"Bearer {token}"}
         transport = _resolve_streamable_http()
-        # Extra configured headers first, Authorization last so it always wins.
-        auth_header = {**extra_headers, "Authorization": f"Bearer {token}"}
 
         # SDK signatures vary: some take headers=, others only http_client=.
         # The http_client path must use the SDK factory: a bare httpx.AsyncClient
         # defaults to a 5s read timeout and aborts long tool calls with ReadTimeout.
         params = inspect.signature(transport).parameters
         if "headers" in params:
-            cm = transport(url, headers=auth_header)
+            cm = transport(url, headers=headers)
         elif "http_client" in params:
-            client = await stack.enter_async_context(_build_mcp_http_client(auth_header))
+            client = await stack.enter_async_context(_build_mcp_http_client(headers))
             cm = transport(url, http_client=client)
         else:
             raise RuntimeError(

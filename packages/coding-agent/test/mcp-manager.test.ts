@@ -107,9 +107,13 @@ describe("McpManager", () => {
 		const handlers = manager.hostHandlers();
 		expect(await handlers["mcp.config"]({ server: "linear" })).toEqual({
 			url: "https://proxy.test/mcp",
+			requiresAuth: true,
 			headers: { "X-Extra": "1" },
 		});
-		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({ url: "https://mcp.notion.com/mcp" });
+		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({
+			url: "https://mcp.notion.com/mcp",
+			requiresAuth: true,
+		});
 	});
 
 	it("does not treat an oauth override of a catalog name as authed via the official stored cred", () => {
@@ -126,6 +130,20 @@ describe("McpManager", () => {
 		});
 		// Must NOT be enabled — else the official token would be sent to the override URL.
 		expect(manager.listStatus().find((s) => s.server === "linear")?.enabled).toBe(false);
+	});
+
+	it("enables anonymous HTTP servers without credentials", async () => {
+		const manager = new McpManager({
+			authStorage,
+			getUserServers: () => ({
+				public: { type: "http", url: "https://public.test/mcp" },
+			}),
+		});
+		expect(manager.listStatus().find((s) => s.server === "public")?.enabled).toBe(true);
+		expect(await manager.hostHandlers()["mcp.config"]({ server: "public" })).toEqual({
+			url: "https://public.test/mcp",
+			requiresAuth: false,
+		});
 	});
 
 	it("honors a bearer-token env var for user-declared servers", () => {

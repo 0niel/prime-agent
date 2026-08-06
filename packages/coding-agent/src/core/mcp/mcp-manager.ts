@@ -123,9 +123,10 @@ export class McpManager {
 		this.registeredUserProviderIds = current;
 	}
 
-	/** True when valid credentials exist for the integration (drives enablement). */
+	/** True when the integration can connect anonymously or has valid credentials. */
 	private isAuthed(integration: ResolvedIntegration): boolean {
 		if (integration.enabled === false) return false;
+		if (!integration.usesOAuth && !integration.bearerTokenEnvVar) return true;
 		if (integration.bearerTokenEnvVar && process.env[integration.bearerTokenEnvVar]?.trim()) {
 			return true;
 		}
@@ -172,7 +173,10 @@ export class McpManager {
 				if (!server) throw new Error("mcp.config requires a server");
 				const integration = this.integrations.get(server);
 				if (!integration) return {};
-				const config: Record<string, unknown> = { url: integration.url };
+				const config: Record<string, unknown> = {
+					url: integration.url,
+					requiresAuth: integration.usesOAuth || Boolean(integration.bearerTokenEnvVar),
+				};
 				if (integration.headers && Object.keys(integration.headers).length > 0) {
 					config.headers = integration.headers;
 				}
