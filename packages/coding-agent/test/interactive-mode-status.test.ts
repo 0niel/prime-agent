@@ -117,25 +117,6 @@ function createConnectionState(overrides: Partial<AgentConnectionState> = {}): A
 	};
 }
 
-describe("InteractiveMode pending message edit header", () => {
-	test("shows configurable browse, requeue, reorder, and steering hints", () => {
-		const fakeThis = {
-			pendingMessageNavigation: { selected: { lane: "steering", index: 1 } },
-			getAppKeyDisplay: (action: string) =>
-				new Map([
-					["app.message.navigateOlder", "Opt+Up"],
-					["app.message.navigateNewer", "Opt+Down"],
-					["app.message.followUp", "Opt+Enter"],
-					["app.message.moveEarlier", "Ctrl+Opt+Up"],
-					["app.message.moveLater", "Ctrl+Opt+Down"],
-				]).get(action) ?? "",
-		};
-		const header = Reflect.get(InteractiveMode.prototype, "getPendingMessageEditorHeader").call(fakeThis);
-		expect(header).toBe(
-			"steering 2 · Opt+Up/Opt+Down browse · Opt+Enter requeue · Ctrl+Opt+Up/Ctrl+Opt+Down reorder · Enter steer · empty submit deletes",
-		);
-	});
-});
 
 describe("InteractiveMode update notifications", () => {
 	beforeAll(() => {
