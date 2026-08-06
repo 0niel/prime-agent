@@ -196,7 +196,7 @@ Submit messages while the agent is working:
 - **Escape** clears the input without interrupting active work
 - **Alt+Up / Alt+Down** browse pending messages individually and restore the original editor draft
 - While browsing, **Alt+Enter** updates the selected item as a follow-up; **Enter** removes it and sends the edited text as steering input; submitting an empty edit with either key deletes the item
-- **Ctrl+Option+Up / Ctrl+Option+Down** reorder the selected item within its steering or follow-up queue
+- **Ctrl+Alt+Up / Ctrl+Alt+Down** reorder the selected item within its steering or follow-up queue
 
 On Windows Terminal, `Alt+Enter` is fullscreen by default. Remap it in [docs/terminal-setup.md](docs/terminal-setup.md) so Prime Agent can receive the follow-up shortcut.
 

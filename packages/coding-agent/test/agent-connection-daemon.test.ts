@@ -47,7 +47,6 @@ class FakeDaemonClient {
 	connectionStateGate: Promise<void> | undefined;
 	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	abortBashUnknownCommand = false;
-	abortAndClearQueueUnknownCommand = false;
 	cronAddGate: Promise<void> | undefined;
 	promptGate: Promise<void> | undefined;
 	promptError: Error | undefined;
@@ -268,21 +267,6 @@ class FakeDaemonClient {
 					command: command.type,
 					success: true,
 					data: { steering: ["cleared"], followUp: [] },
-				};
-			case "abort_and_clear_queue":
-				if (this.abortAndClearQueueUnknownCommand) {
-					return {
-						type: "response",
-						command: command.type,
-						success: false,
-						error: "Unknown daemon command: abort_and_clear_queue",
-					};
-				}
-				return {
-					type: "response",
-					command: command.type,
-					success: true,
-					data: { steering: ["aborted"], followUp: ["cleared"] },
 				};
 			case "heartbeats_list":
 				return this.serverCapabilities.has("heartbeat_catalog")
@@ -2270,45 +2254,6 @@ describe("DaemonAgentConnection", () => {
 			status: "unsupported",
 		});
 		expect(fakeClient.requests.some((request) => request.type === "mutate_queue_item")).toBe(false);
-	});
-
-	it("sends queue commands through the daemon protocol", async () => {
-		const fakeClient = new FakeDaemonClient();
-		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
-		await connection.attach();
-
-		await expect(connection.getQueue()).resolves.toEqual({ steering: ["steer"], followUp: ["follow"] });
-		await expect(connection.clearQueue()).resolves.toEqual({ steering: ["cleared"], followUp: [] });
-		await expect(connection.abortAndClearQueue()).resolves.toEqual({ steering: ["aborted"], followUp: ["cleared"] });
-		await connection.waitForIdle();
-		const model = getModel("anthropic", "claude-sonnet-4-5");
-		if (!model) {
-			throw new Error("Test model not found");
-		}
-		await connection.setScopedModels([{ model, thinkingLevel: "high" }]);
-
-		expect(fakeClient.requests.map((request) => request.type)).toEqual([
-			"attach",
-			"get_queue",
-			"clear_queue",
-			"abort_and_clear_queue",
-			"wait_for_idle",
-			"set_scoped_models",
-		]);
-		expect(fakeClient.requests[1]).toMatchObject({ type: "get_queue", activeSessionId: "active-1" });
-		expect(fakeClient.requests[2]).toMatchObject({ type: "clear_queue", activeSessionId: "active-1" });
-		expect(fakeClient.requests[3]).toMatchObject({ type: "abort_and_clear_queue", activeSessionId: "active-1" });
-		expect(fakeClient.requests[4]).toMatchObject({ type: "wait_for_idle", activeSessionId: "active-1" });
-		expect(fakeClient.requests[5]).toMatchObject({
-			type: "set_scoped_models",
-			activeSessionId: "active-1",
-			scopedModels: [{ model, thinkingLevel: "high" }],
-		});
-
-		fakeClient.abortAndClearQueueUnknownCommand = true;
-		await expect(connection.abortAndClearQueue()).rejects.toThrow(
-			"the daemon is running an older build; restart the daemon and try again",
-		);
 	});
 
 	it("cancels rlm child runs through the daemon protocol", async () => {

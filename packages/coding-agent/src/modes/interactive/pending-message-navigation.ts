@@ -109,7 +109,8 @@ export class PendingMessageNavigation {
 	sync(queue: AgentConnectionQueueState): string | undefined {
 		if (!this.queue) return undefined;
 		const previous = this.queue;
-		const selectedId = this.selected?.id;
+		const selected = items(previous)[this.cursor];
+		const selectedId = selected?.id;
 		const atDraft = this.cursor === items(previous).length;
 		if (equal(previous, queue)) {
 			// The content may be unchanged while a newer CAS revision arrived.
@@ -123,7 +124,9 @@ export class PendingMessageNavigation {
 			return undefined;
 		}
 		if (selectedId) {
-			const cursor = items(queue).findIndex((item) => item.id === selectedId);
+			const cursor = items(queue).findIndex(
+				(item) => item.id === selectedId && (!selectedId.startsWith("legacy:") || item.text === selected?.text),
+			);
 			if (cursor >= 0) {
 				this.queue = clone(queue);
 				this.cursor = cursor;
@@ -133,6 +136,16 @@ export class PendingMessageNavigation {
 		const draft = this.draft;
 		this.reset();
 		return draft;
+	}
+
+	recallFirst(queue: AgentConnectionQueueState, draft: string): string | undefined {
+		const first = items(queue)[0];
+		if (!first) return undefined;
+		this.queue = clone(queue);
+		this.cursor = 0;
+		this.draft = draft;
+		this.edits.clear();
+		return first.text;
 	}
 
 	browse(queue: AgentConnectionQueueState, text: string, delta: -1 | 1): string | undefined {

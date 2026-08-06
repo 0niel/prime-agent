@@ -3942,11 +3942,7 @@ export class AgentDaemon {
 			}
 
 			case "resume_queue": {
-				const state = this.getSessionState(command.activeSessionId);
-				if (!state.runtime.session.resumeQueuedWork()) {
-					const error = new Error("No queued work to resume");
-					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
-				}
+				this.getSessionState(command.activeSessionId).runtime.session.resumeQueuedWork();
 				return success(command.id, "resume_queue");
 			}
 

@@ -30,7 +30,8 @@ type FakeInteractiveMode = {
 	agentConnection: {
 		abort: Mock;
 		clearQueue: Mock;
-		abortAndClearQueue: Mock;
+		getQueue: Mock;
+		resumeQueue: Mock;
 		abortRetry: Mock;
 		abortCompaction: Mock;
 		abortBranchSummary: Mock;
@@ -38,7 +39,15 @@ type FakeInteractiveMode = {
 	};
 	subagentSummaryLine: { invalidate: Mock };
 	ui: { requestRender: Mock; onDebug?: () => void };
-	restoreQueuedMessagesToEditor: Mock;
+	pendingMessageNavigation: {
+		selected?: { id: string; lane: "steering" | "followUp"; index: number };
+		checkpoint: Mock;
+		recallFirst: Mock;
+		reset: Mock;
+	};
+	editorChangeGeneration: number;
+	queuePausedForPendingEdit: boolean;
+	setEditorFromPendingNavigation: Mock;
 	updatePendingMessagesDisplay: Mock;
 	showTreeSelector: Mock;
 	shutdown: Mock;
@@ -100,7 +109,8 @@ function createInteractiveFake(options: {
 		agentConnection: {
 			abort: vi.fn().mockResolvedValue(undefined),
 			clearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
-			abortAndClearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
+			getQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [], revision: 1, items: [] }),
+			resumeQueue: vi.fn().mockResolvedValue(undefined),
 			abortRetry: vi.fn(),
 			abortCompaction: vi.fn(),
 			abortBranchSummary: vi.fn(),
@@ -108,7 +118,14 @@ function createInteractiveFake(options: {
 		},
 		subagentSummaryLine: { invalidate: vi.fn() },
 		ui: { requestRender: vi.fn() },
-		restoreQueuedMessagesToEditor: vi.fn().mockResolvedValue(0),
+		pendingMessageNavigation: {
+			checkpoint: vi.fn(() => ({ draft: editor.getText() })),
+			recallFirst: vi.fn(() => undefined),
+			reset: vi.fn(),
+		},
+		editorChangeGeneration: 0,
+		queuePausedForPendingEdit: false,
+		setEditorFromPendingNavigation: vi.fn((text: string) => editor.setText(text)),
 		updatePendingMessagesDisplay: vi.fn(),
 		showTreeSelector: vi.fn(),
 		shutdown: vi.fn().mockResolvedValue(undefined),
@@ -130,25 +147,55 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		vi.useRealTimers();
 	});
 
-	it("interrupts streaming and shows the exit hint on first Ctrl+C", () => {
+	it("interrupts streaming and recalls the first queued item on first Ctrl+C", async () => {
 		const mode = createInteractiveFake({ streaming: true });
 
+		mode.agentConnection.getQueue.mockResolvedValue({
+			steering: ["next", "later"],
+			followUp: ["follow"],
+			revision: 1,
+			items: [{ id: "next", lane: "steering", index: 0, text: "next" }],
+		});
+		mode.pendingMessageNavigation.recallFirst.mockReturnValue("next");
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
+		await vi.waitFor(() => expect(mode.agentConnection.getQueue).toHaveBeenCalledOnce());
 
-		expect(mode.restoreQueuedMessagesToEditor).toHaveBeenCalledWith({ abort: true });
+		expect(mode.agentConnection.abort).toHaveBeenCalledOnce();
+		expect(mode.setEditorFromPendingNavigation).toHaveBeenCalledWith("next");
+		expect(mode.queuePausedForPendingEdit).toBe(true);
 		expect(mode.shutdown).not.toHaveBeenCalled();
 		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBe(
 			"Press Ctrl+C again to exit",
 		);
 	});
 
-	it("interrupts bash and streaming on the same Ctrl+C", () => {
+	it("keeps newer typing out of recalled-item ownership", async () => {
+		const mode = createInteractiveFake({ editorText: "draft", streaming: true });
+		mode.pendingMessageNavigation.recallFirst.mockReturnValue("queued");
+		mode.agentConnection.abort.mockImplementation(async () => {
+			mode.editor.setText("newer typing");
+			mode.editorChangeGeneration++;
+		});
+		mode.agentConnection.getQueue.mockResolvedValue({
+			steering: ["queued"],
+			followUp: [],
+			revision: 1,
+			items: [{ id: "queued", lane: "steering", index: 0, text: "queued" }],
+		});
+		await Reflect.get(InteractiveMode.prototype, "interruptAndRecallPending").call(mode);
+		expect(mode.editor.getText()).toBe("newer typing");
+		expect(mode.pendingMessageNavigation.reset).toHaveBeenCalledOnce();
+		expect(mode.agentConnection.resumeQueue).toHaveBeenCalledOnce();
+		expect(mode.queuePausedForPendingEdit).toBe(false);
+	});
+
+	it("interrupts bash and streaming on the same Ctrl+C", async () => {
 		const mode = createInteractiveFake({ streaming: true, bashRunning: true });
 
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
+		await vi.waitFor(() => expect(mode.agentConnection.abort).toHaveBeenCalledOnce());
 
 		expect(mode.agentConnection.abortBash).toHaveBeenCalledTimes(1);
-		expect(mode.restoreQueuedMessagesToEditor).toHaveBeenCalledWith({ abort: true });
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
@@ -167,24 +214,6 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
-	it("atomically aborts, clears, and merges every queued item before the draft without prompting", async () => {
-		const mode = createInteractiveFake({ editorText: "draft" });
-		mode.agentConnection.abortAndClearQueue.mockResolvedValue({
-			steering: ["steer one", "steer two"],
-			followUp: ["follow one", "follow two"],
-		});
-
-		const restored = await Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor").call(mode, {
-			abort: true,
-		});
-
-		expect(restored).toBe(4);
-		expect(mode.agentConnection.abortAndClearQueue).toHaveBeenCalledOnce();
-		expect(mode.agentConnection.clearQueue).not.toHaveBeenCalled();
-		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
-		expect(mode.editor.getText()).toBe("steer one\n\nsteer two\n\nfollow one\n\nfollow two\n\ndraft");
-	});
-
 	it("exits on the second Ctrl+C while the hint is visible", () => {
 		const mode = createInteractiveFake({ streaming: true });
 		const handleCtrlC = Reflect.get(InteractiveMode.prototype, "handleCtrlC");
@@ -192,7 +221,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		handleCtrlC.call(mode);
 		handleCtrlC.call(mode);
 
-		expect(mode.restoreQueuedMessagesToEditor).toHaveBeenCalledTimes(1);
+		expect(mode.agentConnection.abort).toHaveBeenCalledTimes(1);
 		expect(mode.shutdown).toHaveBeenCalledTimes(1);
 	});
 
@@ -218,7 +247,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
 
 		expect(mode.editor.getText()).toBe("draft");
-		expect(mode.restoreQueuedMessagesToEditor).not.toHaveBeenCalled();
+		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
@@ -239,7 +268,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		Reflect.get(InteractiveMode.prototype, "setupKeyHandlers").call(mode);
 		expect(defaultEditor.onEscape).toBeDefined();
 		defaultEditor.onEscape?.();
-		expect(mode.restoreQueuedMessagesToEditor).toHaveBeenCalledWith({ abort: true });
+		expect(mode.agentConnection.abort).toHaveBeenCalledOnce();
 		expect(mode.editor.getText()).toBe("draft");
 		mode.editor.setText("queued draft");
 		defaultEditor.onChange?.("queued draft");
@@ -250,30 +279,20 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
-	it("preserves the tree repeat while restoring queued messages", async () => {
+	it("preserves the tree repeat while recalling a queued message", async () => {
 		const mode = createInteractiveFake({});
-		const defaultEditor: NonNullable<FakeInteractiveMode["defaultEditor"]> = {
-			onAction: vi.fn(),
-		};
-		Object.assign(mode, {
-			defaultEditor,
-			keybindings: new KeybindingsManager(),
-			handleDebugCommand: vi.fn(),
-		});
-		Reflect.get(InteractiveMode.prototype, "setupKeyHandlers").call(mode);
-		const setText = mode.editor.setText.bind(mode.editor);
-		mode.editor.setText = (text) => {
-			setText(text);
-			defaultEditor.onChange?.(text);
-		};
 		mode.escapeRepeatAction = "tree";
 		mode.escapeRepeatExpiresAt = Date.now() + 500;
-		mode.agentConnection.abortAndClearQueue.mockResolvedValue({ steering: ["queued"], followUp: [] });
-
-		const restoreQueuedMessagesToEditor = Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor");
-		await restoreQueuedMessagesToEditor.call(mode, { abort: true });
-
+		mode.pendingMessageNavigation.recallFirst.mockReturnValue("queued");
+		mode.agentConnection.getQueue.mockResolvedValue({
+			steering: ["queued"],
+			followUp: [],
+			revision: 1,
+			items: [{ id: "queued", lane: "steering", index: 0, text: "queued" }],
+		});
+		await Reflect.get(InteractiveMode.prototype, "interruptAndRecallPending").call(mode);
 		expect(mode.escapeRepeatAction).toBe("tree");
+		expect(mode.editor.getText()).toBe("queued");
 	});
 
 	it("clears an idle draft on double Escape", () => {
@@ -297,7 +316,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		defaultEditor.onEscape?.();
 
 		expect(mode.editor.getText()).toBe("");
-		expect(mode.restoreQueuedMessagesToEditor).not.toHaveBeenCalled();
+		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
 	});
 
 	it("opens the tree on double Escape with an empty idle prompt", () => {

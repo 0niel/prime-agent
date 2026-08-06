@@ -551,20 +551,6 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	async abortAndClearQueue(): Promise<AgentConnectionQueueState> {
-		try {
-			return await this.requestData<AgentConnectionQueueState>({
-				type: "abort_and_clear_queue",
-				activeSessionId: this.activeSessionId,
-			});
-		} catch (error) {
-			if (isUnknownDaemonCommandError(error, "abort_and_clear_queue")) {
-				throw new Error("the daemon is running an older build; restart the daemon and try again");
-			}
-			throw error;
-		}
-	}
-
 	async listCronJobs(options: { includeInactive?: boolean } = {}): Promise<AgentCronJob[]> {
 		const data = await this.requestData<{ jobs: AgentCronJob[] }>({
 			type: "cron_list",
@@ -898,6 +884,17 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async abort(): Promise<void> {
 		await this.requestOk({ type: "abort", activeSessionId: this.activeSessionId });
+	}
+
+	async resumeQueue(): Promise<void> {
+		try {
+			await this.requestOk({ type: "resume_queue", activeSessionId: this.activeSessionId });
+		} catch (error) {
+			if (isUnknownDaemonCommandError(error, "resume_queue")) {
+				throw new Error("the daemon is running an older build; restart the daemon and try again");
+			}
+			throw error;
+		}
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {

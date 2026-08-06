@@ -630,6 +630,8 @@ type SubmitHandlerHarness = {
 	isBashRunning: () => boolean;
 	patchConnectionState: (patch: Record<string, unknown>) => void;
 	requestAgentsView: () => Promise<void>;
+	queuePausedForPendingEdit?: boolean;
+	resumeInterruptedQueue?: () => Promise<boolean>;
 	agentConnection: {
 		prompt: (message: string) => Promise<void>;
 		executeBash: (command: string, options?: { excludeFromContext?: boolean }) => Promise<void>;
@@ -861,7 +863,7 @@ describe("InteractiveMode submit handling", () => {
 			const reconcile = vi.spyOn(harness.navigation, "reconcile");
 			const applied = await harness.apply("followUp");
 			expect(applied).toBe("retained");
-			expect(harness.editorText).toBe(status === "stale" ? "draft" : "edited");
+			expect(harness.editorText).toBe("edited");
 			expect(harness.showWarning).toHaveBeenCalledOnce();
 			if (status === "invalid") {
 				expect(reconcile).toHaveBeenCalledWith(queue, "action-1");
@@ -871,6 +873,106 @@ describe("InteractiveMode submit handling", () => {
 			}
 		},
 	);
+
+	test("resumes an interrupted queue before admitting a plain prompt", async () => {
+		const order: string[] = [];
+		const fakeThis = createSubmitHandlerHarness({
+			queuePausedForPendingEdit: true,
+			resumeInterruptedQueue: vi.fn(async () => {
+				order.push("resume");
+				return true;
+			}),
+			agentConnection: {
+				prompt: vi.fn(async () => {
+					order.push("prompt");
+				}),
+				getState: vi.fn(async () => ({ isBashRunning: false })),
+				executeBash: vi.fn(async () => {}),
+			},
+		});
+		await fakeThis.defaultEditor.onSubmit?.("next prompt");
+		expect(order).toEqual(["resume", "prompt"]);
+	});
+
+	test("restores a submitted draft when interrupted-queue resume fails", async () => {
+		let editorText = "";
+		const fakeThis = createSubmitHandlerHarness({
+			queuePausedForPendingEdit: true,
+			resumeInterruptedQueue: vi.fn(async () => false),
+			editor: {
+				getText: () => editorText,
+				setText: (text: string) => {
+					editorText = text;
+				},
+			},
+		});
+		await fakeThis.defaultEditor.onSubmit?.("preserved draft");
+		expect(editorText).toBe("preserved draft");
+		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		["steer", true],
+		["followUp", true],
+		["earlier", false],
+	] as const)("%s mutation resumes only committed interrupted edits", async (kind, shouldResume) => {
+		const queue = {
+			steering: [],
+			followUp: ["old"],
+			revision: 1,
+			items: [{ id: "action-1", lane: "followUp" as const, index: 0, text: "old" }],
+		};
+		const resumeQueue = vi.fn(async () => {});
+		const harness = createApplyMutationHarness({
+			queue,
+			mutateQueueItem: async () => ({ status: "applied", queue: { ...queue, revision: 2 } }),
+			extra: {
+				queuePausedForPendingEdit: true,
+				resumeInterruptedQueue: Reflect.get(InteractiveMode.prototype, "resumeInterruptedQueue"),
+				updatePendingMessagesDisplay: vi.fn(),
+				ui: { requestRender: vi.fn() },
+				agentConnection: {
+					mutateQueueItem: vi.fn(async () => ({ status: "applied", queue: { ...queue, revision: 2 } })),
+					resumeQueue,
+				},
+			},
+		});
+		await harness.apply(kind);
+		expect(resumeQueue).toHaveBeenCalledTimes(shouldResume ? 1 : 0);
+	});
+
+	test.each([
+		[
+			"next",
+			{
+				steering: ["next"],
+				followUp: [],
+				revision: 2,
+				items: [{ id: "next", lane: "steering" as const, index: 0, text: "next" }],
+			},
+		],
+		["draft", { steering: [], followUp: [], revision: 2, items: [] }],
+	] as const)("interrupted delete recalls %s while leaving the queue paused", async (expected, resultQueue) => {
+		const queue = {
+			steering: [],
+			followUp: ["old"],
+			revision: 1,
+			items: [{ id: "old", lane: "followUp" as const, index: 0, text: "old" }],
+		};
+		const harness = createApplyMutationHarness({
+			queue,
+			draft: "draft",
+			mutateQueueItem: async () => ({ status: "applied", queue: resultQueue }),
+			extra: {
+				queuePausedForPendingEdit: true,
+				updatePendingMessagesDisplay: vi.fn(),
+				ui: { requestRender: vi.fn() },
+			},
+		});
+		await harness.apply("delete");
+		expect(harness.editorText).toBe(expected);
+		expect(Reflect.get(harness.fakeThis, "queuePausedForPendingEdit")).toBe(true);
+	});
 
 	test("applies two serialized real reorder mutations at successive revisions without losing edit or draft", async () => {
 		let editorText = "f2 edited";

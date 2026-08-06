@@ -669,7 +669,6 @@ export interface AgentConnection {
 		mutation: AgentConnectionQueueMutation,
 	): Promise<AgentConnectionQueueMutationResult>;
 	clearQueue(): Promise<AgentConnectionQueueState>;
-	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
 	listHeartbeats(): Promise<AgentConnectionHeartbeat[]>;
 	manageHeartbeat(
@@ -707,6 +706,7 @@ export interface AgentConnection {
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
 	/** Request cancellation of the active turn and return once the request is accepted. */
 	abort(): Promise<void>;
+	resumeQueue(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;
 	waitForHeadlessCompletion(): Promise<AgentAutonomousStatus>;

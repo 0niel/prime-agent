@@ -15,6 +15,13 @@ const queue = {
 };
 
 describe("PendingMessageNavigation", () => {
+	it("recalls the first due item and preserves the draft", () => {
+		const state = new PendingMessageNavigation();
+		expect(state.recallFirst(queue, "draft")).toBe("s1");
+		expect(state.selected).toEqual({ id: "s1", lane: "steering", index: 0 });
+		expect(state.checkpoint().draft).toBe("draft");
+	});
+
 	it("browses distinct items with per-item edits and restores the draft", () => {
 		const state = new PendingMessageNavigation();
 		expect(state.browse(queue, "draft", -1)).toBe("f3");
@@ -89,6 +96,14 @@ describe("PendingMessageNavigation", () => {
 		state.browse({ ...queue, revision: 3 }, "draft", -1);
 		expect(state.sync({ ...queue, revision: 4 })).toBeUndefined();
 		expect(state.checkpoint().queue?.revision).toBe(4);
+	});
+
+	it("does not reanchor synthetic legacy ids after the underlying text changes", () => {
+		const state = new PendingMessageNavigation();
+		const legacy = { steering: [], followUp: ["first", "selected"] };
+		state.browse(legacy, "draft", -1);
+		expect(state.sync({ steering: [], followUp: ["inserted", "first", "selected"] })).toBe("draft");
+		expect(state.selected).toBeUndefined();
 	});
 
 	it("resets when the authoritative queue changes", () => {

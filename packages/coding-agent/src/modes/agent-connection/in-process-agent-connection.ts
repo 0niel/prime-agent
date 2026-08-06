@@ -206,12 +206,6 @@ export class InProcessAgentConnection implements AgentConnection {
 		return this.session.clearQueue();
 	}
 
-	async abortAndClearQueue(): Promise<AgentConnectionQueueState> {
-		const queue = this.session.clearQueue();
-		this.session.requestAbort();
-		return queue;
-	}
-
 	async listCronJobs(_options: { includeInactive?: boolean } = {}): Promise<AgentCronJob[]> {
 		return [];
 	}
@@ -383,6 +377,10 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async abort(): Promise<void> {
 		this.session.requestAbort();
+	}
+
+	async resumeQueue(): Promise<void> {
+		this.session.resumeQueuedWork();
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {

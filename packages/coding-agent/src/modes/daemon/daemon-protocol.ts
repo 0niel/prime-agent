@@ -61,7 +61,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 15 adds revisioned CAS semantics to queued-message mutation.
 // Revision 16 adds explicit invalid-command mutation outcomes.
 export const DAEMON_SCHEMA_REVISION = 16;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-183e264f7df2";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-b2f58a0b3b8e";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -513,6 +513,7 @@ export type DaemonCommand =
 	| { id?: string; type: "get_available_models"; activeSessionId: string }
 	| { id?: string; type: "get_queue"; activeSessionId: string }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
+	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| {
 			id?: string;
 			type: "mutate_queue_item";
@@ -521,7 +522,6 @@ export type DaemonCommand =
 			expectedRevision: number;
 			mutation: AgentConnectionQueueMutation;
 	  }
-	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
 	| { id?: string; type: "heartbeats_list"; activeSessionId?: string }
 	| {

@@ -991,6 +991,7 @@ export class InteractiveMode {
 	};
 	private readonly pendingMessageNavigation = new PendingMessageNavigation();
 	private pendingMessageMutation: Promise<PendingMessageMutationOutcome> = Promise.resolve("noop");
+	private queuePausedForPendingEdit = false;
 	private queueMutationInFlight = 0;
 	private queueEventGeneration = 0;
 	private isPendingMessageNavigationTextChange = false;
@@ -1061,6 +1062,7 @@ export class InteractiveMode {
 			throw new Error("Local extension binding requires localSessionHost");
 		}
 		this.agentConnection.onBeforeSessionInvalidate(() => {
+			void this.abandonInterruptedQueue();
 			this.resetExtensionUI();
 			this.resetSideQuestion();
 		});
@@ -2819,6 +2821,7 @@ export class InteractiveMode {
 		this.queuedMessagesContainer.clear();
 		this.connectionQueue = { steering: [], followUp: [] };
 		this.pendingMessageNavigation?.reset();
+		this.queuePausedForPendingEdit = false;
 		this.featureHintSuppressedByQueue = false;
 		if (options?.clearPromptStash) {
 			this.promptStash = undefined;
@@ -5037,6 +5040,15 @@ export class InteractiveMode {
 					return;
 				}
 				try {
+					if (this.queuePausedForPendingEdit && !(await this.resumeInterruptedQueue())) {
+						const rejectedDraft = submittedDraft ?? { text };
+						if (submissionGeneration === this.inputSubmissionGeneration && this.editor.getText().length === 0) {
+							this.editor.setText(rejectedDraft.text);
+						} else {
+							this.retainSubmittedDraft(rejectedDraft, submissionGeneration, submissionStashState);
+						}
+						return;
+					}
 					await this.agentConnection.prompt(text, {
 						streamingBehavior,
 						queueIfBusy: true,
@@ -6710,9 +6722,47 @@ export class InteractiveMode {
 			void this.agentConnection.abortBash();
 		}
 		if (this.isAgentStreaming()) {
-			void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => {
+			void this.interruptAndRecallPending().catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
+		}
+	}
+
+	private async interruptAndRecallPending(): Promise<void> {
+		const editorGeneration = this.editorChangeGeneration;
+		const checkpoint = this.pendingMessageNavigation.checkpoint();
+		const draft = this.pendingMessageNavigation.selected ? checkpoint.draft : this.editor.getText();
+		await this.agentConnection.abort();
+		const fetched = await this.agentConnection.getQueue();
+		const queue = (fetched.revision ?? -1) >= (this.connectionQueue.revision ?? -1) ? fetched : this.connectionQueue;
+		this.connectionQueue = queue;
+		const recalled = this.pendingMessageNavigation.recallFirst(queue, draft);
+		this.queuePausedForPendingEdit = recalled !== undefined;
+		if (recalled === undefined) {
+			await this.agentConnection.resumeQueue();
+		} else if (this.editorChangeGeneration === editorGeneration) {
+			this.setEditorFromPendingNavigation(recalled);
+		} else {
+			await this.abandonInterruptedQueue();
+		}
+		this.updatePendingMessagesDisplay();
+		this.ui.requestRender();
+	}
+
+	private async abandonInterruptedQueue(): Promise<void> {
+		this.pendingMessageNavigation.reset();
+		await this.resumeInterruptedQueue();
+	}
+
+	private async resumeInterruptedQueue(): Promise<boolean> {
+		if (!this.queuePausedForPendingEdit) return true;
+		try {
+			await this.agentConnection.resumeQueue();
+			this.queuePausedForPendingEdit = false;
+			return true;
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return false;
 		}
 	}
 
@@ -7094,19 +7144,40 @@ export class InteractiveMode {
 				if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
 				this.showWarning("Restart or update the daemon to edit queued messages.");
 			} else {
-				this.pendingMessageNavigation.reset();
-				if (this.editorChangeGeneration === editorGeneration) {
-					this.setEditorFromPendingNavigation(checkpoint.draft);
+				const stillPending = result.queue.items?.some((item) => item.id === selected.id) === true;
+				if (stillPending) {
+					this.pendingMessageNavigation.restore(checkpoint);
+					this.pendingMessageNavigation.reconcile(result.queue, selected.id);
+					if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
+					this.showWarning("The queue changed; your edit was kept. Try again.");
+				} else {
+					this.pendingMessageNavigation.reset();
+					if (this.editorChangeGeneration === editorGeneration) {
+						this.setEditorFromPendingNavigation(checkpoint.draft);
+					}
+					this.showWarning("That queued message is no longer pending.");
 				}
-				this.showWarning("That queued message is no longer pending.");
 			}
 			return "retained";
+		}
+		if (this.queuePausedForPendingEdit && kind === "delete") {
+			this.connectionQueue = result.queue;
+			const recalled = this.pendingMessageNavigation.recallFirst(result.queue, checkpoint.draft);
+			if (this.editorChangeGeneration === editorGeneration) {
+				this.setEditorFromPendingNavigation(recalled ?? checkpoint.draft);
+			}
+			this.updatePendingMessagesDisplay();
+			this.ui.requestRender();
+			return "applied";
 		}
 		this.pendingMessageNavigation.restore(changedState);
 		this.pendingMessageNavigation.reconcile(result.queue, change.selected?.id);
 		this.connectionQueue = result.queue;
 		if (this.editorChangeGeneration === editorGeneration) {
 			this.setEditorFromPendingNavigation(change.selected ? text : change.draft);
+		}
+		if (this.queuePausedForPendingEdit && (kind === "steer" || kind === "followUp")) {
+			await this.resumeInterruptedQueue();
 		}
 		this.updatePendingMessagesDisplay();
 		this.ui.requestRender();
@@ -7279,6 +7350,8 @@ export class InteractiveMode {
 	private clearInputBar(): void {
 		this.clearEscapeRepeat();
 		this.clearCtrlCExitHint({ render: false });
+		this.pendingMessageNavigation.reset();
+		void this.resumeInterruptedQueue();
 		this.editor.setText("");
 		this.ui.requestRender();
 	}
@@ -7311,38 +7384,6 @@ export class InteractiveMode {
 			steering: [...this.connectionQueue.steering],
 			followUp: [...this.connectionQueue.followUp],
 		};
-	}
-
-	/** Clear all session-owned queued messages and return their contents. */
-	private async clearAllQueues(
-		options: { abort?: boolean } = {},
-	): Promise<{ steering: string[]; followUp: string[] }> {
-		const navigation = this.pendingMessageNavigation?.checkpoint();
-		const selectedId = this.pendingMessageNavigation?.selected?.id;
-		const queueEventGeneration = this.queueEventGeneration;
-		const connectionQueue = this.connectionQueue;
-		this.pendingMessageNavigation?.reset();
-		let cleared: { steering: string[]; followUp: string[] };
-		try {
-			cleared = options.abort
-				? await this.agentConnection.abortAndClearQueue()
-				: await this.agentConnection.clearQueue();
-		} catch (error) {
-			if (
-				navigation &&
-				this.queueEventGeneration === queueEventGeneration &&
-				this.connectionQueue === connectionQueue
-			) {
-				this.pendingMessageNavigation?.restore(navigation);
-			} else if (navigation) {
-				this.pendingMessageNavigation?.restore(navigation);
-				if (selectedId) this.pendingMessageNavigation?.reconcile(this.connectionQueue, selectedId);
-			}
-			throw error;
-		}
-		const { steering, followUp } = cleared;
-		this.connectionQueue = { steering: [], followUp: [] };
-		return { steering, followUp };
 	}
 
 	private updatePendingMessagesDisplay(): void {
@@ -7388,30 +7429,6 @@ export class InteractiveMode {
 			this.chatContainer.addChild(component);
 		}
 		this.pendingBashComponents = [];
-	}
-
-	private async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {
-		const navigation = this.pendingMessageNavigation?.checkpoint();
-		const currentText =
-			options?.currentText ?? (this.pendingMessageNavigation?.selected ? navigation?.draft : this.editor.getText());
-		const { steering, followUp } = await this.clearAllQueues({ abort: options?.abort });
-		const allQueued = [...steering, ...followUp];
-		if (allQueued.length === 0) {
-			this.updatePendingMessagesDisplay();
-			return 0;
-		}
-		const queuedText = allQueued.join("\n\n");
-		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
-		// The image registry persists, so the restored `[image #N]` markers resolve
-		// on resubmit without any re-registration here.
-		this.isRestoringQueuedEditorText = true;
-		try {
-			this.editor.setText(combinedText);
-		} finally {
-			this.isRestoringQueuedEditorText = false;
-		}
-		this.updatePendingMessagesDisplay();
-		return allQueued.length;
 	}
 
 	// =========================================================================
@@ -8408,6 +8425,7 @@ export class InteractiveMode {
 	): Promise<{ cancelled: boolean }> {
 		this.stopWorkingLoader();
 		try {
+			if (this.queuePausedForPendingEdit) await this.abandonInterruptedQueue();
 			const result = options?.withSession
 				? await this.getLocalSessionHost().switchSession(sessionPath, {
 						withSession: options.withSession,
@@ -9830,6 +9848,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		};
 		let created = false;
 		try {
+			if (this.queuePausedForPendingEdit) await this.abandonInterruptedQueue();
 			const result = await this.agentConnection.newSession();
 			if (result.cancelled) {
 				restorePrompt();

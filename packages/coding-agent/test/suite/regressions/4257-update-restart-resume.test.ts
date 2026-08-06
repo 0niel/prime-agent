@@ -1386,7 +1386,7 @@ describe("issue #4257 update restart resume", () => {
 		expect(transaction.deferredClientEnv).toEqual([]);
 	});
 
-	it("reports resume_queue failure when no work can resume", async () => {
+	it("treats resume_queue as idempotent when no work can resume", async () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 
@@ -1409,7 +1409,6 @@ describe("issue #4257 update restart resume", () => {
 		await Promise.resolve();
 
 		const response = JSON.parse(writes.join("").trim());
-		expect(response).toMatchObject({ id: "resume-1", command: "resume_queue", success: false });
-		expect(JSON.stringify(response)).toContain("No queued work to resume");
+		expect(response).toMatchObject({ id: "resume-1", command: "resume_queue", success: true });
 	});
 });
