@@ -31,6 +31,7 @@ import type {
 	AgentConnectionHeartbeat,
 	AgentConnectionModel,
 	AgentConnectionModelCatalog,
+	AgentConnectionQueueState,
 	AgentConnectionResourceDiagnostic,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSessionContext,
@@ -709,6 +710,91 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 	return fakeThis;
 }
 
+/** Real-navigation fake harness for applySelectedPendingMessageChange tests. */
+function createApplyMutationHarness(options: {
+	queue: AgentConnectionQueueState;
+	connectionQueue?: AgentConnectionQueueState;
+	draft?: string;
+	mutateQueueItem: (controls: { setEditorText(text: string): void }) => unknown;
+	extra?: Record<string, unknown>;
+}) {
+	let editorText = "edited";
+	const navigation = new PendingMessageNavigation();
+	navigation.browse(options.queue, options.draft ?? "draft", -1);
+	const setEditor = vi.fn((value: string) => {
+		editorText = value;
+	});
+	const showWarning = vi.fn();
+	const fakeThis: Record<string, unknown> = {
+		editor: { getText: () => editorText },
+		pendingMessageNavigation: navigation,
+		connectionQueue: options.connectionQueue ?? options.queue,
+		agentConnection: {
+			mutateQueueItem: vi.fn(() =>
+				options.mutateQueueItem({
+					setEditorText: (value: string) => {
+						editorText = value;
+					},
+				}),
+			),
+		},
+		queueMutationImages: () => [],
+		setEditorFromPendingNavigation: setEditor,
+		showWarning,
+		...options.extra,
+	};
+	return {
+		fakeThis,
+		navigation,
+		setEditor,
+		showWarning,
+		get editorText() {
+			return editorText;
+		},
+		setEditorText(value: string) {
+			editorText = value;
+		},
+		apply(kind: "delete" | "followUp" | "steer" | "earlier" | "later") {
+			return Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
+				fakeThis,
+				kind,
+				editorText,
+			);
+		},
+	};
+}
+
+/** Submit-handler harness with a recalled pending message and owned editor text. */
+function createRecalledEnterHarness() {
+	let editorText = "";
+	let editorChangeGeneration = 0;
+	const fakeThis = createSubmitHandlerHarness({
+		editor: {
+			getText: () => editorText,
+			setText: (value: string) => {
+				editorText = value;
+			},
+		},
+		pendingMessageNavigation: { selected: { lane: "followUp", index: 0 }, reset: vi.fn() },
+	});
+	Object.defineProperty(fakeThis, "editorChangeGeneration", {
+		configurable: true,
+		get: () => editorChangeGeneration,
+	});
+	return {
+		fakeThis,
+		get editorText() {
+			return editorText;
+		},
+		type(value: string) {
+			editorText = value;
+		},
+		bumpEditorGeneration() {
+			editorChangeGeneration += 1;
+		},
+	};
+}
+
 describe("InteractiveMode submit handling", () => {
 	test.each([
 		["enter", "steer", "edited"],
@@ -743,139 +829,63 @@ describe("InteractiveMode submit handling", () => {
 		expect(fakeThis.showError).toHaveBeenCalledWith("delete failed");
 	});
 
-	test("recalled Enter leaves newer editor ownership intact after an obsolete response", async () => {
-		let editorText = "";
-		let resolveMutation!: (outcome: "obsolete") => void;
-		const mutation = new Promise<"obsolete">((resolve) => {
-			resolveMutation = resolve;
-		});
-		const fakeThis = createSubmitHandlerHarness({
-			editor: {
-				getText: () => editorText,
-				setText: (value: string) => {
-					editorText = value;
-				},
-				addToHistory: vi.fn(),
-			},
-			pendingMessageNavigation: {
-				selected: { lane: "followUp", index: 0 },
-				reset: vi.fn(),
-			},
-		});
-		Object.assign(fakeThis, { editorChangeGeneration: 0, changeSelectedPendingMessage: vi.fn(() => mutation) });
-		const submission = fakeThis.defaultEditor.onSubmit!("edited");
-		editorText = "newer editor";
-		Object.assign(fakeThis, { editorChangeGeneration: 1 });
-		resolveMutation("obsolete");
-		await submission;
-		expect(editorText).toBe("newer editor");
-	});
+	test.each([
+		// [outcome, newerText, bumpGeneration, expectedText, expectedError]
+		["obsolete", "newer editor", true, "newer editor", undefined],
+		["obsolete", "", false, "edited", undefined],
+		["transport failed", "", false, "edited", "transport failed"],
+		["transport failed", "newer editor", false, "newer editor", "transport failed"],
+	] as const)(
+		"recalled Enter %s outcome preserves editor ownership (newer text: %j)",
+		async (outcome, newerText, bumpGeneration, expected, expectedError) => {
+			const harness = createRecalledEnterHarness();
+			let settle!: () => void;
+			const mutation = new Promise<"obsolete">((resolve, reject) => {
+				settle = () => (expectedError ? reject(new Error(outcome)) : resolve(outcome as "obsolete"));
+			});
+			Object.assign(harness.fakeThis, { changeSelectedPendingMessage: vi.fn(() => mutation) });
+			const submission = harness.fakeThis.defaultEditor.onSubmit!("edited");
+			harness.type(newerText);
+			if (bumpGeneration) harness.bumpEditorGeneration();
+			settle();
+			await submission;
+			expect(harness.editorText).toBe(expected);
+			if (expectedError) expect(harness.fakeThis.showError).toHaveBeenCalledWith(expectedError);
+		},
+	);
 
-	test("recalled Enter restores submitted text after an obsolete response when it still owns the editor", async () => {
-		let editorText = "";
-		let resolveMutation!: (outcome: "obsolete") => void;
-		const firstMutation = new Promise<"obsolete">((resolve) => {
-			resolveMutation = resolve;
-		});
-		const change = vi
-			.fn()
-			.mockImplementationOnce(() => firstMutation)
-			.mockResolvedValueOnce("retained");
-		const fakeThis = createSubmitHandlerHarness({
-			editor: {
-				getText: () => editorText,
-				setText: (value: string) => {
-					editorText = value;
-				},
-			},
-			pendingMessageNavigation: {
-				selected: { lane: "followUp", index: 0 },
-				reset: vi.fn(),
-			},
-		});
-		Object.assign(fakeThis, { editorChangeGeneration: 0, changeSelectedPendingMessage: change });
-		const submission = fakeThis.defaultEditor.onSubmit!("edited");
-		resolveMutation("obsolete");
-		await submission;
-		expect(editorText).toBe("edited");
-		await fakeThis.defaultEditor.onSubmit!(editorText);
+	test("recalled Enter resubmits restored text as a steer edit, never a delete", async () => {
+		const harness = createRecalledEnterHarness();
+		const change = vi.fn().mockResolvedValueOnce("obsolete").mockResolvedValueOnce("retained");
+		Object.assign(harness.fakeThis, { changeSelectedPendingMessage: change });
+		await harness.fakeThis.defaultEditor.onSubmit!("edited");
+		expect(harness.editorText).toBe("edited");
+		await harness.fakeThis.defaultEditor.onSubmit!(harness.editorText);
 		expect(change).toHaveBeenNthCalledWith(2, "steer", "edited");
 		expect(change).not.toHaveBeenCalledWith("delete");
-	});
-
-	test.each([
-		["", "edited"],
-		["newer editor", "newer editor"],
-	] as const)("recalled Enter transport failure preserves editor ownership for %j", async (newerText, expected) => {
-		let editorText = "";
-		let rejectMutation!: (error: Error) => void;
-		const mutation = new Promise<never>((_resolve, reject) => {
-			rejectMutation = reject;
-		});
-		const fakeThis = createSubmitHandlerHarness({
-			editor: {
-				getText: () => editorText,
-				setText: (value: string) => {
-					editorText = value;
-				},
-			},
-			pendingMessageNavigation: {
-				selected: { lane: "followUp", index: 0 },
-				reset: vi.fn(),
-			},
-		});
-		Object.assign(fakeThis, { changeSelectedPendingMessage: vi.fn(() => mutation) });
-		const submission = fakeThis.defaultEditor.onSubmit!("edited");
-		editorText = newerText;
-		rejectMutation(new Error("transport failed"));
-		await submission;
-		expect(editorText).toBe(expected);
-		expect(fakeThis.showError).toHaveBeenCalledWith("transport failed");
 	});
 
 	test.each(["invalid", "unsupported", "stale"] as const)(
 		"keeps the selected edit when atomic mutation is %s",
 		async (status) => {
-			let editorText = "edited";
-			const showWarning = vi.fn();
-			const fakeThis = {
-				editor: { getText: () => editorText },
-				pendingMessageNavigation: {
-					selected: { id: "action-1", lane: "followUp", index: 0 },
-					checkpoint: () => ({ marker: true, draft: "draft" }),
-					change: () => ({ draft: "draft" }),
-					restore: vi.fn(),
-					reconcile: vi.fn(),
-					reset: vi.fn(),
-				},
-				setEditorFromPendingNavigation: (text: string) => {
-					editorText = text;
-				},
-				connectionQueue: { steering: [], followUp: ["old"], revision: 1 },
-				agentConnection: {
-					mutateQueueItem: vi.fn(async () => ({
-						status,
-						queue: { steering: [], followUp: ["old"], revision: 1 },
-					})),
-				},
-				collectImagesFor: () => [],
-				queueMutationImages: () => [],
-				showWarning,
+			const queue = {
+				steering: [],
+				followUp: ["old"],
+				revision: 1,
+				items: [{ id: "action-1", lane: "followUp" as const, index: 0, text: "old" }],
 			};
-			const applied = await Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
-				fakeThis,
-				"followUp",
-				editorText,
-			);
+			const harness = createApplyMutationHarness({
+				queue,
+				mutateQueueItem: async () => ({ status, queue }),
+			});
+			const reconcile = vi.spyOn(harness.navigation, "reconcile");
+			const applied = await harness.apply("followUp");
 			expect(applied).toBe("retained");
-			expect(editorText).toBe(status === "stale" ? "draft" : "edited");
-			expect(showWarning).toHaveBeenCalledOnce();
+			expect(harness.editorText).toBe(status === "stale" ? "draft" : "edited");
+			expect(harness.showWarning).toHaveBeenCalledOnce();
 			if (status === "invalid") {
-				expect(fakeThis.pendingMessageNavigation.reconcile).toHaveBeenCalledWith(
-					{ steering: [], followUp: ["old"], revision: 1 },
-					"action-1",
-				);
-				expect(showWarning).toHaveBeenCalledWith(
+				expect(reconcile).toHaveBeenCalledWith(queue, "action-1");
+				expect(harness.showWarning).toHaveBeenCalledWith(
 					"Queued session commands must remain valid session commands; your edit was not applied.",
 				);
 			}
@@ -979,13 +989,6 @@ describe("InteractiveMode submit handling", () => {
 		["followUp", "unsupported"],
 		["earlier", "applied"],
 	] as const)("preserves newer editor ownership for %s mutation with %s response", async (kind, status) => {
-		let editorText = "edited";
-		let editorChangeGeneration = 0;
-		let resolveMutation!: (result: unknown) => void;
-		const response = new Promise((resolve) => {
-			resolveMutation = resolve;
-		});
-		const navigation = new PendingMessageNavigation();
 		const initial = {
 			steering: [],
 			followUp: ["first", "selected"],
@@ -995,7 +998,6 @@ describe("InteractiveMode submit handling", () => {
 				{ id: "selected", lane: "followUp" as const, index: 1, text: "selected" },
 			],
 		};
-		navigation.browse(initial, "draft", -1);
 		const authoritative =
 			kind === "earlier"
 				? {
@@ -1008,118 +1010,63 @@ describe("InteractiveMode submit handling", () => {
 						],
 					}
 				: { ...initial, revision: 5 };
-		const setEditor = vi.fn((value: string) => {
-			editorText = value;
+		let resolveMutation!: (result: unknown) => void;
+		const harness = createApplyMutationHarness({
+			queue: initial,
+			mutateQueueItem: () =>
+				new Promise((resolve) => {
+					resolveMutation = resolve;
+				}),
+			extra: { editorChangeGeneration: 0, updatePendingMessagesDisplay: vi.fn(), ui: { requestRender: vi.fn() } },
 		});
-		const fakeThis = {
-			editor: { getText: () => editorText },
-			editorChangeGeneration,
-			pendingMessageNavigation: navigation,
-			connectionQueue: initial,
-			agentConnection: { mutateQueueItem: vi.fn(() => response) },
-			queueMutationImages: () => [],
-			setEditorFromPendingNavigation: setEditor,
-			showWarning: vi.fn(),
-			updatePendingMessagesDisplay: vi.fn(),
-			ui: { requestRender: vi.fn() },
-		};
-		const mutation = Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
-			fakeThis,
-			kind,
-			editorText,
-		);
-		editorText = "newer typing";
-		fakeThis.editorChangeGeneration = ++editorChangeGeneration;
+		const mutation = harness.apply(kind);
+		harness.setEditorText("newer typing");
+		harness.fakeThis.editorChangeGeneration = 1;
 		resolveMutation({ status, queue: authoritative });
 		await mutation;
-		expect(editorText).toBe("newer typing");
-		expect(setEditor).not.toHaveBeenCalled();
+		expect(harness.editorText).toBe("newer typing");
+		expect(harness.setEditor).not.toHaveBeenCalled();
 		if (status === "applied" && kind === "earlier") {
-			expect(navigation.selected).toMatchObject({ id: "selected", index: 0 });
+			expect(harness.navigation.selected).toMatchObject({ id: "selected", index: 0 });
 		}
 	});
 
-	test("ignores an obsolete stale response after a newer authoritative revision", async () => {
-		let editorText = "edited";
-		const navigation = new PendingMessageNavigation();
-		const queue = {
-			steering: [],
-			followUp: ["selected", "external"],
-			revision: 9,
-			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
-		};
-		navigation.browse(queue, "draft", -1);
-		const fakeThis = {
-			editor: { getText: () => editorText },
-			pendingMessageNavigation: navigation,
-			connectionQueue: queue,
-			agentConnection: {
-				mutateQueueItem: vi.fn(async () => {
-					editorText = "newer editor";
-					return {
-						status: "stale" as const,
-						queue: { steering: [], followUp: ["selected"], revision: 8, items: queue.items },
-					};
-				}),
-			},
-			collectImagesFor: () => [],
-			queueMutationImages: () => [],
-			setEditorFromPendingNavigation: vi.fn((value: string) => {
-				editorText = value;
-			}),
-			showWarning: vi.fn(),
-		};
-		await expect(
-			Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
-				fakeThis,
-				"followUp",
-				"edited",
-			),
-		).resolves.toBe("obsolete");
-		expect(fakeThis.connectionQueue).toBe(queue);
-		expect(fakeThis.setEditorFromPendingNavigation).not.toHaveBeenCalled();
-		expect(fakeThis.showWarning).not.toHaveBeenCalled();
-		expect(navigation.selected?.id).toBe("selected");
-		expect(navigation.checkpoint().draft).toBe("draft");
-		expect(editorText).toBe("newer editor");
-	});
-
-	test("clears a dead selection and restores draft after an obsolete response", async () => {
-		const navigation = new PendingMessageNavigation();
-		const selectedQueue = {
-			steering: [],
-			followUp: ["selected"],
-			revision: 8,
-			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
-		};
-		navigation.browse(selectedQueue, "draft", -1);
-		let editorText = "edited";
-		const setEditor = vi.fn((value: string) => {
-			editorText = value;
-		});
-		const fakeThis = {
-			editor: { getText: () => editorText },
-			pendingMessageNavigation: navigation,
-			connectionQueue: { steering: [], followUp: ["external"], revision: 9, items: [] },
-			agentConnection: {
-				mutateQueueItem: vi.fn(async () => {
-					editorText = "newer editor";
+	const obsoleteSelectedItem = { id: "selected", lane: "followUp" as const, index: 0, text: "selected" };
+	test.each([
+		[
+			"keeps the live selection and draft",
+			{ steering: [], followUp: ["selected", "external"], revision: 9, items: [obsoleteSelectedItem] },
+			true,
+		],
+		["clears a dead selection and warns", { steering: [], followUp: ["external"], revision: 9, items: [] }, false],
+	] as [string, AgentConnectionQueueState, boolean][])(
+		"ignores an obsolete stale response and %s",
+		async (_label, newerQueue, stillPending) => {
+			const selectedQueue = { steering: [], followUp: ["selected"], revision: 8, items: [obsoleteSelectedItem] };
+			const harness = createApplyMutationHarness({
+				queue: selectedQueue,
+				connectionQueue: newerQueue,
+				mutateQueueItem: async ({ setEditorText }) => {
+					setEditorText("newer editor");
 					return { status: "stale" as const, queue: selectedQueue };
-				}),
-			},
-			queueMutationImages: () => [],
-			setEditorFromPendingNavigation: setEditor,
-			showWarning: vi.fn(),
-		};
-		await Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
-			fakeThis,
-			"followUp",
-			"edited",
-		);
-		expect(navigation.selected).toBeUndefined();
-		expect(setEditor).not.toHaveBeenCalled();
-		expect(editorText).toBe("newer editor");
-	});
+				},
+			});
+			await expect(harness.apply("followUp")).resolves.toBe("obsolete");
+			expect(harness.fakeThis.connectionQueue).toBe(newerQueue);
+			expect(harness.setEditor).not.toHaveBeenCalled();
+			expect(harness.editorText).toBe("newer editor");
+			if (stillPending) {
+				expect(harness.navigation.selected?.id).toBe("selected");
+				expect(harness.navigation.checkpoint().draft).toBe("draft");
+				expect(harness.showWarning).not.toHaveBeenCalled();
+			} else {
+				expect(harness.navigation.selected).toBeUndefined();
+				expect(harness.showWarning).toHaveBeenCalledWith(
+					"That queued message was already delivered or removed; your edit is now a draft.",
+				);
+			}
+		},
+	);
 
 	test.each([
 		["plain text", [], [], "clear"],

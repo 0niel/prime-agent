@@ -110,6 +110,29 @@ function emitHello(
 	);
 }
 
+type MockDaemonSocket = (typeof netMock.sockets)[number];
+
+async function connectToDaemon(
+	serverCapabilities: string[] = ["session_input_admission"],
+	options: { version?: number; schemaRevision?: number } = {},
+): Promise<{ client: DaemonClient; socket: MockDaemonSocket }> {
+	const client = new DaemonClient("/tmp/prime-agent.sock");
+	const connect = client.connect();
+	const socket = netMock.sockets.at(-1)!;
+	socket.emit("connect");
+	await connect;
+	emitHello(socket, options.version ?? DAEMON_PROTOCOL_VERSION, serverCapabilities, options.schemaRevision);
+	return { client, socket };
+}
+
+function readWireEnvelope(socket: MockDaemonSocket, index = 0): { id?: string } & Record<string, unknown> {
+	return JSON.parse(socket.writes[index]!.trim());
+}
+
+function emitSuccessResponse(socket: MockDaemonSocket, id: unknown, command: string): void {
+	socket.emit("data", `${JSON.stringify({ id, type: "response", command, success: true })}\n`);
+}
+
 describe("DaemonClient", () => {
 	beforeEach(() => {
 		netMock.sockets.length = 0;
@@ -202,12 +225,7 @@ describe("DaemonClient", () => {
 	});
 
 	it("rejects unsupported optional commands without writing them to an older daemon", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, 3);
+		const { client, socket } = await connectToDaemon(["session_input_admission"], { version: 3 });
 
 		expect(client.supportsServerCapability("heartbeat_catalog")).toBe(false);
 		await expect(client.request({ type: "heartbeats_list" })).rejects.toThrow("does not support heartbeat_catalog");
@@ -216,12 +234,7 @@ describe("DaemonClient", () => {
 	});
 
 	it("does not send subagent deletion to an old daemon without the capability", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, DAEMON_PROTOCOL_VERSION, []);
+		const { client, socket } = await connectToDaemon([]);
 
 		await expect(
 			client.request({ type: "delete_rlm_subagent", activeSessionId: "active-1", childId: "child-1" }),
@@ -231,12 +244,9 @@ describe("DaemonClient", () => {
 	});
 
 	it("sends subagent deletion to a capable daemon without requiring a schema bump", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["delete_rlm_subagent"], DAEMON_SCHEMA_REVISION - 1);
+		const { client, socket } = await connectToDaemon(["delete_rlm_subagent"], {
+			schemaRevision: DAEMON_SCHEMA_REVISION - 1,
+		});
 
 		const request = client.request({
 			type: "delete_rlm_subagent",
@@ -249,12 +259,7 @@ describe("DaemonClient", () => {
 	});
 
 	it("does not send queue item mutation to an old daemon without the capability", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets.at(-1)!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], DAEMON_SCHEMA_REVISION);
+		const { client, socket } = await connectToDaemon([], { schemaRevision: DAEMON_SCHEMA_REVISION });
 		await expect(
 			client.request({
 				type: "mutate_queue_item",
@@ -269,41 +274,25 @@ describe("DaemonClient", () => {
 	});
 
 	it("rejects schema-14 queue mutation before writing even when the daemon advertises the capability", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets.at(-1)!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["queue_item_mutation"], 14);
-		expect(
-			client.canRequest({
-				type: "mutate_queue_item",
-				activeSessionId: "active-1",
-				actionId: "action-1",
-				expectedRevision: 1,
-				mutation: { type: "delete" },
-			}),
-		).toBe(false);
-		await expect(
-			client.request({
-				type: "mutate_queue_item",
-				activeSessionId: "active-1",
-				actionId: "action-1",
-				expectedRevision: 1,
-				mutation: { type: "delete" },
-			}),
-		).rejects.toThrow();
+		const { client, socket } = await connectToDaemon(["queue_item_mutation"], { schemaRevision: 14 });
+		const command: Parameters<DaemonClient["request"]>[0] = {
+			type: "mutate_queue_item",
+			activeSessionId: "active-1",
+			actionId: "action-1",
+			expectedRevision: 1,
+			mutation: { type: "delete" },
+		};
+
+		expect(client.canRequest(command)).toBe(false);
+		await expect(client.request(command)).rejects.toThrow();
 		expect(socket.writes).toEqual([]);
 		client.close();
 	});
 
 	it("rejects an old daemon before requesting session state", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, DAEMON_PROTOCOL_VERSION - 1);
+		const { client, socket } = await connectToDaemon(["session_input_admission"], {
+			version: DAEMON_PROTOCOL_VERSION - 1,
+		});
 
 		await expect(client.request({ type: "get_state", activeSessionId: "active-1" })).rejects.toThrow(
 			"does not support get_state",
@@ -313,12 +302,7 @@ describe("DaemonClient", () => {
 	});
 
 	it("rejects session input admission clearly when an old daemon lacks the capability", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, DAEMON_PROTOCOL_VERSION, []);
+		const { client, socket } = await connectToDaemon([]);
 
 		await expect(
 			client.request({ type: "prompt", activeSessionId: "active-1", message: "hello", queueIfBusy: true }),
@@ -328,12 +312,9 @@ describe("DaemonClient", () => {
 	});
 
 	it("field-gates prompt admissionId before writing raw commands", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["session_input_admission", "prompt_admission_cancellation"], 3);
+		const { client, socket } = await connectToDaemon(["session_input_admission", "prompt_admission_cancellation"], {
+			schemaRevision: 3,
+		});
 
 		await expect(
 			client.request({ type: "prompt", activeSessionId: "active-1", message: "hello", admissionId: "a-1" }),
@@ -343,18 +324,11 @@ describe("DaemonClient", () => {
 	});
 
 	it("accepts a newer compatible daemon schema for admission-gated prompts", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
 		const compatibility = DAEMON_COMMAND_COMPATIBILITY.cancel_prompt_admission;
-		emitHello(
-			socket,
-			compatibility.minProtocol,
-			["session_input_admission", "prompt_admission_cancellation"],
-			compatibility.minSchemaRevision + 1,
-		);
+		const { client, socket } = await connectToDaemon(["session_input_admission", "prompt_admission_cancellation"], {
+			version: compatibility.minProtocol,
+			schemaRevision: compatibility.minSchemaRevision + 1,
+		});
 
 		const request = client.request({
 			type: "prompt",
@@ -368,12 +342,7 @@ describe("DaemonClient", () => {
 	});
 
 	it("isolates a message consumer failure from the rest of the client", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket);
+		const { client, socket } = await connectToDaemon();
 		let delivered = 0;
 		client.onMessage(() => {
 			throw new Error("broken optional consumer");
@@ -386,24 +355,11 @@ describe("DaemonClient", () => {
 	});
 
 	it("serializes activeSessionId for session commands", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-
-		const connect = client.connect();
-		expect(netMock.sockets).toHaveLength(1);
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket);
+		const { client, socket } = await connectToDaemon();
 
 		const response = client.request({ type: "attach", activeSessionId: "active-1" });
 		expect(socket.writes).toHaveLength(1);
-		const envelope = JSON.parse(socket.writes[0]!.trim()) as {
-			id?: string;
-			type?: string;
-			clientId?: string;
-			protocol?: { name?: string; version?: number };
-			command?: { type?: string; activeSessionId?: string; daemonSessionId?: unknown };
-		};
+		const envelope = readWireEnvelope(socket);
 
 		expect(envelope).toMatchObject({
 			type: "command",
@@ -413,36 +369,21 @@ describe("DaemonClient", () => {
 		});
 		expect(envelope.command).not.toHaveProperty("daemonSessionId");
 
-		socket.emit(
-			"data",
-			`${JSON.stringify({ id: envelope.id, type: "response", command: "attach", success: true })}\n`,
-		);
+		emitSuccessResponse(socket, envelope.id, "attach");
 		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
 
 		client.close();
 	});
 
 	it("serializes list commands with all sessions requested", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-
-		const connect = client.connect();
-		expect(netMock.sockets).toHaveLength(1);
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket);
+		const { client, socket } = await connectToDaemon();
 
 		const response = client.request({ type: "list", all: true });
 		expect(socket.writes).toHaveLength(1);
-		const envelope = JSON.parse(socket.writes[0]!.trim()) as {
-			id?: string;
-			type?: string;
-			command?: { type?: string; all?: boolean };
-		};
-
+		const envelope = readWireEnvelope(socket);
 		expect(envelope).toMatchObject({ type: "command", command: { type: "list", all: true } });
 
-		socket.emit("data", `${JSON.stringify({ id: envelope.id, type: "response", command: "list", success: true })}\n`);
+		emitSuccessResponse(socket, envelope.id, "list");
 		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
 
 		client.close();
@@ -467,31 +408,19 @@ describe("DaemonClient", () => {
 	});
 
 	it("keeps durable command envelopes on the session-action protocol", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, DAEMON_PROTOCOL_VERSION);
+		const { client, socket } = await connectToDaemon();
 
 		const response = client.request({ type: "create" });
-		const request = JSON.parse(socket.writes[0]!.trim()) as {
-			id: string;
-			protocol: { version: number };
-		};
+		const request = readWireEnvelope(socket) as { id: string; protocol: { version: number } };
 		expect(request.protocol.version).toBe(DAEMON_PROTOCOL_VERSION);
 
-		socket.emit(
-			"data",
-			`${JSON.stringify({ id: request.id, type: "response", command: "create", success: true })}\n`,
-		);
+		emitSuccessResponse(socket, request.id, "create");
 		await response;
 
-		const acknowledgement = JSON.parse(socket.writes[1]!.trim()) as {
-			protocol: { version: number };
-			command: { type: string; commandId: string };
-		};
-		expect(acknowledgement).toMatchObject({
+		// Durable mutating-command results are acknowledged on the current protocol.
+		expect(socket.writes).toHaveLength(2);
+		expect(readWireEnvelope(socket, 1)).toMatchObject({
+			type: "command",
 			protocol: { version: DAEMON_PROTOCOL_VERSION },
 			command: { type: "ack_result", commandId: request.id },
 		});
@@ -499,14 +428,7 @@ describe("DaemonClient", () => {
 	});
 
 	it("routes request progress by response id without notifying general listeners", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-
-		const connect = client.connect();
-		expect(netMock.sockets).toHaveLength(1);
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket);
+		const { client, socket } = await connectToDaemon();
 
 		const progress: Array<[number, number]> = [];
 		const discovered: string[] = [];
@@ -597,14 +519,7 @@ describe("DaemonClient", () => {
 	});
 
 	it("serializes per-session config for create commands", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-
-		const connect = client.connect();
-		expect(netMock.sockets).toHaveLength(1);
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket);
+		const { client, socket } = await connectToDaemon();
 
 		const response = client.request({
 			type: "create",
@@ -616,22 +531,7 @@ describe("DaemonClient", () => {
 			},
 		});
 		expect(socket.writes).toHaveLength(1);
-		const envelope = JSON.parse(socket.writes[0]!.trim()) as {
-			id?: string;
-			type?: string;
-			command?: {
-				type?: string;
-				name?: string;
-				config?: {
-					cwd?: string;
-					model?: string;
-					tools?: string[];
-				};
-				cwd?: unknown;
-				model?: unknown;
-			};
-		};
-
+		const envelope = readWireEnvelope(socket);
 		expect(envelope).toMatchObject({
 			type: "command",
 			command: {
@@ -647,36 +547,9 @@ describe("DaemonClient", () => {
 		expect(envelope.command).not.toHaveProperty("cwd");
 		expect(envelope.command).not.toHaveProperty("model");
 
-		socket.emit(
-			"data",
-			`${JSON.stringify({ id: envelope.id, type: "response", command: "create", success: true })}\n`,
-		);
+		emitSuccessResponse(socket, envelope.id, "create");
 		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
 
-		client.close();
-	});
-
-	it("acknowledges durable mutating-command results on the current protocol", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket);
-
-		const response = client.request({ type: "create" });
-		const request = JSON.parse(socket.writes[0]!.trim()) as { id: string };
-		socket.emit(
-			"data",
-			`${JSON.stringify({ id: request.id, type: "response", command: "create", success: true })}\n`,
-		);
-		await response;
-
-		expect(socket.writes).toHaveLength(2);
-		expect(JSON.parse(socket.writes[1]!.trim())).toMatchObject({
-			type: "command",
-			command: { type: "ack_result", commandId: request.id },
-		});
 		client.close();
 	});
 

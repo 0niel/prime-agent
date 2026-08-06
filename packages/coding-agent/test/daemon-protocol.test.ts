@@ -46,19 +46,8 @@ describe("daemon protocol helpers", () => {
 
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {
 		expect(DAEMON_PROTOCOL_VERSION).toBe(7);
+		expect(DAEMON_SCHEMA_REVISION).toBe(16);
 		expect(DAEMON_SCHEMA_ID).toContain(`protocol-${DAEMON_PROTOCOL_VERSION}`);
-		expect(DAEMON_COMMAND_COMPATIBILITY.heartbeats_list).toEqual({
-			minProtocol: 7,
-			capability: "heartbeat_catalog",
-		});
-		expect(DAEMON_COMMAND_COMPATIBILITY.heartbeat_manage).toEqual({
-			minProtocol: 7,
-			capability: "heartbeat_management",
-		});
-		expect(DAEMON_COMMAND_COMPATIBILITY.complete_owned_session).toEqual({
-			minProtocol: 7,
-			capability: "client_owned_sessions",
-		});
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.heartbeats_changed).toEqual({
 			minProtocol: 7,
 			capability: "heartbeat_catalog",
@@ -66,6 +55,26 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
 			expect.arrayContaining(["heartbeat_catalog", "heartbeat_management"]),
 		);
+	});
+
+	it.each([
+		["heartbeats_list", { minProtocol: 7, capability: "heartbeat_catalog" }],
+		["heartbeat_manage", { minProtocol: 7, capability: "heartbeat_management" }],
+		["complete_owned_session", { minProtocol: 7, capability: "client_owned_sessions" }],
+		["delete_rlm_subagent", { minProtocol: 7, capability: "delete_rlm_subagent" }],
+		["get_model_catalog", { minProtocol: 7, capability: "model_catalog" }],
+		["get_rlm_max_depth_status", { minProtocol: 7, minSchemaRevision: 11 }],
+		["set_rlm_max_depth", { minProtocol: 7, minSchemaRevision: 11 }],
+		[
+			"cancel_prompt_admission",
+			{ minProtocol: 7, minSchemaRevision: 8, capability: "prompt_admission_cancellation" },
+		],
+		["mutate_queue_item", { minProtocol: 7, minSchemaRevision: 16, capability: "queue_item_mutation" }],
+	] as const)("gates %s at its introducing compatibility metadata", (command, expected) => {
+		expect(DAEMON_COMMAND_COMPATIBILITY[command]).toEqual(expected);
+		if ("capability" in expected) {
+			expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain(expected.capability);
+		}
 	});
 
 	it("builds worker capabilities for chunked, non-chunked, and extension subscriptions", () => {
@@ -83,46 +92,6 @@ describe("daemon protocol helpers", () => {
 			"queue_item_mutation",
 		]);
 		expect(workerAttachCapabilities({ extensionUi: true })).toContain("extension_ui");
-	});
-
-	it("capability- and schema-gates atomic queue item mutation", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(16);
-		expect(DAEMON_COMMAND_COMPATIBILITY.mutate_queue_item).toEqual({
-			minProtocol: 7,
-			minSchemaRevision: 16,
-			capability: "queue_item_mutation",
-		});
-		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queue_item_mutation");
-	});
-
-	it("capability-gates explicit subagent deletion instead of schema-gating it", () => {
-		expect(DAEMON_COMMAND_COMPATIBILITY.delete_rlm_subagent).toEqual({
-			minProtocol: 7,
-			capability: "delete_rlm_subagent",
-		});
-		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("delete_rlm_subagent");
-	});
-
-	it("capability-gates the optional model catalog surface", () => {
-		expect(DAEMON_COMMAND_COMPATIBILITY.get_model_catalog).toEqual({
-			minProtocol: 7,
-			capability: "model_catalog",
-		});
-		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("model_catalog");
-	});
-
-	it("schema-gates the RLM max depth commands at their introducing revision", () => {
-		expect(DAEMON_COMMAND_COMPATIBILITY.get_rlm_max_depth_status).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
-		expect(DAEMON_COMMAND_COMPATIBILITY.set_rlm_max_depth).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
-	});
-
-	it("version- and capability-gates prompt admission cancellation", () => {
-		expect(DAEMON_COMMAND_COMPATIBILITY.cancel_prompt_admission).toEqual({
-			minProtocol: 7,
-			minSchemaRevision: 8,
-			capability: "prompt_admission_cancellation",
-		});
-		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("prompt_admission_cancellation");
 	});
 
 	it("keeps refine failure events backward-compatible on the existing session event channel", () => {
