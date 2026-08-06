@@ -6171,9 +6171,10 @@ export class AgentSession {
 						? [{ type: "text", text: mutation.text }, ...mutation.images.map((image) => ({ ...image }))]
 						: [{ type: "text", text: mutation.text }];
 				} else if (action.payload.content) {
-					action.payload.content = action.payload.content.map((block) =>
-						block.type === "text" ? { ...block, text: mutation.text } : block,
-					);
+					action.payload.content = [
+						{ type: "text", text: mutation.text },
+						...action.payload.content.filter((block) => block.type !== "text"),
+					];
 				}
 				action.payload.preview = undefined;
 				action.payload.prepared = undefined;

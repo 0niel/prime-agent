@@ -209,6 +209,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			queueIfBusy: true,
 			source: "interactive",
 			images: [originalImage],
+			content: [{ type: "text", text: "duplicate" }, { type: "text", text: " [image #1]" }, originalImage],
 		});
 		await session.prompt("follow", { streamingBehavior: "followUp", queueIfBusy: true, source: "interactive" });
 		type Mutation = Parameters<AgentSession["mutateQueuedUserMessage"]>[2];
@@ -280,7 +281,10 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Turn image tri-state: preserved without an update, replaced, then cleared.
 		mutate(second!.id, { type: "replace_steering", text: "reconnected edit [image #1]" });
-		expect(payloadOf(second!.id)).toMatchObject({ images: [originalImage] });
+		expect(payloadOf(second!.id)).toMatchObject({
+			images: [originalImage],
+			content: [{ type: "text", text: "reconnected edit [image #1]" }, originalImage],
+		});
 		const imageOnlyRevision = session.queueRevision;
 		const imageOnlyReplacement: ImageContent = { type: "image", data: "replacement", mimeType: "image/png" };
 		mutate(
