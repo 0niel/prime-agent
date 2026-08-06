@@ -2146,6 +2146,42 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.sessionManager.getBranch().at(-1)?.id).toBe(followUpEntryId);
 	});
 
+	it("does not retain a non-triggering custom message when persistence fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		vi.spyOn(harness.sessionManager, "appendCustomMessageEntry").mockImplementationOnce(() => {
+			throw new Error("custom message append failed");
+		});
+
+		await expect(
+			harness.session.sendCustomMessage({
+				customType: "failed-custom-message",
+				content: "must not survive",
+				display: true,
+				details: {},
+			}),
+		).rejects.toThrow("custom message append failed");
+
+		expect(
+			harness.session.messages.some(
+				(message) => message.role === "custom" && message.customType === "failed-custom-message",
+			),
+		).toBe(false);
+		expect(
+			harness.sessionManager
+				.getBranch()
+				.some((entry) => entry.type === "custom_message" && entry.customType === "failed-custom-message"),
+		).toBe(false);
+
+		harness.setResponses([fauxAssistantMessage("clean context")]);
+		await harness.session.prompt("continue after failure");
+		expect(
+			harness.session.messages.some(
+				(message) => message.role === "custom" && message.customType === "failed-custom-message",
+			),
+		).toBe(false);
+	});
+
 	it("does not record a benign compaction skip as a command failure", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

@@ -65,8 +65,15 @@ export function streamFailureMessage(info: StreamFailureInfo, detail?: string): 
 	return message;
 }
 
+function isTransientQuotaThrottleMessage(value: string): boolean {
+	return /\bquota metric\b|\b(?:requests?|tokens?)[_ /-]*per[_ -]?(?:second|minute|hour)|\bper[_ -]?(?:second|minute|hour)|\bresource has been exhausted\b[^\n]{0,80}\bcheck quota\b/i.test(
+		value,
+	);
+}
+
 export function isQuotaExhaustionMessage(value: string): boolean {
-	return /insufficient[_ -]?(?:quota|credits?|funds?)|(?:quota|credits?|funds?)[^\n]{0,48}(?:exceed(?:ed)?|exhaust(?:ed)?|deplet(?:ed)?|reached|used up|not enough|unavailable)|(?:exceed(?:ed)?|exhaust(?:ed)?|deplet(?:ed)?|reached|used up)[^\n]{0,80}(?:quota|credits?|funds?|premium requests?|(?:credit|usage|spend(?:ing)?)[_ -]?limit)|(?:credit|usage|spend(?:ing)?)[_ -]?limit[^\n]{0,48}(?:exceed(?:ed)?|exhaust(?:ed)?|reached)|(?:out of|no)[_ -]*(?:premium[_ -]*)?(?:credits?|quota|funds?|requests?)(?:[_ -]*remaining)?|payment required/i.test(
+	if (isTransientQuotaThrottleMessage(value)) return false;
+	return /insufficient[_ -]?(?:quota|credits?|funds?)|(?:quota|credits?|funds?)[^\n]{0,48}(?:exceed(?:ed)?|exhaust(?:ed)?|deplet(?:ed)?|reached|used up|not enough)|(?:exceed(?:ed)?|exhaust(?:ed)?|deplet(?:ed)?|reached|used up)[^\n]{0,80}(?:quota|credits?|funds?|premium requests?|(?:credit|usage|spend(?:ing)?)[_ -]?limit)|(?:credit|usage|spend(?:ing)?)[_ -]?limit[^\n]{0,48}(?:exceed(?:ed)?|exhaust(?:ed)?|reached)|(?:out of|no)[_ -]*(?:premium[_ -]*)?(?:credits?|quota|funds?|requests?)(?:[_ -]*remaining)?|payment required/i.test(
 		value,
 	);
 }

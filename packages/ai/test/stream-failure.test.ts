@@ -63,6 +63,28 @@ describe("classifyStreamFailure", () => {
 			"quota",
 		);
 	});
+
+	test("does not treat temporary quota-service unavailability as quota exhaustion", () => {
+		expect(classifyStreamFailure("server_error", 503, "quota service temporarily unavailable")).toBe("server_error");
+	});
+
+	test.each([
+		"Quota exceeded for quota metric 'GenerateRequestsPerMinutePerProjectPerBaseModel': requests per minute",
+		"Resource has been exhausted (e.g. check quota)",
+	])("treats transient quota throttling as a rate limit: %s", (detail) => {
+		expect(classifyStreamFailure("RESOURCE_EXHAUSTED", 429, detail)).toBe("rate_limit");
+	});
+
+	test("keeps explicit account-capacity exhaustion classified as quota", () => {
+		expect(classifyStreamFailure("rate_limit_error", 429, "premium request quota exceeded")).toBe("quota");
+		expect(
+			classifyStreamFailure(
+				"rate_limit_error",
+				429,
+				"You exceeded your current quota. Please check your plan and billing details.",
+			),
+		).toBe("quota");
+	});
 });
 
 describe("streamFailureFromStopReason", () => {

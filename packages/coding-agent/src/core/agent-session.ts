@@ -4490,6 +4490,7 @@ export class AgentSession {
 			options?.customMessage && isAgentSessionMessage(options.customMessage) ? options.customMessage : undefined;
 		await this._prompt(text, {
 			...options,
+			internalPrompt: true,
 			expandPromptTemplates: false,
 			skipInputHandlers: true,
 			skipPrePromptWork: true,
@@ -5001,6 +5002,9 @@ export class AgentSession {
 				...(recovered.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
 			};
 		});
+		if (actions.some((action) => action.payload.kind === "turn") && this.isProviderQuotaCircuitOpen) {
+			this._assertProviderQuotaCircuitClosed();
+		}
 		for (const action of actions) this._admitSessionInput(action, { restore: true });
 		return actions.length;
 	}
@@ -5321,7 +5325,6 @@ export class AgentSession {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (action.payload.kind === "turn" && this.isProviderQuotaCircuitOpen) {
-			if (options.restore) return { accepted: false, disposition: "queued" };
 			this._assertProviderQuotaCircuitClosed();
 		}
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
@@ -5976,13 +5979,13 @@ export class AgentSession {
 				admissionFence.release();
 			}
 		} else {
-			this.agent.state.messages.push(appMessage);
 			this.sessionManager.appendCustomMessageEntryWithRollback(
 				message.customType,
 				message.content,
 				message.display,
 				message.details,
 			);
+			this.agent.state.messages.push(appMessage);
 			this._emit({ type: "message_start", message: appMessage });
 			this._emit({ type: "message_end", message: appMessage });
 		}
@@ -9024,7 +9027,7 @@ export class AgentSession {
 			timestamp: Date.now(),
 		} satisfies CustomMessage<ProviderQuotaFailure>;
 		try {
-			this.sessionManager.appendCustomMessageEntry(
+			this.sessionManager.appendCustomMessageEntryWithRollback(
 				message.customType,
 				message.content,
 				message.display,
@@ -9041,6 +9044,7 @@ export class AgentSession {
 		const error = new Error(this._formatProviderQuotaFailure(failure));
 		this.requestAbort();
 		this._cancelSessionActions((action) => action.payload.kind === "turn", error);
+		this.agent.clearAllQueues();
 		this._pendingNextTurnMessages = [];
 		const descendants = new Set<AgentSession>();
 		for (const run of this._activeRlmChildRuns.values()) {
@@ -9083,10 +9087,15 @@ export class AgentSession {
 	private _resetProviderQuotaCircuit(): void {
 		const root = this._familyRootSession();
 		if (!root._providerQuotaFailure) return;
-		root.sessionManager.appendCustomEntryWithRollback(PROVIDER_QUOTA_CIRCUIT_CUSTOM_TYPE, {
-			state: "reset",
-			timestamp: Date.now(),
-		} satisfies ProviderQuotaCircuitEntry);
+		try {
+			root.sessionManager.appendCustomEntryWithRollback(PROVIDER_QUOTA_CIRCUIT_CUSTOM_TYPE, {
+				state: "reset",
+				timestamp: Date.now(),
+			} satisfies ProviderQuotaCircuitEntry);
+		} catch {
+			// Explicit user authorization clears the live latch. Without a durable reset,
+			// a later reload remains conservatively fail-closed on the persisted trip.
+		}
 		root._providerQuotaFailure = undefined;
 	}
 
@@ -9799,12 +9808,12 @@ export class AgentSession {
 			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		}
 		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
-		this._assertProviderQuotaCircuitClosed();
 
 		const childSessionDir = this._createChildRlmSessionDir();
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+		this._assertProviderQuotaCircuitClosed();
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);

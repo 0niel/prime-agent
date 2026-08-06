@@ -3,7 +3,8 @@ import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import { SessionManager } from "../../src/core/session-manager.js";
-import { createHarness, type Harness } from "./harness.js";
+import { createHarness, getUserTexts, type Harness } from "./harness.js";
+import { createDeferred, withStreaming } from "./scheduling.js";
 
 type SessionInternals = {
 	_processAgentEvent: (event: AgentEvent) => Promise<void>;
@@ -74,6 +75,43 @@ describe("AgentSession financial safety", () => {
 		expect(harness.faux.state.callCount).toBe(2);
 	});
 
+	it("does not let an inbound agent message reset the quota circuit", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await (harness.session as unknown as SessionInternals)._processAgentEvent({
+			type: "message_end",
+			message: providerFailure("quota", "premium request quota exceeded", "req_agent_message"),
+		} as AgentEvent);
+		harness.setResponses([fauxAssistantMessage("must not run")]);
+
+		await expect(harness.session.acceptAgentMessagePrompt("child cancellation notice")).rejects.toThrow(
+			/quota exhausted.*req_agent_message/i,
+		);
+
+		expect(harness.session.isProviderQuotaCircuitOpen).toBe(true);
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	it("rejects recovered provider turns atomically while the quota circuit is open", async () => {
+		const source = await createHarness();
+		const target = await createHarness();
+		harnesses.push(source, target);
+		withStreaming(source, true);
+		await source.session.followUp("recover this queued turn");
+		const snapshot = source.session.getSessionActionRecoverySnapshot();
+		expect(snapshot.actions).toHaveLength(1);
+
+		await (target.session as unknown as SessionInternals)._processAgentEvent({
+			type: "message_end",
+			message: providerFailure("quota", "premium request quota exceeded", "req_restore"),
+		} as AgentEvent);
+
+		await expect(target.session.restoreSessionActions(snapshot)).rejects.toThrow(/quota exhausted.*req_restore/i);
+		expect(target.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+		expect(target.session.queuedActionCount).toBe(0);
+		expect(target.faux.state.callCount).toBe(0);
+	});
+
 	it("keeps transient rate limits on the bounded agent-level retry path", async () => {
 		const harness = await createHarness({
 			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
@@ -120,6 +158,94 @@ describe("AgentSession financial safety", () => {
 		expect(resetReload.session.isProviderQuotaCircuitOpen).toBe(false);
 	});
 
+	it("clears the live quota latch when persisting an explicit reset fails", async () => {
+		const original = await createHarness({ persistSession: true });
+		harnesses.push(original);
+		await (original.session as unknown as SessionInternals)._processAgentEvent({
+			type: "message_end",
+			message: providerFailure("quota", "premium request quota exceeded", "req_reset_write"),
+		} as AgentEvent);
+		original.sessionManager.flushNow();
+		const sessionFile = original.sessionManager.getSessionFile();
+		expect(sessionFile).toBeTruthy();
+		vi.spyOn(original.sessionManager, "appendCustomEntryWithRollback").mockImplementationOnce(() => {
+			throw new Error("disk full");
+		});
+		original.setResponses([fauxAssistantMessage("recovered")]);
+
+		await original.session.prompt("explicit retry despite reset persistence failure");
+
+		expect(original.session.isProviderQuotaCircuitOpen).toBe(false);
+		expect(original.faux.state.callCount).toBe(1);
+		original.sessionManager.flushNow();
+
+		const resetReload = await createHarness({ sessionManager: SessionManager.open(sessionFile!) });
+		harnesses.push(resetReload);
+		expect(resetReload.session.isProviderQuotaCircuitOpen).toBe(true);
+	});
+
+	it("rolls back a quota notice that fails after mutating the session tree", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const appendCustomMessage = harness.sessionManager.appendCustomMessageEntry.bind(harness.sessionManager);
+		vi.spyOn(harness.sessionManager, "appendCustomMessageEntry").mockImplementationOnce(
+			(customType, content, display, details) => {
+				appendCustomMessage(customType, content, display, details);
+				throw new Error("disk full");
+			},
+		);
+
+		await (harness.session as unknown as SessionInternals)._processAgentEvent({
+			type: "message_end",
+			message: providerFailure("quota", "premium request quota exceeded", "req_notice_rollback"),
+		} as AgentEvent);
+
+		const branch = harness.sessionManager.getBranch();
+		const circuitEntry = branch.find(
+			(entry) => entry.type === "custom" && entry.customType === "prime-agent.provider-quota-circuit",
+		);
+		expect(circuitEntry).toBeDefined();
+		expect(
+			branch.some((entry) => entry.type === "custom_message" && entry.customType === "provider_quota_exhausted"),
+		).toBe(false);
+
+		const laterEntryId = harness.sessionManager.appendCustomEntryWithRollback("post-quota-test");
+		expect(harness.sessionManager.getEntry(laterEntryId)?.parentId).toBe(circuitEntry?.id);
+	});
+
+	it("purges queued turns at both session and agent layers before an explicit reset", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		withStreaming(harness, true);
+		await harness.session.steer("stale session steering");
+		harness.session.agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "stale agent steering" }],
+			timestamp: Date.now(),
+		});
+		harness.session.agent.followUp({
+			role: "user",
+			content: [{ type: "text", text: "stale agent follow-up" }],
+			timestamp: Date.now(),
+		});
+		expect(harness.session.queuedActionCount).toBe(1);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+
+		await (harness.session as unknown as SessionInternals)._processAgentEvent({
+			type: "message_end",
+			message: providerFailure("quota", "premium request quota exceeded", "req_queued"),
+		} as AgentEvent);
+
+		expect(harness.session.queuedActionCount).toBe(0);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		withStreaming(harness, false);
+		harness.setResponses([fauxAssistantMessage("recovered")]);
+		await harness.session.prompt("explicit retry");
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(getUserTexts(harness)).toEqual(["explicit retry"]);
+	});
+
 	it("cascades a child quota failure to the parent and every sibling", async () => {
 		const parent = await createHarness({ rlmDepth: 0, rlmMaxDepth: 1 });
 		const child = await createHarness({ rlmDepth: 1, rlmParentSession: parent.session });
@@ -162,6 +288,39 @@ describe("AgentSession financial safety", () => {
 			.find((event) => event.child.id === spawned.rlm_child_id && event.child.status === "cancelled");
 		expect(terminalUpdate?.child.error).toContain("req_inline_child");
 		expect(harness.faux.state.callCount).toBe(1);
+	});
+
+	it("blocks a child when quota trips during its final name-availability check", async () => {
+		const availabilityReached = createDeferred();
+		const releaseAvailability = createDeferred();
+		const parent = await createHarness({
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+			agentMessageController: {
+				assertSessionNameAvailable: async () => {
+					availabilityReached.resolve();
+					await releaseAvailability.promise;
+				},
+				listAgents: () => ({ agents: [] }),
+				sendAgentMessage: async () => {
+					throw new Error("Unexpected agent message");
+				},
+			},
+		});
+		const sibling = await createHarness({ rlmDepth: 1, rlmParentSession: parent.session });
+		harnesses.push(parent, sibling);
+
+		const spawn = parent.session.runRlmChild("race quota with child admission");
+		await availabilityReached.promise;
+		await (sibling.session as unknown as SessionInternals)._processAgentEvent({
+			type: "message_end",
+			message: providerFailure("quota", "premium request quota exceeded", "req_admission_race"),
+		} as AgentEvent);
+		releaseAvailability.resolve();
+
+		await expect(spawn).rejects.toThrow(/quota exhausted.*req_admission_race/i);
+		expect(parent.eventsOfType("rlm_child_update")).toEqual([]);
+		expect(parent.faux.state.callCount).toBe(0);
 	});
 
 	it("keeps explicit abort cascading to active children", async () => {
