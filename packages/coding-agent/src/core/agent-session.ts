@@ -686,6 +686,14 @@ interface PreparedCommandPayload extends SessionCommandPayload {
 
 type QueuedSessionAction = SessionAction<PreparedTurnPayload | PreparedCommandPayload>;
 
+function sessionCommandUsesProvider(command: SessionSlashCommand): boolean {
+	return command.name === "compact" || command.name === "refine";
+}
+
+function sessionActionUsesProvider(action: QueuedSessionAction): boolean {
+	return action.payload.kind === "turn" || sessionCommandUsesProvider(action.payload.command);
+}
+
 interface PreparedPromptPreparation {
 	result: Awaited<ReturnType<ExtensionRunner["emitBeforeAgentStart"]>>;
 	/** Base system prompt captured at emitBeforeAgentStart, for stale-base refresh at handoff. */
@@ -5002,7 +5010,7 @@ export class AgentSession {
 				...(recovered.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
 			};
 		});
-		if (actions.some((action) => action.payload.kind === "turn") && this.isProviderQuotaCircuitOpen) {
+		if (actions.some(sessionActionUsesProvider) && this.isProviderQuotaCircuitOpen) {
 			this._assertProviderQuotaCircuitClosed();
 		}
 		for (const action of actions) this._admitSessionInput(action, { restore: true });
@@ -5324,7 +5332,7 @@ export class AgentSession {
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
-		if (action.payload.kind === "turn" && this.isProviderQuotaCircuitOpen) {
+		if (sessionActionUsesProvider(action) && this.isProviderQuotaCircuitOpen) {
 			this._assertProviderQuotaCircuitClosed();
 		}
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
@@ -5620,6 +5628,7 @@ export class AgentSession {
 				this._notifySessionInputCheckpointChange();
 				this._emitQueueUpdate();
 				try {
+					if (sessionCommandUsesProvider(input.command)) this._assertProviderQuotaCircuitClosed();
 					this._appendDurableSessionCommandMessage(input.text, input.command, false);
 					this._actionStore.ticketFor(action).settleDelivered({ status: "not_applicable" });
 					this._settleAgentMessage(action.agentMessageId, "delivery");
@@ -7026,6 +7035,7 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
+		this._assertProviderQuotaCircuitClosed();
 		if (options.skipAbort && this.isStreaming) {
 			throw new Error("Cannot compact without aborting while the agent is running.");
 		}
@@ -7156,9 +7166,12 @@ export class AgentSession {
 			}
 		}
 
-		const { summary, firstKeptEntryId, tokensBefore, details } =
-			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
+		let result = extensionCompaction;
+		if (!result) {
+			this._assertProviderQuotaCircuitClosed();
+			result = await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel);
+		}
+		const { summary, firstKeptEntryId, tokensBefore, details } = result;
 
 		if (signal.aborted) {
 			throw new Error("Compaction cancelled");
@@ -7578,6 +7591,7 @@ export class AgentSession {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
 		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		this._assertProviderQuotaCircuitClosed();
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
@@ -7623,6 +7637,7 @@ export class AgentSession {
 		} = {},
 		internal: { skipAbort?: boolean } = {},
 	): Promise<RefinementResult> {
+		this._assertProviderQuotaCircuitClosed();
 		// Queued /refine executes from the session-input pump between turns;
 		// refine never aborts the agent (planning is backgrounded and the apply
 		// phase waits for quiescence), so skipAbort only asserts the pump's
@@ -7789,6 +7804,7 @@ export class AgentSession {
 			: baselineScope === "global"
 				? globalPlanningState
 				: localPlanningState!;
+		this._assertProviderQuotaCircuitClosed();
 		const plan = await planRefinement(
 			this.agent.state.messages,
 			planningState,
@@ -9043,7 +9059,7 @@ export class AgentSession {
 	private _failClosedForProviderQuota(failure: ProviderQuotaFailure): void {
 		const error = new Error(this._formatProviderQuotaFailure(failure));
 		this.requestAbort();
-		this._cancelSessionActions((action) => action.payload.kind === "turn", error);
+		this._cancelSessionActions(sessionActionUsesProvider, error);
 		this.agent.clearAllQueues();
 		this._pendingNextTurnMessages = [];
 		const descendants = new Set<AgentSession>();

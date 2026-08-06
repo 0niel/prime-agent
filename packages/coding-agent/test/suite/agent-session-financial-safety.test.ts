@@ -67,6 +67,10 @@ describe("AgentSession financial safety", () => {
 			/quota exhausted.*request_id: req_quota/i,
 		);
 		await expect(harness.session.runRlmChild("background child")).rejects.toThrow(/quota exhausted/i);
+		await expect(harness.session.prompt("/compact")).rejects.toThrow(/quota exhausted.*request_id: req_quota/i);
+		expect(harness.faux.state.callCount).toBe(1);
+		await harness.session.prompt("/goal");
+		expect(harness.session.isProviderQuotaCircuitOpen).toBe(true);
 		expect(harness.faux.state.callCount).toBe(1);
 
 		await harness.session.prompt("retry after fixing quota");
@@ -107,6 +111,30 @@ describe("AgentSession financial safety", () => {
 		} as AgentEvent);
 
 		await expect(target.session.restoreSessionActions(snapshot)).rejects.toThrow(/quota exhausted.*req_restore/i);
+		expect(target.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+		expect(target.session.queuedActionCount).toBe(0);
+		expect(target.faux.state.callCount).toBe(0);
+	});
+
+	it("rejects a restored provider-backed session command while the quota circuit is open", async () => {
+		const source = await createHarness();
+		const target = await createHarness();
+		harnesses.push(source, target);
+		withStreaming(source, true);
+		await source.session.prompt("/compact", { streamingBehavior: "followUp" });
+		const snapshot = source.session.getSessionActionRecoverySnapshot();
+		expect(snapshot.actions).toEqual([
+			expect.objectContaining({ payload: expect.objectContaining({ kind: "session_command" }) }),
+		]);
+
+		await (target.session as unknown as SessionInternals)._processAgentEvent({
+			type: "message_end",
+			message: providerFailure("quota", "premium request quota exceeded", "req_restore_command"),
+		} as AgentEvent);
+
+		await expect(target.session.restoreSessionActions(snapshot)).rejects.toThrow(
+			/quota exhausted.*req_restore_command/i,
+		);
 		expect(target.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
 		expect(target.session.queuedActionCount).toBe(0);
 		expect(target.faux.state.callCount).toBe(0);
@@ -213,11 +241,13 @@ describe("AgentSession financial safety", () => {
 		expect(harness.sessionManager.getEntry(laterEntryId)?.parentId).toBe(circuitEntry?.id);
 	});
 
-	it("purges queued turns at both session and agent layers before an explicit reset", async () => {
+	it("purges queued provider work at both session and agent layers before an explicit reset", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		withStreaming(harness, true);
+		const compact = vi.spyOn(harness.session, "compact");
 		await harness.session.steer("stale session steering");
+		await harness.session.prompt("/compact", { streamingBehavior: "followUp" });
 		harness.session.agent.steer({
 			role: "user",
 			content: [{ type: "text", text: "stale agent steering" }],
@@ -228,7 +258,7 @@ describe("AgentSession financial safety", () => {
 			content: [{ type: "text", text: "stale agent follow-up" }],
 			timestamp: Date.now(),
 		});
-		expect(harness.session.queuedActionCount).toBe(1);
+		expect(harness.session.queuedActionCount).toBe(2);
 		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
 
 		await (harness.session as unknown as SessionInternals)._processAgentEvent({
@@ -243,6 +273,7 @@ describe("AgentSession financial safety", () => {
 		await harness.session.prompt("explicit retry");
 
 		expect(harness.faux.state.callCount).toBe(1);
+		expect(compact).not.toHaveBeenCalled();
 		expect(getUserTexts(harness)).toEqual(["explicit retry"]);
 	});
 
