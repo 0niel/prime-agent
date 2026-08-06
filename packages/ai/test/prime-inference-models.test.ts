@@ -200,8 +200,8 @@ describe("Prime Inference models", () => {
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.6").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-5").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-haiku-4.5").contextWindow).toBe(200000);
-		// Empirically verified: this route rejects prompts above 200k tokens even
-		// though OpenRouter reports 1M for the upstream model.
+		// Confirmed against the live API: this route serves a 200k window, not the
+		// larger one the upstream model's published spec lists.
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.5").contextWindow).toBe(200000);
 	});
 
