@@ -135,11 +135,12 @@ interface PrimeInferenceModelMetadata {
 }
 
 // The full Prime Inference catalog is registered (minus raw/duplicate variants).
-// The /models endpoint publishes pricing only, so context/output limits and
-// modalities come from the OpenRouter catalog, which Prime routes most models
-// through. Entries here override OpenRouter where the Prime route enforces a
-// different limit (verified against the live API) or fill gaps for models
-// OpenRouter does not list or leaves incomplete.
+// Prime's /models endpoint publishes pricing only, so context/output limits and
+// modalities are read from OpenRouter's public catalog, used here purely as a
+// published spec sheet for the same upstream models — requests always go to
+// Prime's own baseUrl. Entries below override those specs where the Prime route
+// enforces a different limit (verified against the live API) or fill gaps for
+// models OpenRouter does not list or leaves incomplete.
 const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata> = {
 	// Verified 2026-07-08: these routes reject prompts above 200k tokens even
 	// though OpenRouter reports 1M. Every other Claude route accepted a >200k
