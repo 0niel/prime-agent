@@ -7122,6 +7122,11 @@ export class InteractiveMode {
 								images: this.queueMutationImages(text),
 							};
 		const editorGeneration = this.editorChangeGeneration;
+		const retainEdit = (queue: AgentConnectionQueueState, reconcile = true) => {
+			this.pendingMessageNavigation.restore(checkpoint);
+			if (reconcile) this.pendingMessageNavigation.reconcile(queue, selected.id);
+			if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
+		};
 		const queueEventGeneration = this.queueEventGeneration;
 		const connectionQueue = this.connectionQueue;
 		let result: AgentConnectionQueueMutationResult;
@@ -7148,30 +7153,23 @@ export class InteractiveMode {
 			return "obsolete";
 		}
 		if (result.status === "noop") {
-			this.pendingMessageNavigation.restore(checkpoint);
-			this.pendingMessageNavigation.reconcile(result.queue, selected.id);
+			retainEdit(result.queue);
 			this.connectionQueue = result.queue;
-			if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
 			this.showStatus("Queued message is already at the queue boundary");
 			return "noop";
 		}
 		if (result.status !== "applied") {
 			this.connectionQueue = result.queue;
 			if (result.status === "invalid") {
-				this.pendingMessageNavigation.restore(checkpoint);
-				this.pendingMessageNavigation.reconcile(result.queue, selected.id);
-				if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
+				retainEdit(result.queue);
 				this.showWarning("Queued session commands must remain valid session commands; your edit was not applied.");
 			} else if (result.status === "unsupported") {
-				this.pendingMessageNavigation.restore(checkpoint);
-				if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
+				retainEdit(result.queue, false);
 				this.showWarning("Restart or update the daemon to edit queued messages.");
 			} else {
 				const stillPending = result.queue.items?.some((item) => item.id === selected.id) === true;
 				if (stillPending) {
-					this.pendingMessageNavigation.restore(checkpoint);
-					this.pendingMessageNavigation.reconcile(result.queue, selected.id);
-					if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
+					retainEdit(result.queue);
 					this.showWarning("The queue changed; your edit was kept. Try again.");
 				} else {
 					this.pendingMessageNavigation.reset();
@@ -7198,15 +7196,17 @@ export class InteractiveMode {
 		this.pendingMessageNavigation.restore(changedState);
 		this.pendingMessageNavigation.reconcile(result.queue, change.selected?.id);
 		this.connectionQueue = result.queue;
+		let appliedEditorGeneration: number | undefined;
 		if (this.editorChangeGeneration === editorGeneration) {
 			this.setEditorFromPendingNavigation(change.selected ? text : change.draft);
+			appliedEditorGeneration = this.editorChangeGeneration;
 		}
 		let outcome: PendingMessageMutationOutcome = "applied";
 		if (this.queuePausedForPendingEdit && (kind === "steer" || kind === "followUp")) {
 			if (!(await this.resumeInterruptedQueue())) {
 				this.pendingMessageNavigation.restore(checkpoint);
 				this.pendingMessageNavigation.reconcile(result.queue, selected.id);
-				if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
+				if (appliedEditorGeneration === this.editorChangeGeneration) this.setEditorFromPendingNavigation(text);
 				outcome = "retained";
 			}
 		}

@@ -692,6 +692,26 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 	return fakeThis;
 }
 
+function followUpQueue(
+	revision: number,
+	...entries: readonly (readonly [id: string, text: string])[]
+): AgentConnectionQueueState & { items: NonNullable<AgentConnectionQueueState["items"]> } {
+	return {
+		steering: [],
+		followUp: entries.map(([, text]) => text),
+		revision,
+		items: entries.map(([id, text], index) => ({ id, lane: "followUp", index, text })),
+	};
+}
+
+function stubPromptConnection(prompt: (message: string) => Promise<void>): SubmitHandlerHarness["agentConnection"] {
+	return {
+		prompt,
+		executeBash: vi.fn(async () => {}),
+		getState: vi.fn(async () => ({ isBashRunning: false })),
+	};
+}
+
 /** Real-navigation fake harness for applySelectedPendingMessageChange tests. */
 function createApplyMutationHarness(options: {
 	queue: AgentConnectionQueueState;
@@ -703,8 +723,10 @@ function createApplyMutationHarness(options: {
 	let editorText = "edited";
 	const navigation = new PendingMessageNavigation();
 	navigation.browse(options.queue, options.draft ?? "draft", -1);
+	let editorChangeGeneration = 0;
 	const setEditor = vi.fn((value: string) => {
 		editorText = value;
+		editorChangeGeneration++;
 	});
 	const showWarning = vi.fn();
 	const fakeThis: Record<string, unknown> = {
@@ -723,8 +745,17 @@ function createApplyMutationHarness(options: {
 		queueMutationImages: () => [],
 		setEditorFromPendingNavigation: setEditor,
 		showWarning,
+		updatePendingMessagesDisplay: vi.fn(),
+		ui: { requestRender: vi.fn() },
 		...options.extra,
 	};
+	Object.defineProperty(fakeThis, "editorChangeGeneration", {
+		configurable: true,
+		get: () => editorChangeGeneration,
+		set: (value: number) => {
+			editorChangeGeneration = value;
+		},
+	});
 	return {
 		fakeThis,
 		navigation,
@@ -850,12 +881,7 @@ describe("InteractiveMode submit handling", () => {
 	test.each(["invalid", "unsupported", "stale"] as const)(
 		"keeps the selected edit when atomic mutation is %s",
 		async (status) => {
-			const queue = {
-				steering: [],
-				followUp: ["old"],
-				revision: 1,
-				items: [{ id: "action-1", lane: "followUp" as const, index: 0, text: "old" }],
-			};
+			const queue = followUpQueue(1, ["action-1", "old"]);
 			const harness = createApplyMutationHarness({
 				queue,
 				mutateQueueItem: async () => ({ status, queue }),
@@ -882,13 +908,9 @@ describe("InteractiveMode submit handling", () => {
 				order.push("resume");
 				return true;
 			}),
-			agentConnection: {
-				prompt: vi.fn(async () => {
-					order.push("prompt");
-				}),
-				getState: vi.fn(async () => ({ isBashRunning: false })),
-				executeBash: vi.fn(async () => {}),
-			},
+			agentConnection: stubPromptConnection(async () => {
+				order.push("prompt");
+			}),
 		});
 		await fakeThis.defaultEditor.onSubmit?.("next prompt");
 		expect(order).toEqual(["resume", "prompt"]);
@@ -916,12 +938,7 @@ describe("InteractiveMode submit handling", () => {
 		["followUp", true],
 		["earlier", false],
 	] as const)("%s mutation resumes only committed interrupted edits", async (kind, shouldResume) => {
-		const queue = {
-			steering: [],
-			followUp: ["old"],
-			revision: 1,
-			items: [{ id: "action-1", lane: "followUp" as const, index: 0, text: "old" }],
-		};
+		const queue = followUpQueue(1, ["action-1", "old"]);
 		const resumeQueue = vi.fn(async () => {});
 		const harness = createApplyMutationHarness({
 			queue,
@@ -930,8 +947,6 @@ describe("InteractiveMode submit handling", () => {
 				queuePausedForPendingEdit: true,
 				queuePauseGeneration: 1,
 				resumeInterruptedQueue: Reflect.get(InteractiveMode.prototype, "resumeInterruptedQueue"),
-				updatePendingMessagesDisplay: vi.fn(),
-				ui: { requestRender: vi.fn() },
 				agentConnection: {
 					mutateQueueItem: vi.fn(async () => ({ status: "applied", queue: { ...queue, revision: 2 } })),
 					resumeQueue,
@@ -943,20 +958,13 @@ describe("InteractiveMode submit handling", () => {
 	});
 
 	test("reports a committed edit as retained when queue resume fails", async () => {
-		const queue = {
-			steering: [],
-			followUp: ["old"],
-			revision: 1,
-			items: [{ id: "action-1", lane: "followUp" as const, index: 0, text: "old" }],
-		};
+		const queue = followUpQueue(1, ["action-1", "old"]);
 		const harness = createApplyMutationHarness({
 			queue,
 			mutateQueueItem: async () => ({ status: "applied", queue: { ...queue, revision: 2 } }),
 			extra: {
 				queuePausedForPendingEdit: true,
 				resumeInterruptedQueue: vi.fn(async () => false),
-				updatePendingMessagesDisplay: vi.fn(),
-				ui: { requestRender: vi.fn() },
 			},
 		});
 		expect(await harness.apply("followUp")).toBe("retained");
@@ -975,12 +983,7 @@ describe("InteractiveMode submit handling", () => {
 		],
 		["draft", { steering: [], followUp: [], revision: 2, items: [] }],
 	] as const)("interrupted delete recalls %s and resumes when empty", async (expected, resultQueue) => {
-		const queue = {
-			steering: [],
-			followUp: ["old"],
-			revision: 1,
-			items: [{ id: "old", lane: "followUp" as const, index: 0, text: "old" }],
-		};
+		const queue = followUpQueue(1, ["old", "old"]);
 		const harness = createApplyMutationHarness({
 			queue,
 			draft: "draft",
@@ -993,8 +996,6 @@ describe("InteractiveMode submit handling", () => {
 					mutateQueueItem: vi.fn(async () => ({ status: "applied", queue: resultQueue })),
 					resumeQueue: vi.fn(async () => {}),
 				},
-				updatePendingMessagesDisplay: vi.fn(),
-				ui: { requestRender: vi.fn() },
 			},
 		});
 		await harness.apply("delete");
@@ -1003,95 +1004,77 @@ describe("InteractiveMode submit handling", () => {
 	});
 
 	test("applies two serialized real reorder mutations at successive revisions without losing edit or draft", async () => {
-		let editorText = "f2 edited";
-		const navigation = new PendingMessageNavigation();
-		const initial = {
-			steering: [],
-			followUp: ["f1", "f2", "f3"],
-			revision: 7,
-			items: [
-				{ id: "f1", lane: "followUp" as const, index: 0, text: "f1" },
-				{ id: "f2", lane: "followUp" as const, index: 1, text: "f2" },
-				{ id: "f3", lane: "followUp" as const, index: 2, text: "f3" },
-			],
-		};
-		navigation.browse(initial, "original draft", -1); // f3
-		navigation.browse(initial, "f3 edited", -1); // f2
-		navigation.capture(editorText);
+		const initial = followUpQueue(7, ["f1", "f1"], ["f2", "f2"], ["f3", "f3"]);
 		const calls: number[] = [];
-		const holder: { value?: unknown } = {};
-		const fakeThis = {
-			editor: { getText: () => editorText },
-			pendingMessageNavigation: navigation,
-			pendingMessageMutation: Promise.resolve(false),
-			connectionQueue: initial,
-			agentConnection: {
-				mutateQueueItem: vi.fn(async (_id: string, revision: number) => {
-					calls.push(revision);
-					const nextRevision = revision + 1;
-					const items =
-						revision === 7
-							? [{ ...initial.items[1]!, index: 0 }, { ...initial.items[0]!, index: 1 }, initial.items[2]!]
-							: [initial.items[0]!, initial.items[1]!, initial.items[2]!];
-					const followUp = revision === 7 ? ["f2", "f1", "f3"] : initial.followUp;
-					const actions = { queuedCount: 3, steering: [], followUps: followUp, revision: nextRevision, items };
-					Reflect.get(InteractiveMode.prototype, "applyQueueActionSnapshot").call(holder.value, actions);
-					return { status: "applied" as const, queue: { ...initial, followUp, revision: nextRevision, items } };
-				}),
+		let harness: ReturnType<typeof createApplyMutationHarness>;
+		harness = createApplyMutationHarness({
+			queue: initial,
+			draft: "original draft",
+			mutateQueueItem: async () => {
+				const revision = (harness.fakeThis.connectionQueue as AgentConnectionQueueState).revision as number;
+				calls.push(revision);
+				const items = (revision === 7 ? [initial.items[1]!, initial.items[0]!, initial.items[2]!] : initial.items).map(
+					(item, index) => ({ ...item, index }),
+				);
+				const queue = {
+					...initial,
+					followUp: revision === 7 ? ["f2", "f1", "f3"] : initial.followUp,
+					revision: revision + 1,
+					items,
+				};
+				Reflect.get(InteractiveMode.prototype, "applyQueueActionSnapshot").call(harness.fakeThis, {
+					queuedCount: 3,
+					followUps: queue.followUp,
+					...queue,
+				});
+				return { status: "applied" as const, queue };
 			},
-			collectImagesFor: () => [],
-			setEditorFromPendingNavigation: (text: string) => {
-				editorText = text;
+			extra: {
+				pendingMessageMutation: Promise.resolve("noop"),
+				applySelectedPendingMessageChange: Reflect.get(
+					InteractiveMode.prototype,
+					"applySelectedPendingMessageChange",
+				),
 			},
-			updatePendingMessagesDisplay: vi.fn(),
-			ui: { requestRender: vi.fn() },
-			applySelectedPendingMessageChange: Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange"),
-		};
-		holder.value = fakeThis;
+		});
+		harness.navigation.browse(initial, "f3 edited", -1);
+		harness.setEditorText("f2 edited");
+		harness.navigation.capture("f2 edited");
 		const mutate = Reflect.get(InteractiveMode.prototype, "changeSelectedPendingMessage");
-		await mutate.call(fakeThis, "earlier", editorText);
-		await mutate.call(fakeThis, "later", editorText);
+		await mutate.call(harness.fakeThis, "earlier", harness.editorText);
+		await mutate.call(harness.fakeThis, "later", harness.editorText);
 		expect(calls).toEqual([7, 8]);
-		expect(navigation.selected?.id).toBe("f2");
-		expect(navigation.checkpoint().draft).toBe("original draft");
-		expect(editorText).toBe("f2 edited");
-		expect(navigation.browse(fakeThis.connectionQueue, editorText, 1)).toBe("f3 edited");
+		expect(harness.navigation.selected?.id).toBe("f2");
+		expect(harness.navigation.checkpoint().draft).toBe("original draft");
+		expect(harness.editorText).toBe("f2 edited");
+		expect(
+			harness.navigation.browse(
+				harness.fakeThis.connectionQueue as AgentConnectionQueueState,
+				harness.editorText,
+				1,
+			),
+		).toBe("f3 edited");
 	});
 
 	test("does not resurrect navigation checkpoint when mutation rejects after a newer queue event", async () => {
-		const navigation = new PendingMessageNavigation();
-		const initial = {
-			steering: [],
-			followUp: ["selected"],
-			revision: 4,
-			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
-		};
-		navigation.browse(initial, "draft", -1);
 		let rejectMutation!: (error: Error) => void;
 		const response = new Promise<never>((_resolve, reject) => {
 			rejectMutation = reject;
 		});
-		const fakeThis = {
-			editor: { getText: () => "edited" },
-			editorChangeGeneration: 0,
-			queueEventGeneration: 1,
-			pendingMessageNavigation: navigation,
-			connectionQueue: initial,
-			agentConnection: { mutateQueueItem: vi.fn(() => response) },
-			queueMutationImages: () => [],
-		};
-		const mutation = Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
-			fakeThis,
-			"followUp",
-			"edited",
-		);
-		fakeThis.connectionQueue = { steering: [], followUp: [], revision: 5, items: [] };
-		fakeThis.queueEventGeneration++;
-		navigation.reset();
+		const initial = followUpQueue(4, ["selected", "selected"]);
+		const harness = createApplyMutationHarness({
+			queue: initial,
+			mutateQueueItem: () => response,
+			extra: { queueEventGeneration: 1 },
+		});
+		const mutation = harness.apply("followUp");
+		harness.fakeThis.connectionQueue = { steering: [], followUp: [], revision: 5, items: [] };
+		harness.fakeThis.queueEventGeneration = 2;
+		harness.navigation.reset();
 		rejectMutation(new Error("transport failed"));
 		await expect(mutation).rejects.toThrow("transport failed");
-		expect(navigation.selected).toBeUndefined();
-		expect(navigation.checkpoint().draft).toBe("");
+		expect(harness.navigation.selected).toBeUndefined();
+		expect(harness.navigation.checkpoint().draft).toBe("");
 	});
 
 	test.each([
@@ -1099,15 +1082,7 @@ describe("InteractiveMode submit handling", () => {
 		["followUp", "unsupported"],
 		["earlier", "applied"],
 	] as const)("preserves newer editor ownership for %s mutation with %s response", async (kind, status) => {
-		const initial = {
-			steering: [],
-			followUp: ["first", "selected"],
-			revision: 4,
-			items: [
-				{ id: "first", lane: "followUp" as const, index: 0, text: "first" },
-				{ id: "selected", lane: "followUp" as const, index: 1, text: "selected" },
-			],
-		};
+		const initial = followUpQueue(4, ["first", "first"], ["selected", "selected"]);
 		const authoritative =
 			kind === "earlier"
 				? {
@@ -1127,7 +1102,7 @@ describe("InteractiveMode submit handling", () => {
 				new Promise((resolve) => {
 					resolveMutation = resolve;
 				}),
-			extra: { editorChangeGeneration: 0, updatePendingMessagesDisplay: vi.fn(), ui: { requestRender: vi.fn() } },
+			extra: { editorChangeGeneration: 0 },
 		});
 		const mutation = harness.apply(kind);
 		harness.setEditorText("newer typing");
@@ -1152,7 +1127,7 @@ describe("InteractiveMode submit handling", () => {
 	] as [string, AgentConnectionQueueState, boolean][])(
 		"ignores an obsolete stale response and %s",
 		async (_label, newerQueue, stillPending) => {
-			const selectedQueue = { steering: [], followUp: ["selected"], revision: 8, items: [obsoleteSelectedItem] };
+			const selectedQueue = followUpQueue(8, ["selected", "selected"]);
 			const harness = createApplyMutationHarness({
 				queue: selectedQueue,
 				connectionQueue: newerQueue,
@@ -2619,6 +2594,70 @@ describe("InteractiveMode model selection persistence", () => {
 		}) as AgentConnectionModel;
 	const overlayPrototype = InteractiveMode.prototype as unknown as ModelSelectorOverlayHarness;
 
+	function createModelSelectionFake(options: {
+		setModel: (provider: string, modelId: string) => Promise<void>;
+		state?: AgentConnectionState;
+		onPersist?: () => void;
+	}): ModelSelectionHarness {
+		const fakeThis = Object.create(InteractiveMode.prototype) as ModelSelectionHarness;
+		fakeThis.agentConnection = {
+			setModel: vi.fn(options.setModel),
+			getState: vi.fn(async () => options.state ?? createConnectionState()),
+		};
+		fakeThis.uiServices = {
+			settingsManager: { setDefaultModelAndProvider: vi.fn(() => options.onPersist?.()) },
+		};
+		fakeThis.footer = { invalidate: vi.fn() };
+		fakeThis.subagentSummaryLine = { invalidate: vi.fn() };
+		fakeThis.patchConnectionState = vi.fn();
+		fakeThis.updateEditorBorderColor = vi.fn();
+		return fakeThis;
+	}
+
+	type CatalogRefreshHarness = ModelSelectorOverlayHarness & {
+		connectionCommands: unknown[];
+		connectionResourceSnapshot: unknown;
+		refreshConnectionCatalog(): Promise<void>;
+		applyConnectionStateSnapshot(state: AgentConnectionState): void;
+		invalidateConnectionModels(): void;
+		invalidateConnectionModelRefresh(): void;
+	};
+
+	function createCatalogRefreshHarness(options: {
+		getModelCatalog: () => Promise<AgentConnectionModelCatalog>;
+		getCommands?: () => Promise<never[]>;
+		cachedModel?: AgentConnectionModel;
+	}): CatalogRefreshHarness {
+		const fakeThis = Object.create(InteractiveMode.prototype) as CatalogRefreshHarness;
+		fakeThis.agentConnection = {
+			getModelCatalog: options.getModelCatalog,
+			getState: vi.fn(async () => createConnectionState()),
+			getCommands: vi.fn(options.getCommands ?? (async () => [])),
+			getResourceSnapshot: vi.fn(async () => ({})),
+			setModel: vi.fn(async () => {}),
+		} as never;
+		fakeThis.connectionModels = options.cachedModel ? [options.cachedModel] : [];
+		fakeThis.connectionModelCatalog = options.cachedModel ? [options.cachedModel] : [];
+		fakeThis.connectionConfiguredProviders = new Set(options.cachedModel ? [options.cachedModel.provider] : []);
+		fakeThis.connectionModelsFetchedAt = options.cachedModel ? Date.now() : 0;
+		fakeThis.connectionModelsRefreshVersion = 0;
+		fakeThis.connectionModelsRefreshInFlight = undefined;
+		fakeThis.getScopedModelState = vi.fn(() => []);
+		fakeThis.applyConnectionModelCatalog = overlayPrototype.applyConnectionModelCatalog;
+		fakeThis.getConnectionAvailableModels = overlayPrototype.getConnectionAvailableModels;
+		fakeThis.refreshConnectionCatalog = (
+			InteractiveMode.prototype as unknown as { refreshConnectionCatalog(): Promise<void> }
+		).refreshConnectionCatalog;
+		fakeThis.invalidateConnectionModels = (
+			InteractiveMode.prototype as unknown as { invalidateConnectionModels(): void }
+		).invalidateConnectionModels;
+		fakeThis.invalidateConnectionModelRefresh = (
+			InteractiveMode.prototype as unknown as { invalidateConnectionModelRefresh(): void }
+		).invalidateConnectionModelRefresh;
+		fakeThis.applyConnectionStateSnapshot = vi.fn();
+		return fakeThis;
+	}
+
 	function createSelectorOverlayHarness(options: {
 		connectionModels: AgentConnectionModel[];
 		catalogModels?: AgentConnectionModel[];
@@ -2741,26 +2780,13 @@ describe("InteractiveMode model selection persistence", () => {
 	test("persists local default only after the connection accepts the model", async () => {
 		const order: string[] = [];
 		const model = createModel("openai", "gpt-5.5");
-		const fakeThis = Object.create(InteractiveMode.prototype) as ModelSelectionHarness;
-		fakeThis.agentConnection = {
-			setModel: vi.fn(async () => {
+		const fakeThis = createModelSelectionFake({
+			setModel: async () => {
 				order.push("connection");
-			}),
-			getState: vi.fn(async () =>
-				createConnectionState({ model, serviceTier: "default", availableThinkingLevels: ["off"] }),
-			),
-		};
-		fakeThis.uiServices = {
-			settingsManager: {
-				setDefaultModelAndProvider: vi.fn(() => {
-					order.push("settings");
-				}),
 			},
-		};
-		fakeThis.footer = { invalidate: vi.fn() };
-		fakeThis.subagentSummaryLine = { invalidate: vi.fn() };
-		fakeThis.patchConnectionState = vi.fn();
-		fakeThis.updateEditorBorderColor = vi.fn();
+			state: createConnectionState({ model, serviceTier: "default", availableThinkingLevels: ["off"] }),
+			onPersist: () => order.push("settings"),
+		});
 		fakeThis.setupAutocompleteProvider = vi.fn();
 
 		await fakeThis.applySelectedModel(model);
@@ -2779,22 +2805,11 @@ describe("InteractiveMode model selection persistence", () => {
 
 	test("does not persist local default when the connection rejects the model", async () => {
 		const model = createModel("openai", "missing-model");
-		const fakeThis = Object.create(InteractiveMode.prototype) as ModelSelectionHarness;
-		fakeThis.agentConnection = {
-			setModel: vi.fn(async () => {
+		const fakeThis = createModelSelectionFake({
+			setModel: async () => {
 				throw new Error("model unavailable");
-			}),
-			getState: vi.fn(async () => createConnectionState()),
-		};
-		fakeThis.uiServices = {
-			settingsManager: {
-				setDefaultModelAndProvider: vi.fn(),
 			},
-		};
-		fakeThis.footer = { invalidate: vi.fn() };
-		fakeThis.subagentSummaryLine = { invalidate: vi.fn() };
-		fakeThis.patchConnectionState = vi.fn();
-		fakeThis.updateEditorBorderColor = vi.fn();
+		});
 
 		await expect(fakeThis.applySelectedModel(model)).rejects.toThrow("model unavailable");
 
@@ -2806,22 +2821,10 @@ describe("InteractiveMode model selection persistence", () => {
 
 	test("persists exact /model command selections after the connection accepts them", async () => {
 		const model = createModel("openai", "gpt-5.5");
-		const fakeThis = Object.create(InteractiveMode.prototype) as ModelSelectionHarness;
-		fakeThis.agentConnection = {
-			setModel: vi.fn(async () => {}),
-			getState: vi.fn(async () =>
-				createConnectionState({ model, serviceTier: "default", availableThinkingLevels: ["off"] }),
-			),
-		};
-		fakeThis.uiServices = {
-			settingsManager: {
-				setDefaultModelAndProvider: vi.fn(),
-			},
-		};
-		fakeThis.footer = { invalidate: vi.fn() };
-		fakeThis.subagentSummaryLine = { invalidate: vi.fn() };
-		fakeThis.patchConnectionState = vi.fn();
-		fakeThis.updateEditorBorderColor = vi.fn();
+		const fakeThis = createModelSelectionFake({
+			setModel: async () => {},
+			state: createConnectionState({ model, serviceTier: "default", availableThinkingLevels: ["off"] }),
+		});
 		fakeThis.showStatus = vi.fn();
 		fakeThis.showError = vi.fn();
 		fakeThis.connectionConfiguredProviders = new Set([model.provider]);
@@ -3194,40 +3197,7 @@ describe("InteractiveMode model selection persistence", () => {
 			.fn<() => Promise<AgentConnectionModelCatalog>>()
 			.mockImplementationOnce(() => oldModels.promise)
 			.mockImplementationOnce(async () => ({ models: [freshModel], configuredProviders: [freshModel.provider] }));
-		const fakeThis = Object.create(InteractiveMode.prototype) as ModelSelectorOverlayHarness & {
-			connectionCommands: unknown[];
-			connectionResourceSnapshot: unknown;
-			refreshConnectionCatalog(): Promise<void>;
-			applyConnectionStateSnapshot(state: AgentConnectionState): void;
-			invalidateConnectionModels(): void;
-			invalidateConnectionModelRefresh(): void;
-		};
-		fakeThis.agentConnection = {
-			getModelCatalog,
-			getState: vi.fn(async () => createConnectionState()),
-			getCommands: vi.fn(async () => []),
-			getResourceSnapshot: vi.fn(async () => ({})),
-			setModel: vi.fn(async () => {}),
-		} as never;
-		fakeThis.connectionModels = [];
-		fakeThis.connectionModelCatalog = [];
-		fakeThis.connectionConfiguredProviders = new Set();
-		fakeThis.connectionModelsFetchedAt = 0;
-		fakeThis.connectionModelsRefreshVersion = 0;
-		fakeThis.connectionModelsRefreshInFlight = undefined;
-		fakeThis.getScopedModelState = vi.fn(() => []);
-		fakeThis.applyConnectionModelCatalog = overlayPrototype.applyConnectionModelCatalog;
-		fakeThis.getConnectionAvailableModels = overlayPrototype.getConnectionAvailableModels;
-		fakeThis.refreshConnectionCatalog = (
-			InteractiveMode.prototype as unknown as { refreshConnectionCatalog(): Promise<void> }
-		).refreshConnectionCatalog;
-		fakeThis.invalidateConnectionModels = (
-			InteractiveMode.prototype as unknown as { invalidateConnectionModels(): void }
-		).invalidateConnectionModels;
-		fakeThis.invalidateConnectionModelRefresh = (
-			InteractiveMode.prototype as unknown as { invalidateConnectionModelRefresh(): void }
-		).invalidateConnectionModelRefresh;
-		fakeThis.applyConnectionStateSnapshot = vi.fn();
+		const fakeThis = createCatalogRefreshHarness({ getModelCatalog });
 
 		const staleRefresh = fakeThis.getConnectionAvailableModels();
 		await fakeThis.refreshConnectionCatalog();
@@ -3240,39 +3210,16 @@ describe("InteractiveMode model selection persistence", () => {
 
 	test("keeps the cached model catalog when a catalog refresh fails", async () => {
 		const cachedModel = createModel("openai", "cached");
-		const fakeThis = Object.create(InteractiveMode.prototype) as ModelSelectorOverlayHarness & {
-			connectionCommands: unknown[];
-			connectionResourceSnapshot: unknown;
-			refreshConnectionCatalog(): Promise<void>;
-			applyConnectionStateSnapshot(state: AgentConnectionState): void;
-			invalidateConnectionModelRefresh(): void;
-		};
-		fakeThis.agentConnection = {
-			getModelCatalog: vi.fn(async () => {
+		const fakeThis = createCatalogRefreshHarness({
+			getModelCatalog: async () => {
 				const fresh = createModel("openai", "fresh");
 				return { models: [fresh], configuredProviders: [fresh.provider] };
-			}),
-			getState: vi.fn(async () => createConnectionState()),
-			getCommands: vi.fn(async () => {
+			},
+			getCommands: async () => {
 				throw new Error("commands unavailable");
-			}),
-			getResourceSnapshot: vi.fn(async () => ({})),
-			setModel: vi.fn(async () => {}),
-		} as never;
-		fakeThis.connectionModels = [cachedModel];
-		fakeThis.connectionModelCatalog = [cachedModel];
-		fakeThis.connectionConfiguredProviders = new Set([cachedModel.provider]);
-		fakeThis.connectionModelsFetchedAt = Date.now();
-		fakeThis.connectionModelsRefreshVersion = 0;
-		fakeThis.connectionModelsRefreshInFlight = undefined;
-		fakeThis.applyConnectionModelCatalog = overlayPrototype.applyConnectionModelCatalog;
-		fakeThis.refreshConnectionCatalog = (
-			InteractiveMode.prototype as unknown as { refreshConnectionCatalog(): Promise<void> }
-		).refreshConnectionCatalog;
-		fakeThis.invalidateConnectionModelRefresh = (
-			InteractiveMode.prototype as unknown as { invalidateConnectionModelRefresh(): void }
-		).invalidateConnectionModelRefresh;
-		fakeThis.applyConnectionStateSnapshot = vi.fn();
+			},
+			cachedModel,
+		});
 
 		await expect(fakeThis.refreshConnectionCatalog()).resolves.toBeUndefined();
 
@@ -3469,6 +3416,19 @@ describe("InteractiveMode session switch command catalog", () => {
 	});
 });
 
+const primeInferenceModel: AgentConnectionModel = {
+	id: "openai/gpt-5.5",
+	name: "GPT-5.5",
+	api: "openai-completions",
+	provider: PRIME_INFERENCE_PROVIDER_ID,
+	baseUrl: "https://api.pinference.ai/api/v1",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 1050000,
+	maxTokens: 128000,
+} as AgentConnectionModel;
+
 describe("InteractiveMode Prime CLI onboarding", () => {
 	type OnboardingSplashHandle = {
 		showProgress(message: string): void;
@@ -3550,23 +3510,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		};
 	}
 
-	const primeModel: AgentConnectionModel = {
-		id: "openai/gpt-5.5",
-		name: "GPT-5.5",
-		api: "openai-completions",
-		provider: PRIME_INFERENCE_PROVIDER_ID,
-		baseUrl: "https://api.pinference.ai/api/v1",
-		reasoning: true,
-		input: ["text"],
-		cost: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-		},
-		contextWindow: 1050000,
-		maxTokens: 128000,
-	} as AgentConnectionModel;
+	const primeModel = primeInferenceModel;
 
 	test("defers, retries transient startup failures, and skips a persistently failing prompt", async () => {
 		vi.useFakeTimers();
@@ -3585,11 +3529,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		});
 		const showError = vi.fn();
 		const submitHarness = createSubmitHandlerHarness({
-			agentConnection: {
-				prompt,
-				executeBash: vi.fn(async () => {}),
-				getState: vi.fn(async () => ({ isBashRunning: false })),
-			},
+			agentConnection: stubPromptConnection(prompt),
 		});
 		const fakeThis = Object.assign(
 			submitHarness,
@@ -3668,11 +3608,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			const promptStashState: PromptStashState = { stash: { text: "existing draft [image #3]" } };
 			const submitHarness = createSubmitHandlerHarness({
 				promptStashState,
-				agentConnection: {
-					prompt,
-					executeBash: vi.fn(async () => {}),
-					getState: vi.fn(async () => ({ isBashRunning: false })),
-				},
+				agentConnection: stubPromptConnection(prompt),
 				pastedImages: new Map([[1, { type: "image", data: "existing", mimeType: "image/png" }]]),
 				nextImageMarkerId: 1,
 			});
@@ -3727,11 +3663,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			.mockRejectedValueOnce(new AgentConnectionPromptAdmissionError("session owns prompt", "owned"))
 			.mockResolvedValueOnce(undefined);
 		const submitHarness = createSubmitHandlerHarness({
-			agentConnection: {
-				prompt,
-				executeBash: vi.fn(async () => {}),
-				getState: vi.fn(async () => ({ isBashRunning: false })),
-			},
+			agentConnection: stubPromptConnection(prompt),
 		});
 		const fakeThis = Object.assign(
 			submitHarness,
@@ -3777,11 +3709,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 						editorText = text;
 					},
 				},
-				agentConnection: {
-					prompt,
-					executeBash: vi.fn(async () => {}),
-					getState: vi.fn(async () => ({ isBashRunning: false })),
-				},
+				agentConnection: stubPromptConnection(prompt),
 			});
 			const fakeThis = Object.assign(
 				submitHarness,
@@ -3852,11 +3780,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		});
 		const fakeThis = Object.assign(
 			createSubmitHandlerHarness({
-				agentConnection: {
-					prompt,
-					executeBash: vi.fn(async () => {}),
-					getState: vi.fn(async () => ({ isBashRunning: false })),
-				},
+				agentConnection: stubPromptConnection(prompt),
 			}),
 			createStartupRunHarness(
 				{ initialMessage: "startup" },
@@ -3955,11 +3879,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		const fakeThis = createSubmitHandlerHarness({
 			promptStashState: oldState,
 			admitPendingStartupPrompts: () => barrier.promise,
-			agentConnection: {
-				prompt,
-				executeBash: vi.fn(async () => {}),
-				getState: vi.fn(async () => ({ isBashRunning: false })),
-			},
+			agentConnection: stubPromptConnection(prompt),
 		});
 		(fakeThis as unknown as { promptStashSessionId?: string }).promptStashSessionId = "session-old";
 
@@ -3976,15 +3896,25 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(newState.stash).toBeUndefined();
 	});
 
+	function createDeferredReleaseFake(store: ClientPromptStashStore, sessionId: string, state: PromptStashState) {
+		return {
+			inputSubmissionsPending: 1,
+			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
+			promptStashStore: store,
+			promptStashSessionId: sessionId,
+			promptStashState: state,
+		};
+	}
+	const deferredReleaseMethods = InteractiveMode.prototype as unknown as {
+		releasePromptStashSession(this: unknown): void;
+		completeDeferredPromptStashRelease(this: unknown): void;
+	};
+
 	test("defers stash-store release until lifecycle-retained submissions settle", () => {
 		const store = new ClientPromptStashStore();
 		const state = store.forSession("session-a");
 		const fakeThis = {
-			inputSubmissionsPending: 1,
-			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
-			promptStashStore: store,
-			promptStashSessionId: "session-a",
-			promptStashState: state,
+			...createDeferredReleaseFake(store, "session-a", state),
 			retainedSubmissionGenerations: new WeakMap(),
 		};
 		const release = (InteractiveMode.prototype as unknown as { releasePromptStashSession(this: unknown): void })
@@ -4008,26 +3938,16 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 	test("a deferred release targets the session captured at deferral, not a rebound one", () => {
 		const store = new ClientPromptStashStore();
 		const oldState = store.forSession("session-old");
-		const fakeThis = {
-			inputSubmissionsPending: 1,
-			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
-			promptStashStore: store,
-			promptStashSessionId: "session-old",
-			promptStashState: oldState,
-		};
-		const methods = InteractiveMode.prototype as unknown as {
-			releasePromptStashSession(this: unknown): void;
-			completeDeferredPromptStashRelease(this: unknown): void;
-		};
+		const fakeThis = createDeferredReleaseFake(store, "session-old", oldState);
 
-		methods.releasePromptStashSession.call(fakeThis);
+		deferredReleaseMethods.releasePromptStashSession.call(fakeThis);
 		const newState = store.forSession("session-new");
 		newState.stash = { text: "new session draft" };
 		fakeThis.promptStashSessionId = "session-new";
 		fakeThis.promptStashState = newState;
 
 		fakeThis.inputSubmissionsPending = 0;
-		methods.completeDeferredPromptStashRelease.call(fakeThis);
+		deferredReleaseMethods.completeDeferredPromptStashRelease.call(fakeThis);
 
 		expect(store.forSession("session-old")).not.toBe(oldState);
 		expect(store.forSession("session-new")).toBe(newState);
@@ -4037,33 +3957,23 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 	test("a teardown release after a rebind keeps both deferred session releases", () => {
 		const store = new ClientPromptStashStore();
 		const oldState = store.forSession("session-old");
-		const fakeThis = {
-			inputSubmissionsPending: 1,
-			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
-			promptStashStore: store,
-			promptStashSessionId: "session-old",
-			promptStashState: oldState,
-		};
-		const methods = InteractiveMode.prototype as unknown as {
-			releasePromptStashSession(this: unknown): void;
-			completeDeferredPromptStashRelease(this: unknown): void;
-		};
+		const fakeThis = createDeferredReleaseFake(store, "session-old", oldState);
 
 		// /new rebind defers the old session's release...
-		methods.releasePromptStashSession.call(fakeThis);
+		deferredReleaseMethods.releasePromptStashSession.call(fakeThis);
 		const newState = store.forSession("session-new");
 		fakeThis.promptStashSessionId = "session-new";
 		fakeThis.promptStashState = newState;
 		// ...then teardown defers the rebound session's release while the same
 		// submission is still pending. The first pair must not be overwritten.
-		methods.releasePromptStashSession.call(fakeThis);
+		deferredReleaseMethods.releasePromptStashSession.call(fakeThis);
 		expect(fakeThis.pendingPromptStashReleases.map((pending) => pending.sessionId)).toEqual([
 			"session-old",
 			"session-new",
 		]);
 
 		fakeThis.inputSubmissionsPending = 0;
-		methods.completeDeferredPromptStashRelease.call(fakeThis);
+		deferredReleaseMethods.completeDeferredPromptStashRelease.call(fakeThis);
 
 		expect(store.forSession("session-old")).not.toBe(oldState);
 		expect(store.forSession("session-new")).not.toBe(newState);
@@ -4324,35 +4234,29 @@ describe("InteractiveMode post-login model preparation", () => {
 
 	const prepareForModelSelectionAfterLogin = (InteractiveMode.prototype as unknown as LoginHarness)
 		.prepareForModelSelectionAfterLogin;
-	const loginPrimeModel: AgentConnectionModel = {
-		id: "openai/gpt-5.5",
-		name: "GPT-5.5",
-		api: "openai-completions",
-		provider: PRIME_INFERENCE_PROVIDER_ID,
-		baseUrl: "https://api.pinference.ai/api/v1",
-		reasoning: true,
-		input: ["text"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 1050000,
-		maxTokens: 128000,
-	} as AgentConnectionModel;
+	const loginPrimeModel = primeInferenceModel;
+
+	function createLoginHarness(options: {
+		currentModel?: AgentConnectionModel;
+		foundModel?: AgentConnectionModel;
+		flush?: () => Promise<void>;
+	}): LoginHarness {
+		const fakeThis = Object.create(InteractiveMode.prototype) as LoginHarness;
+		fakeThis.invalidateConnectionModels = vi.fn();
+		fakeThis.getCurrentModel = vi.fn(() => options.currentModel);
+		fakeThis.applySelectedModel = vi.fn(async () => {});
+		fakeThis.showError = vi.fn();
+		fakeThis.uiServices = {
+			modelRegistry: { find: vi.fn(() => options.foundModel) },
+			settingsManager: { flush: options.flush ?? (async () => {}) },
+		};
+		return fakeThis;
+	}
 
 	test("persists GLM 5.2 before model selection after Prime Inference login", async () => {
 		const fallbackModel = { ...loginPrimeModel, id: "z-ai/glm-5.2", name: "GLM 5.2" };
 		const flushSettings = vi.fn(async () => {});
-		const fakeThis = Object.create(InteractiveMode.prototype) as LoginHarness;
-		fakeThis.invalidateConnectionModels = vi.fn();
-		fakeThis.getCurrentModel = vi.fn(() => undefined);
-		fakeThis.applySelectedModel = vi.fn(async () => {});
-		fakeThis.showError = vi.fn();
-		fakeThis.uiServices = {
-			modelRegistry: {
-				find: vi.fn(() => fallbackModel),
-			},
-			settingsManager: {
-				flush: flushSettings,
-			},
-		};
+		const fakeThis = createLoginHarness({ foundModel: fallbackModel, flush: flushSettings });
 
 		await expect(
 			prepareForModelSelectionAfterLogin.call(fakeThis, {
@@ -4370,19 +4274,7 @@ describe("InteractiveMode post-login model preparation", () => {
 	});
 
 	test("preserves refreshed models after any model-provider login", async () => {
-		const fakeThis = Object.create(InteractiveMode.prototype) as LoginHarness;
-		fakeThis.invalidateConnectionModels = vi.fn();
-		fakeThis.getCurrentModel = vi.fn(() => loginPrimeModel);
-		fakeThis.applySelectedModel = vi.fn(async () => {});
-		fakeThis.showError = vi.fn();
-		fakeThis.uiServices = {
-			modelRegistry: {
-				find: vi.fn(() => undefined),
-			},
-			settingsManager: {
-				flush: vi.fn(async () => {}),
-			},
-		};
+		const fakeThis = createLoginHarness({ currentModel: loginPrimeModel });
 
 		await expect(
 			prepareForModelSelectionAfterLogin.call(fakeThis, {
@@ -4501,79 +4393,55 @@ describe("InteractiveMode tray goal label", () => {
 		};
 	}
 
-	test("shows active goals in the lower tray without an objective", () => {
+	function createTrayLabelHarness(options: {
+		objective?: string;
+		contextUsage?: TrayUsage;
+		withHeartbeat?: boolean;
+	}): TrayLabelHarness {
+		const heartbeat = options.withHeartbeat ? createHeartbeat("active") : undefined;
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
-		fakeThis.heartbeats = [];
+		fakeThis.heartbeats = heartbeat ? [{ job: heartbeat }] : [];
 		fakeThis.connectionState = {
 			goal: {
 				active: true,
 				status: "active",
-				objective: "a long objective that should not render in the tray",
+				objective: options.objective ?? "finish the task",
 				tokensUsed: 0,
 				timeUsedSeconds: 65,
 				continuationsUsed: 1,
 			} satisfies GoalState,
-			contextUsage: undefined,
+			...(heartbeat ? { heartbeat } : {}),
+			contextUsage: options.contextUsage,
 		};
 		fakeThis.uiServices = { getContextUsage: () => undefined };
+		return fakeThis;
+	}
+
+	test("shows active goals in the lower tray without an objective", () => {
+		const fakeThis = createTrayLabelHarness({ objective: "a long objective that should not render in the tray" });
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
 	test("combines active goals with token/context usage in one lower-tray label", () => {
-		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
-		fakeThis.heartbeats = [];
-		fakeThis.connectionState = {
-			goal: {
-				active: true,
-				status: "active",
-				objective: "finish the task",
-				tokensUsed: 0,
-				timeUsedSeconds: 65,
-				continuationsUsed: 1,
-			} satisfies GoalState,
+		const fakeThis = createTrayLabelHarness({
 			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
-		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		});
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 75k (75%)");
 	});
 
 	test("combines active goals, active heartbeats, and context usage in one lower-tray label", () => {
-		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
-		fakeThis.heartbeats = [{ job: createHeartbeat("active") }];
-		fakeThis.connectionState = {
-			goal: {
-				active: true,
-				status: "active",
-				objective: "finish the task",
-				tokensUsed: 0,
-				timeUsedSeconds: 65,
-				continuationsUsed: 1,
-			} satisfies GoalState,
-			heartbeat: createHeartbeat("active"),
+		const fakeThis = createTrayLabelHarness({
+			withHeartbeat: true,
 			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
-		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		});
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 1 heartbeat · 75k (75%)");
 	});
 
 	test("omits the usage segment when token count is unknown", () => {
-		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
-		fakeThis.heartbeats = [];
-		fakeThis.connectionState = {
-			goal: {
-				active: true,
-				status: "active",
-				objective: "finish the task",
-				tokensUsed: 0,
-				timeUsedSeconds: 65,
-				continuationsUsed: 1,
-			} satisfies GoalState,
-			contextUsage: { contextWindow: 100_000, tokens: null, percent: null },
-		};
-		fakeThis.uiServices = { getContextUsage: () => undefined };
+		const fakeThis = createTrayLabelHarness({ contextUsage: { contextWindow: 100_000, tokens: null, percent: null } });
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});

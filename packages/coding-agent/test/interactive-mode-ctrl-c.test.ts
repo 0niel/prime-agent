@@ -193,27 +193,20 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.queuePausedForPendingEdit).toBe(false);
 	});
 
-	it("resumes after queue fetch fails without losing track of a failed resume", async () => {
+	it.each([
+		[undefined, false],
+		["resume unavailable", true],
+	] as const)("tracks a queue-fetch failure when resume fails with %s", async (resumeError, remainsPaused) => {
 		const mode = createInteractiveFake({ streaming: true });
 		mode.agentConnection.getQueue.mockRejectedValue(new Error("queue unavailable"));
+		if (resumeError) mode.agentConnection.resumeQueue.mockRejectedValue(new Error(resumeError));
 
 		await expect(Reflect.get(InteractiveMode.prototype, "interruptAndRecallPending").call(mode)).rejects.toThrow(
 			"queue unavailable",
 		);
 		expect(mode.agentConnection.resumeQueue).toHaveBeenCalledOnce();
-		expect(mode.queuePausedForPendingEdit).toBe(false);
-	});
-
-	it("keeps the pause retryable when queue fetch and resume both fail", async () => {
-		const mode = createInteractiveFake({ streaming: true });
-		mode.agentConnection.getQueue.mockRejectedValue(new Error("queue unavailable"));
-		mode.agentConnection.resumeQueue.mockRejectedValue(new Error("resume unavailable"));
-
-		await expect(Reflect.get(InteractiveMode.prototype, "interruptAndRecallPending").call(mode)).rejects.toThrow(
-			"queue unavailable",
-		);
-		expect(mode.queuePausedForPendingEdit).toBe(true);
-		expect(mode.showError).toHaveBeenCalledWith("resume unavailable");
+		expect(mode.queuePausedForPendingEdit).toBe(remainsPaused);
+		if (resumeError) expect(mode.showError).toHaveBeenCalledWith(resumeError);
 	});
 
 	it("does not let an older resume clear a newer interrupt pause", async () => {
