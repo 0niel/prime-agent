@@ -940,6 +940,25 @@ export function findActiveDaemonSessionSummaryForSessionFile(
 	);
 }
 
+/**
+ * ACP requests a resident daemon worker when the negotiated daemon supports it.
+ * Keeping this as a pure helper makes the compatibility fallback explicit.
+ */
+export function shouldUseResidentAcpSession(serverCapabilities: readonly string[]): boolean {
+	return serverCapabilities.includes("acp_resident_sessions");
+}
+
+export function resolveHeadlessDaemonSessionLifecycle(options: {
+	preferResident?: boolean;
+	clientOwned?: boolean;
+	serverCapabilities: readonly string[];
+}): "resident" | "client_owned" {
+	if (options.preferResident) {
+		return shouldUseResidentAcpSession(options.serverCapabilities) ? "resident" : "client_owned";
+	}
+	return options.clientOwned ? "client_owned" : "resident";
+}
+
 async function createDaemonClientConnection(options: {
 	socketPath: string;
 	config: AgentSessionRuntimeConfig;
@@ -947,6 +966,8 @@ async function createDaemonClientConnection(options: {
 	continueRecent?: boolean;
 	activeSessionId?: string;
 	clientOwned?: boolean;
+	/** ACP prefers resident lifecycle, but old daemons must fall back cleanly. */
+	preferResident?: boolean;
 	noSession?: boolean;
 	supportsExtensionUi?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
@@ -955,11 +976,20 @@ async function createDaemonClientConnection(options: {
 	await client.connect();
 
 	try {
+		await client.waitForHello();
+		// Resident ACP is optional so a newer client remains compatible with an
+		// older daemon. RPC and other callers retain their explicit lifecycle.
+		const lifecycle = resolveHeadlessDaemonSessionLifecycle({
+			preferResident: options.preferResident,
+			clientOwned: options.clientOwned,
+			serverCapabilities: client.hello?.serverCapabilities ?? [],
+		});
+		const clientOwned = lifecycle === "client_owned";
 		const attach = async (summary: SessionSummary) => {
 			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
 				closeClientOnDispose: true,
 				sendClientEnv: true,
-				ownedSession: options.clientOwned,
+				ownedSession: clientOwned,
 				supportsExtensionUi: options.supportsExtensionUi,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
@@ -972,7 +1002,7 @@ async function createDaemonClientConnection(options: {
 			return await attach(summary);
 		}
 
-		if (options.sessionPath && !options.clientOwned) {
+		if (options.sessionPath && !clientOwned) {
 			const activeSummary = findActiveDaemonSessionSummaryForSessionFile(
 				await listActiveDaemonSessionSummaries(client),
 				options.sessionPath,
@@ -981,8 +1011,7 @@ async function createDaemonClientConnection(options: {
 				return await attach(activeSummary);
 			}
 		}
-		if (options.clientOwned) {
-			await client.waitForHello();
+		if (clientOwned) {
 			if (!client.supportsServerCapability("client_owned_sessions")) {
 				throw new DaemonCapabilityUnavailableError("create", "client_owned_sessions");
 			}
@@ -995,8 +1024,8 @@ async function createDaemonClientConnection(options: {
 			continueRecent: options.continueRecent,
 			noSession: options.noSession,
 			env: collectDaemonClientEnv(),
-			lifecycle: options.clientOwned ? "client_owned" : "resident",
-			launchEnv: options.clientOwned ? collectDaemonLaunchEnv() : undefined,
+			lifecycle: clientOwned ? "client_owned" : "resident",
+			launchEnv: clientOwned ? collectDaemonLaunchEnv() : undefined,
 		});
 		if (!response.success) {
 			throw deserializeDaemonError(response);
@@ -1530,7 +1559,8 @@ export async function main(args: string[], options?: MainOptions) {
 				config: defaultSessionConfig,
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
 				continueRecent: parsed.continue,
-				clientOwned: true,
+				clientOwned: appMode === "rpc",
+				preferResident: appMode === "acp",
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
 			}));
