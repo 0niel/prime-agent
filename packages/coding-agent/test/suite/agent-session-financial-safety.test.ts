@@ -96,6 +96,23 @@ describe("AgentSession financial safety", () => {
 		expect(harness.faux.state.callCount).toBe(0);
 	});
 
+	it("allows inference-free refinement rollback while the quota circuit is open", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		await (harness.session as unknown as SessionInternals)._processAgentEvent({
+			type: "message_end",
+			message: providerFailure("quota", "premium request quota exceeded", "req_refine_rollback"),
+		} as AgentEvent);
+
+		await expect(harness.session.refine({ rollbackId: "missing_refinement" })).rejects.toThrow(
+			"Refinement missing_refinement not found",
+		);
+		await harness.session.prompt("/refine rollback missing_refinement");
+
+		expect(harness.session.isProviderQuotaCircuitOpen).toBe(true);
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
 	it("rejects recovered provider turns atomically while the quota circuit is open", async () => {
 		const source = await createHarness();
 		const target = await createHarness();

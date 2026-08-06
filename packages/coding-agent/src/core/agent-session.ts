@@ -687,7 +687,14 @@ interface PreparedCommandPayload extends SessionCommandPayload {
 type QueuedSessionAction = SessionAction<PreparedTurnPayload | PreparedCommandPayload>;
 
 function sessionCommandUsesProvider(command: SessionSlashCommand): boolean {
-	return command.name === "compact" || command.name === "refine";
+	if (command.name === "compact") return true;
+	if (command.name !== "refine") return false;
+	try {
+		return parseRefineCommandOptions(command.args).rollbackId === undefined;
+	} catch {
+		// Invalid rollback syntax fails during command execution without inference.
+		return false;
+	}
 }
 
 function sessionActionUsesProvider(action: QueuedSessionAction): boolean {
@@ -7637,7 +7644,7 @@ export class AgentSession {
 		} = {},
 		internal: { skipAbort?: boolean } = {},
 	): Promise<RefinementResult> {
-		this._assertProviderQuotaCircuitClosed();
+		if (!options.rollbackId) this._assertProviderQuotaCircuitClosed();
 		// Queued /refine executes from the session-input pump between turns;
 		// refine never aborts the agent (planning is backgrounded and the apply
 		// phase waits for quiescence), so skipAbort only asserts the pump's
@@ -7773,7 +7780,7 @@ export class AgentSession {
 		}
 
 		const model = this.model;
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const requestAuth = options.rollbackId ? undefined : await this._getRequiredRequestAuth(model);
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -7804,15 +7811,15 @@ export class AgentSession {
 			: baselineScope === "global"
 				? globalPlanningState
 				: localPlanningState!;
-		this._assertProviderQuotaCircuitClosed();
+		if (!options.rollbackId) this._assertProviderQuotaCircuitClosed();
 		const plan = await planRefinement(
 			this.agent.state.messages,
 			planningState,
 			history,
 			model,
-			apiKey,
+			requestAuth?.apiKey ?? "",
 			options,
-			headers,
+			requestAuth?.headers,
 			signal,
 			this.thinkingLevel,
 		);
