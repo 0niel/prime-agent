@@ -992,6 +992,8 @@ export class InteractiveMode {
 	private readonly pendingMessageNavigation = new PendingMessageNavigation();
 	private pendingMessageMutation: Promise<PendingMessageMutationOutcome> = Promise.resolve("noop");
 	private queuePausedForPendingEdit = false;
+	private queuePauseGeneration = 0;
+	private queueResumeInFlight?: Promise<boolean>;
 	private queueMutationInFlight = 0;
 	private queueEventGeneration = 0;
 	private isPendingMessageNavigationTextChange = false;
@@ -1062,7 +1064,9 @@ export class InteractiveMode {
 			throw new Error("Local extension binding requires localSessionHost");
 		}
 		this.agentConnection.onBeforeSessionInvalidate(() => {
-			void this.abandonInterruptedQueue();
+			this.pendingMessageNavigation.reset();
+			this.queuePausedForPendingEdit = false;
+			this.queuePauseGeneration++;
 			this.resetExtensionUI();
 			this.resetSideQuestion();
 		});
@@ -2822,6 +2826,7 @@ export class InteractiveMode {
 		this.connectionQueue = { steering: [], followUp: [] };
 		this.pendingMessageNavigation?.reset();
 		this.queuePausedForPendingEdit = false;
+		this.queuePauseGeneration++;
 		this.featureHintSuppressedByQueue = false;
 		if (options?.clearPromptStash) {
 			this.promptStash = undefined;
@@ -6729,17 +6734,25 @@ export class InteractiveMode {
 	}
 
 	private async interruptAndRecallPending(): Promise<void> {
+		if (this.queueResumeInFlight) await this.queueResumeInFlight;
 		const editorGeneration = this.editorChangeGeneration;
 		const checkpoint = this.pendingMessageNavigation.checkpoint();
 		const draft = this.pendingMessageNavigation.selected ? checkpoint.draft : this.editor.getText();
 		await this.agentConnection.abort();
-		const fetched = await this.agentConnection.getQueue();
+		this.queuePausedForPendingEdit = true;
+		this.queuePauseGeneration++;
+		let fetched: AgentConnectionQueueState;
+		try {
+			fetched = await this.agentConnection.getQueue();
+		} catch (error) {
+			await this.resumeInterruptedQueue();
+			throw error;
+		}
 		const queue = (fetched.revision ?? -1) >= (this.connectionQueue.revision ?? -1) ? fetched : this.connectionQueue;
 		this.connectionQueue = queue;
 		const recalled = this.pendingMessageNavigation.recallFirst(queue, draft);
-		this.queuePausedForPendingEdit = recalled !== undefined;
 		if (recalled === undefined) {
-			await this.agentConnection.resumeQueue();
+			await this.resumeInterruptedQueue();
 		} else if (this.editorChangeGeneration === editorGeneration) {
 			this.setEditorFromPendingNavigation(recalled);
 		} else {
@@ -6755,14 +6768,24 @@ export class InteractiveMode {
 	}
 
 	private async resumeInterruptedQueue(): Promise<boolean> {
+		if (this.queueResumeInFlight) return this.queueResumeInFlight;
 		if (!this.queuePausedForPendingEdit) return true;
+		const pauseGeneration = this.queuePauseGeneration;
+		const resume = (async () => {
+			try {
+				await this.agentConnection.resumeQueue();
+				if (this.queuePauseGeneration === pauseGeneration) this.queuePausedForPendingEdit = false;
+				return true;
+			} catch (error) {
+				this.showError(error instanceof Error ? error.message : String(error));
+				return false;
+			}
+		})();
+		this.queueResumeInFlight = resume;
 		try {
-			await this.agentConnection.resumeQueue();
-			this.queuePausedForPendingEdit = false;
-			return true;
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-			return false;
+			return await resume;
+		} finally {
+			if (this.queueResumeInFlight === resume) this.queueResumeInFlight = undefined;
 		}
 	}
 
@@ -7163,12 +7186,14 @@ export class InteractiveMode {
 		if (this.queuePausedForPendingEdit && kind === "delete") {
 			this.connectionQueue = result.queue;
 			const recalled = this.pendingMessageNavigation.recallFirst(result.queue, checkpoint.draft);
+			if (recalled === undefined) this.pendingMessageNavigation.reset();
 			if (this.editorChangeGeneration === editorGeneration) {
 				this.setEditorFromPendingNavigation(recalled ?? checkpoint.draft);
 			}
+			const resumed = recalled !== undefined || (await this.resumeInterruptedQueue());
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
-			return "applied";
+			return resumed ? "applied" : "retained";
 		}
 		this.pendingMessageNavigation.restore(changedState);
 		this.pendingMessageNavigation.reconcile(result.queue, change.selected?.id);
@@ -7176,12 +7201,18 @@ export class InteractiveMode {
 		if (this.editorChangeGeneration === editorGeneration) {
 			this.setEditorFromPendingNavigation(change.selected ? text : change.draft);
 		}
+		let outcome: PendingMessageMutationOutcome = "applied";
 		if (this.queuePausedForPendingEdit && (kind === "steer" || kind === "followUp")) {
-			await this.resumeInterruptedQueue();
+			if (!(await this.resumeInterruptedQueue())) {
+				this.pendingMessageNavigation.restore(checkpoint);
+				this.pendingMessageNavigation.reconcile(result.queue, selected.id);
+				if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
+				outcome = "retained";
+			}
 		}
 		this.updatePendingMessagesDisplay();
 		this.ui.requestRender();
-		return "applied";
+		return outcome;
 	}
 
 	private moveSelectedPendingMessage(delta: -1 | 1): Promise<PendingMessageMutationOutcome> {
@@ -8425,7 +8456,6 @@ export class InteractiveMode {
 	): Promise<{ cancelled: boolean }> {
 		this.stopWorkingLoader();
 		try {
-			if (this.queuePausedForPendingEdit) await this.abandonInterruptedQueue();
 			const result = options?.withSession
 				? await this.getLocalSessionHost().switchSession(sessionPath, {
 						withSession: options.withSession,
@@ -9848,7 +9878,6 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		};
 		let created = false;
 		try {
-			if (this.queuePausedForPendingEdit) await this.abandonInterruptedQueue();
 			const result = await this.agentConnection.newSession();
 			if (result.cancelled) {
 				restorePrompt();

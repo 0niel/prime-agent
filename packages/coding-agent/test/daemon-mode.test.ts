@@ -8458,12 +8458,19 @@ describe("daemon mode helpers", () => {
 			activity: { unfinishedActionCount: 1 },
 			acceptingAgentMessage: false,
 		},
+		{
+			name: "queues generic cron jobs without resuming an interrupted editor pause",
+			activity: { unfinishedActionCount: 1, isQueuedWorkSuspended: true },
+			acceptingAgentMessage: false,
+		},
 	] as const)("$name", async ({ activity, acceptingAgentMessage }) => {
 		const fixture = makeCronAdmissionFixture(activity, { acceptingAgentMessage });
 
 		await fixture.runCronJob(makeCronJob({ id: "cron-1", source: "cron", activeSessionId: fixture.activeSessionId }));
 
-		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
+		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, {
+			resumeIfIdle: activity.isQueuedWorkSuspended !== true,
+		});
 		expect(fixture.prompt).not.toHaveBeenCalled();
 		expect(fixture.promptHeartbeat).not.toHaveBeenCalled();
 	});

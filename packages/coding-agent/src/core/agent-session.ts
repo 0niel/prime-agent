@@ -6203,6 +6203,10 @@ export class AgentSession {
 		return this._actionStore.unfinishedActions().length;
 	}
 
+	get isQueuedWorkSuspended(): boolean {
+		return this._sessionInputPumpSuspended;
+	}
+
 	get isSessionActive(): boolean {
 		return (
 			this.isStreaming ||

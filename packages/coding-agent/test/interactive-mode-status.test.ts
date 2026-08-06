@@ -928,6 +928,7 @@ describe("InteractiveMode submit handling", () => {
 			mutateQueueItem: async () => ({ status: "applied", queue: { ...queue, revision: 2 } }),
 			extra: {
 				queuePausedForPendingEdit: true,
+				queuePauseGeneration: 1,
 				resumeInterruptedQueue: Reflect.get(InteractiveMode.prototype, "resumeInterruptedQueue"),
 				updatePendingMessagesDisplay: vi.fn(),
 				ui: { requestRender: vi.fn() },
@@ -941,6 +942,27 @@ describe("InteractiveMode submit handling", () => {
 		expect(resumeQueue).toHaveBeenCalledTimes(shouldResume ? 1 : 0);
 	});
 
+	test("reports a committed edit as retained when queue resume fails", async () => {
+		const queue = {
+			steering: [],
+			followUp: ["old"],
+			revision: 1,
+			items: [{ id: "action-1", lane: "followUp" as const, index: 0, text: "old" }],
+		};
+		const harness = createApplyMutationHarness({
+			queue,
+			mutateQueueItem: async () => ({ status: "applied", queue: { ...queue, revision: 2 } }),
+			extra: {
+				queuePausedForPendingEdit: true,
+				resumeInterruptedQueue: vi.fn(async () => false),
+				updatePendingMessagesDisplay: vi.fn(),
+				ui: { requestRender: vi.fn() },
+			},
+		});
+		expect(await harness.apply("followUp")).toBe("retained");
+		expect(harness.editorText).toBe("edited");
+	});
+
 	test.each([
 		[
 			"next",
@@ -952,7 +974,7 @@ describe("InteractiveMode submit handling", () => {
 			},
 		],
 		["draft", { steering: [], followUp: [], revision: 2, items: [] }],
-	] as const)("interrupted delete recalls %s while leaving the queue paused", async (expected, resultQueue) => {
+	] as const)("interrupted delete recalls %s and resumes when empty", async (expected, resultQueue) => {
 		const queue = {
 			steering: [],
 			followUp: ["old"],
@@ -965,13 +987,19 @@ describe("InteractiveMode submit handling", () => {
 			mutateQueueItem: async () => ({ status: "applied", queue: resultQueue }),
 			extra: {
 				queuePausedForPendingEdit: true,
+				queuePauseGeneration: 1,
+				resumeInterruptedQueue: Reflect.get(InteractiveMode.prototype, "resumeInterruptedQueue"),
+				agentConnection: {
+					mutateQueueItem: vi.fn(async () => ({ status: "applied", queue: resultQueue })),
+					resumeQueue: vi.fn(async () => {}),
+				},
 				updatePendingMessagesDisplay: vi.fn(),
 				ui: { requestRender: vi.fn() },
 			},
 		});
 		await harness.apply("delete");
 		expect(harness.editorText).toBe(expected);
-		expect(Reflect.get(harness.fakeThis, "queuePausedForPendingEdit")).toBe(true);
+		expect(Reflect.get(harness.fakeThis, "queuePausedForPendingEdit")).toBe(expected === "next");
 	});
 
 	test("applies two serialized real reorder mutations at successive revisions without losing edit or draft", async () => {

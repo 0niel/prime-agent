@@ -19,6 +19,8 @@ type ClearCommandContext = {
 	chatContainer: Container;
 	ui: { requestRender: () => void };
 	handleFatalRuntimeError: (prefix: string, error: unknown) => Promise<never>;
+	queuePausedForPendingEdit?: boolean;
+	abandonInterruptedQueue?: () => Promise<void>;
 };
 
 type InteractiveModePrototype = {
@@ -83,10 +85,13 @@ describe("InteractiveMode /clear", () => {
 	it("does not rerender when the connection reports cancellation", async () => {
 		const newSession = vi.fn(async () => ({ cancelled: true }));
 		const setText = vi.fn();
+		const abandonInterruptedQueue = vi.fn(async () => {});
 		const context: ClearCommandContext = {
 			stopWorkingLoader: vi.fn(),
 			agentConnection: { newSession },
 			editor: { setText },
+			queuePausedForPendingEdit: true,
+			abandonInterruptedQueue,
 			getPromptStashImages: vi.fn(() => []),
 			pastedImages: new Map(),
 			renderCurrentSessionState: vi.fn(async () => {}),
@@ -100,6 +105,7 @@ describe("InteractiveMode /clear", () => {
 		await interactiveModePrototype.handleClearCommand.call(context, { prompt: "keep me" });
 
 		expect(newSession).toHaveBeenCalledWith();
+		expect(abandonInterruptedQueue).not.toHaveBeenCalled();
 		expect(setText).toHaveBeenCalledWith("keep me");
 		expect(context.renderCurrentSessionState).not.toHaveBeenCalled();
 		expect(context.ui.requestRender).not.toHaveBeenCalled();

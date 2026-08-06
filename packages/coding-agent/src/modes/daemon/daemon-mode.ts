@@ -1605,7 +1605,7 @@ export class AgentDaemon {
 				return "skipped";
 			}
 			await session.followUp(runnableJob.prompt, undefined, {
-				resumeIfIdle: true,
+				resumeIfIdle: !session.isQueuedWorkSuspended,
 			});
 			return;
 		}

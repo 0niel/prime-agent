@@ -47,8 +47,10 @@ type FakeInteractiveMode = {
 	};
 	editorChangeGeneration: number;
 	queuePausedForPendingEdit: boolean;
+	queuePauseGeneration: number;
 	setEditorFromPendingNavigation: Mock;
 	updatePendingMessagesDisplay: Mock;
+	showError: Mock;
 	showTreeSelector: Mock;
 	shutdown: Mock;
 	updateEditorBorderColor: Mock;
@@ -125,8 +127,10 @@ function createInteractiveFake(options: {
 		},
 		editorChangeGeneration: 0,
 		queuePausedForPendingEdit: false,
+		queuePauseGeneration: 0,
 		setEditorFromPendingNavigation: vi.fn((text: string) => editor.setText(text)),
 		updatePendingMessagesDisplay: vi.fn(),
+		showError: vi.fn(),
 		showTreeSelector: vi.fn(),
 		shutdown: vi.fn().mockResolvedValue(undefined),
 		updateEditorBorderColor: vi.fn(),
@@ -187,6 +191,48 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.pendingMessageNavigation.reset).toHaveBeenCalledOnce();
 		expect(mode.agentConnection.resumeQueue).toHaveBeenCalledOnce();
 		expect(mode.queuePausedForPendingEdit).toBe(false);
+	});
+
+	it("resumes after queue fetch fails without losing track of a failed resume", async () => {
+		const mode = createInteractiveFake({ streaming: true });
+		mode.agentConnection.getQueue.mockRejectedValue(new Error("queue unavailable"));
+
+		await expect(Reflect.get(InteractiveMode.prototype, "interruptAndRecallPending").call(mode)).rejects.toThrow(
+			"queue unavailable",
+		);
+		expect(mode.agentConnection.resumeQueue).toHaveBeenCalledOnce();
+		expect(mode.queuePausedForPendingEdit).toBe(false);
+	});
+
+	it("keeps the pause retryable when queue fetch and resume both fail", async () => {
+		const mode = createInteractiveFake({ streaming: true });
+		mode.agentConnection.getQueue.mockRejectedValue(new Error("queue unavailable"));
+		mode.agentConnection.resumeQueue.mockRejectedValue(new Error("resume unavailable"));
+
+		await expect(Reflect.get(InteractiveMode.prototype, "interruptAndRecallPending").call(mode)).rejects.toThrow(
+			"queue unavailable",
+		);
+		expect(mode.queuePausedForPendingEdit).toBe(true);
+		expect(mode.showError).toHaveBeenCalledWith("resume unavailable");
+	});
+
+	it("does not let an older resume clear a newer interrupt pause", async () => {
+		const mode = createInteractiveFake({ streaming: true });
+		let finishResume: (() => void) | undefined;
+		mode.queuePausedForPendingEdit = true;
+		mode.queuePauseGeneration = 1;
+		mode.agentConnection.resumeQueue.mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					finishResume = resolve;
+				}),
+		);
+		const resume = Reflect.get(InteractiveMode.prototype, "resumeInterruptedQueue").call(mode);
+		mode.queuePauseGeneration = 2;
+		mode.queuePausedForPendingEdit = true;
+		finishResume?.();
+		await resume;
+		expect(mode.queuePausedForPendingEdit).toBe(true);
 	});
 
 	it("interrupts bash and streaming on the same Ctrl+C", async () => {
