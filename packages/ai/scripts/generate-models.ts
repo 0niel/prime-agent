@@ -154,8 +154,6 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"minimax/minimax-m3": { contextWindow: 524288 },
 	"moonshotai/kimi-k2-0905": { contextWindow: 98304 },
 	"nvidia/nemotron-3-super-120b-a12b": { contextWindow: 262144, maxTokens: 4096 },
-	// Preserve the existing output cap when OpenRouter leaves it unspecified.
-	"nvidia/nvidia-nemotron-3-ultra-550b-a55b": { contextWindow: 131072, maxTokens: 16384 },
 	// Enforced window is LARGER than OpenRouter's listing.
 	"qwen/qwen3-30b-a3b-instruct-2507": { contextWindow: 262144 },
 	// OpenRouter has no max_completion_tokens for the rest of these.
@@ -206,10 +204,10 @@ const PRIME_INFERENCE_FEATURED_MODELS = new Set([
 	"z-ai/glm-5.2",
 ]);
 
-// Prime ids whose OpenRouter listing uses a different id.
-const PRIME_INFERENCE_OPENROUTER_ALIASES: Record<string, string> = {
-	"nvidia/nvidia-nemotron-3-ultra-550b-a55b": "nvidia/nemotron-3-ultra-550b-a55b",
-};
+// Prime ids whose OpenRouter listing uses a different id. Empty today — Prime
+// currently publishes ids that match OpenRouter's, but HF-style ids show up
+// whenever a new route is added, so the mapping stays.
+const PRIME_INFERENCE_OPENROUTER_ALIASES: Record<string, string> = {};
 
 // Conservative fallbacks for catalog models with no OpenRouter match and no
 // override above: an under-declared window degrades gracefully, an

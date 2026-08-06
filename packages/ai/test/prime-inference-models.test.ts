@@ -31,7 +31,6 @@ describe("Prime Inference models", () => {
 				"meta-llama/llama-4-maverick",
 				"minimax/minimax-m3",
 				"moonshotai/kimi-k2.7-code",
-				"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
 				"nvidia/nemotron-3-super-120b-a12b",
 				"openai/gpt-5.4",
 				"openai/gpt-5.5",
@@ -95,14 +94,14 @@ describe("Prime Inference models", () => {
 		expect(gemini.input).toEqual(["text", "image"]);
 		expect(gemini.reasoning).toBe(true);
 
-		// The HF-style ultra id maps onto OpenRouter's short id via alias for
-		// modality/reasoning, but the gateway enforces a 131k window (measured
-		// 2026-07-08), so the curated override wins for contextWindow. OpenRouter
-		// may omit its live output cap, in which case the conservative fallback wins.
-		const ultra = getModel("prime-inference", "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B");
-		expect(ultra.contextWindow).toBe(131072);
-		expect(ultra.maxTokens).toBeGreaterThan(0);
-		expect(ultra.maxTokens).toBeLessThanOrEqual(ultra.contextWindow);
+		// Modality and reasoning come from OpenRouter, but the Prime route enforces
+		// a smaller window and output cap than OpenRouter lists (1M/16k), so the
+		// curated override wins for contextWindow and maxTokens.
+		const nemotronSuper = getModel("prime-inference", "nvidia/nemotron-3-super-120b-a12b");
+		expect(nemotronSuper.reasoning).toBe(true);
+		expect(nemotronSuper.input).toEqual(["text"]);
+		expect(nemotronSuper.contextWindow).toBe(262144);
+		expect(nemotronSuper.maxTokens).toBe(4096);
 
 		const maverick = getModel("prime-inference", "meta-llama/llama-4-maverick");
 		expect(maverick.contextWindow).toBe(1048576);
