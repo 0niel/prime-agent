@@ -253,6 +253,36 @@ class McpIntegrationTest(unittest.TestCase):
         self._run_open_session_with_transport(transport)
         self.assertIsNotNone(captured["http_client"])
 
+    def test_open_session_http_client_uses_mcp_timeouts(self):
+        # Bare httpx.AsyncClient defaults to a 5s read timeout, which aborts long
+        # MCP tool calls with ReadTimeout. The http_client branch must use the SDK
+        # factory so MCP defaults (30s general / 300s SSE read) apply.
+        captured = {}
+
+        class _CM:
+            async def __aenter__(self_inner):
+                return ("read", "write", None)
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        def transport(url, *, http_client=None):
+            captured["http_client"] = http_client
+            return _CM()
+
+        self._run_open_session_with_transport(transport)
+        client = captured["http_client"]
+        self.assertIsNotNone(client)
+        timeout = client.timeout
+        # Literals (not SDK constants): pin values that keep long tool calls alive.
+        # A 5s read timeout is what the bare-httpx regression used to apply.
+        self.assertEqual(timeout.connect, 30.0)
+        self.assertEqual(timeout.write, 30.0)
+        self.assertEqual(timeout.pool, 30.0)
+        self.assertEqual(timeout.read, 300.0)
+        # Authorization must still be injected on the prebuilt client.
+        self.assertEqual(client.headers.get("Authorization"), "Bearer tok-xyz")
+
     def test_resolve_config_prefers_host_override_and_headers(self):
         async def host_with_override(req_type, payload):
             return {"url": "https://override.test/mcp", "headers": {"X-Extra": "1"}}

@@ -109,6 +109,13 @@ def _resolve_streamable_http():
     )
 
 
+def _build_mcp_http_client(headers: dict[str, str]):
+    """Return an SDK-configured streamable-HTTP client with ``headers`` applied."""
+    from mcp.shared._httpx_utils import create_mcp_http_client  # noqa: PLC0415
+
+    return create_mcp_http_client(headers=headers)
+
+
 class McpIntegration:
     """Subclass and set :attr:`server` (and :attr:`url` for remote servers).
 
@@ -225,13 +232,13 @@ class McpIntegration:
         auth_header = {**extra_headers, "Authorization": f"Bearer {token}"}
 
         # SDK signatures vary: some take headers=, others only http_client=.
+        # The http_client path must use the SDK factory: a bare httpx.AsyncClient
+        # defaults to a 5s read timeout and aborts long tool calls with ReadTimeout.
         params = inspect.signature(transport).parameters
         if "headers" in params:
             cm = transport(url, headers=auth_header)
         elif "http_client" in params:
-            import httpx  # noqa: PLC0415
-
-            client = await stack.enter_async_context(httpx.AsyncClient(headers=auth_header))
+            client = await stack.enter_async_context(_build_mcp_http_client(auth_header))
             cm = transport(url, http_client=client)
         else:
             raise RuntimeError(
