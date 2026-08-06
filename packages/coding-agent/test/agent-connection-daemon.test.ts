@@ -717,6 +717,26 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 	});
 }
 
+const ATTACH_CAPABILITIES = [
+	"attach_snapshot",
+	"event_sequence",
+	"extension_ui",
+	"slim_attach",
+	"chunked_snapshot",
+	"queue_item_mutation",
+];
+
+async function attachQueueMutationConnection(
+	options: { queueMutationCompatible?: boolean } = {},
+): Promise<{ fakeClient: FakeDaemonClient; connection: DaemonAgentConnection }> {
+	const fakeClient = new FakeDaemonClient();
+	fakeClient.serverCapabilities.add("queue_item_mutation");
+	fakeClient.queueMutationCompatible = options.queueMutationCompatible ?? true;
+	const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+	await connection.attach();
+	return { fakeClient, connection };
+}
+
 describe("DaemonAgentConnection", () => {
 	it("forwards queueIfBusy for prompt admission", async () => {
 		const fakeClient = new FakeDaemonClient();
@@ -2013,14 +2033,7 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({
 			type: "attach",
 			activeSessionId: "active-1",
-			capabilities: [
-				"attach_snapshot",
-				"event_sequence",
-				"extension_ui",
-				"slim_attach",
-				"chunked_snapshot",
-				"queue_item_mutation",
-			],
+			capabilities: ATTACH_CAPABILITIES,
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
@@ -2237,10 +2250,7 @@ describe("DaemonAgentConnection", () => {
 	});
 
 	it("negotiates stable queue ids and sends revisioned atomic mutations", async () => {
-		const fakeClient = new FakeDaemonClient();
-		fakeClient.serverCapabilities.add("queue_item_mutation");
-		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
-		await connection.attach();
+		const { fakeClient, connection } = await attachQueueMutationConnection();
 		expect(fakeClient.requests[0]).toMatchObject({ capabilities: expect.arrayContaining(["queue_item_mutation"]) });
 		await expect(connection.getQueue()).resolves.toMatchObject({ revision: 2, items: [{ id: "action-1" }] });
 		await expect(connection.mutateQueueItem("action-1", 2, { type: "delete" })).resolves.toMatchObject({
@@ -2255,11 +2265,7 @@ describe("DaemonAgentConnection", () => {
 	});
 
 	it("degrades schema-14 queue mutation to unsupported without writing", async () => {
-		const fakeClient = new FakeDaemonClient();
-		fakeClient.serverCapabilities.add("queue_item_mutation");
-		fakeClient.queueMutationCompatible = false;
-		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
-		await connection.attach();
+		const { fakeClient, connection } = await attachQueueMutationConnection({ queueMutationCompatible: false });
 		await expect(connection.mutateQueueItem("action-1", 2, { type: "delete" })).resolves.toMatchObject({
 			status: "unsupported",
 		});
@@ -2545,14 +2551,7 @@ describe("DaemonAgentConnection", () => {
 			type: "attach",
 			activeSessionId: "active-1",
 			clientId: expect.any(String),
-			capabilities: [
-				"attach_snapshot",
-				"event_sequence",
-				"extension_ui",
-				"slim_attach",
-				"chunked_snapshot",
-				"queue_item_mutation",
-			],
+			capabilities: ATTACH_CAPABILITIES,
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
@@ -2564,14 +2563,7 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({
 			type: "attach",
 			activeSessionId: "active-1",
-			capabilities: [
-				"attach_snapshot",
-				"event_sequence",
-				"extension_ui",
-				"slim_attach",
-				"chunked_snapshot",
-				"queue_item_mutation",
-			],
+			capabilities: ATTACH_CAPABILITIES,
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
@@ -2630,14 +2622,7 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			supportsExtensionUi: true,
 			clientId: expect.any(String),
-			capabilities: [
-				"attach_snapshot",
-				"event_sequence",
-				"extension_ui",
-				"slim_attach",
-				"chunked_snapshot",
-				"queue_item_mutation",
-			],
+			capabilities: ATTACH_CAPABILITIES,
 		});
 
 		fakeClient.emitMessage({
