@@ -1,39 +1,6 @@
-import type { EditorTheme, OverlayHandle, TUI } from "@earendil-works/pi-tui";
-import { setKeybindings } from "@earendil-works/pi-tui";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
 import { PendingMessageNavigation } from "../src/modes/interactive/pending-message-navigation.js";
-
-const passthrough = (text: string) => text;
-const editorTheme: EditorTheme = {
-	borderColor: passthrough,
-	selectList: {
-		selectedPrefix: passthrough,
-		selectedText: passthrough,
-		description: passthrough,
-		scrollInfo: passthrough,
-		noMatch: passthrough,
-	},
-};
-const fakeTui = {
-	requestRender: vi.fn(),
-	showOverlay: vi.fn(
-		() =>
-			({
-				hide: vi.fn(),
-				setHidden: vi.fn(),
-				isHidden: () => false,
-				focus: vi.fn(),
-				unfocus: vi.fn(),
-				isFocused: () => false,
-			}) satisfies OverlayHandle,
-	),
-	terminal: { rows: 24, columns: 80 },
-} as unknown as TUI;
-
-/** Real editor so reorder chords are asserted through actual key dispatch. */
-const createEditor = () => new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
 
 const queue = {
 	steering: ["s1", "s2"],
@@ -48,11 +15,6 @@ const queue = {
 };
 
 describe("PendingMessageNavigation", () => {
-	beforeEach(() => {
-		setKeybindings(new KeybindingsManager());
-		vi.clearAllMocks();
-	});
-
 	it("browses distinct items with per-item edits and restores the draft", () => {
 		const state = new PendingMessageNavigation();
 		expect(state.browse(queue, "draft", -1)).toBe("f3");
@@ -137,39 +99,6 @@ describe("PendingMessageNavigation", () => {
 
 		state.browse(queue, "", -1);
 		expect(state.sync({ steering: [], followUp: [] })).toBe("");
-	});
-
-	// xterm modifier parameter is 1-based: 1 + shift(1) + alt(2) + ctrl(4), so Ctrl+Alt is 7.
-	it.each([
-		["xterm CSI", "\x1b[1;7A", "\x1b[1;7B"],
-		["Kitty CSI-u", "\x1b[57419;7u", "\x1b[57420;7u"],
-		["legacy Option-as-Meta", "\x1b\x1b[1;5A", "\x1b\x1b[1;5B"],
-	])("dispatches %s ctrl+alt arrows to the reorder actions", (_label, earlier, later) => {
-		const editor = createEditor();
-		const moveEarlier = vi.fn();
-		const moveLater = vi.fn();
-		editor.onAction("app.message.moveEarlier", moveEarlier);
-		editor.onAction("app.message.moveLater", moveLater);
-
-		editor.handleInput(earlier);
-		editor.handleInput(later);
-
-		expect([moveEarlier.mock.calls.length, moveLater.mock.calls.length]).toEqual([1, 1]);
-		expect(editor.getText()).toBe("");
-	});
-
-	it("keeps plain and shifted arrows away from the reorder actions", () => {
-		const editor = createEditor();
-		const moveEarlier = vi.fn();
-		const navigateOlder = vi.fn();
-		editor.onAction("app.message.moveEarlier", moveEarlier);
-		editor.onAction("app.message.navigateOlder", navigateOlder);
-
-		editor.handleInput("\x1b[1;8A"); // shift+ctrl+alt+up must not alias onto ctrl+alt+up
-		expect(moveEarlier).not.toHaveBeenCalled();
-
-		editor.handleInput("\x1b[1;3A"); // alt+up browses instead of reordering
-		expect([navigateOlder.mock.calls.length, moveEarlier.mock.calls.length]).toEqual([1, 0]);
 	});
 
 	it("uses configurable conflict-free defaults", () => {

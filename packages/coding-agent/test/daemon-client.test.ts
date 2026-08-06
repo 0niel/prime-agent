@@ -118,7 +118,8 @@ async function connectToDaemon(
 ): Promise<{ client: DaemonClient; socket: MockDaemonSocket }> {
 	const client = new DaemonClient("/tmp/prime-agent.sock");
 	const connect = client.connect();
-	const socket = netMock.sockets.at(-1)!;
+	expect(netMock.sockets).toHaveLength(1);
+	const socket = netMock.sockets[0]!;
 	socket.emit("connect");
 	await connect;
 	emitHello(socket, options.version ?? DAEMON_PROTOCOL_VERSION, serverCapabilities, options.schemaRevision);

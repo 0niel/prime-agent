@@ -211,7 +211,17 @@ describe("AgentSession concurrent prompt guard", () => {
 			images: [originalImage],
 		});
 		await session.prompt("follow", { streamingBehavior: "followUp", queueIfBusy: true, source: "interactive" });
-		const staleRevision = session.queueRevision - 1;
+		type Mutation = Parameters<AgentSession["mutateQueuedUserMessage"]>[2];
+		type MutationStatus = ReturnType<AgentSession["mutateQueuedUserMessage"]>;
+		const mutate = (
+			id: string,
+			mutation: Mutation,
+			expected: MutationStatus = "applied",
+			revision = session.queueRevision,
+		) => expect(session.mutateQueuedUserMessage(id, revision, mutation)).toBe(expected);
+		const payloadOf = (id: string) =>
+			session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === id)?.payload;
+
 		const [first, extension, command, second, follow] = session.getEditableQueueItems();
 		expect([first?.text, extension?.text, command?.text, second?.text, follow?.text]).toEqual([
 			"duplicate",
@@ -220,21 +230,22 @@ describe("AgentSession concurrent prompt guard", () => {
 			"duplicate [image #1]",
 			"follow",
 		]);
-
 		expect(session.getSteeringMessages()).toEqual([
 			"duplicate",
 			"extension item",
 			"/compact focus on tools",
 			"duplicate [image #1]",
 		]);
+
+		// CAS guards: lane boundary is a noop, mismatched revisions and unknown ids are stale.
 		const boundaryRevision = session.queueRevision;
-		expect(session.mutateQueuedUserMessage(first!.id, boundaryRevision, { type: "move_earlier" })).toBe("noop");
+		mutate(first!.id, { type: "move_earlier" }, "noop", boundaryRevision);
 		expect(session.queueRevision).toBe(boundaryRevision);
-		expect(session.mutateQueuedUserMessage(second!.id, staleRevision, { type: "delete" })).toBe("stale");
-		expect(session.mutateQueuedUserMessage("missing", session.queueRevision, { type: "delete" })).toBe("stale");
-		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "move_earlier" })).toBe(
-			"applied",
-		);
+		mutate(second!.id, { type: "delete" }, "stale", session.queueRevision - 1);
+		mutate("missing", { type: "delete" }, "stale");
+
+		// Reorder keeps every editable item and moves the selected one within its lane.
+		mutate(second!.id, { type: "move_earlier" });
 		expect(session.getEditableQueueItems().map((item) => item.id)).toEqual([
 			first!.id,
 			extension!.id,
@@ -242,100 +253,49 @@ describe("AgentSession concurrent prompt guard", () => {
 			command!.id,
 			follow!.id,
 		]);
-		expect(
-			session.mutateQueuedUserMessage(command!.id, session.queueRevision, {
-				type: "replace_follow_up",
-				text: "/compact revised focus",
-			}),
-		).toBe("applied");
+
+		// Session commands must remain valid session commands across edits and lane changes.
+		mutate(command!.id, { type: "replace_follow_up", text: "/compact revised focus" });
 		expect(session.getEditableQueueItems().find((item) => item.id === command!.id)?.lane).toBe("followUp");
-		const editedCommand = session
-			.getSessionActionRecoverySnapshot()
-			.actions.find((action) => action.id === command!.id);
-		expect(editedCommand?.payload).toMatchObject({
+		expect(payloadOf(command!.id)).toMatchObject({
 			kind: "session_command",
 			text: "/compact revised focus",
 			command: { name: "compact", args: "revised focus" },
 		});
 		const commandRevision = session.queueRevision;
-		expect(
-			session.mutateQueuedUserMessage(command!.id, commandRevision, {
-				type: "replace_steering",
-				text: "not a session command",
-			}),
-		).toBe("invalid");
+		mutate(command!.id, { type: "replace_steering", text: "not a session command" }, "invalid");
 		expect(session.queueRevision).toBe(commandRevision);
+
+		// Command image tri-state: set, preserved (and cloned) without an update, cleared.
 		const commandImage: ImageContent = { type: "image", data: "command", mimeType: "image/png" };
-		expect(
-			session.mutateQueuedUserMessage(command!.id, session.queueRevision, {
-				type: "replace_steering",
-				text: "/compact revised focus",
-				images: [commandImage],
-			}),
-		).toBe("applied");
-		expect(
-			session.mutateQueuedUserMessage(command!.id, session.queueRevision, {
-				type: "replace_steering",
-				text: "/compact preserve image",
-			}),
-		).toBe("applied");
-		let commandPayload = session
-			.getSessionActionRecoverySnapshot()
-			.actions.find((action) => action.id === command!.id)?.payload;
+		mutate(command!.id, { type: "replace_steering", text: "/compact revised focus", images: [commandImage] });
+		mutate(command!.id, { type: "replace_steering", text: "/compact preserve image" });
+		const commandPayload = payloadOf(command!.id);
 		expect(commandPayload).toMatchObject({ images: [commandImage] });
 		if (commandPayload?.kind === "session_command") expect(commandPayload.images?.[0]).not.toBe(commandImage);
-		expect(
-			session.mutateQueuedUserMessage(command!.id, session.queueRevision, {
-				type: "replace_steering",
-				text: "/compact clear image",
-				images: [],
-			}),
-		).toBe("applied");
-		commandPayload = session
-			.getSessionActionRecoverySnapshot()
-			.actions.find((action) => action.id === command!.id)?.payload;
-		expect(commandPayload).not.toHaveProperty("images");
-		expect(session.mutateQueuedUserMessage(command!.id, session.queueRevision, { type: "move_earlier" })).toBe(
-			"applied",
-		);
-		expect(session.mutateQueuedUserMessage(command!.id, session.queueRevision, { type: "move_later" })).toBe(
-			"applied",
-		);
-		expect(
-			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
-				type: "replace_steering",
-				text: "reconnected edit [image #1]",
-			}),
-		).toBe("applied");
-		let preserved = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
-		expect(preserved?.payload).toMatchObject({ images: [originalImage] });
+		mutate(command!.id, { type: "replace_steering", text: "/compact clear image", images: [] });
+		expect(payloadOf(command!.id)).not.toHaveProperty("images");
+		mutate(command!.id, { type: "move_earlier" });
+		mutate(command!.id, { type: "move_later" });
+
+		// Turn image tri-state: preserved without an update, replaced, then cleared.
+		mutate(second!.id, { type: "replace_steering", text: "reconnected edit [image #1]" });
+		expect(payloadOf(second!.id)).toMatchObject({ images: [originalImage] });
 		const imageOnlyRevision = session.queueRevision;
 		const imageOnlyReplacement: ImageContent = { type: "image", data: "replacement", mimeType: "image/png" };
-		expect(
-			session.mutateQueuedUserMessage(second!.id, imageOnlyRevision, {
-				type: "replace_steering",
-				text: "reconnected edit [image #1]",
-				images: [imageOnlyReplacement],
-			}),
-		).toBe("applied");
+		mutate(
+			second!.id,
+			{ type: "replace_steering", text: "reconnected edit [image #1]", images: [imageOnlyReplacement] },
+			"applied",
+			imageOnlyRevision,
+		);
 		expect(session.queueRevision).toBe(imageOnlyRevision + 1);
-		expect(
-			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
-				type: "replace_steering",
-				text: "removed marker",
-				images: [],
-			}),
-		).toBe("applied");
-		preserved = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
-		expect(preserved?.payload).not.toHaveProperty("images");
+		mutate(second!.id, { type: "replace_steering", text: "removed marker", images: [] });
+		expect(payloadOf(second!.id)).not.toHaveProperty("images");
+
+		// Lane conversion rewrites the stored turn record with the edited content.
 		const image: ImageContent = { type: "image", data: "encoded", mimeType: "image/png" };
-		expect(
-			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
-				type: "replace_follow_up",
-				text: "converted",
-				images: [image],
-			}),
-		).toBe("applied");
+		mutate(second!.id, { type: "replace_follow_up", text: "converted", images: [image] });
 		expect(session.getEditableQueueItems()).toMatchObject([
 			{ id: first!.id, lane: "steering", text: "duplicate" },
 			{ id: extension!.id, lane: "steering", text: "extension item" },
@@ -343,23 +303,24 @@ describe("AgentSession concurrent prompt guard", () => {
 			{ id: follow!.id, lane: "followUp", text: "follow" },
 			{ id: second!.id, lane: "followUp", text: "converted" },
 		]);
-		const recovered = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
-		expect(recovered?.payload).toMatchObject({ text: "converted", images: [image] });
-		expect(recovered?.payload.kind === "turn" ? recovered.payload.records[0]?.message.content : undefined).toEqual([
+		const recovered = payloadOf(second!.id);
+		expect(recovered).toMatchObject({ text: "converted", images: [image] });
+		expect(recovered?.kind === "turn" ? recovered.records[0]?.message.content : undefined).toEqual([
 			{ type: "text", text: "converted" },
 			image,
 		]);
-		expect(session.mutateQueuedUserMessage(command!.id, session.queueRevision, { type: "delete" })).toBe("applied");
+
+		// Deletes bump the revision and reject replays of the consumed revision.
+		mutate(command!.id, { type: "delete" });
 		const deleteRevision = session.queueRevision;
-		expect(session.mutateQueuedUserMessage(second!.id, deleteRevision, { type: "delete" })).toBe("applied");
+		mutate(second!.id, { type: "delete" }, "applied", deleteRevision);
 		expect(session.queueRevision).toBe(deleteRevision + 1);
-		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "delete" })).toBe("stale");
+		mutate(second!.id, { type: "delete" }, "stale");
 		expect(session.isStreaming).toBe(true);
 
 		await session.abort();
 		await firstPrompt.catch(() => {});
 	});
-
 	it("should queue extension-origin steering messages while streaming", async () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;

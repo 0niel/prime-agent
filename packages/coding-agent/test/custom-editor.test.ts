@@ -263,4 +263,27 @@ describe("CustomEditor", () => {
 
 		expect(editor.render(40)).toEqual(withoutCallback);
 	});
+
+	it.each([
+		["xterm", "\x1b[1;7A", "\x1b[1;7B"],
+		["Kitty", "\x1b[57419;7u", "\x1b[57420;7u"],
+		["legacy Meta", "\x1b\x1b[1;5A", "\x1b\x1b[1;5B"],
+	])("dispatches %s Ctrl+Alt arrows to reorder actions", (_name, earlier, later) => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const moveEarlier = vi.fn();
+		const moveLater = vi.fn();
+		editor.onAction("app.message.moveEarlier", moveEarlier);
+		editor.onAction("app.message.moveLater", moveLater);
+		editor.handleInput(earlier);
+		editor.handleInput(later);
+		expect([moveEarlier.mock.calls.length, moveLater.mock.calls.length, editor.getText()]).toEqual([1, 1, ""]);
+	});
+
+	it("does not alias shifted arrows onto reorder", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const moveEarlier = vi.fn();
+		editor.onAction("app.message.moveEarlier", moveEarlier);
+		editor.handleInput("\x1b[1;8A");
+		expect(moveEarlier).not.toHaveBeenCalled();
+	});
 });

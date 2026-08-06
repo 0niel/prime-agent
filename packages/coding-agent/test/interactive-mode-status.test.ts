@@ -117,7 +117,6 @@ function createConnectionState(overrides: Partial<AgentConnectionState> = {}): A
 	};
 }
 
-
 describe("InteractiveMode update notifications", () => {
 	beforeAll(() => {
 		initTheme("dark");
