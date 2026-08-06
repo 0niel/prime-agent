@@ -707,6 +707,7 @@ export function resolveRuntimeSessionOptions(
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
 		rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
 		rlmParentAgent: runtimeSessionOptions?.rlmParentAgent,
+		rlmParentSession: runtimeSessionOptions?.rlmParentSession,
 		subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
 	};
 }

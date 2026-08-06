@@ -13,6 +13,7 @@ export type StreamFailureKind =
 	| "safety"
 	| "overloaded"
 	| "rate_limit"
+	| "quota"
 	| "server_error"
 	| "auth"
 	| "invalid_request"
@@ -44,6 +45,7 @@ const KIND_MESSAGES: Record<StreamFailureKind, string> = {
 	safety: "Response blocked by provider safety filters",
 	overloaded: "Provider overloaded",
 	rate_limit: "Provider rate limit exceeded",
+	quota: "Provider usage quota or credit exhausted",
 	server_error: "Provider server error",
 	auth: "Provider authentication failed",
 	invalid_request: "Provider rejected the request",
@@ -63,11 +65,21 @@ export function streamFailureMessage(info: StreamFailureInfo, detail?: string): 
 	return message;
 }
 
-export function classifyStreamFailure(providerErrorType?: string, status?: number): StreamFailureKind {
-	const type = providerErrorType?.toLowerCase() ?? "";
-	if (type === "refusal") return "refusal";
+export function isQuotaExhaustionMessage(value: string): boolean {
+	return /insufficient[_ -]?(?:quota|credits?|funds?)|(?:quota|credits?|funds?)[^\n]{0,48}(?:exceed(?:ed)?|exhaust(?:ed)?|deplet(?:ed)?|reached|used up|not enough|unavailable)|(?:exceed(?:ed)?|exhaust(?:ed)?|deplet(?:ed)?|reached|used up)[^\n]{0,80}(?:quota|credits?|funds?|premium requests?|(?:credit|usage|spend(?:ing)?)[_ -]?limit)|(?:credit|usage|spend(?:ing)?)[_ -]?limit[^\n]{0,48}(?:exceed(?:ed)?|exhaust(?:ed)?|reached)|(?:out of|no)[_ -]*(?:premium[_ -]*)?(?:credits?|quota|funds?|requests?)(?:[_ -]*remaining)?|payment required/i.test(
+		value,
+	);
+}
+
+export function classifyStreamFailure(providerErrorType?: string, status?: number, detail?: string): StreamFailureKind {
+	const type = `${providerErrorType ?? ""} ${detail ?? ""}`.trim().toLowerCase();
+	if (status === 402) return "quota";
+	if (/\brefusal\b/.test(type)) return "refusal";
 	if (/sensitive|safety|prohibited_content|blocklist|spii|recitation|content.?filter|guardrail|flagged/.test(type)) {
 		return "safety";
+	}
+	if (isQuotaExhaustionMessage(type)) {
+		return "quota";
 	}
 	if (type.includes("overloaded") || status === 529) return "overloaded";
 	if (type.includes("rate_limit") || type.includes("throttl") || status === 429) return "rate_limit";
@@ -162,7 +174,7 @@ function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; d
 
 	return {
 		info: {
-			kind: classifyStreamFailure(providerErrorType ?? error.message, status),
+			kind: classifyStreamFailure(providerErrorType, status, `${String(bodyMessage ?? "")} ${error.message}`),
 			providerErrorType,
 			status,
 			requestId,

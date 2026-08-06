@@ -111,10 +111,12 @@ The stable `latest.json` and beta `beta.json` manifests use the same JSON shape:
 | `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts |
 | `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
 | `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds |
-| `retry.provider.maxRetries` | number | SDK default | Provider/SDK retry attempts |
+| `retry.provider.maxRetries` | number | `0` | Provider/SDK retry attempts; agent-level retry owns the default policy |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
 
 When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., Google's "quota will reset after 5h"), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap.
+
+Quota and credit exhaustion fail closed without retrying. The first such failure stops the current session and all of its subagents, blocks recurring background prompts, and remains latched until a user sends a new prompt.
 
 ```json
 {

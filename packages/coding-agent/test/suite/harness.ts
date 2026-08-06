@@ -73,8 +73,10 @@ export interface HarnessOptions {
 	agentMessageController?: AgentSessionMessageController;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	persistSession?: boolean;
+	sessionManager?: SessionManager;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
+	rlmParentSession?: AgentSession;
 	autonomous?: AgentAutonomousConfig;
 	autoRefineReviewer?: AutoRefineReviewer;
 	serializedRefine?: boolean;
@@ -118,9 +120,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = options.persistSession
-		? SessionManager.create(tempDir, join(tempDir, "sessions"))
-		: SessionManager.inMemory();
+	const sessionManager =
+		options.sessionManager ??
+		(options.persistSession ? SessionManager.create(tempDir, join(tempDir, "sessions")) : SessionManager.inMemory());
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -199,6 +201,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		extensionRunnerRef,
 		rlmDepth: options.rlmDepth,
 		rlmMaxDepth: options.rlmMaxDepth,
+		rlmParentSession: options.rlmParentSession,
 		autonomous: options.autonomous,
 		autoRefineReviewer: options.autoRefineReviewer,
 		serializedRefine: options.serializedRefine,
