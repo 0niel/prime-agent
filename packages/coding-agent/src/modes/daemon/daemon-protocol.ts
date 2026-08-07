@@ -56,8 +56,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 11 adds immediate get/set commands for active-session RLM max depth.
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
-export const DAEMON_SCHEMA_REVISION = 13;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-13-816309b1cd50";
+// Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
+export const DAEMON_SCHEMA_REVISION = 14;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-816309b1cd50";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -150,6 +151,8 @@ export interface DaemonAttachClientMetadata {
 	clientId?: DaemonClientId;
 	capabilities?: readonly DaemonClientCapability[];
 	resumeCursor?: DaemonResumeCursor;
+	/** Opt-out-only policy. A telemetry-enabled worker must reject this attach. */
+	telemetryDisabled?: true;
 }
 
 /**
@@ -631,6 +634,7 @@ const DELETE_RLM_SUBAGENT_COMMAND = {
 	capability: "delete_rlm_subagent",
 } as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
+const TELEMETRY_POLICY_COMMAND = { minProtocol: 7, minSchemaRevision: 14 } as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -734,6 +738,12 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 
 export function getDaemonCommandCompatibilities(command: DaemonCommand): readonly DaemonCommandCompatibility[] {
 	const compatibility = DAEMON_COMMAND_COMPATIBILITY[command.type];
+	const carriesTelemetryPolicy =
+		((command.type === "attach" || command.type === "reattach") && command.telemetryDisabled !== undefined) ||
+		(command.type === "create" && command.config?.telemetryDisabled !== undefined);
+	if (carriesTelemetryPolicy) {
+		return [TELEMETRY_POLICY_COMMAND, compatibility];
+	}
 	if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 		return [PROMPT_ADMISSION_CANCELLATION_COMMAND, compatibility];
 	}

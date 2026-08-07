@@ -2944,6 +2944,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		};
 		uiServices: {
 			modelRegistry: {
+				authStorage: Pick<AuthStorage, "get">;
 				refresh: () => void;
 				hasConfiguredAuth: (model: unknown) => boolean;
 				getProviderAuthStatus: (provider: string) => AuthStatus;
@@ -3616,6 +3617,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		};
 		fakeThis.uiServices = {
 			modelRegistry: {
+				authStorage: AuthStorage.inMemory(),
 				refresh: vi.fn(),
 				hasConfiguredAuth: vi.fn(() => true),
 				getProviderAuthStatus: vi.fn(

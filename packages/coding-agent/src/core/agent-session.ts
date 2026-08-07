@@ -1189,7 +1189,8 @@ export class AgentSession {
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
 	private _disposed = false;
-	private readonly _disposeCallbacks = new Set<() => void>();
+	private readonly _disposeCallbacks = new Set<() => void | Promise<void>>();
+	private _disposeCallbacksPromise?: Promise<void>;
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
@@ -3769,7 +3770,7 @@ export class AgentSession {
 	 */
 	async disposeAsync(): Promise<void> {
 		if (this._disposed) {
-			return;
+			return this._disposeCallbacksPromise;
 		}
 		// Concurrent callers await the same in-flight teardown so none resolves before
 		// the kernel snapshot flush finishes.
@@ -3781,7 +3782,7 @@ export class AgentSession {
 			// agent_end completes instead of being aborted by dispose().
 			await this._drainPendingRefinementForDisposal();
 			if (this._disposed) {
-				return;
+				return this._disposeCallbacksPromise;
 			}
 			this._disposing = true;
 			this._sessionActionCommitDisposeAbortController.abort();
@@ -3945,6 +3946,27 @@ export class AgentSession {
 			// a failed kernel startup already cleaned up after itself
 		}
 		this.dispose();
+		await this._disposeCallbacksPromise;
+	}
+
+	private _startDisposeCallbacks(): Promise<void> {
+		if (this._disposeCallbacksPromise) {
+			return this._disposeCallbacksPromise;
+		}
+		const pending: Promise<void>[] = [];
+		for (const callback of this._disposeCallbacks) {
+			try {
+				const result = callback();
+				if (result) {
+					pending.push(result.catch(() => undefined));
+				}
+			} catch {
+				// Disposal remains best-effort; one owner must not block the rest.
+			}
+		}
+		this._disposeCallbacks.clear();
+		this._disposeCallbacksPromise = Promise.all(pending).then(() => undefined);
+		return this._disposeCallbacksPromise;
 	}
 
 	dispose(): void {
@@ -3995,20 +4017,18 @@ export class AgentSession {
 			this._eventListeners = [];
 			cleanupSessionResources(this.sessionId);
 		} finally {
-			for (const callback of this._disposeCallbacks) {
-				try {
-					callback();
-				} catch {
-					// Disposal remains best-effort; one owner must not block the rest.
-				}
-			}
-			this._disposeCallbacks.clear();
+			void this._startDisposeCallbacks();
 		}
 	}
 
-	registerDisposeCallback(callback: () => void): void {
+	registerDisposeCallback(callback: () => void | Promise<void>): void {
 		if (this._disposed) {
-			callback();
+			try {
+				const result = callback();
+				if (result) void result.catch(() => undefined);
+			} catch {
+				// Late registration follows the same best-effort disposal contract.
+			}
 			return;
 		}
 		this._disposeCallbacks.add(callback);
