@@ -1531,7 +1531,8 @@ export async function main(args: string[], options?: MainOptions) {
 				config: defaultSessionConfig,
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
 				continueRecent: parsed.continue,
-				clientOwned: appMode !== "acp",
+				// A no-session ACP invocation has nothing to reattach to; complete its worker on disconnect.
+				clientOwned: appMode !== "acp" || parsed.noSession,
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
 			}));
