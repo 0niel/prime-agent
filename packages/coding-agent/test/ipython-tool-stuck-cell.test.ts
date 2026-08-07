@@ -161,7 +161,7 @@ describeIfKernel(
 			// Cell 1 exceeds the 3s budget but finishes on its own shortly after.
 			const first = await tool.execute(
 				"finishes-late",
-				{ code: "import time\ntime.sleep(4.5)\nprint('late done')" },
+				{ code: "import time\ntime.sleep(5)\nprint('late done')" },
 				undefined,
 				noUpdate,
 				{} as ExtensionContext,
@@ -186,7 +186,7 @@ describeIfKernel(
 			// not the 1s re-poll budget (which would background it).
 			const fresh = await tool.execute(
 				"fresh-after-recovery",
-				{ code: "import time\ntime.sleep(2)\nprint('fresh ok')" },
+				{ code: "import time\ntime.sleep(2.5)\nprint('fresh ok')" },
 				undefined,
 				noUpdate,
 				{} as ExtensionContext,
