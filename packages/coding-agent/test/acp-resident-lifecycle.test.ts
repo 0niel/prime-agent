@@ -275,10 +275,16 @@ function launchAcp(agentDir: string, projectDir: string, daemonSocket: string, r
 }
 
 describe("ACP daemon lifecycle negotiation", () => {
-	it("uses resident lifecycle for ACP and client-owned lifecycle for other daemon clients", () => {
-		// The ACP call site is intentionally the only mode requesting a resident worker.
+	it("uses resident lifecycle only for ACP sessions that can be reattached", () => {
 		const source = readFileSync(resolve(__dirname, "../src/main.ts"), "utf8");
-		expect(source).toContain('clientOwned: appMode !== "acp"');
+		// ACP with a session file stays resident; --no-session remains client-owned
+		// so disconnect completes the worker instead of leaking it.
+		expect(source).toContain('clientOwned: appMode !== "acp" || parsed.noSession');
+		expect(source).toContain("sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile()");
+
+		const clientOwned = (appMode: "acp" | "rpc", noSession: boolean) => appMode !== "acp" || noSession;
+		expect(clientOwned("acp", false)).toBe(false);
+		expect(clientOwned("acp", true)).toBe(true);
 	});
 
 	it(
