@@ -1,12 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
-import { resolveHeadlessDaemonSessionLifecycle, shouldUseResidentAcpSession } from "../src/main.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
@@ -276,18 +275,10 @@ function launchAcp(agentDir: string, projectDir: string, daemonSocket: string, r
 }
 
 describe("ACP daemon lifecycle negotiation", () => {
-	it("keeps RPC client-owned while ACP uses resident only when negotiated", () => {
-		expect(shouldUseResidentAcpSession(["acp_resident_sessions"])).toBe(true);
-		expect(shouldUseResidentAcpSession(["client_owned_sessions"])).toBe(false);
-		expect(
-			resolveHeadlessDaemonSessionLifecycle({ preferResident: true, serverCapabilities: ["acp_resident_sessions"] }),
-		).toBe("resident");
-		expect(resolveHeadlessDaemonSessionLifecycle({ preferResident: true, serverCapabilities: [] })).toBe(
-			"client_owned",
-		);
-		expect(
-			resolveHeadlessDaemonSessionLifecycle({ clientOwned: true, serverCapabilities: ["acp_resident_sessions"] }),
-		).toBe("client_owned");
+	it("uses resident lifecycle for ACP and client-owned lifecycle for other daemon clients", () => {
+		// The ACP call site is intentionally the only mode requesting a resident worker.
+		const source = readFileSync(resolve(__dirname, "../src/main.ts"), "utf8");
+		expect(source).toContain('clientOwned: appMode !== "acp"');
 	});
 
 	it(

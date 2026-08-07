@@ -49,22 +49,17 @@ import type { SessionSummary } from "./daemon-session-list.js";
  */
 
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
-export const DAEMON_PROTOCOL_VERSION = 8;
+export const DAEMON_PROTOCOL_VERSION = 7;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 9 publishes persisted RLM spawn depth on passive session rows.
 // Revision 10 publishes persisted RLM spawn depth on all session catalog rows.
 // Revision 11 adds immediate get/set commands for active-session RLM max depth.
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
-<<<<<<< HEAD
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
-export const DAEMON_SCHEMA_REVISION = 14;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-816309b1cd50";
-=======
-// Revision 14 advertises the ACP resident-session capability.
+// Protocol 8 also advertises ACP resident-session capability.
 export const DAEMON_SCHEMA_REVISION = 14;
 export const DAEMON_SCHEMA_ID = "protocol-8-schema-14-816309b1cd50";
->>>>>>> 9b50394b9 (feat(coding-agent): keep ACP daemon sessions resident)
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -102,9 +97,7 @@ export type DaemonServerCapability =
 	// identity). Clients must check before sending.
 	| "transient_bash"
 	| "session_input_admission"
-	| "prompt_admission_cancellation"
-	// ACP clients may request resident lifecycle; absence falls back to client-owned.
-	| "acp_resident_sessions";
+	| "prompt_admission_cancellation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -142,7 +135,6 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"transient_bash",
 	"session_input_admission",
 	"prompt_admission_cancellation",
-	"acp_resident_sessions",
 ];
 
 export interface DaemonRuntimeIdentity {
