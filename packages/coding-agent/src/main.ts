@@ -940,25 +940,6 @@ export function findActiveDaemonSessionSummaryForSessionFile(
 	);
 }
 
-/**
- * ACP requests a resident daemon worker when the negotiated daemon supports it.
- * Keeping this as a pure helper makes the compatibility fallback explicit.
- */
-export function shouldUseResidentAcpSession(serverCapabilities: readonly string[]): boolean {
-	return serverCapabilities.includes("acp_resident_sessions");
-}
-
-export function resolveHeadlessDaemonSessionLifecycle(options: {
-	preferResident?: boolean;
-	clientOwned?: boolean;
-	serverCapabilities: readonly string[];
-}): "resident" | "client_owned" {
-	if (options.preferResident) {
-		return shouldUseResidentAcpSession(options.serverCapabilities) ? "resident" : "client_owned";
-	}
-	return options.clientOwned ? "client_owned" : "resident";
-}
-
 async function createDaemonClientConnection(options: {
 	socketPath: string;
 	config: AgentSessionRuntimeConfig;
@@ -966,8 +947,6 @@ async function createDaemonClientConnection(options: {
 	continueRecent?: boolean;
 	activeSessionId?: string;
 	clientOwned?: boolean;
-	/** ACP prefers resident lifecycle, but old daemons must fall back cleanly. */
-	preferResident?: boolean;
 	noSession?: boolean;
 	supportsExtensionUi?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
@@ -977,14 +956,7 @@ async function createDaemonClientConnection(options: {
 
 	try {
 		await client.waitForHello();
-		// Resident ACP is optional so a newer client remains compatible with an
-		// older daemon. RPC and other callers retain their explicit lifecycle.
-		const lifecycle = resolveHeadlessDaemonSessionLifecycle({
-			preferResident: options.preferResident,
-			clientOwned: options.clientOwned,
-			serverCapabilities: client.hello?.serverCapabilities ?? [],
-		});
-		const clientOwned = lifecycle === "client_owned";
+		const clientOwned = options.clientOwned ?? false;
 		const attach = async (summary: SessionSummary) => {
 			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
 				closeClientOnDispose: true,
@@ -1559,8 +1531,7 @@ export async function main(args: string[], options?: MainOptions) {
 				config: defaultSessionConfig,
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
 				continueRecent: parsed.continue,
-				clientOwned: appMode === "rpc",
-				preferResident: appMode === "acp",
+				clientOwned: appMode !== "acp",
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
 			}));
