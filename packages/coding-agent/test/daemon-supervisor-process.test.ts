@@ -413,7 +413,7 @@ describe("daemon supervisor resident workers", () => {
 		mkdirSync(projectDir, { recursive: true });
 		writeFileSync(
 			extensionPath,
-			"import { writeFileSync } from 'node:fs';\nexport default function() { writeFileSync(process.env.PRIME_AGENT_TEST_RESIDENT_ENV_MARKER!, process.env.PRIME_AGENT_TEST_RESIDENT_ENV!); }\n",
+			"import { appendFileSync } from 'node:fs';\nexport default function() { appendFileSync(process.env.PRIME_AGENT_TEST_RESIDENT_ENV_MARKER!, process.pid + ':' + process.env.PRIME_AGENT_TEST_RESIDENT_ENV + '\\n'); }\n",
 		);
 
 		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
@@ -431,10 +431,44 @@ describe("daemon supervisor resident workers", () => {
 		expect(created.success).toBe(true);
 		const summary = requireSummary(created.success ? created.data : undefined);
 		if (summary.workerPid) workerPids.add(summary.workerPid);
-		expect(readFileSync(markerPath, "utf8")).toBe(launchEnvSentinel);
+		const initialMarkerLines = readFileSync(markerPath, "utf8").trim().split("\n");
+		expect(initialMarkerLines).toHaveLength(1);
+		expect(initialMarkerLines[0]).toMatch(new RegExp(`^${summary.workerPid}:${launchEnvSentinel}$`));
+		const descriptor = readWorkerDescriptor(agentDir);
+		expect(descriptor.launchEnv).toEqual({
+			PRIME_AGENT_TEST_RESIDENT_ENV: launchEnvSentinel,
+			PRIME_AGENT_TEST_RESIDENT_ENV_MARKER: markerPath,
+		});
 
-		await client.request({ type: "shutdown" });
+		supervisor.kill("SIGTERM");
+		await waitForExit(supervisor);
+		children.delete(supervisor);
 		client.close();
+
+		const replacementClient = await connectEventually(socketPath);
+		const adopted = await replacementClient.request({ type: "list" });
+		const adoptedSummary = requireSessionList(adopted.success ? adopted.data : undefined)[0];
+		expect(adoptedSummary.workerPid).toBe(summary.workerPid);
+		if (!adoptedSummary.workerPid) throw new Error("Adopted resident worker did not expose its pid");
+		process.kill(-adoptedSummary.workerPid, "SIGKILL");
+		await waitForProcessGone(adoptedSummary.workerPid);
+		let recoveredSummary: SessionSummary | undefined;
+		const recoveryDeadline = Date.now() + 15_000;
+		while (!recoveredSummary && Date.now() < recoveryDeadline) {
+			const listed = await replacementClient.request({ type: "list" });
+			recoveredSummary = requireSessionList(listed.success ? listed.data : undefined).find(
+				(session) => session.workerPid !== adoptedSummary.workerPid,
+			);
+			if (!recoveredSummary) await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+		}
+		expect(recoveredSummary).toBeDefined();
+		const markerLines = readFileSync(markerPath, "utf8").trim().split("\n");
+		expect(markerLines).toHaveLength(2);
+		expect(markerLines[1]).toMatch(new RegExp(`^${recoveredSummary?.workerPid}:${launchEnvSentinel}$`));
+		expect(recoveredSummary?.workerPid).not.toBe(adoptedSummary.workerPid);
+
+		await replacementClient.request({ type: "shutdown" });
+		replacementClient.close();
 	});
 
 	it("keeps client-owned workers hidden and removes them without archiving", async () => {

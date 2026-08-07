@@ -416,6 +416,12 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
+		(descriptor.launchEnv === undefined ||
+			(typeof descriptor.launchEnv === "object" &&
+				descriptor.launchEnv !== null &&
+				Object.entries(descriptor.launchEnv).every(
+					([key, value]) => typeof key === "string" && typeof value === "string",
+				))) &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
 		typeof descriptor.rootActiveSessionId === "string" &&
@@ -936,6 +942,7 @@ export class DaemonSupervisor {
 					snapshotLoads: new Map(),
 					intentionalStop: descriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
+					launchEnv: descriptor.launchEnv,
 				});
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
@@ -2070,7 +2077,7 @@ export class DaemonSupervisor {
 			throw new Error("Session is not owned by this client");
 		}
 		const previousDescriptor = worker.descriptor;
-		worker.descriptor = { ...previousDescriptor, ownerClientId: undefined };
+		worker.descriptor = { ...previousDescriptor, ownerClientId: undefined, launchEnv: undefined };
 		try {
 			this.persistWorker(worker);
 		} catch (error) {
@@ -2096,7 +2103,8 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker ${existing.descriptor.workerId} recovery was cancelled`);
 		}
 		const recoveryStopRevision = existing?.stopRevision;
-		const launchEnv = command.launchEnv ?? existing?.launchEnv;
+		const launchEnv = command.launchEnv ?? existing?.launchEnv ?? existing?.descriptor.launchEnv;
+		const ownerClientIdForDescriptor = existing?.descriptor.ownerClientId ?? ownerClientId;
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
@@ -2173,7 +2181,8 @@ export class DaemonSupervisor {
 				supervisorSocketPath: this.socketPath,
 				authenticationToken: token,
 				rootActiveSessionId,
-				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
+				ownerClientId: ownerClientIdForDescriptor,
+				...(ownerClientIdForDescriptor === undefined && launchEnv ? { launchEnv } : {}),
 				createdAt: existing?.descriptor.createdAt ?? now,
 				updatedAt: now,
 				lifecycle: "starting",
