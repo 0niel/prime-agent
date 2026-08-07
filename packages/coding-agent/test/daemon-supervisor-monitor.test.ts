@@ -1645,7 +1645,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(supervisor.effectiveWorkerState(worker)).toBe("ready");
 	});
 
-	it("excludes stopping workers from the live session list", async () => {
+	it("keeps stopping workers listed with an honest state for busy-daemon checks", async () => {
 		const makeWorker = (workerId: string, stopRequestedAt?: string) => ({
 			descriptor: {
 				workerId,
@@ -1683,14 +1683,20 @@ describe("daemon worker supervisor monitoring", () => {
 			handleList(
 				client: object,
 				command: { id: string; type: "list" },
-			): Promise<{ success: boolean; data?: { sessions: Array<{ activeSessionId?: string; id: string }> } }>;
+			): Promise<{
+				success: boolean;
+				data?: { sessions: Array<{ activeSessionId?: string; id: string; workerState?: string }> };
+			}>;
 		};
 
 		const response = await supervisor.handleList({}, { id: "list-1", type: "list" });
 
 		expect(response.success).toBe(true);
 		const sessions = response.data?.sessions ?? [];
-		expect(sessions.map((session) => session.activeSessionId ?? session.id)).toEqual(["worker-live-active"]);
+		expect(sessions.map((session) => [session.activeSessionId ?? session.id, session.workerState]).sort()).toEqual([
+			["worker-live-active", "ready"],
+			["worker-stopping-active", "stopping"],
+		]);
 	});
 
 	it("ignores malformed persisted worker descriptors", () => {
