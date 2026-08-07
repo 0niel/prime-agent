@@ -1927,13 +1927,13 @@ export class DaemonSupervisor {
 		);
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 		const clientOwnedWorkers = [...this.workers.values()].filter((worker) => !this.isVisibleWorker(worker));
+		// Stopping workers stay listed (with an honest workerState) because this
+		// list also feeds busy-daemon safety checks in daemon-launch.
 		const active = [...this.workers.values()]
 			.filter(
 				(worker) =>
-					this.isLiveWorker(worker) ||
-					(command.includeClientOwned === true &&
-						!this.isWorkerStopping(worker) &&
-						this.isWorkerAccessibleToClient(client, worker)),
+					this.isVisibleWorker(worker) ||
+					(command.includeClientOwned === true && this.isWorkerAccessibleToClient(client, worker)),
 			)
 			.flatMap((worker) => [...worker.summaries.values()].map((summary) => this.publicSummary(worker, summary)));
 		const busyClientOwnedSessionCount = clientOwnedWorkers
