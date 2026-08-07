@@ -848,8 +848,6 @@ export function createIpythonToolDefinition(
 					if (silentPolls >= ipythonStuckCellPolls()) {
 						recovery = await provisioner.recoverStuckExecution().catch(() => "no-kernel" as const);
 						if (recovery !== "no-kernel" && recovery.outcome === "recovered") {
-							stuckTracker.requestMsgId = undefined;
-							stuckTracker.silentPolls = 0;
 							// Recovery may let this call's own execute settle; prefer the
 							// real result over a "still executing" notice.
 							const settled = await Promise.race([
@@ -888,6 +886,15 @@ export function createIpythonToolDefinition(
 						}
 					}
 					if (raced === BACKGROUNDED) {
+						// Re-seed if the in-flight execution changed during this call
+						// (a recovery drained the queue and this call's own cell is now
+						// running): the next call must keep the short re-poll cadence.
+						// Same-execution polls were already counted at entry — updating
+						// again here would double-count them.
+						const liveInfo = provisioner.activeExecutionInfo;
+						if (liveInfo && liveInfo.requestMsgId !== stuckTracker.requestMsgId) {
+							updateStuckTracker(stuckTracker, liveInfo);
+						}
 						return {
 							content: [
 								{ type: "text", text: backgroundedNotice(timeoutMs, streamedOutput, recovery, silentPolls) },

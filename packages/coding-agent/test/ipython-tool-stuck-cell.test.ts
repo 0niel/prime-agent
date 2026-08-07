@@ -245,5 +245,60 @@ describeIfKernel(
 			}
 			expect(sawDone).toBe(true);
 		});
+
+		it("keeps the short re-poll cadence when the queued cell is still running after a recovery", async () => {
+			setEnv("PRIME_AGENT_IPYTHON_TOOL_TIMEOUT_MS", "3000");
+			setEnv("PRIME_AGENT_IPYTHON_REPOLL_TIMEOUT_MS", "2000");
+			setEnv("PRIME_AGENT_IPYTHON_STUCK_CELL_POLLS", "2");
+			setEnv("PRIME_AGENT_KERNEL_PYTHON", python as string);
+
+			provisioner = new IpythonKernelProvisioner(process.cwd(), {});
+			const tool = createIpythonToolDefinition(process.cwd(), { provisioner });
+			const noUpdate = () => undefined;
+
+			// Stuck cell -> backgrounded with silent poll 1 counted.
+			const first = await tool.execute(
+				"reseed-stuck",
+				{ code: "import asyncio\nawait asyncio.Future()" },
+				undefined,
+				noUpdate,
+				{} as ExtensionContext,
+			);
+			expect(first.details?.status).toBe("backgrounded");
+
+			// Queued behind the stuck cell, this call re-polls on the 2s budget,
+			// counts silent poll 2, and fires recovery; its own cell (sleep 8)
+			// then runs but cannot finish inside the 3s settle window ->
+			// backgrounded with the tracker re-seeded to the NEW execution.
+			const second = await tool.execute(
+				"reseed-long",
+				{ code: "import time\ntime.sleep(8)\nprint('long done')" },
+				undefined,
+				noUpdate,
+				{} as ExtensionContext,
+			);
+			if (second.details?.status !== "backgrounded") {
+				// The recovery's interrupt can also hit this call's own queued cell
+				// (residual SIGINT) or the cell can finish inside the settle window;
+				// both yield a real result, which correctly resets the tracker. The
+				// re-seed path only exists for a backgrounded return.
+				return;
+			}
+
+			// The next call must run on the short 2s re-poll budget, not the full
+			// 3s first-call budget stacked behind an 8s cell (which would take ~8s).
+			const started = Date.now();
+			const third = await tool.execute(
+				"reseed-poll",
+				{ code: "print('quick')" },
+				undefined,
+				noUpdate,
+				{} as ExtensionContext,
+			);
+			const elapsed = Date.now() - started;
+			if (third.details?.status === "backgrounded") {
+				expect(elapsed).toBeLessThan(4000);
+			}
+		});
 	},
 );
