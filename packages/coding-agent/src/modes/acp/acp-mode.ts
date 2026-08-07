@@ -262,6 +262,7 @@ export async function runAcpModeWithConnection(
 	// session keeps every event unambiguously attributable; a second session/new
 	// is refused rather than silently sharing conversation state, cwd, and queues.
 	let session: AcpSessionEntry | undefined;
+	let sessionNewInFlight = false;
 	let bound = false;
 
 	const stream =
@@ -284,77 +285,87 @@ export async function runAcpModeWithConnection(
 			_meta: primeAgentMeta({}),
 		}))
 		.onRequest("session/new", async (ctx: any) => {
-			if (!bound) {
-				// Only latch after a successful bind: a rejected bind must not leave
-				// extensions permanently unavailable for the rest of the process.
-				await options.bindHeadlessExtensions?.();
-				bound = true;
-			}
-			if (session) {
+			// Reserve the single-session slot before the first await. Otherwise two
+			// concurrent requests can both pass the empty-slot check while cwd or
+			// snapshot reads are in flight, then overwrite each other's session.
+			if (session || sessionNewInFlight) {
 				throw new Error(
 					"prime-agent ACP mode hosts one session per connection; " +
 						"start another prime-agent process for a second session",
 				);
 			}
-			// prime-agent's cwd is fixed at startup by the session it was launched
-			// with, so a client-supplied cwd cannot be adopted after the fact.
-			// Report the real cwd back in `_meta` rather than failing the request or
-			// letting the client assume a directory the agent is not using.
-			const requestedCwd = (ctx.params as { cwd?: unknown } | undefined)?.cwd;
-			let cwdMismatch: { requested: string; actual: string } | undefined;
-			if (typeof requestedCwd === "string" && requestedCwd.length > 0) {
-				const actual = await connection
-					.getState()
-					.then((state) => state.cwd)
-					.catch(() => undefined);
-				if (actual && !sameCwd(requestedCwd, actual)) {
-					cwdMismatch = { requested: requestedCwd, actual };
-				}
-			}
-			const sessionId = randomUUID();
-			// Install the listener before fetching the snapshot. Child updates can arrive
-			// while the snapshot request is in flight; the connection remains the
-			// authoritative source used when quiescence is emitted below.
-			const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined };
-			// Subscribe for the session lifetime, not per prompt turn: prime-agent
-			// subagents are fire-and-forget and keep reporting after the spawning turn
-			// ends, so a turn-scoped subscription would drop their updates. One
-			// mapping state per session keeps streaming bash output correlated with
-			// the run that produced it.
-			const mappingState: AcpEventMappingState = {};
-			const unsubscribe = connection.subscribe((event) => {
-				const notify = (update: Record<string, unknown>) =>
-					void ctx.client.notify(acp.methods.client.session.update, { sessionId, update }).catch(() => undefined);
-				// Heartbeats and cron schedules are connection-level rather than
-				// session events, but they drive the long-running work an ACP client
-				// most needs to observe.
-				if (event.type === "heartbeats_changed") {
-					notify({ sessionUpdate: "session_info_update", _meta: primeAgentMeta({ heartbeatsChanged: true }) });
-					return;
-				}
-				if (event.type !== "session_event") return;
-				for (const update of acpUpdatesForSessionEvent(event.event, mappingState)) {
-					notify(update);
-				}
-			});
+			sessionNewInFlight = true;
 			try {
-				// Reconcile after subscribing so updates cannot be lost while the snapshot
-				// request is in flight. Do not turn a failed read into an empty roster.
-				await connection.getInitialSnapshot();
-			} catch (error) {
-				// A failed setup never claims the session slot, but it must still release
-				// the listener installed above.
-				unsubscribe();
-				throw error;
+				if (!bound) {
+					// Only latch after a successful bind: a rejected bind must not leave
+					// extensions permanently unavailable for the rest of the process.
+					await options.bindHeadlessExtensions?.();
+					bound = true;
+				}
+				// prime-agent's cwd is fixed at startup by the session it was launched
+				// with, so a client-supplied cwd cannot be adopted after the fact.
+				// Report the real cwd back in `_meta` rather than failing the request or
+				// letting the client assume a directory the agent is not using.
+				const requestedCwd = (ctx.params as { cwd?: unknown } | undefined)?.cwd;
+				let cwdMismatch: { requested: string; actual: string } | undefined;
+				if (typeof requestedCwd === "string" && requestedCwd.length > 0) {
+					const actual = await connection
+						.getState()
+						.then((state) => state.cwd)
+						.catch(() => undefined);
+					if (actual && !sameCwd(requestedCwd, actual)) {
+						cwdMismatch = { requested: requestedCwd, actual };
+					}
+				}
+				const sessionId = randomUUID();
+				// Install the listener before fetching the snapshot. Child updates can arrive
+				// while the snapshot request is in flight; the connection remains the
+				// authoritative source used when quiescence is emitted below.
+				const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined };
+				// Subscribe for the session lifetime, not per prompt turn: prime-agent
+				// subagents are fire-and-forget and keep reporting after the spawning turn
+				// ends, so a turn-scoped subscription would drop their updates. One
+				// mapping state per session keeps streaming bash output correlated with
+				// the run that produced it.
+				const mappingState: AcpEventMappingState = {};
+				const unsubscribe = connection.subscribe((event) => {
+					const notify = (update: Record<string, unknown>) =>
+						void ctx.client
+							.notify(acp.methods.client.session.update, { sessionId, update })
+							.catch(() => undefined);
+					// Heartbeats and cron schedules are connection-level rather than
+					// session events, but they drive the long-running work an ACP client
+					// most needs to observe.
+					if (event.type === "heartbeats_changed") {
+						notify({ sessionUpdate: "session_info_update", _meta: primeAgentMeta({ heartbeatsChanged: true }) });
+						return;
+					}
+					if (event.type !== "session_event") return;
+					for (const update of acpUpdatesForSessionEvent(event.event, mappingState)) {
+						notify(update);
+					}
+				});
+				try {
+					// Reconcile after subscribing so updates cannot be lost while the snapshot
+					// request is in flight. Do not turn a failed read into an empty roster.
+					await connection.getInitialSnapshot();
+				} catch (error) {
+					// A failed setup never claims the session slot, but it must still release
+					// the listener installed above.
+					unsubscribe();
+					throw error;
+				}
+				// Claim the single-session slot only once the subscription and snapshot are
+				// ready, so a failed setup cannot leave it occupied and unusable.
+				entry.unsubscribe = unsubscribe;
+				session = entry;
+				return {
+					sessionId,
+					...(cwdMismatch ? { _meta: primeAgentMeta({ cwd: cwdMismatch }) } : {}),
+				};
+			} finally {
+				sessionNewInFlight = false;
 			}
-			// Claim the single-session slot only once the subscription and snapshot are
-			// ready, so a failed setup cannot leave it occupied and unusable.
-			entry.unsubscribe = unsubscribe;
-			session = entry;
-			return {
-				sessionId,
-				...(cwdMismatch ? { _meta: primeAgentMeta({ cwd: cwdMismatch }) } : {}),
-			};
 		})
 		.onRequest("session/prompt", async (ctx: any) => {
 			const params = ctx.params as { sessionId: string; prompt: readonly unknown[] };

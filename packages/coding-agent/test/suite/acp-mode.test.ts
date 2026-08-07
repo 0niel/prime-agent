@@ -178,6 +178,32 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("rejects a concurrent session creation while the first snapshot is pending", async () => {
+		let enteredSnapshot!: () => void;
+		let releaseSnapshot!: () => void;
+		const snapshotEntered = new Promise<void>((resolve) => {
+			enteredSnapshot = resolve;
+		});
+		const snapshotReleased = new Promise<void>((resolve) => {
+			releaseSnapshot = resolve;
+		});
+		const connection = fakeAcpConnection({
+			initialSnapshot: async () => {
+				enteredSnapshot();
+				await snapshotReleased;
+				return { state: { cwd: process.cwd() }, messages: [], children: [] };
+			},
+		});
+		const { client, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const first = client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await snapshotEntered;
+		await expect(client.request("session/new", { cwd: process.cwd(), mcpServers: [] })).rejects.toThrow();
+		releaseSnapshot();
+		await expect(first).resolves.toMatchObject({ sessionId: expect.any(String) });
+		close();
+	});
+
 	it("subscribes before taking the initial roster snapshot", async () => {
 		let subscribedAtSnapshot: boolean | undefined;
 		const connection = fakeAcpConnection({
