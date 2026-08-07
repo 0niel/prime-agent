@@ -1601,6 +1601,98 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.descriptor.consecutiveFailures).toBe(0);
 	});
 
+	it("reports a stop-tombstoned worker as stopping, not ready", () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-tombstoned",
+				pid: process.pid,
+				lifecycle: "ready" as const,
+				stopRequestedAt: new Date().toISOString(),
+			},
+			client: {},
+			intentionalStop: false,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {}) as {
+			effectiveWorkerState(target: object): string;
+		};
+
+		expect(supervisor.effectiveWorkerState(worker)).toBe("stopping");
+	});
+
+	it("never reports a disconnected worker as ready", () => {
+		const worker = {
+			descriptor: { workerId: "worker-disconnected", pid: process.pid, lifecycle: "ready" as const },
+			client: undefined,
+			intentionalStop: false,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {}) as {
+			effectiveWorkerState(target: object): string;
+		};
+
+		expect(supervisor.effectiveWorkerState(worker)).toBe("recovering");
+	});
+
+	it("reports a connected ready worker as ready", () => {
+		const worker = {
+			descriptor: { workerId: "worker-live", pid: process.pid, lifecycle: "ready" as const },
+			client: {},
+			intentionalStop: false,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {}) as {
+			effectiveWorkerState(target: object): string;
+		};
+
+		expect(supervisor.effectiveWorkerState(worker)).toBe("ready");
+	});
+
+	it("excludes stopping workers from the live session list", async () => {
+		const makeWorker = (workerId: string, stopRequestedAt?: string) => ({
+			descriptor: {
+				workerId,
+				pid: process.pid,
+				rootActiveSessionId: `${workerId}-active`,
+				lifecycle: "ready" as const,
+				...(stopRequestedAt ? { stopRequestedAt } : {}),
+			},
+			client: {},
+			intentionalStop: false,
+			summaries: new Map([
+				[
+					`${workerId}-active`,
+					{
+						id: `${workerId}-active`,
+						activeSessionId: `${workerId}-active`,
+						sessionId: `${workerId}-session`,
+						cwd: "/tmp",
+					} as unknown as SessionSummary,
+				],
+			]),
+		});
+		const liveWorker = makeWorker("worker-live");
+		const stoppingWorker = makeWorker("worker-stopping", new Date().toISOString());
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([
+				[liveWorker.descriptor.workerId, liveWorker],
+				[stoppingWorker.descriptor.workerId, stoppingWorker],
+			]),
+			clients: new Set(),
+			refreshWorkerSummaries: vi.fn(async () => {}),
+			syncAgentPeers: vi.fn(async () => {}),
+			log: vi.fn(),
+		}) as {
+			handleList(
+				client: object,
+				command: { id: string; type: "list" },
+			): Promise<{ success: boolean; data?: { sessions: Array<{ activeSessionId?: string; id: string }> } }>;
+		};
+
+		const response = await supervisor.handleList({}, { id: "list-1", type: "list" });
+
+		expect(response.success).toBe(true);
+		const sessions = response.data?.sessions ?? [];
+		expect(sessions.map((session) => session.activeSessionId ?? session.id)).toEqual(["worker-live-active"]);
+	});
+
 	it("ignores malformed persisted worker descriptors", () => {
 		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-descriptor-test-"));
 		try {
