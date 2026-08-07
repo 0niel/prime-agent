@@ -347,7 +347,7 @@ export class TUI extends Container {
 			previousViewportTop: number;
 		};
 	} | null = null;
-	private static readonly WHEEL_SCROLL_LINES = 3;
+	private pendingWheelDirection: SelectionScrollDirection | null = null;
 	private static readonly SELECTION_AUTO_SCROLL_DELAY_MS = 150;
 	private static readonly SELECTION_AUTO_SCROLL_INTERVAL_MS = 50;
 	private selectionAutoScrollTimer: NodeJS.Timeout | undefined;
@@ -673,6 +673,7 @@ export class TUI extends Container {
 	 */
 	enterFullscreen(options: FullscreenOptions): void {
 		if (this.fullscreen) return;
+		this.pendingWheelDirection = null;
 		this.fullscreen = {
 			viewport: new FullscreenViewport(),
 			scroll: options.scroll,
@@ -702,6 +703,7 @@ export class TUI extends Container {
 	 */
 	exitFullscreen(options: ExitFullscreenOptions = {}): void {
 		this.stopSelectionAutoScroll();
+		this.pendingWheelDirection = null;
 		if (!this.fullscreen) return;
 		const { inlineState } = this.fullscreen;
 		this.fullscreen = null;
@@ -896,11 +898,12 @@ export class TUI extends Container {
 				const viewport = fullscreen.viewport;
 				if (isWheelUp(event)) {
 					this.stopSelectionAutoScroll();
-					this.scrollBy(-TUI.WHEEL_SCROLL_LINES);
+					this.scrollByWheel(-1);
 				} else if (isWheelDown(event)) {
 					this.stopSelectionAutoScroll();
-					this.scrollBy(TUI.WHEEL_SCROLL_LINES);
+					this.scrollByWheel(1);
 				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
+					this.pendingWheelDirection = null;
 					this.stopSelectionAutoScroll();
 					if (!viewport.beginSelection(event.y - 1, event.x - 1)) {
 						viewport.beginFrameSelection(event.y - 1, event.x - 1);
@@ -920,6 +923,7 @@ export class TUI extends Container {
 					viewport.clearSelection();
 				}
 			} else if (event && overlayFocused) {
+				this.pendingWheelDirection = null;
 				this.stopSelectionAutoScroll();
 				const viewport = fullscreen.viewport;
 				if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
@@ -940,6 +944,7 @@ export class TUI extends Container {
 			}
 			return true;
 		}
+		this.pendingWheelDirection = null;
 		this.stopSelectionAutoScroll();
 
 		if (overlayFocused || !fullscreen.viewportControls) return false;
@@ -962,6 +967,15 @@ export class TUI extends Container {
 			return true;
 		}
 		return false;
+	}
+
+	private scrollByWheel(direction: SelectionScrollDirection): void {
+		if (this.pendingWheelDirection !== direction) {
+			this.pendingWheelDirection = direction;
+			return;
+		}
+		this.pendingWheelDirection = null;
+		this.scrollBy(direction);
 	}
 
 	private consumeCellSizeResponse(data: string): boolean {

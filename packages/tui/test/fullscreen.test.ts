@@ -236,9 +236,14 @@ describe("TUI fullscreen mode", () => {
 
 		terminal.sendInput(WHEEL_UP);
 		await terminal.waitForRender();
+		assert.strictEqual(terminal.getViewport()[0], "Line 12", "first wheel step stays on the current row");
+		assert.strictEqual(tui.getScrollInfo()?.following, true);
+
+		terminal.sendInput(WHEEL_UP);
+		await terminal.waitForRender();
 
 		let viewport = terminal.getViewport();
-		assert.strictEqual(viewport[0], "Line 9", "wheel scrolls up 3 lines");
+		assert.strictEqual(viewport[0], "Line 11", "second wheel step scrolls up one row");
 		assert.strictEqual(tui.getScrollInfo()?.following, false);
 
 		chat.lines = lines(40);
@@ -246,9 +251,9 @@ describe("TUI fullscreen mode", () => {
 		await terminal.waitForRender();
 
 		viewport = terminal.getViewport();
-		assert.strictEqual(viewport[0], "Line 9", "appended content does not move the window");
+		assert.strictEqual(viewport[0], "Line 11", "appended content does not move the window");
 		assert.strictEqual(viewport[8], "> prompt", "dock still visible");
-		assert.strictEqual(tui.getScrollInfo()?.linesBelow, 23);
+		assert.strictEqual(tui.getScrollInfo()?.linesBelow, 21);
 		assert.ok(viewport[7]?.includes("ctrl+shift+down to follow"), "follow hint composited above the dock");
 
 		tui.stop();
@@ -261,6 +266,7 @@ describe("TUI fullscreen mode", () => {
 
 		assert.ok(!terminal.getViewport().join("\n").includes("to follow"));
 
+		terminal.sendInput(WHEEL_UP);
 		terminal.sendInput(WHEEL_UP);
 		await terminal.waitForRender();
 		assert.ok(terminal.getViewport().join("\n").includes("to follow"));
@@ -278,8 +284,14 @@ describe("TUI fullscreen mode", () => {
 		await terminal.waitForRender();
 
 		terminal.sendInput(WHEEL_UP);
+		terminal.sendInput(WHEEL_UP);
 		await terminal.waitForRender();
 		assert.strictEqual(tui.getScrollInfo()?.following, false);
+
+		terminal.sendInput(WHEEL_UP);
+		terminal.sendInput(WHEEL_DOWN);
+		await terminal.waitForRender();
+		assert.strictEqual(tui.getScrollInfo()?.following, false, "direction change only arms the reverse step");
 
 		terminal.sendInput(WHEEL_DOWN);
 		await terminal.waitForRender();
