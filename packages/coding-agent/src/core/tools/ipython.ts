@@ -891,6 +891,11 @@ export function createIpythonToolDefinition(
 					}
 				}
 				const { result: r, kernelRestarted } = raced;
+				// A real result means nothing is backgrounded anymore: reset stuckness
+				// tracking so later independent calls get the full timeout again
+				// instead of the short re-poll budget.
+				stuckTracker.requestMsgId = undefined;
+				stuckTracker.silentPolls = 0;
 
 				let text = r.stdout;
 				if (r.stderr) text += (text ? "\n" : "") + r.stderr;

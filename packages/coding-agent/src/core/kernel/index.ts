@@ -53,6 +53,8 @@ const CONTROL_RPC_TIMEOUT_MS = 5000;
 const RECOVERY_WEAPON_SETTLE_MS = 4000;
 // Budget for one subshell-lane cell (weapon injection or user inspection).
 const SUBSHELL_EXEC_TIMEOUT_MS = 10_000;
+// Retained-output cap for lane cells, mirroring DEFAULT_MAX_OUTPUT_CHARS.
+const SUBSHELL_MAX_OUTPUT_CHARS = 65536;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
@@ -323,6 +325,9 @@ interface ActiveExecution {
 	opts: ExecuteOptions;
 	stdout: string;
 	stderr: string;
+	/** Total stream chars observed, uncapped — retained stdout/stderr are
+	 *  truncated at maxChars, so stuckness detection must not use them. */
+	totalStreamChars: number;
 	stdoutTruncated: boolean;
 	stderrTruncated: boolean;
 	result?: string;
@@ -912,6 +917,7 @@ export class KernelManager {
 			opts,
 			stdout: "",
 			stderr: "",
+			totalStreamChars: 0,
 			stdoutTruncated: false,
 			stderrTruncated: false,
 			diffs: [],
@@ -1034,6 +1040,7 @@ export class KernelManager {
 		}
 		if (t === "stream") {
 			const c = incoming.content as { name: "stdout" | "stderr"; text: string };
+			execution.totalStreamChars += c.text.length;
 			if (c.name === "stdout") {
 				if (execution.stdout.length < execution.maxChars) {
 					execution.stdout += c.text;
@@ -1331,8 +1338,15 @@ export class KernelManager {
 		const t = incoming.header.msg_type;
 		if (t === "stream") {
 			const c = incoming.content as { name: "stdout" | "stderr"; text: string };
-			if (c.name === "stdout") execution.stdout += c.text;
-			else execution.stderr += c.text;
+			// Cap retained lane output like the main execution path does; a verbose
+			// lane cell must not grow host memory without bound.
+			if (c.name === "stdout") {
+				if (execution.stdout.length < SUBSHELL_MAX_OUTPUT_CHARS) {
+					execution.stdout = (execution.stdout + c.text).slice(0, SUBSHELL_MAX_OUTPUT_CHARS);
+				}
+			} else if (execution.stderr.length < SUBSHELL_MAX_OUTPUT_CHARS) {
+				execution.stderr = (execution.stderr + c.text).slice(0, SUBSHELL_MAX_OUTPUT_CHARS);
+			}
 		} else if (t === "error") {
 			execution.status = "error";
 		} else if (t === "status") {
@@ -1418,13 +1432,15 @@ export class KernelManager {
 	}
 
 	/** Identity and output volume of the in-flight execution, for stuckness
-	 *  tracking across backgrounded polls (no output growth => stuck). */
+	 *  tracking across backgrounded polls (no output growth => stuck).
+	 *  Uses the uncapped stream counter: retained stdout/stderr are truncated
+	 *  at maxChars, which would freeze the count for verbose healthy cells. */
 	get activeExecutionInfo(): { requestMsgId: string; outputChars: number } | undefined {
 		const execution = this.activeExecution;
 		if (!execution) return undefined;
 		return {
 			requestMsgId: execution.requestMsgId,
-			outputChars: execution.stdout.length + execution.stderr.length,
+			outputChars: execution.totalStreamChars,
 		};
 	}
 
@@ -1524,24 +1540,37 @@ export class KernelManager {
 		}
 
 		const settled = () => this.waitForActiveExecutionToClear(undefined, settleMs);
+		// The stuck cell may settle during any await above/between weapons; the
+		// serialized queue can then start an unrelated cell, and a weapon fired
+		// now would hit valid work. Re-check identity before every weapon.
+		const stuckCellGone = () => this.activeExecution !== execution;
 
+		if (stuckCellGone()) {
+			return { outcome: "recovered", weapon: undefined };
+		}
 		this.appendKernelDiagnostic(`recovery: firing interrupt at ${execution.requestMsgId}`);
 		await this.interrupt().catch(() => undefined);
-		if ((await settled()) || this.activeExecution !== execution) {
+		if ((await settled()) || stuckCellGone()) {
 			return { outcome: "recovered", weapon: "interrupt" };
 		}
 
+		if (stuckCellGone()) {
+			return { outcome: "recovered", weapon: undefined };
+		}
 		this.appendKernelDiagnostic(`recovery: firing task-cancel at ${execution.requestMsgId}`);
 		await this.executeInRecoverySubshell(CANCEL_MAIN_TASK_CODE);
-		if ((await settled()) || this.activeExecution !== execution) {
+		if ((await settled()) || stuckCellGone()) {
 			return { outcome: "recovered", weapon: "task-cancel" };
 		}
 
 		const diagnosis = await this.executeInRecoverySubshell(DIAGNOSE_MAIN_STACK_CODE);
+		if (stuckCellGone()) {
+			return { outcome: "recovered", weapon: undefined };
+		}
 		if (diagnosis.status === "ok" && diagnosis.output.includes("_rec_in_user=True")) {
 			this.appendKernelDiagnostic(`recovery: firing async-exc at ${execution.requestMsgId}`);
 			await this.executeInRecoverySubshell(ASYNC_EXC_MAIN_CODE);
-			if ((await settled()) || this.activeExecution !== execution) {
+			if ((await settled()) || stuckCellGone()) {
 				return { outcome: "recovered", weapon: "async-exc" };
 			}
 		}

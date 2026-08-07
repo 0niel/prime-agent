@@ -42,16 +42,25 @@ export interface KernelRecoveryResult {
 }
 
 /** Cancel the main shell's in-flight execute task from the subshell thread.
- *  call_soon_threadsafe is the only loop-safe cross-thread entry point. */
+ *  call_soon_threadsafe is the only loop-safe cross-thread entry point.
+ *  Matches exact kernel-machinery qualnames only (the stuck cell's task is
+ *  InteractiveShell.run_cell_async on ipykernel 7; the other two cover
+ *  wrapper-level tasks across versions) so user tasks with similar names are
+ *  never cancelled. */
 export const CANCEL_MAIN_TASK_CODE = `
 import asyncio as _rec_aio
 from ipykernel.kernelapp import IPKernelApp as _RecApp
 _rec_loop = _RecApp.instance().kernel.io_loop.asyncio_loop
+_REC_KERNEL_TASKS = {
+    "InteractiveShell.run_cell_async",
+    "IPythonKernel.do_execute",
+    "Kernel.execute_request",
+}
 def _rec_cancel():
     _n = 0
     for _t in _rec_aio.all_tasks(_rec_loop):
         _name = getattr(_t.get_coro(), "__qualname__", "")
-        if "execute_request" in _name or "do_execute" in _name or "run_cell" in _name:
+        if _name in _REC_KERNEL_TASKS:
             _t.cancel(); _n += 1
     print(f"_rec_cancelled={_n}")
 _rec_loop.call_soon_threadsafe(_rec_cancel)

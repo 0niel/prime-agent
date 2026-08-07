@@ -147,5 +147,103 @@ describeIfKernel(
 			}
 			expect(sawDone).toBe(true);
 		});
+
+		it("restores the full timeout budget after a backgrounded cell completes", async () => {
+			setEnv("PRIME_AGENT_IPYTHON_TOOL_TIMEOUT_MS", "3000");
+			setEnv("PRIME_AGENT_IPYTHON_REPOLL_TIMEOUT_MS", "1000");
+			setEnv("PRIME_AGENT_IPYTHON_STUCK_CELL_POLLS", "10");
+			setEnv("PRIME_AGENT_KERNEL_PYTHON", python as string);
+
+			provisioner = new IpythonKernelProvisioner(process.cwd(), {});
+			const tool = createIpythonToolDefinition(process.cwd(), { provisioner });
+			const noUpdate = () => undefined;
+
+			// Cell 1 exceeds the 3s budget but finishes on its own shortly after.
+			const first = await tool.execute(
+				"finishes-late",
+				{ code: "import time\ntime.sleep(4.5)\nprint('late done')" },
+				undefined,
+				noUpdate,
+				{} as ExtensionContext,
+			);
+			expect(first.details?.status).toBe("backgrounded");
+
+			// Poll until the late cell's completion is consumed by a queued call.
+			let completed = false;
+			for (let i = 0; i < 8 && !completed; i++) {
+				const poll = await tool.execute(
+					`late-poll-${i}`,
+					{ code: "print('ping')" },
+					undefined,
+					noUpdate,
+					{} as ExtensionContext,
+				);
+				if (poll.details?.status === "ok") completed = true;
+			}
+			expect(completed).toBe(true);
+
+			// A fresh independent cell needing ~2s must now get the FULL 3s budget,
+			// not the 1s re-poll budget (which would background it).
+			const fresh = await tool.execute(
+				"fresh-after-recovery",
+				{ code: "import time\ntime.sleep(2)\nprint('fresh ok')" },
+				undefined,
+				noUpdate,
+				{} as ExtensionContext,
+			);
+			expect(fresh.details?.status).toBe("ok");
+			expect(fresh.details?.stdout).toContain("fresh ok");
+		});
+
+		it("does not misclassify a verbose cell as stuck once retained output hits the cap", async () => {
+			setEnv("PRIME_AGENT_IPYTHON_TOOL_TIMEOUT_MS", "2000");
+			setEnv("PRIME_AGENT_IPYTHON_REPOLL_TIMEOUT_MS", "1500");
+			setEnv("PRIME_AGENT_IPYTHON_STUCK_CELL_POLLS", "2");
+			setEnv("PRIME_AGENT_KERNEL_PYTHON", python as string);
+
+			provisioner = new IpythonKernelProvisioner(process.cwd(), {});
+			const tool = createIpythonToolDefinition(process.cwd(), { provisioner });
+			const noUpdate = () => undefined;
+
+			// Saturate the 64KiB retained-output cap immediately, then keep printing
+			// (slowly) for ~8s. Capped stdout stops growing, but the uncapped stream
+			// counter must keep the stuckness count at zero.
+			const first = await tool.execute(
+				"verbose-1",
+				{
+					code: [
+						"import time",
+						"print('x' * 70000)",
+						"vdone = 0",
+						"for _i in range(8):",
+						"    time.sleep(1)",
+						"    print('tick', _i, flush=True)",
+						"vdone = 1",
+						"print('verbose done')",
+					].join("\n"),
+				},
+				undefined,
+				noUpdate,
+				{} as ExtensionContext,
+			);
+			expect(first.details?.status).toBe("backgrounded");
+
+			let sawDone = false;
+			for (let i = 0; i < 8 && !sawDone; i++) {
+				const poll = await tool.execute(
+					`verbose-poll-${i}`,
+					{ code: "print('vdone =', vdone)" },
+					undefined,
+					noUpdate,
+					{} as ExtensionContext,
+				);
+				expect(poll.details?.recovery ?? undefined).toBeUndefined();
+				if (poll.details?.status === "ok") {
+					sawDone = true;
+					expect(poll.details?.stdout).toContain("vdone = 1");
+				}
+			}
+			expect(sawDone).toBe(true);
+		});
 	},
 );
