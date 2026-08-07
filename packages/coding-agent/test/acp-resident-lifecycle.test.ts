@@ -287,6 +287,16 @@ describe("ACP daemon lifecycle negotiation", () => {
 		expect(clientOwned("acp", true)).toBe(true);
 	});
 
+	it("forwards the caller environment for resident sessions too", () => {
+		// A resident worker is still launched by the daemon, so it needs the
+		// caller's env. An embedder (the verifiers ACP harness) passes the model
+		// endpoint, bearer token, and proxy settings that way; gating launchEnv on
+		// clientOwned would start the worker unable to reach the model at all.
+		const source = readFileSync(resolve(__dirname, "../src/main.ts"), "utf8");
+		expect(source).toContain("launchEnv: collectDaemonLaunchEnv(),");
+		expect(source).not.toContain("launchEnv: clientOwned ? collectDaemonLaunchEnv() : undefined");
+	});
+
 	it(
 		"preserves an ACP kernel's live Python namespace across client disconnect and re-attach",
 		{ tags: ["kernel-heavy"], timeout: 240_000 },

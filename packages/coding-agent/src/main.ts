@@ -997,7 +997,12 @@ async function createDaemonClientConnection(options: {
 			noSession: options.noSession,
 			env: collectDaemonClientEnv(),
 			lifecycle: clientOwned ? "client_owned" : "resident",
-			launchEnv: clientOwned ? collectDaemonLaunchEnv() : undefined,
+			// Forward the caller's environment for BOTH lifecycles. A resident
+			// worker still has to be launched with the caller's env: an embedder
+			// such as the verifiers ACP harness passes the model endpoint, its
+			// bearer token, and proxy settings that way, and a worker started
+			// without them cannot reach the model at all.
+			launchEnv: collectDaemonLaunchEnv(),
 		});
 		if (!response.success) {
 			throw deserializeDaemonError(response);
