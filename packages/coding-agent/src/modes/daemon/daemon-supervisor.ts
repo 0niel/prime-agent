@@ -113,6 +113,7 @@ import {
 	type DaemonCreateCommand,
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
+	type DaemonWorkerLifecycle,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
@@ -765,7 +766,7 @@ export class DaemonSupervisor {
 		return {
 			lifecycle: worker.descriptor.lifecycle,
 			isConnected: worker.client !== undefined,
-			isStopping: worker.intentionalStop || worker.descriptor.stopRequestedAt !== undefined,
+			isStopping: this.isWorkerStopping(worker),
 			hasOwnerClient: worker.descriptor.ownerClientId !== undefined,
 			isPreparingUpdateRestart:
 				this.updateRestartPhase !== undefined || worker.updateRestartPrepareClient !== undefined,
@@ -1580,7 +1581,7 @@ export class DaemonSupervisor {
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
 					return this.forwardToWorker(match.worker, command);
 				}
-				const first = [...this.workers.values()].find((worker) => this.isVisibleWorker(worker) && worker.client);
+				const first = [...this.workers.values()].find((worker) => this.isLiveWorker(worker) && worker.client);
 				if (!first) {
 					return success(command.id, command.type, { paused: false, limits: {} });
 				}
@@ -1594,7 +1595,7 @@ export class DaemonSupervisor {
 				}
 				const responses = await Promise.all(
 					[...this.workers.values()]
-						.filter((worker) => this.isVisibleWorker(worker) && worker.client)
+						.filter((worker) => this.isLiveWorker(worker) && worker.client)
 						.map((worker) => this.forwardToWorker(worker, command)),
 				);
 				const failed = responses.find((response) => !response.success);
@@ -1609,8 +1610,7 @@ export class DaemonSupervisor {
 				const responses = await Promise.all(
 					[...this.workers.values()]
 						.filter(
-							(worker) =>
-								this.isVisibleWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
+							(worker) => this.isLiveWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
 						)
 						.map((worker) =>
 							this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
@@ -1634,7 +1634,7 @@ export class DaemonSupervisor {
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
 					return this.forwardToWorker(match.worker, command);
 				}
-				const workers = [...this.workers.values()].filter((worker) => this.isVisibleWorker(worker));
+				const workers = [...this.workers.values()].filter((worker) => this.isLiveWorker(worker));
 				const heartbeats = new Map<string, AgentConnectionHeartbeat>();
 				const snapshots: Array<{ heartbeats?: AgentConnectionHeartbeat[]; response?: DaemonResponse }> =
 					await Promise.all(
@@ -1718,8 +1718,7 @@ export class DaemonSupervisor {
 				const listed = await Promise.all(
 					[...this.workers.values()]
 						.filter(
-							(worker) =>
-								this.isVisibleWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
+							(worker) => this.isLiveWorker(worker) && worker.client && worker.descriptor.lifecycle === "ready",
 						)
 						.map(async (worker) => ({
 							worker,
@@ -1930,8 +1929,10 @@ export class DaemonSupervisor {
 		const active = [...this.workers.values()]
 			.filter(
 				(worker) =>
-					this.isVisibleWorker(worker) ||
-					(command.includeClientOwned === true && this.isWorkerAccessibleToClient(client, worker)),
+					this.isLiveWorker(worker) ||
+					(command.includeClientOwned === true &&
+						!this.isWorkerStopping(worker) &&
+						this.isWorkerAccessibleToClient(client, worker)),
 			)
 			.flatMap((worker) => [...worker.summaries.values()].map((summary) => this.publicSummary(worker, summary)));
 		const busyClientOwnedSessionCount = clientOwnedWorkers
@@ -3061,9 +3062,7 @@ export class DaemonSupervisor {
 			.then(async () => {
 				const readyWorkers = [...this.workers.values()].filter(
 					(worker): worker is ResidentWorker & { client: DaemonWorkerClient } =>
-						this.isVisibleWorker(worker) &&
-						worker.descriptor.lifecycle === "ready" &&
-						worker.client !== undefined,
+						this.isLiveWorker(worker) && worker.descriptor.lifecycle === "ready" && worker.client !== undefined,
 				);
 				await Promise.all(
 					readyWorkers.map(async (worker) => {
@@ -3088,6 +3087,30 @@ export class DaemonSupervisor {
 
 	private isVisibleWorker(worker: ResidentWorker): boolean {
 		return worker.descriptor.ownerClientId === undefined;
+	}
+
+	/** A worker with a durable or in-memory stop intent is stopping, never live. */
+	private isWorkerStopping(worker: ResidentWorker): boolean {
+		return worker.intentionalStop || worker.descriptor.stopRequestedAt !== undefined;
+	}
+
+	/** Live workers are visible to all clients and not stopping. */
+	private isLiveWorker(worker: ResidentWorker): boolean {
+		return this.isVisibleWorker(worker) && !this.isWorkerStopping(worker);
+	}
+
+	/**
+	 * The lifecycle reported to clients. A stop intent always wins, and a worker
+	 * whose process connection is gone is never reported as "ready".
+	 */
+	private effectiveWorkerState(worker: ResidentWorker): DaemonWorkerLifecycle {
+		if (this.isWorkerStopping(worker)) {
+			return "stopping";
+		}
+		if (worker.descriptor.lifecycle === "ready" && worker.client === undefined) {
+			return "recovering";
+		}
+		return worker.descriptor.lifecycle;
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
@@ -3134,7 +3157,7 @@ export class DaemonSupervisor {
 			...summary,
 			attachedClients: [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId))
 				.length,
-			workerState: worker.descriptor.lifecycle,
+			workerState: this.effectiveWorkerState(worker),
 			workerPid: worker.descriptor.pid,
 		};
 	}
@@ -3240,7 +3263,7 @@ export class DaemonSupervisor {
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<DaemonResponse> {
 		if (!worker.client || worker.descriptor.lifecycle !== "ready") {
-			throw new Error(`Session worker is ${worker.descriptor.lifecycle}`);
+			throw new Error(`Session worker is ${this.effectiveWorkerState(worker)}`);
 		}
 		const response = await worker.client.request(withoutCommandId(command), timeoutMs);
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
