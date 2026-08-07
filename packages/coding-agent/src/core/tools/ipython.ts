@@ -148,6 +148,10 @@ const ipythonSchema = Type.Object({
 	}),
 });
 
+// Cap for the streamed-output tail retained for backgrounded notices,
+// mirroring the kernel's own retained-output cap.
+const STREAMED_OUTPUT_MAX_CHARS = 65_536;
+
 const BUSY_KERNEL_WAIT_CHOICE = "Wait and preserve state";
 const BUSY_KERNEL_KILL_CHOICE = "Kill kernel and restart";
 const BUSY_KERNEL_PROMPT = [
@@ -781,6 +785,9 @@ export function createIpythonToolDefinition(
 
 			try {
 				const code = applyShellSettingsToBashMagicCell(params.code, options);
+				// Only surfaced in the backgrounded notice, so keep the most recent
+				// tail; unbounded accumulation from a verbose long-running cell would
+				// grow host memory for the life of the call.
 				let streamedOutput = "";
 				const executePromise = executeWithBusyKernelChoice(
 					provisioner,
@@ -789,7 +796,7 @@ export function createIpythonToolDefinition(
 					code,
 					signal,
 					(chunk) => {
-						streamedOutput += chunk;
+						streamedOutput = (streamedOutput + chunk).slice(-STREAMED_OUTPUT_MAX_CHARS);
 						onUpdate?.({
 							content: [{ type: "text", text: chunk }],
 							details: { status: "ok" },
