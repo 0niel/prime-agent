@@ -34,6 +34,7 @@ function fakeAcpConnection(
 		initialSnapshot?: () => Promise<any>;
 		finalSnapshot?: () => Promise<any>;
 		onInitialSnapshot?: (subscribed: boolean) => void;
+		onUnsubscribe?: () => void;
 	} = {},
 ): any {
 	let listener: ((event: any) => void) | undefined;
@@ -45,6 +46,7 @@ function fakeAcpConnection(
 			listener = callback;
 			return () => {
 				listener = undefined;
+				options.onUnsubscribe?.();
 			};
 		},
 		getState: async () => snapshot.state,
@@ -156,6 +158,23 @@ describe("ACP mode end to end", () => {
 		const { client, close } = connectAcpClient(connection);
 		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
 		await expect(client.request("session/new", { cwd: process.cwd(), mcpServers: [] })).rejects.toThrow();
+		close();
+	});
+
+	it("releases the subscription when the initial roster snapshot fails", async () => {
+		let unsubscribeCount = 0;
+		const connection = fakeAcpConnection({
+			initialSnapshot: async () => {
+				throw new Error("snapshot unavailable");
+			},
+			onUnsubscribe: () => {
+				unsubscribeCount += 1;
+			},
+		});
+		const { client, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		await expect(client.request("session/new", { cwd: process.cwd(), mcpServers: [] })).rejects.toThrow();
+		expect(unsubscribeCount).toBe(1);
 		close();
 	});
 

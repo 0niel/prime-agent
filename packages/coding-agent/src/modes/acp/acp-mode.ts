@@ -337,9 +337,16 @@ export async function runAcpModeWithConnection(
 					notify(update);
 				}
 			});
-			// Reconcile after subscribing so updates cannot be lost while the snapshot
-			// request is in flight. Do not turn a failed read into an empty roster.
-			await connection.getInitialSnapshot();
+			try {
+				// Reconcile after subscribing so updates cannot be lost while the snapshot
+				// request is in flight. Do not turn a failed read into an empty roster.
+				await connection.getInitialSnapshot();
+			} catch (error) {
+				// A failed setup never claims the session slot, but it must still release
+				// the listener installed above.
+				unsubscribe();
+				throw error;
+			}
 			// Claim the single-session slot only once the subscription and snapshot are
 			// ready, so a failed setup cannot leave it occupied and unusable.
 			entry.unsubscribe = unsubscribe;
