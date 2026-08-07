@@ -2,7 +2,10 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-08-07
+
 - Fixed the bundled `websearch` skill description and missing-key guidance omitting the `/login` → **MCP Connections** step required to configure Serper.
+- Fixed `retry_worker` cancelling its own recovery when a stopped session worker left a saved stop marker behind, leaving the session stuck at "Session worker is not connected".
 
 ## [0.7.0] - 2026-08-05
 
