@@ -399,6 +399,44 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
+	it("passes launchEnv to resident workers", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-resident-env-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		const extensionPath = join(projectDir, "resident-env-extension.ts");
+		const markerPath = join(root, "resident-env-marker");
+		mkdirSync(projectDir, { recursive: true });
+		writeFileSync(
+			extensionPath,
+			"import { writeFileSync } from 'node:fs';\nexport default function() { writeFileSync(process.env.PRIME_AGENT_TEST_RESIDENT_ENV_MARKER!, process.env.PRIME_AGENT_TEST_RESIDENT_ENV!); }\n",
+		);
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, supervisor);
+		const launchEnvSentinel = `resident-env-${randomUUID()}`;
+		const created = await client.request({
+			type: "create",
+			lifecycle: "resident",
+			launchEnv: {
+				PRIME_AGENT_TEST_RESIDENT_ENV: launchEnvSentinel,
+				PRIME_AGENT_TEST_RESIDENT_ENV_MARKER: markerPath,
+			},
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, extensions: [extensionPath] },
+		});
+		expect(created.success).toBe(true);
+		const summary = requireSummary(created.success ? created.data : undefined);
+		if (summary.workerPid) workerPids.add(summary.workerPid);
+		expect(readFileSync(markerPath, "utf8")).toBe(launchEnvSentinel);
+
+		await client.request({ type: "shutdown" });
+		client.close();
+	});
+
 	it("keeps client-owned workers hidden and removes them without archiving", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
