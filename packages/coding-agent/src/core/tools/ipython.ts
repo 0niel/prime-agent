@@ -14,6 +14,7 @@ import {
 	KernelBusyAfterInterruptError,
 	type KernelDiffDisplay,
 	KernelManager,
+	type KernelRecoveryResult,
 	type KernelSentAgentMessage,
 } from "../kernel/index.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
@@ -260,6 +261,8 @@ export interface IpythonToolDetails {
 	sentAgentMessages?: KernelSentAgentMessage[];
 	/** True when this result came after killing and restarting a busy kernel. */
 	kernelRestarted?: boolean;
+	/** Outcome of the stuck-cell recovery ladder, when it fired on this poll. */
+	recovery?: KernelRecoveryResult | "no-kernel";
 	error?: {
 		ename: string;
 		evalue: string;
@@ -361,6 +364,18 @@ export class IpythonKernelProvisioner {
 	/** Whether a kernel has finished starting and is currently running. */
 	get hasRunningKernel(): boolean {
 		return this.startedManager?.isRunning ?? false;
+	}
+
+	/** Escalate a stuck execution through the recovery ladder (see kernel/recovery.ts). */
+	async recoverStuckExecution(): Promise<KernelRecoveryResult | "no-kernel"> {
+		const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
+		if (!m) return "no-kernel";
+		return m.recoverStuckExecution();
+	}
+
+	/** Identity/output of the in-flight execution, for cross-call stuckness tracking. */
+	get activeExecutionInfo(): { requestMsgId: string; outputChars: number } | undefined {
+		return this.startedManager?.activeExecutionInfo;
 	}
 
 	/** Live user-defined names in the kernel namespace, or null if listing failed / no kernel. */
@@ -572,16 +587,110 @@ function ipythonToolTimeoutMs(): number {
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 900_000;
 }
 
-function backgroundedNotice(timeoutMs: number, outputSoFar: string): string {
+/** Once a cell is backgrounded, follow-up calls queued behind it re-poll on a
+ *  short budget instead of the full tool timeout, so stuckness is established
+ *  (and recovery fires) in minutes, not multiples of the full timeout. */
+function ipythonRepollTimeoutMs(): number {
+	const raw = process.env.PRIME_AGENT_IPYTHON_REPOLL_TIMEOUT_MS;
+	if (raw === undefined) {
+		return 30_000;
+	}
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
+}
+
+/** Silent backgrounded polls (no output growth) before the destructive
+ *  recovery ladder fires on the stuck cell. */
+function ipythonStuckCellPolls(): number {
+	const raw = process.env.PRIME_AGENT_IPYTHON_STUCK_CELL_POLLS;
+	if (raw === undefined) {
+		return 3;
+	}
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed >= 1 ? parsed : 3;
+}
+
+/** Cross-call stuckness tracking for one provisioner's kernel: a cell counts
+ *  as stuck only after N consecutive backgrounded polls with zero output
+ *  growth. Output growth resets the count (slow-but-healthy cells are never
+ *  fired upon). */
+interface StuckTracker {
+	requestMsgId?: string;
+	outputChars: number;
+	silentPolls: number;
+}
+
+function updateStuckTracker(
+	tracker: StuckTracker,
+	info: { requestMsgId: string; outputChars: number } | undefined,
+): number {
+	if (!info) {
+		tracker.requestMsgId = undefined;
+		tracker.silentPolls = 0;
+		return 0;
+	}
+	if (tracker.requestMsgId !== info.requestMsgId) {
+		tracker.requestMsgId = info.requestMsgId;
+		tracker.outputChars = info.outputChars;
+		tracker.silentPolls = 1;
+		return 1;
+	}
+	if (info.outputChars > tracker.outputChars) {
+		tracker.outputChars = info.outputChars;
+		tracker.silentPolls = 0;
+		return 0;
+	}
+	tracker.silentPolls += 1;
+	return tracker.silentPolls;
+}
+
+function backgroundedNotice(
+	timeoutMs: number,
+	outputSoFar: string,
+	recovery?: KernelRecoveryResult | "no-kernel",
+	silentPolls?: number,
+): string {
 	const head =
 		`Cell still executing after ${Math.round(timeoutMs / 1000)}s; it continues in the background. ` +
 		"The kernel runs cells serially, so your next ipython call waits for this cell to finish " +
 		"before it runs (and reports again if the cell is still going). Variables the cell assigns " +
-		"stay in the kernel; after it finishes, inspect them with a cheap follow-up cell. If you " +
-		"believe the cell is stuck rather than working, run a short follow-up cell to regain " +
-		"control after interrupt, and prefer restructuring the work into smaller cells.";
-	return outputSoFar ? `${head}\n\nOutput so far:\n${outputSoFar}` : head;
+		"stay in the kernel; after it finishes, inspect them with a cheap follow-up cell. " +
+		"Long-running work should print progress; a cell that keeps running with no new output " +
+		"across repeated polls is treated as stuck and automatically recovered.";
+	const parts = [head];
+	if (recovery && recovery !== "no-kernel") {
+		if (recovery.outcome === "recovered") {
+			parts.push(
+				`The stuck cell was just auto-recovered (${recovery.weapon}); it ends with an interrupt/cancel ` +
+					"error, variables assigned before the hang remain, and your queued cell should run now — " +
+					"issue a follow-up call to see its result.",
+			);
+		} else if (recovery.outcome === "recovery-lane-only") {
+			parts.push(
+				"Auto-recovery could not stop the stuck cell (it swallows interrupts), but the kernel is " +
+					"otherwise healthy. Follow-up calls keep queueing behind it; if this persists the kernel " +
+					"will need a restart to regain the main lane.",
+			);
+		} else if (recovery.outcome === "kernel-unresponsive" || recovery.outcome === "kernel-wedged") {
+			parts.push(
+				"Warning: the kernel did not respond to recovery probes — it is likely wedged " +
+					"(e.g. a C extension holding the GIL) and will be restarted.",
+			);
+		}
+	} else if (silentPolls !== undefined && silentPolls > 0) {
+		parts.push(
+			`No new output for ${silentPolls} consecutive poll(s); automatic recovery fires after ` +
+				`${ipythonStuckCellPolls()} silent polls.`,
+		);
+	}
+	if (outputSoFar) parts.push(`Output so far:\n${outputSoFar}`);
+	return parts.join("\n\n");
 }
+
+const WEDGED_KERNEL_RESTART_NOTICE =
+	"A previous cell was stuck and the kernel was unresponsive to recovery probes, so the IPython " +
+	"kernel was killed; a fresh kernel starts on the next call. Variables, imports, async tasks, and " +
+	"open resources are gone; recreate what you need, then resubmit this cell.";
 
 const BACKGROUNDED = Symbol("ipython-backgrounded");
 
@@ -643,6 +752,9 @@ export function createIpythonToolDefinition(
 	options?: IpythonToolOptions,
 ): ToolDefinition<typeof ipythonSchema, IpythonToolDetails> {
 	const provisioner = options?.provisioner ?? new IpythonKernelProvisioner(cwd, options);
+	// One tracker per tool definition (= per kernel): counts silent backgrounded
+	// polls so destructive recovery only fires on established stuckness.
+	const stuckTracker: StuckTracker = { outputChars: 0, silentPolls: 0 };
 
 	return {
 		name: "ipython",
@@ -687,7 +799,15 @@ export function createIpythonToolDefinition(
 					options?.onLateSentAgentMessage,
 					ctx,
 				);
-				const timeoutMs = ipythonToolTimeoutMs();
+				// Adaptive budget: a call queued behind a backgrounded cell re-polls on a
+				// short budget instead of the full tool timeout, so stuckness is
+				// established (and recovery fires) in minutes rather than multiples of
+				// the full timeout.
+				const fullTimeoutMs = ipythonToolTimeoutMs();
+				const timeoutMs =
+					fullTimeoutMs > 0 && stuckTracker.requestMsgId !== undefined
+						? Math.min(fullTimeoutMs, ipythonRepollTimeoutMs())
+						: fullTimeoutMs;
 				let raced: Awaited<typeof executePromise> | typeof BACKGROUNDED;
 				if (timeoutMs > 0) {
 					let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
@@ -710,11 +830,65 @@ export function createIpythonToolDefinition(
 					// Late completion is intentionally not delivered as a message — the
 					// kernel namespace carries the results forward.
 					executePromise.catch(() => undefined);
-					return {
-						content: [{ type: "text", text: backgroundedNotice(timeoutMs, streamedOutput) }],
-						details: { status: "backgrounded", stdout: streamedOutput },
-						isError: false,
-					};
+					// Phase 1 (safe): count this poll against the in-flight execution.
+					// Output growth resets the count, so slow-but-healthy cells are
+					// never fired upon.
+					const silentPolls = updateStuckTracker(stuckTracker, provisioner.activeExecutionInfo);
+					// Phase 2 (destructive, gated): stuckness established -> escalate
+					// through the recovery ladder (interrupt -> task-cancel -> gated
+					// async-exc; see kernel/recovery.ts).
+					let recovery: KernelRecoveryResult | "no-kernel" | undefined;
+					if (silentPolls >= ipythonStuckCellPolls()) {
+						recovery = await provisioner.recoverStuckExecution().catch(() => "no-kernel" as const);
+						if (recovery !== "no-kernel" && recovery.outcome === "recovered") {
+							stuckTracker.requestMsgId = undefined;
+							stuckTracker.silentPolls = 0;
+							// Recovery may let this call's own execute settle; prefer the
+							// real result over a "still executing" notice.
+							const settled = await Promise.race([
+								executePromise,
+								new Promise<typeof BACKGROUNDED>((resolve) => {
+									const settleTimer = globalThis.setTimeout(() => resolve(BACKGROUNDED), 3000);
+									if (settleTimer && typeof settleTimer === "object" && "unref" in settleTimer) {
+										settleTimer.unref();
+									}
+								}),
+							]);
+							if (settled !== BACKGROUNDED) {
+								raced = settled;
+							}
+						} else if (
+							recovery !== "no-kernel" &&
+							recovery !== undefined &&
+							(recovery.outcome === "kernel-unresponsive" || recovery.outcome === "kernel-wedged")
+						) {
+							// Provably unrecoverable: restart so the session regains a
+							// working kernel instead of stalling until the rollout dies.
+							setToolWorkingMessage("Restarting IPython kernel...");
+							await provisioner.kill();
+							stuckTracker.requestMsgId = undefined;
+							stuckTracker.silentPolls = 0;
+							return {
+								content: [{ type: "text", text: WEDGED_KERNEL_RESTART_NOTICE }],
+								details: {
+									status: "backgrounded",
+									stdout: streamedOutput,
+									recovery,
+									kernelRestarted: true,
+								},
+								isError: false,
+							};
+						}
+					}
+					if (raced === BACKGROUNDED) {
+						return {
+							content: [
+								{ type: "text", text: backgroundedNotice(timeoutMs, streamedOutput, recovery, silentPolls) },
+							],
+							details: { status: "backgrounded", stdout: streamedOutput, recovery },
+							isError: false,
+						};
+					}
 				}
 				const { result: r, kernelRestarted } = raced;
 
