@@ -2,8 +2,6 @@
 
 ## [Unreleased]
 
-- Changed fullscreen mouse-wheel scrolling to use two wheel steps per transcript row for finer control.
-
 ## [0.7.1] - 2026-08-07
 
 ## [0.7.0] - 2026-08-05
