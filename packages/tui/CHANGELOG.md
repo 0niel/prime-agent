@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Reduced fullscreen mouse-wheel sensitivity by accumulating half-row input steps while keeping the viewport aligned to complete transcript rows.
+
 ## [0.7.1] - 2026-08-07
 
 ## [0.7.0] - 2026-08-05
