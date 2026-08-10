@@ -5113,7 +5113,9 @@ export class InteractiveMode {
 			// A replacement advances sessionEventGeneration synchronously. This event
 			// was already received by the old UI and is deliberately ordered before
 			// that replacement, so it must not be discarded by that advance.
-			void this.enqueueSessionEvent(pending, this.sessionEventGeneration, { preserveAcrossReplacement: true }).catch(() => {});
+			void this.enqueueSessionEvent(pending, this.sessionEventGeneration, { preserveAcrossReplacement: true }).catch(
+				() => {},
+			);
 		}
 	}
 

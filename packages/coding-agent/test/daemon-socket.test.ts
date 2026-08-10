@@ -6,13 +6,13 @@ import { basename, dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import lockfile from "proper-lockfile";
 import { describe, expect, it, vi } from "vitest";
+import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	cleanupDaemonSocketPath,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
 	prepareDaemonSocketPath,
 } from "../src/modes/daemon/daemon-socket.js";
-import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 
 describe("defaultDaemonSocketPath", () => {
@@ -249,7 +249,6 @@ describe("defaultDaemonSocketPath", () => {
 		}
 	});
 });
-
 
 function attachmentClient(id: string): DaemonSocketClient {
 	return {

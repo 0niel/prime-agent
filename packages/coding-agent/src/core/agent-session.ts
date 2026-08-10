@@ -1572,8 +1572,15 @@ export class AgentSession {
 		if (this._disposed || !isCurrent()) return;
 		const { child } = event;
 		const terminal = child.status === "done" || child.status === "error" || child.status === "cancelled";
-		if (terminal || publishSynchronously) {
-			// A terminal/edge cannot be overtaken by prior replaceable activity.
+		if (terminal) {
+			// A terminal must not overtake the final retained activity for this child.
+			this._flushRlmChildUpdates();
+			if (!this._disposed && isCurrent()) this._emit(event);
+			return;
+		}
+		if (publishSynchronously) {
+			// A status edge replaces any older activity for its own child, then
+			// preserves ordering with activity retained for other children.
 			this._pendingRlmChildUpdates.delete(child.id);
 			this._flushRlmChildUpdates();
 			if (!this._disposed && isCurrent()) this._emit(event);

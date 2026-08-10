@@ -1623,14 +1623,16 @@ describe("InteractiveMode connection events", () => {
 				progressFlushGeneration: 0,
 				progressFlushStopped: false,
 				handleEvent: vi.fn(async (event: { type: string; partialResult?: { content: unknown[] } }) => {
-					handled.push(event.type === "tool_execution_update" ? String(event.partialResult?.content[0]) : event.type);
+					handled.push(
+						event.type === "tool_execution_update" ? String(event.partialResult?.content[0]) : event.type,
+					);
 				}),
 				showError: vi.fn(),
 			};
 			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
-			(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
-				fakeThis,
-			);
+			(
+				InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }
+			).subscribeToAgent.call(fakeThis);
 
 			const progress = (value: string) =>
 				listener?.({
@@ -1644,10 +1646,15 @@ describe("InteractiveMode connection events", () => {
 			progress("first");
 			progress("latest");
 			expect(vi.getTimerCount()).toBe(1);
-			expect((fakeThis as unknown as { pendingProgressEvent?: { partialResult?: { content: string[] } } }).pendingProgressEvent)
-				.toMatchObject({ partialResult: { content: ["latest"] } });
+			expect(
+				(fakeThis as unknown as { pendingProgressEvent?: { partialResult?: { content: string[] } } })
+					.pendingProgressEvent,
+			).toMatchObject({ partialResult: { content: ["latest"] } });
 
-			const terminal = listener?.({ type: "session_event", event: { type: "agent_end" } as AgentConnectionSessionEvent });
+			const terminal = listener?.({
+				type: "session_event",
+				event: { type: "agent_end" } as AgentConnectionSessionEvent,
+			});
 			await terminal;
 			expect(handled).toEqual(["latest", "agent_end"]);
 			expect(vi.getTimerCount()).toBe(0);
@@ -1708,13 +1715,20 @@ describe("InteractiveMode connection events", () => {
 			let listener: ((event: Event) => Promise<void>) | undefined;
 			const handled: string[] = [];
 			const fakeThis = {
-				agentConnection: { subscribe: (callback: (event: Event) => Promise<void>) => ((listener = callback), vi.fn()) },
+				agentConnection: {
+					subscribe: (callback: (event: Event) => Promise<void>) => {
+						listener = callback;
+						return vi.fn();
+					},
+				},
 				sessionEventQueue: Promise.resolve(),
 				sessionEventGeneration: 0,
 				progressFlushGeneration: 0,
 				progressFlushStopped: false,
 				handleEvent: vi.fn(async (event: { type: string; partialResult?: { content: unknown[] } }) => {
-					handled.push(event.type === "tool_execution_update" ? String(event.partialResult?.content[0]) : event.type);
+					handled.push(
+						event.type === "tool_execution_update" ? String(event.partialResult?.content[0]) : event.type,
+					);
 				}),
 				resetSideQuestion: vi.fn(),
 				resetExtensionUI: vi.fn(),
@@ -1726,9 +1740,9 @@ describe("InteractiveMode connection events", () => {
 				showError: vi.fn(),
 			};
 			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
-			(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
-				fakeThis,
-			);
+			(
+				InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }
+			).subscribeToAgent.call(fakeThis);
 			listener?.({
 				type: "session_event",
 				event: { type: "tool_execution_update", toolCallId: "tool-1", partialResult: { content: ["old"] } },

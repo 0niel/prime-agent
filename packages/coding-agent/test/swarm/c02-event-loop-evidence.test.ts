@@ -12,14 +12,14 @@ import {
 	canonicalJson,
 	createSwarmEvidenceTrustRoot,
 	createSwarmManifest,
+	type ProcessSampler,
 	runSwarmBenchmark,
 	SWARM_EVIDENCE_COMMITMENT_SCHEMA,
+	type SwarmEvidence,
 	swarmEvidenceCommitmentPayload,
 	verifyAuthenticatedSwarmEvidence,
 	verifySwarmEvidence,
 	writeSwarmEvidence,
-	type ProcessSampler,
-	type SwarmEvidence,
 } from "./swarm-evidence.js";
 
 const execFile = promisify(execFileCallback);
