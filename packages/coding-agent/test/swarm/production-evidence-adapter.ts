@@ -6,19 +6,22 @@
  * and keeps the authenticated artifact commitment in a sibling trust root.
  */
 import { execFile as execFileCallback } from "node:child_process";
-import { type KeyObject, sign, verify as verifySignature } from "node:crypto";
+import { type KeyObject, sign } from "node:crypto";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import {
+	artifactBundleIdForSwarmEvidenceCapability,
 	canonicalJson,
+	createSwarmEvidenceTrustRoot,
 	runSwarmBenchmark,
+	SWARM_EVIDENCE_COMMITMENT_SCHEMA,
 	type SwarmBenchmarkConfig,
-	verifySwarmEvidence,
+	swarmEvidenceCommitmentPayload,
+	verifyAuthenticatedSwarmEvidence,
 	writeSwarmEvidence,
 } from "./swarm-evidence.js";
 
 const execFile = promisify(execFileCallback);
-const COMMITMENT_SCHEMA = "prime-agent.swarm-evidence-commitment/v1";
 const MODEL_IDS = new Set(["fixture-a", "fixture-b", "fixture-zero"]);
 const RESOLVED_MODEL_IDS = new Set([...MODEL_IDS].map((id) => `${id}-resolved`));
 
@@ -49,11 +52,6 @@ export interface ProductionEvidenceInput {
 	readonly priceCard: FrozenPriceCard;
 	readonly metadata?: Readonly<Record<string, unknown>>;
 }
-interface SignedCommitment {
-	readonly schemaVersion: typeof COMMITMENT_SCHEMA;
-	readonly artifactBundleId: string;
-	readonly signature: string;
-}
 export interface SignedProductionEvidence {
 	readonly artifactBundleId: string;
 	readonly commitmentPath: string;
@@ -64,9 +62,6 @@ function assert(condition: unknown, code: string): asserts condition {
 }
 function integer(value: number): boolean {
 	return Number.isSafeInteger(value) && value >= 0;
-}
-function commitmentPayload(artifactBundleId: string) {
-	return { schemaVersion: COMMITMENT_SCHEMA, artifactBundleId };
 }
 function safeModel(value: string, resolved = false): string {
 	return (resolved ? RESOLVED_MODEL_IDS : MODEL_IDS).has(value) ? value : "[REDACTED]";
@@ -164,51 +159,35 @@ export async function writeSignedProductionEvidence(
 		"B00B_EVIDENCE_TRUST_ROOT_OVERLAP",
 	);
 	const evidence = await runSwarmBenchmark(projectProductionObservations(input));
-	await writeSwarmEvidence(artifactRoot, evidence);
-	const manifest = JSON.parse(await readFile(`${artifactRoot}/manifest.json`, "utf8")) as {
-		artifactBundleId?: unknown;
-	};
-	assert(
-		typeof manifest.artifactBundleId === "string" && /^[0-9a-f]{64}$/.test(manifest.artifactBundleId),
-		"B00B_EVIDENCE_WRITER_ID",
-	);
-	const artifactBundleId = manifest.artifactBundleId;
-	const commitment: SignedCommitment = {
-		schemaVersion: COMMITMENT_SCHEMA,
+	const writerCapability = await writeSwarmEvidence(artifactRoot, evidence);
+	// This value is taken from the writer's opaque registration, never manifest.json.
+	const artifactBundleId = artifactBundleIdForSwarmEvidenceCapability(writerCapability);
+	const commitment = {
+		schemaVersion: SWARM_EVIDENCE_COMMITMENT_SCHEMA,
 		artifactBundleId,
-		signature: sign(null, Buffer.from(canonicalJson(commitmentPayload(artifactBundleId))), signer).toString("base64"),
+		signature: sign(
+			null,
+			Buffer.from(canonicalJson(swarmEvidenceCommitmentPayload(artifactBundleId))),
+			signer,
+		).toString("base64"),
 	};
 	const commitmentPath = `${trustRoot}/artifact-commitment.json`;
 	await writeFile(commitmentPath, `${canonicalJson(commitment)}\n`, { encoding: "utf8", mode: 0o600 });
 	return { artifactBundleId, commitmentPath };
 }
 
-/** Fresh-process safe verification: authenticate an externally supplied key first, then B00A semantics. */
+/**
+ * Fresh-process safe verification. The supplied public key is registered as an
+ * opaque trust root before the B00B verifier authenticates the commitment.
+ */
 export async function verifySignedProductionEvidence(
 	directory: string,
 	commitmentPath: string,
 	trustedPublicKeyPem: string,
 ): Promise<void> {
-	const raw = await readFile(commitmentPath, "utf8");
-	const commitment = JSON.parse(raw) as Partial<SignedCommitment>;
-	assert(raw === `${canonicalJson(commitment)}\n`, "B00B_EVIDENCE_NONCANONICAL_COMMITMENT");
-	assert(
-		commitment.schemaVersion === COMMITMENT_SCHEMA &&
-			typeof commitment.artifactBundleId === "string" &&
-			/^[0-9a-f]{64}$/.test(commitment.artifactBundleId) &&
-			typeof commitment.signature === "string",
-		"B00B_EVIDENCE_BAD_COMMITMENT",
-	);
-	assert(
-		verifySignature(
-			null,
-			Buffer.from(canonicalJson(commitmentPayload(commitment.artifactBundleId))),
-			trustedPublicKeyPem,
-			Buffer.from(commitment.signature, "base64"),
-		),
-		"B00B_EVIDENCE_BAD_SIGNATURE",
-	);
-	await verifySwarmEvidence(directory, commitment.artifactBundleId);
+	const commitmentRaw = await readFile(commitmentPath, "utf8");
+	const trustRoot = createSwarmEvidenceTrustRoot(trustedPublicKeyPem);
+	await verifyAuthenticatedSwarmEvidence(directory, commitmentRaw, trustRoot);
 }
 
 /** Runs the authentication-plus-B00A verifier in a clean Node process. */

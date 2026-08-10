@@ -343,7 +343,7 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		const samples = JSON.parse(await readFile(join(first, "process-samples.json"), "utf8"));
 		samples[0].processes[0].pid += 1;
 		await rehashArtifact(first, "process-samples.json", `${canonicalJson(samples)}\n`);
-		await expect(verify(first)).rejects.toThrow("trusted artifact bundle mismatch");
+		await expect(verify(first)).rejects.toThrow("issued swarm evidence capability bundle mismatch");
 	});
 
 	test("rejects a capability issued for a different evidence directory", async () => {
@@ -410,12 +410,10 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		await writeFile(manifestPath, `${canonicalJson(forged)}\n`);
 		const readBack = JSON.parse(await readFile(manifestPath, "utf8")).artifactBundleId;
 		expect(typeof readBack).toBe("string");
-		// A bundle id only becomes a cross-process trust root when authenticated
-		// outside the mutable evidence directory (B00B signs it). An unrelated
-		// externally supplied commitment still rejects this coherent forgery.
-		expect(readBack).not.toBe("f".repeat(64));
-		await expect(verifySwarmEvidence(directory, "f".repeat(64))).rejects.toThrow("trusted artifact bundle mismatch");
-		await expect(verify(directory)).rejects.toThrow("trusted artifact bundle mismatch");
+		await expect(verifySwarmEvidence(directory, readBack)).rejects.toThrow(
+			"issued swarm evidence capability is required",
+		);
+		await expect(verify(directory)).rejects.toThrow("issued swarm evidence capability bundle mismatch");
 	});
 
 	test("binds direct output usage to provider_completed terminal evidence", async () => {

@@ -7,7 +7,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, type KeyObject, verify as verifySignature } from "node:crypto";
 import { chmod, lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -169,6 +169,49 @@ type RegisteredBundle = Readonly<{ directory: string; artifactBundleId: string }
 const registeredBundles = new WeakMap<object, RegisteredBundle>();
 function issueSwarmEvidenceCapability(): SwarmEvidenceCapability {
 	return Object.freeze({}) as SwarmEvidenceCapability;
+}
+
+/** An opaque root created only from an externally supplied Ed25519 public key. */
+declare const swarmEvidenceTrustRootBrand: unique symbol;
+export type SwarmEvidenceTrustRoot = { readonly [swarmEvidenceTrustRootBrand]: true };
+const registeredTrustRoots = new WeakMap<object, KeyObject>();
+export const SWARM_EVIDENCE_COMMITMENT_SCHEMA = "prime-agent.swarm-evidence-commitment/v1";
+export interface SignedSwarmEvidenceCommitment {
+	readonly schemaVersion: typeof SWARM_EVIDENCE_COMMITMENT_SCHEMA;
+	readonly artifactBundleId: string;
+	readonly signature: string;
+}
+
+/**
+ * Registers a verifier trust root. The caller must provide this public key out
+ * of band: an artifact directory has no authority to manufacture this object.
+ */
+export function createSwarmEvidenceTrustRoot(publicKeyPem: string): SwarmEvidenceTrustRoot {
+	let publicKey: KeyObject;
+	try {
+		publicKey = createPublicKey(publicKeyPem);
+	} catch {
+		throw new Error("invalid swarm evidence public key");
+	}
+	assert(publicKey.asymmetricKeyType === "ed25519", "swarm evidence trust root must be Ed25519");
+	const root = Object.freeze({}) as SwarmEvidenceTrustRoot;
+	registeredTrustRoots.set(root, publicKey);
+	return root;
+}
+
+/** Checked accessor: use the writer-issued identity; never read it back from mutable artifacts. */
+export function artifactBundleIdForSwarmEvidenceCapability(capability: SwarmEvidenceCapability): string {
+	const registration = registeredBundles.get(capability);
+	assert(registration, "issued swarm evidence capability is required");
+	return registration.artifactBundleId;
+}
+
+export function swarmEvidenceCommitmentPayload(artifactBundleId: string): {
+	schemaVersion: typeof SWARM_EVIDENCE_COMMITMENT_SCHEMA;
+	artifactBundleId: string;
+} {
+	assert(/^[0-9a-f]{64}$/.test(artifactBundleId), "invalid trusted artifact bundle identity");
+	return { schemaVersion: SWARM_EVIDENCE_COMMITMENT_SCHEMA, artifactBundleId };
 }
 
 /** Canonical JSON rejects values which JSON.stringify silently changes. */
@@ -1072,29 +1115,9 @@ function verifyProcessSamples(samples: unknown): void {
 }
 
 /** Strict verifier: expected set only, no links/extras, canonical bytes, hashes, and semantic joins. */
-/**
- * Verifies an evidence directory against either the writer's in-process
- * capability or an externally held artifact-bundle commitment.  The latter is
- * intentionally only the expected bundle id: callers which need durable
- * trust (B00B) authenticate that id outside this artifact directory before
- * invoking this canonical/semantic verifier in a fresh process.
- */
-export async function verifySwarmEvidence(
-	directory: string,
-	trustedArtifactBundle: SwarmEvidenceCapability | string,
-): Promise<void> {
-	const registration =
-		typeof trustedArtifactBundle === "string" ? undefined : registeredBundles.get(trustedArtifactBundle);
-	if (typeof trustedArtifactBundle !== "string") assert(registration, "issued swarm evidence capability is required");
-	assert(
-		typeof trustedArtifactBundle === "string" || registration !== undefined,
-		"issued swarm evidence capability is required",
-	);
-	const expectedArtifactBundleId =
-		typeof trustedArtifactBundle === "string" ? trustedArtifactBundle : registration!.artifactBundleId;
+async function verifyExpectedSwarmEvidence(directory: string, expectedArtifactBundleId: string): Promise<void> {
 	assert(/^[0-9a-f]{64}$/.test(expectedArtifactBundleId), "invalid trusted artifact bundle identity");
 	const root = await realpath(directory);
-	if (registration) assert(root === registration.directory, "swarm evidence capability directory mismatch");
 	const names = (await readdir(root)).sort();
 	assert(
 		canonicalJson(names) === canonicalJson([...ALL_EVIDENCE_FILES].sort()),
@@ -1160,6 +1183,62 @@ export async function verifySwarmEvidence(
 	});
 	assert(manifest.deterministicBundleId === deterministic, "deterministic bundle identity mismatch");
 	assert(manifest.artifactBundleId === expectedArtifactBundleId, "trusted artifact bundle mismatch");
+}
+
+/** B00A accepts only an issued in-process writer capability. */
+export async function verifySwarmEvidence(directory: string, capability: SwarmEvidenceCapability): Promise<void> {
+	const registration = registeredBundles.get(capability);
+	assert(registration, "issued swarm evidence capability is required");
+	const root = await realpath(directory);
+	assert(root === registration.directory, "swarm evidence capability directory mismatch");
+	try {
+		await verifyExpectedSwarmEvidence(root, registration.artifactBundleId);
+	} catch (error) {
+		if (error instanceof Error && error.message === "trusted artifact bundle mismatch")
+			throw new Error("issued swarm evidence capability bundle mismatch", { cause: error });
+		throw error;
+	}
+}
+
+/**
+ * B00B fresh-process entry point. It authenticates canonical commitment bytes
+ * against an explicitly registered public-key root before entering the shared
+ * expected-ID semantic verifier. No artifact-derived string is a trust input.
+ */
+export async function verifyAuthenticatedSwarmEvidence(
+	directory: string,
+	commitmentRaw: string,
+	trustRoot: SwarmEvidenceTrustRoot,
+): Promise<void> {
+	const publicKey = registeredTrustRoots.get(trustRoot);
+	assert(publicKey, "registered swarm evidence trust root is required");
+	const commitment = parseCanonicalJson(
+		commitmentRaw,
+		"artifact commitment",
+	) as Partial<SignedSwarmEvidenceCommitment>;
+	assert(
+		commitment.schemaVersion === SWARM_EVIDENCE_COMMITMENT_SCHEMA &&
+			typeof commitment.artifactBundleId === "string" &&
+			/^[0-9a-f]{64}$/.test(commitment.artifactBundleId) &&
+			typeof commitment.signature === "string",
+		"invalid swarm evidence commitment",
+	);
+	let signature: Buffer;
+	try {
+		signature = Buffer.from(commitment.signature, "base64");
+	} catch {
+		throw new Error("invalid swarm evidence commitment signature");
+	}
+	assert(
+		verifySignature(
+			null,
+			Buffer.from(canonicalJson(swarmEvidenceCommitmentPayload(commitment.artifactBundleId))),
+			publicKey,
+			signature,
+		),
+		"B00B_EVIDENCE_BAD_SIGNATURE",
+	);
+	await verifyExpectedSwarmEvidence(directory, commitment.artifactBundleId);
 }
 export function createFixedFanoutScenario(fanout: (typeof SUPPORTED_SWARM_FANOUTS)[number]): SwarmBenchmarkConfig {
 	return {
