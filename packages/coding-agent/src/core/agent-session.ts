@@ -214,7 +214,16 @@ import {
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
-import { materializedTerminalMessageId, type RlmTerminalMessage } from "./rlm-durable-operations.js";
+import {
+	createRlmSafeTerminalResultTerminalMessage,
+	materializedTerminalMessageId,
+	type RlmTerminalMessage,
+} from "./rlm-durable-operations.js";
+import {
+	canonicalChildResultBytes,
+	createOrGetTerminalChildResult,
+	type C04ChildResultStatus,
+} from "./rlm-child-results.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -10148,7 +10157,62 @@ export class AgentSession {
 			onSessionPublished: publishChildSession,
 		};
 
-		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
+		/** C04 commits a bounded projection before daemon C03 sees any terminal envelope. */
+		const createDaemonTerminalResultMessage = async (): Promise<RlmTerminalMessage | undefined> => {
+			if (!this._subagentRuntimeHost?.assignmentIdentityFenced || !childSession) return undefined;
+			const childFile = childSession.sessionManager.getSessionFile?.();
+			const childArtifactDir = childSession.sessionManager.getSessionArtifactDir?.();
+			if (!childFile || !childArtifactDir) return undefined;
+			const status: C04ChildResultStatus =
+				run.status === "done" ? "completed" : run.status === "cancelled" ? "cancelled" : "failed";
+			const terminalModel = childSession.model ?? modelSelection.model;
+			try {
+				const reference = await createOrGetTerminalChildResult({
+					owner: {
+						parentSessionId: this.sessionId,
+						childSessionId: childSession.sessionId,
+						childSessionFile: childFile,
+						assignmentId: run.assignmentId,
+						operationId: run.operationId,
+						deliveryId: run.deliveryId,
+					},
+					childArtifactRoot: dirname(childArtifactDir),
+					candidate: {
+						status,
+						summary: status === "completed" ? "Child completed." : "Child terminal result is unavailable.",
+						preview: answerPreview || "No bounded terminal preview is available.",
+						...(status === "completed"
+							? {}
+							: {
+									error: {
+										code: status === "cancelled" ? "cancelled" : "terminal_storage_failed",
+										message:
+											status === "cancelled"
+												? "Child was cancelled."
+												: "Child failed without a publishable diagnostic.",
+									},
+								}),
+						model: {
+							initialResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+							terminalResolvedSelector: `${terminalModel.provider}/${terminalModel.id}`,
+						},
+					},
+				});
+				// C03 treats this as opaque bytes. C04 is the only parser/codec authority.
+				const projection = Buffer.from(canonicalChildResultBytes(reference)).toString("utf8");
+				const content =
+					status === "completed"
+						? "Child completed; bounded result available."
+						: "Child ended; bounded result available.";
+				return createRlmSafeTerminalResultTerminalMessage(content, projection, Date.now());
+			} catch {
+				// No raw exception fallback and no second terminal path. A storage failure is
+				// intentionally left for C03 recovery/normal failure handling.
+				return undefined;
+			}
+		};
+
+		const deliverTerminalMessageToParent = async (message: RlmTerminalMessage | CustomMessage): Promise<void> => {
 			const activeOwner =
 				this._activeRlmChildRuns.get(run.id) === run &&
 				this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
@@ -10346,14 +10410,16 @@ export class AgentSession {
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
-				if (!run.detachedDeletion && child._parentReplyCount === parentReplyCountBeforeRun) {
-					const lastAssistantText = child.getLastAssistantText();
+				if (!run.detachedDeletion && this._subagentRuntimeHost?.assignmentIdentityFenced) {
+					const terminal = await createDaemonTerminalResultMessage();
+					if (terminal) await deliverTerminalMessageToParent(terminal);
+				} else if (!run.detachedDeletion && child._parentReplyCount === parentReplyCountBeforeRun) {
 					await deliverTerminalMessageToParent(
 						createRlmChildTerminalNoticeMessage({
 							kind: "completed_without_reply",
 							childId: run.id,
 							sessionName,
-							lastAssistantTextPreview: lastAssistantText ? compactRlmText(lastAssistantText) : undefined,
+							lastAssistantTextPreview: answerPreview || undefined,
 						}),
 					);
 				}
@@ -10385,9 +10451,12 @@ export class AgentSession {
 				// the daemon's durable delete intent turns it into deleted/discarded.
 				// Do not suppress this merely because UI cleanup is detached.
 				if (
-					run.status === "cancelled" &&
-					(!run.detachedDeletion || this._subagentRuntimeHost?.assignmentIdentityFenced)
+					this._subagentRuntimeHost?.assignmentIdentityFenced &&
+					(!run.detachedDeletion || run.status === "cancelled")
 				) {
+					const terminal = await createDaemonTerminalResultMessage();
+					if (terminal) await deliverTerminalMessageToParent(terminal);
+				} else if (run.status === "cancelled" && !run.detachedDeletion) {
 					await deliverTerminalMessageToParent(
 						createRlmChildTerminalNoticeMessage({
 							kind: "cancelled",
