@@ -1,16 +1,19 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
-import { createConnection, createServer } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { PassThrough } from "node:stream";
 import lockfile from "proper-lockfile";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	cleanupDaemonSocketPath,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
 	prepareDaemonSocketPath,
 } from "../src/modes/daemon/daemon-socket.js";
+import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 
 describe("defaultDaemonSocketPath", () => {
 	it("uses a fixed Windows named pipe path", () => {
@@ -244,5 +247,83 @@ describe("defaultDaemonSocketPath", () => {
 			}
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+});
+
+
+function attachmentClient(id: string): DaemonSocketClient {
+	return {
+		id,
+		socket: new PassThrough() as unknown as Socket,
+		attachedActiveSessionIds: new Set(["active-c02"]),
+		catchupActiveSessionIds: new Set(),
+		detachInput: () => {},
+		supportsExtensionUi: false,
+		capabilities: new Set(),
+	};
+}
+
+describe("attachment-local catch-up scheduling", () => {
+	it("coalesces drain and cache triggers while preserving replacement precedence", async () => {
+		const supervisor = new DaemonSupervisor("/tmp/c02-catchup.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/c02-catchup-state",
+		});
+		const client = attachmentClient("slow-c02");
+		const catchUpClient = vi.fn(async () => {});
+		const internals = supervisor as unknown as {
+			clients: Set<DaemonSocketClient>;
+			queueCatchup(client: DaemonSocketClient, activeSessionId: string, purpose?: "replacement" | "resync"): void;
+			scheduleClientCatchup(client: DaemonSocketClient): void;
+			catchUpClient: typeof catchUpClient;
+		};
+		internals.clients.add(client);
+		internals.catchUpClient = catchUpClient;
+
+		internals.queueCatchup(client, "active-c02", "resync");
+		internals.scheduleClientCatchup(client);
+		internals.queueCatchup(client, "active-c02", "replacement");
+		internals.scheduleClientCatchup(client);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		expect(catchUpClient).toHaveBeenCalledTimes(1);
+		expect(client.catchupPurposes?.get("active-c02")).toBe("replacement");
+		expect(client.catchupDrainScheduled).toBe(false);
+		client.socket.destroy();
+	});
+
+	it("makes a queued callback inert on close/cleanup without affecting a healthy peer", async () => {
+		const supervisor = new DaemonSupervisor("/tmp/c02-close.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/c02-close-state",
+		});
+		const closedClient = attachmentClient("closed-c02");
+		const healthyClient = attachmentClient("healthy-c02");
+		const catchUpClient = vi.fn(async () => {});
+		const internals = supervisor as unknown as {
+			clients: Set<DaemonSocketClient>;
+			queueCatchup(client: DaemonSocketClient, activeSessionId: string): void;
+			scheduleClientCatchup(client: DaemonSocketClient): void;
+			cancelClientCatchup(client: DaemonSocketClient): void;
+			catchUpClient: typeof catchUpClient;
+		};
+		internals.clients.add(closedClient);
+		internals.clients.add(healthyClient);
+		internals.catchUpClient = catchUpClient;
+		internals.queueCatchup(closedClient, "active-c02");
+		internals.scheduleClientCatchup(closedClient);
+		internals.queueCatchup(healthyClient, "active-c02");
+		internals.scheduleClientCatchup(healthyClient);
+
+		internals.cancelClientCatchup(closedClient);
+		closedClient.socket.destroy();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		expect(catchUpClient).toHaveBeenCalledTimes(1);
+		expect(catchUpClient).toHaveBeenCalledWith(healthyClient);
+		expect(closedClient.catchupDrainScheduled).toBe(false);
+		expect(closedClient.catchupActiveSessionIds?.size).toBe(0);
+		expect(closedClient.catchupPurposes?.size).toBe(0);
+		healthyClient.socket.destroy();
 	});
 });

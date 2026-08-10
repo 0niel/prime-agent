@@ -661,6 +661,8 @@ export class DaemonSupervisor {
 	private updateRestartPhase?: "draining" | "fencing" | "prepared";
 	private readonly mutationDrain = new MutationDrainLatch();
 	private readonly clients = new Set<DaemonSocketClient>();
+	/** Handles are private supervisor state: the wire/client descriptor remains unchanged. */
+	private readonly catchupDrainTimers = new WeakMap<DaemonSocketClient, NodeJS.Immediate>();
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
@@ -1316,6 +1318,7 @@ export class DaemonSupervisor {
 				return;
 			}
 			cleaned = true;
+			this.cancelClientCatchup(client);
 			client.detachInput();
 			this.clients.delete(client);
 			this.cancelWaitingPromptAdmissionsForClient(client);
@@ -1330,9 +1333,7 @@ export class DaemonSupervisor {
 		socket.on("drain", () => {
 			client.backpressured = false;
 			if (!client.snapshotStreaming) {
-				void this.catchUpClient(client).catch((error) =>
-					this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
-				);
+				this.scheduleClientCatchup(client);
 			}
 		});
 	}
@@ -4459,9 +4460,7 @@ export class DaemonSupervisor {
 				client.backpressured = false;
 			}
 			if (!client.snapshotStreaming && client.catchupActiveSessionIds?.size) {
-				void this.catchUpClient(client).catch((error) =>
-					this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
-				);
+				this.scheduleClientCatchup(client);
 			}
 		};
 	}
@@ -4803,9 +4802,7 @@ export class DaemonSupervisor {
 				for (const client of this.clients) {
 					if (!client.attachedActiveSessionIds.has(activeSessionId)) continue;
 					this.queueCatchup(client, activeSessionId, snapshotPurpose === "replacement" ? "replacement" : "resync");
-					void this.catchUpClient(client).catch((error) =>
-						this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
-					);
+					this.scheduleClientCatchup(client);
 				}
 			}
 			return;
@@ -4842,9 +4839,7 @@ export class DaemonSupervisor {
 							activeSessionId,
 							snapshotPurpose === "replacement" ? "replacement" : "resync",
 						);
-						void this.catchUpClient(client).catch((error) =>
-							this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
-						);
+						this.scheduleClientCatchup(client);
 					}
 				}
 			} catch (error) {
@@ -4979,12 +4974,65 @@ export class DaemonSupervisor {
 		const clients = [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId));
 		for (const client of clients) {
 			this.queueCatchup(client, activeSessionId);
+			this.scheduleClientCatchup(client);
 		}
-		void Promise.all(clients.map((client) => this.catchUpClient(client)))
-			.catch((error) => this.log(`Failed compact catch-up for ${activeSessionId}: ${String(error)}`))
-			.finally(() => {
-				this.compactCatchupInProgress.delete(activeSessionId);
+		// The per-client scheduler owns the deferred work. Do not leave a second,
+		// session-global callback alive solely to release this synchronous dedupe latch.
+		this.compactCatchupInProgress.delete(activeSessionId);
+	}
+
+	/**
+	 * Coalesce recovery triggers for a single socket attachment. This deliberately
+	 * owns no provider/model work: it only starts the existing attachment catch-up
+	 * latch after this event-loop turn.
+	 */
+	private scheduleClientCatchup(client: DaemonSocketClient): void {
+		if (
+			client.catchupDrainScheduled ||
+			client.socket.destroyed ||
+			!this.clients.has(client) ||
+			client.snapshotStreaming ||
+			client.backpressured
+		) {
+			return;
+		}
+		client.catchupDrainScheduled = true;
+		const generation = client.catchupGeneration ?? 0;
+		const timer = setImmediate(() => {
+			this.catchupDrainTimers.delete(client);
+			client.catchupDrainScheduled = false;
+			if (
+				generation !== (client.catchupGeneration ?? 0) ||
+				client.socket.destroyed ||
+				!this.clients.has(client) ||
+				client.snapshotStreaming ||
+				client.backpressured
+			) {
+				return;
+			}
+			void this.catchUpClient(client).catch((error) => {
+				const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+				this.log(`Failed attachment catch-up for client ${client.id.slice(0, 64)} (${errorClass})`);
 			});
+		});
+		this.catchupDrainTimers.set(client, timer);
+	}
+
+	/** Make queued attachment-local work inert without affecting snapshot ownership. */
+	private cancelClientCatchup(client: DaemonSocketClient): void {
+		client.catchupGeneration = (client.catchupGeneration ?? 0) + 1;
+		const timer = this.catchupDrainTimers.get(client);
+		if (timer) {
+			clearImmediate(timer);
+			this.catchupDrainTimers.delete(client);
+		}
+		client.catchupDrainScheduled = false;
+		client.catchupActiveSessionIds?.clear();
+		client.catchupPurposes?.clear();
+		if (client.catchupRetryTimer) {
+			clearTimeout(client.catchupRetryTimer);
+			client.catchupRetryTimer = undefined;
+		}
 	}
 
 	private queueCatchup(
@@ -5661,6 +5709,7 @@ export class DaemonSupervisor {
 			}
 		});
 		for (const client of this.clients) {
+			this.cancelClientCatchup(client);
 			client.attachedActiveSessionIds.clear();
 			await this.runCleanupStep(`daemon client input ${client.id}`, () => client.detachInput());
 			await this.runCleanupStep(`daemon client socket ${client.id}`, () => {
@@ -5780,6 +5829,7 @@ export class DaemonSupervisor {
 		}
 		await this.catalog.stop();
 		for (const client of this.clients) {
+			this.cancelClientCatchup(client);
 			client.detachInput();
 			client.socket.end();
 		}

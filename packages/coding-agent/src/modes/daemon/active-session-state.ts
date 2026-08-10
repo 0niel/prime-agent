@@ -15,6 +15,10 @@ export interface DaemonSocketClient {
 	catchupPurposes?: Map<string, "replacement" | "resync">;
 	/** The single catch-up drain currently serving this client. */
 	catchupPromise?: Promise<void>;
+	/** An attachment-local catch-up callback is queued for the next event-loop turn. */
+	catchupDrainScheduled?: boolean;
+	/** Invalidates queued attachment-local catch-up callbacks during cleanup. */
+	catchupGeneration?: number;
 	/** Delayed retry after transient catch-up snapshot preparation failure. */
 	catchupRetryTimer?: NodeJS.Timeout;
 	backpressured?: boolean;
