@@ -3481,7 +3481,10 @@ print(_result.name)
 						decisionScopes: [],
 						implementationScopes: [],
 						allowedToolNames: [],
-						sharedContext: { maxItems: 0, maxBytes: 0 },
+						// [] is two UTF-8 bytes when canonically serialized. Keep the
+						// cap at that minimum so first admission succeeds without
+						// weakening the production-wide context ceiling.
+						sharedContext: { maxItems: 0, maxBytes: 2 },
 					},
 				},
 			},
@@ -3500,13 +3503,22 @@ print(_result.name)
 			});
 
 			vi.stubEnv("PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY", "0");
-			await expect(policyChild.runRlmChild("must remain fenced")).rejects.toThrow(
-				"after swarm role policy rollback",
-			);
-			legacyRoot = createSession();
+			const policyLookup = vi.spyOn(settingsManager, "getSwarmRolePolicy");
+			const modelCatalog = vi.spyOn(policyChild.modelRegistry, "getExecutableModels");
+			const modelPreflight = vi.spyOn(policyChild.modelRegistry, "getApiKeyAndHeaders");
+			const providerStatus = vi.spyOn(policyChild.modelRegistry, "getProviderAuthStatus");
 			await expect(
-				legacyRoot.runRlmChild("legacy root continues", { model: `${model.provider}/${model.id}` }),
-			).resolves.toMatchObject({
+				policyChild.runRlmChild("must remain fenced", {
+					role: "worker",
+					shared_context: [{ kind: "note", text: "untrusted".repeat(40_000) }],
+				}),
+			).rejects.toThrow("after swarm role policy rollback");
+			expect(policyLookup).not.toHaveBeenCalled();
+			expect(modelCatalog).not.toHaveBeenCalled();
+			expect(modelPreflight).not.toHaveBeenCalled();
+			expect(providerStatus).not.toHaveBeenCalled();
+			legacyRoot = createSession();
+			await expect(legacyRoot.runRlmChild("legacy root continues")).resolves.toMatchObject({
 				model: `${model.provider}/${model.id}`,
 			});
 		} finally {

@@ -9814,10 +9814,12 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		const policyBoundChild = this._swarmRoleAssignment !== undefined;
 		const policyEnabled = this._swarmRolePolicyEnabled();
-		// Rollback affects only new work. A retained policy child cannot silently
-		// switch to legacy admission, which would discard its captured ceiling.
-		if (!policyEnabled && this._swarmRoleAssignment) {
+		// This is the rollback boundary: reject a retained policy child before
+		// parsing untrusted kwargs or resolving its catalog, model, or provider.
+		// A root with no captured assignment remains eligible for legacy admission.
+		if (policyBoundChild && !policyEnabled) {
 			throw new Error("RLM child admission is unavailable after swarm role policy rollback");
 		}
 		const {
