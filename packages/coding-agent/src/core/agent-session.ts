@@ -9041,6 +9041,12 @@ export class AgentSession {
 	}
 
 	private _cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
+		// Cancellation is an idempotent terminal transition while the detached
+		// run remains tracked. Concurrent callers must not mistake a previously
+		// accepted cancellation for a completed child and start conflicting cleanup.
+		if (run.status === "cancelled") {
+			return true;
+		}
 		if (run.status !== "running" && run.status !== "queued") {
 			return false;
 		}
