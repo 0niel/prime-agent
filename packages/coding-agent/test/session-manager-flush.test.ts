@@ -116,7 +116,7 @@ describe("SessionManager.flushNow", () => {
 		);
 	});
 
-	it("preserves live-file metadata before atomically replacing it", () => {
+	it("preserves ownership while repairing private mode before atomically replacing a transcript", () => {
 		const dir = createTempDir();
 		const mgr = SessionManager.create(dir, join(dir, "sessions"));
 		mgr.appendCustomEntry("before_metadata_check");
@@ -140,7 +140,7 @@ describe("SessionManager.flushNow", () => {
 		expect(tempFd).toEqual(expect.any(Number));
 		expect(tempPath).toEqual(expect.any(String));
 		expect(fsMocks.fchownSync).toHaveBeenCalledWith(tempFd, before.uid, before.gid);
-		expect(fsMocks.fchmodSync).toHaveBeenCalledWith(tempFd, before.mode & 0o777);
+		expect(fsMocks.fchmodSync).toHaveBeenCalledWith(tempFd, 0o600);
 		expect(fsMocks.renameSync).toHaveBeenCalledWith(tempPath, join(dirname(tempPath as string), basename(file)));
 		expect(fsMocks.fchownSync.mock.invocationCallOrder[0]!).toBeLessThan(
 			fsMocks.fchmodSync.mock.invocationCallOrder[0]!,
@@ -150,10 +150,24 @@ describe("SessionManager.flushNow", () => {
 		);
 		const after = statSync(file);
 		expect({ mode: after.mode & 0o777, uid: after.uid, gid: after.gid }).toEqual({
-			mode: before.mode & 0o777,
+			mode: 0o600,
 			uid: before.uid,
 			gid: before.gid,
 		});
+	});
+
+	it("repairs a permissive live transcript mode before appending", () => {
+		if (process.platform === "win32") return;
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendCustomEntry("before_append_mode_check");
+		mgr.flushNow();
+		const file = mgr.getSessionFile()!;
+		chmodSync(file, 0o660);
+
+		mgr.appendSessionInfo("private append");
+
+		expect(statSync(file).mode & 0o777).toBe(0o600);
 	});
 
 	it("preserves live bytes and cleans the temp file when restoring ownership fails", () => {
@@ -180,7 +194,7 @@ describe("SessionManager.flushNow", () => {
 		);
 	});
 
-	it("rewrites a cross-directory symlink target without replacing the alias", () => {
+	it("rejects a cross-directory transcript symlink without changing its target", () => {
 		const dir = createTempDir();
 		const targetDir = join(dir, "targets");
 		const aliasDir = join(dir, "aliases");
@@ -188,24 +202,21 @@ describe("SessionManager.flushNow", () => {
 		mkdirSync(aliasDir);
 		const target = join(targetDir, "session.jsonl");
 		const alias = join(aliasDir, "session.jsonl");
-		fsMocks.actualWriteFileSync!(
-			target,
-			`${JSON.stringify({
-				type: "session",
-				version: 2,
-				id: "symlink-session",
-				timestamp: "2026-01-01T00:00:00.000Z",
-				cwd: dir,
-			})}\n`,
-		);
+		const original = `${JSON.stringify({
+			type: "session",
+			version: 2,
+			id: "symlink-session",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: dir,
+		})}
+`;
+		fsMocks.actualWriteFileSync!(target, original);
 		chmodSync(target, 0o640);
 		symlinkSync(target, alias);
 
-		const mgr = SessionManager.open(alias);
-
-		expect(mgr.getSessionFile()).toBe(alias);
+		expect(() => SessionManager.open(alias)).toThrow("Refusing to use non-regular private file");
 		expect(lstatSync(alias).isSymbolicLink()).toBe(true);
-		expect(JSON.parse(readFileSync(target, "utf8")).version).toBe(3);
+		expect(readFileSync(target, "utf8")).toBe(original);
 		expect(statSync(target).mode & 0o777).toBe(0o640);
 	});
 
