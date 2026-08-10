@@ -14,10 +14,12 @@ import {
 	fsyncSync,
 	mkdirSync,
 	openSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
 	rmSync,
 	statSync,
+	utimesSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
@@ -25,6 +27,7 @@ import { readFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
+import lockfile from "proper-lockfile";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
@@ -344,7 +347,10 @@ const CLIENT_CATCHUP_RETRY_MS = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
 const SUPERVISOR_FENCE_POLL_MS = 250;
 const SUPERVISOR_LAUNCH_LOCK_STALE_MS = 30_000;
+const SUPERVISOR_LAUNCH_LOCK_REFRESH_MS = 5_000;
+const SUPERVISOR_LAUNCH_LOCK_GUARD_STALE_MS = 5_000;
 const SUPERVISOR_LAUNCH_LOCK_PROCESS_START_ID_FILE = "process-start-id";
+const SUPERVISOR_LAUNCH_LOCK_OWNER_FILE_SUFFIX = ".owner.json";
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
 	"Prime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been partially completed.\n" +
@@ -370,6 +376,191 @@ const RECOVERY_CHECKPOINT_EVENTS: ReadonlySet<string> = new Set([
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+interface SupervisorLaunchLockOwnerRecord {
+	version: 1;
+	token: string;
+	pid: number;
+	processStartId?: string;
+	createdAt: string;
+}
+
+interface SupervisorLaunchLockSnapshot {
+	generation: string;
+	token?: string;
+	pid?: number;
+	processStartId?: string;
+	leasePath: string;
+	updatedAtMs: number;
+}
+
+function supervisorLaunchLockOwnerFileName(token: string): string {
+	return `${token}${SUPERVISOR_LAUNCH_LOCK_OWNER_FILE_SUFFIX}`;
+}
+
+function readSupervisorLaunchLock(lockDirectory: string): SupervisorLaunchLockSnapshot | undefined {
+	try {
+		const ownerFiles = readdirSync(lockDirectory).filter((name) =>
+			name.endsWith(SUPERVISOR_LAUNCH_LOCK_OWNER_FILE_SUFFIX),
+		);
+		if (ownerFiles.length === 1) {
+			const ownerFile = ownerFiles[0];
+			if (ownerFile) {
+				const leasePath = join(lockDirectory, ownerFile);
+				try {
+					const value = JSON.parse(readFileSync(leasePath, "utf8")) as Partial<SupervisorLaunchLockOwnerRecord>;
+					if (
+						value.version === 1 &&
+						typeof value.token === "string" &&
+						ownerFile === supervisorLaunchLockOwnerFileName(value.token) &&
+						Number.isInteger(value.pid) &&
+						(value.pid ?? 0) > 0 &&
+						(value.processStartId === undefined || typeof value.processStartId === "string") &&
+						typeof value.createdAt === "string"
+					) {
+						return {
+							generation: value.token,
+							token: value.token,
+							pid: value.pid,
+							...(value.processStartId ? { processStartId: value.processStartId } : {}),
+							leasePath,
+							updatedAtMs: statSync(leasePath).mtimeMs,
+						};
+					}
+				} catch {
+					// Corrupt owner metadata falls back to a generation-fenced legacy snapshot.
+				}
+			}
+		}
+		const stat = statSync(lockDirectory);
+		let pid: number | undefined;
+		let processStartId: string | undefined;
+		try {
+			const parsedPid = Number(readFileSync(join(lockDirectory, "pid"), "utf8").trim());
+			if (Number.isInteger(parsedPid) && parsedPid > 0) {
+				pid = parsedPid;
+			}
+		} catch {
+			// Empty and malformed legacy locks are still generation-fenced by inode and mtime.
+		}
+		try {
+			processStartId = readFileSync(
+				join(lockDirectory, SUPERVISOR_LAUNCH_LOCK_PROCESS_START_ID_FILE),
+				"utf8",
+			).trim();
+		} catch {
+			// Legacy launch locks may only contain a pid.
+		}
+		return {
+			generation: `legacy:${stat.dev}:${stat.ino}:${stat.mtimeMs}:${pid ?? "none"}:${processStartId ?? "none"}`,
+			...(pid ? { pid } : {}),
+			...(processStartId ? { processStartId } : {}),
+			leasePath: lockDirectory,
+			updatedAtMs: stat.mtimeMs,
+		};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return undefined;
+		}
+		return undefined;
+	}
+}
+
+export function readSupervisorLaunchLockGeneration(lockDirectory: string): string | undefined {
+	return readSupervisorLaunchLock(lockDirectory)?.generation;
+}
+
+function withSupervisorLaunchLockGuard<T>(lockDirectory: string, action: () => T): T {
+	const release = lockfile.lockSync(dirname(lockDirectory), {
+		realpath: false,
+		lockfilePath: `${lockDirectory}.guard`,
+		stale: SUPERVISOR_LAUNCH_LOCK_GUARD_STALE_MS,
+	});
+	try {
+		return action();
+	} finally {
+		release();
+	}
+}
+
+export function removeSupervisorLaunchLockGeneration(
+	lockDirectory: string,
+	expectedGeneration: string,
+	disposition: "released" | "stale",
+): boolean {
+	return withSupervisorLaunchLockGuard(lockDirectory, () =>
+		removeSupervisorLaunchLockGenerationUnlocked(lockDirectory, expectedGeneration, disposition),
+	);
+}
+
+function removeSupervisorLaunchLockGenerationUnlocked(
+	lockDirectory: string,
+	expectedGeneration: string,
+	disposition: "released" | "stale",
+): boolean {
+	const quarantinedDirectory = `${lockDirectory}.${disposition}-${process.pid}-${randomUUID()}`;
+	try {
+		renameSync(lockDirectory, quarantinedDirectory);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return false;
+		}
+		throw error;
+	}
+	const movedGeneration = readSupervisorLaunchLock(quarantinedDirectory)?.generation;
+	if (movedGeneration !== expectedGeneration) {
+		try {
+			renameSync(quarantinedDirectory, lockDirectory);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "EEXIST" && code !== "ENOTEMPTY") {
+				throw error;
+			}
+		}
+		return false;
+	}
+	rmSync(quarantinedDirectory, { recursive: true, force: true });
+	return true;
+}
+
+function refreshSupervisorLaunchLock(lockDirectory: string, token: string): boolean {
+	const leasePath = join(lockDirectory, supervisorLaunchLockOwnerFileName(token));
+	try {
+		const now = Date.now() / 1000;
+		utimesSync(leasePath, now, now);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return false;
+		}
+		throw error;
+	}
+}
+
+function isProcessIdAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function isSupervisorLaunchLockActive(snapshot: SupervisorLaunchLockSnapshot): boolean {
+	if (Date.now() - snapshot.updatedAtMs >= SUPERVISOR_LAUNCH_LOCK_STALE_MS || !snapshot.pid) {
+		return false;
+	}
+	if (!isProcessIdAlive(snapshot.pid)) {
+		return false;
+	}
+	if (snapshot.processStartId) {
+		const observedProcessStartId = getProcessStartId(snapshot.pid);
+		if (observedProcessStartId !== undefined && observedProcessStartId !== snapshot.processStartId) {
+			return false;
+		}
+	}
+	return true;
 }
 
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
@@ -765,9 +956,10 @@ export class AgentDaemon {
 		this.supervisorLaunchInProgress = true;
 		const key = createHash("sha256").update(supervisorSocketPath).digest("hex").slice(0, 12);
 		const lockDirectory = join(dirname(supervisorSocketPath), `.supervisor-launch-${key}.lock`);
-		let ownsLock = false;
+		let lockGeneration: string | undefined;
+		let lockRefreshTimer: ReturnType<typeof setInterval> | undefined;
 		try {
-			for (let attempt = 0; attempt < 3 && !ownsLock; attempt++) {
+			for (let attempt = 0; attempt < 3 && !lockGeneration; attempt++) {
 				const token = randomUUID();
 				const candidateDirectory = `${lockDirectory}.candidate-${process.pid}-${token}`;
 				mkdirSync(candidateDirectory, { mode: 0o700 });
@@ -784,48 +976,64 @@ export class AgentDaemon {
 						},
 					);
 				}
+				const owner: SupervisorLaunchLockOwnerRecord = {
+					version: 1,
+					token,
+					pid: process.pid,
+					...(processStartId ? { processStartId } : {}),
+					createdAt: new Date().toISOString(),
+				};
+				writeFileSync(
+					join(candidateDirectory, supervisorLaunchLockOwnerFileName(token)),
+					`${JSON.stringify(owner)}\n`,
+					{ mode: 0o600 },
+				);
+				let outcome: "acquired" | "active" | "retry" | undefined;
 				try {
-					renameSync(candidateDirectory, lockDirectory);
-					ownsLock = true;
-					break;
-				} catch (error) {
-					rmSync(candidateDirectory, { recursive: true, force: true });
-					const code = (error as NodeJS.ErrnoException).code;
-					if (code !== "EEXIST" && code !== "ENOTEMPTY") {
-						throw error;
-					}
-					let ownerPid: number | undefined;
-					let ownerProcessStartId: string | undefined;
-					try {
-						ownerPid = Number(readFileSync(join(lockDirectory, "pid"), "utf8").trim());
-					} catch {
-						// An invalid owner is reclaimed atomically below.
-					}
-					try {
-						ownerProcessStartId = readFileSync(
-							join(lockDirectory, SUPERVISOR_LAUNCH_LOCK_PROCESS_START_ID_FILE),
-							"utf8",
-						).trim();
-					} catch {
-						// Legacy launch locks only contain a pid and expire by age.
-					}
-					if (ownerPid && this.isSupervisorLaunchLockActive(lockDirectory, ownerPid, ownerProcessStartId)) {
-						return;
-					}
-					const staleDirectory = `${lockDirectory}.stale-${process.pid}-${token}`;
-					try {
-						renameSync(lockDirectory, staleDirectory);
-						rmSync(staleDirectory, { recursive: true, force: true });
-					} catch (reclaimError) {
-						if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") {
-							throw reclaimError;
+					outcome = withSupervisorLaunchLockGuard(lockDirectory, () => {
+						try {
+							renameSync(candidateDirectory, lockDirectory);
+							return "acquired";
+						} catch (error) {
+							const code = (error as NodeJS.ErrnoException).code;
+							if (code !== "EEXIST" && code !== "ENOTEMPTY") {
+								throw error;
+							}
+							const observedLock = readSupervisorLaunchLock(lockDirectory);
+							if (!observedLock) {
+								return "retry";
+							}
+							if (isSupervisorLaunchLockActive(observedLock)) {
+								return "active";
+							}
+							removeSupervisorLaunchLockGenerationUnlocked(lockDirectory, observedLock.generation, "stale");
+							return "retry";
 						}
+					});
+				} finally {
+					if (outcome !== "acquired") {
+						rmSync(candidateDirectory, { recursive: true, force: true });
 					}
 				}
+				if (outcome === "active") {
+					return;
+				}
+				if (outcome === "acquired") {
+					lockGeneration = token;
+				}
 			}
-			if (!ownsLock) {
+			if (!lockGeneration) {
 				return;
 			}
+			lockRefreshTimer = setInterval(() => {
+				if (lockGeneration && !refreshSupervisorLaunchLock(lockDirectory, lockGeneration)) {
+					if (lockRefreshTimer) {
+						clearInterval(lockRefreshTimer);
+						lockRefreshTimer = undefined;
+					}
+				}
+			}, SUPERVISOR_LAUNCH_LOCK_REFRESH_MS);
+			lockRefreshTimer.unref();
 			if (await this.canConnectToSupervisor(supervisorSocketPath)) {
 				return;
 			}
@@ -860,43 +1068,18 @@ export class AgentDaemon {
 		} catch (error) {
 			this.log(`failed to launch replacement supervisor: ${String(error)}`);
 		} finally {
-			if (ownsLock) {
-				rmSync(lockDirectory, { recursive: true, force: true });
+			if (lockRefreshTimer) {
+				clearInterval(lockRefreshTimer);
 			}
-			this.supervisorLaunchInProgress = false;
-		}
-	}
-
-	private isSupervisorLaunchLockActive(
-		lockDirectory: string,
-		ownerPid: number,
-		ownerProcessStartId?: string,
-	): boolean {
-		if (!this.isProcessAlive(ownerPid)) {
-			return false;
-		}
-		if (ownerProcessStartId) {
-			const observedProcessStartId = getProcessStartId(ownerPid);
-			if (observedProcessStartId !== undefined && observedProcessStartId !== ownerProcessStartId) {
-				return false;
+			try {
+				if (lockGeneration) {
+					removeSupervisorLaunchLockGeneration(lockDirectory, lockGeneration, "released");
+				}
+			} catch (error) {
+				this.log(`failed to release supervisor launch lock: ${String(error)}`);
+			} finally {
+				this.supervisorLaunchInProgress = false;
 			}
-		}
-		try {
-			return Date.now() - statSync(lockDirectory).mtimeMs < SUPERVISOR_LAUNCH_LOCK_STALE_MS;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				return false;
-			}
-			throw error;
-		}
-	}
-
-	private isProcessAlive(pid: number): boolean {
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch (error) {
-			return (error as NodeJS.ErrnoException).code === "EPERM";
 		}
 	}
 

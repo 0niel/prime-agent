@@ -3,7 +3,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
+import {
+	AgentDaemon,
+	readSupervisorLaunchLockGeneration,
+	removeSupervisorLaunchLockGeneration,
+} from "../../../src/modes/daemon/daemon-mode.js";
 
 interface LaunchHarness {
 	supervisorLaunchInProgress: boolean;
@@ -15,6 +19,8 @@ interface LaunchHarness {
 const tempDirs: string[] = [];
 
 afterEach(() => {
+	vi.useRealTimers();
+	vi.restoreAllMocks();
 	for (const directory of tempDirs.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
 	}
@@ -25,12 +31,29 @@ function launchLockPath(supervisorSocketPath: string): string {
 	return join(dirname(supervisorSocketPath), `.supervisor-launch-${key}.lock`);
 }
 
-function createHarness(): LaunchHarness {
+function createHarness(canConnect: () => Promise<boolean> = async () => true): LaunchHarness {
 	return Object.assign(Object.create(AgentDaemon.prototype), {
 		supervisorLaunchInProgress: false,
 		shuttingDown: false,
-		canConnectToSupervisor: vi.fn(async () => true),
+		canConnectToSupervisor: vi.fn(canConnect),
 	}) as LaunchHarness;
+}
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
+function writeGeneration(lockDirectory: string, token: string): void {
+	mkdirSync(lockDirectory, { recursive: true, mode: 0o700 });
+	writeFileSync(
+		join(lockDirectory, `${token}.owner.json`),
+		`${JSON.stringify({ version: 1, token, pid: process.pid, createdAt: new Date().toISOString() })}\n`,
+		{ mode: 0o600 },
+	);
 }
 
 describe("#1131 orphan supervisor launch lock recovery", () => {
@@ -80,5 +103,73 @@ describe("#1131 orphan supervisor launch lock recovery", () => {
 		expect(daemon.canConnectToSupervisor).not.toHaveBeenCalled();
 		expect(existsSync(lockDirectory)).toBe(true);
 		expect(daemon.supervisorLaunchInProgress).toBe(false);
+	});
+	it("does not delete a successor generation discovered after stale inspection", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-regression-1131-generation-"));
+		tempDirs.push(root);
+		const lockDirectory = join(root, ".supervisor-launch-generation.lock");
+		writeGeneration(lockDirectory, "generation-a");
+		const observedGeneration = readSupervisorLaunchLockGeneration(lockDirectory);
+		expect(observedGeneration).toBe("generation-a");
+		rmSync(lockDirectory, { recursive: true, force: true });
+		writeGeneration(lockDirectory, "generation-b");
+
+		expect(removeSupervisorLaunchLockGeneration(lockDirectory, observedGeneration!, "stale")).toBe(false);
+		expect(readSupervisorLaunchLockGeneration(lockDirectory)).toBe("generation-b");
+	});
+
+	it("renews a held launch lock so a second contender cannot expire it", async () => {
+		vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+		const root = mkdtempSync(join(tmpdir(), "prime-regression-1131-renew-"));
+		tempDirs.push(root);
+		const supervisorSocketPath = join(root, "daemon.sock");
+		const lockDirectory = launchLockPath(supervisorSocketPath);
+		const firstProbe = deferred<boolean>();
+		const first = createHarness(() => firstProbe.promise);
+		const firstLaunch = first.launchReplacementSupervisor(supervisorSocketPath);
+		await vi.advanceTimersByTimeAsync(0);
+		const firstGeneration = readSupervisorLaunchLockGeneration(lockDirectory);
+		expect(firstGeneration).toEqual(expect.any(String));
+
+		await vi.advanceTimersByTimeAsync(60_000);
+		const second = createHarness();
+		await second.launchReplacementSupervisor(supervisorSocketPath);
+
+		expect(second.canConnectToSupervisor).not.toHaveBeenCalled();
+		expect(readSupervisorLaunchLockGeneration(lockDirectory)).toBe(firstGeneration);
+		firstProbe.resolve(true);
+		await firstLaunch;
+		expect(existsSync(lockDirectory)).toBe(false);
+	});
+
+	it("a stalled old launcher cannot delete its successor lock when it resumes", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-regression-1131-successor-"));
+		tempDirs.push(root);
+		const supervisorSocketPath = join(root, "daemon.sock");
+		const lockDirectory = launchLockPath(supervisorSocketPath);
+		const firstProbe = deferred<boolean>();
+		const first = createHarness(() => firstProbe.promise);
+		const firstLaunch = first.launchReplacementSupervisor(supervisorSocketPath);
+		await Promise.resolve();
+		const firstGeneration = readSupervisorLaunchLockGeneration(lockDirectory);
+		expect(firstGeneration).toEqual(expect.any(String));
+
+		const realNow = Date.now();
+		vi.spyOn(Date, "now").mockReturnValue(realNow + 31_000);
+		const secondProbe = deferred<boolean>();
+		const second = createHarness(() => secondProbe.promise);
+		const secondLaunch = second.launchReplacementSupervisor(supervisorSocketPath);
+		await Promise.resolve();
+		await Promise.resolve();
+		const secondGeneration = readSupervisorLaunchLockGeneration(lockDirectory);
+		expect(secondGeneration).toEqual(expect.any(String));
+		expect(secondGeneration).not.toBe(firstGeneration);
+
+		firstProbe.resolve(true);
+		await firstLaunch;
+		expect(readSupervisorLaunchLockGeneration(lockDirectory)).toBe(secondGeneration);
+		secondProbe.resolve(true);
+		await secondLaunch;
+		expect(existsSync(lockDirectory)).toBe(false);
 	});
 });
