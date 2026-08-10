@@ -2904,12 +2904,13 @@ export class DaemonSupervisor {
 		}
 		// Re-read immediately before signaling. In particular, an unreadable
 		// process-start value never becomes permission to signal or finalize.
+		const identity = worker.descriptor.process;
 		const state = this.classifyWorkerProcessIdentity(worker);
-		if (state !== "exact") {
+		if (state !== "exact" || !identity) {
 			this.log(`Refusing ${signal}: ${state} process identity for ${worker.descriptor.workerId}`);
-			return state;
+			return state === "exact" ? "unreadable" : state;
 		}
-		signalProcessGroupOrProcess(worker.descriptor.process!.pid, signal);
+		signalProcessGroupOrProcess(identity.pid, signal);
 		return state;
 	}
 
