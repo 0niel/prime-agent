@@ -176,6 +176,14 @@ is a few lines — the package above is the whole integration.
   the integration is "connected" whenever that env var is set. Set the matching
   `bearer_token_env = "ACME_TOKEN"` on the subclass.
 
+OAuth discovery checks RFC 9728 well-known protected-resource metadata directly.
+The AI package also exports `parseMcpOAuthChallenge()` and accepts its raw challenge
+through programmatic `McpOAuthConfig.authorizationChallenge` when an integration has
+captured the MCP resource's actual 401 response. The current `/mcp login` call site
+does **not** perform an unauthenticated MCP initialize request or surface
+`WWW-Authenticate`, so servers that publish metadata only through a
+`resource_metadata` challenge still require that integration-level handoff.
+
 ## The `McpIntegration` API
 
 Imported from `rlm` (`from rlm import McpIntegration`).

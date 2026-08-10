@@ -5,6 +5,7 @@ import type { Server } from "node:http";
 import { oauthErrorHtml, oauthSuccessHtml } from "../utils/oauth/oauth-page.js";
 import { generatePKCE } from "../utils/oauth/pkce.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "../utils/oauth/types.js";
+import { createOAuthFetchPolicy, type OAuthFetchPolicy, safeFetchJson, validateOAuthNetworkUrl } from "./safe-fetch.js";
 
 const CALLBACK_HOST = process.env.PI_OAUTH_CALLBACK_HOST || "127.0.0.1";
 // A range (not one port) so a leaked/concurrent login can't wedge all logins with EADDRINUSE.
@@ -24,12 +25,21 @@ interface AuthServerMetadata {
 	token_endpoint: string;
 	registration_endpoint?: string;
 	scopes_supported?: string[];
+	code_challenge_methods_supported?: string[];
 }
 
 /** OAuth protected-resource metadata (RFC 9728). */
 interface ProtectedResourceMetadata {
 	resource: string;
 	authorization_servers?: string[];
+	scopes_supported?: string[];
+}
+
+interface OAuthDiscovery {
+	metadata: AuthServerMetadata;
+	resource: string;
+	resourceScopes?: string[];
+	challengedScope?: string;
 }
 
 export interface McpOAuthConfig {
@@ -41,29 +51,22 @@ export interface McpOAuthConfig {
 	url: string;
 	/** Pre-registered client id (servers without DCR, e.g. Slack). */
 	clientId?: string;
-	/** Explicit scopes; falls back to the server's advertised scopes. */
+	/** Explicit scopes; otherwise resource scopes are preferred over AS-wide scopes. */
 	scopes?: string;
+	/**
+	 * Optional raw WWW-Authenticate challenge obtained from this MCP resource.
+	 * The current login command does not yet surface challenges automatically;
+	 * integrations that have the 401 response can pass it through this field.
+	 */
+	authorizationChallenge?: string;
 }
 
 /** Extra fields we persist alongside the standard credential triple. */
 interface McpCredentials extends OAuthCredentials {
 	tokenEndpoint?: string;
 	clientId?: string;
-}
-
-async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
-	const method = init?.method ?? "GET";
-	const res = await fetch(url, init);
-	const text = await res.text();
-	if (!res.ok) {
-		throw new Error(`${method} ${url} failed: ${res.status} ${text}`);
-	}
-	try {
-		return JSON.parse(text);
-	} catch (cause) {
-		const contentType = res.headers.get("content-type") ?? "unknown content type";
-		throw new Error(`${method} ${url} returned non-JSON (${contentType})`, { cause });
-	}
+	issuer?: string;
+	resource?: string;
 }
 
 /** Random, URL-safe CSRF `state` value, independent of the PKCE verifier. */
@@ -74,6 +77,105 @@ function randomState(): string {
 		.replace(/\+/g, "-")
 		.replace(/\//g, "_")
 		.replace(/=/g, "");
+}
+
+function splitAuthenticateHeader(header: string): string[] {
+	const parts: string[] = [];
+	let start = 0;
+	let quoted = false;
+	let escaped = false;
+	for (let index = 0; index < header.length; index++) {
+		const char = header[index];
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (quoted && char === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (char === '"') quoted = !quoted;
+		else if (char === "," && !quoted) {
+			parts.push(header.slice(start, index).trim());
+			start = index + 1;
+		}
+	}
+	if (quoted || escaped) throw new Error("Malformed WWW-Authenticate header");
+	parts.push(header.slice(start).trim());
+	return parts.filter(Boolean);
+}
+
+function decodeAuthParameter(value: string): string {
+	if (!value.startsWith('"')) return value.trim();
+	if (!value.endsWith('"')) throw new Error("Malformed WWW-Authenticate parameter");
+	let decoded = "";
+	for (let index = 1; index < value.length - 1; index++) {
+		const char = value[index];
+		if (char === "\\") {
+			index++;
+			if (index >= value.length - 1) throw new Error("Malformed WWW-Authenticate escape");
+			decoded += value[index];
+		} else {
+			decoded += char;
+		}
+	}
+	if (/[\u0000-\u001f\u007f]/.test(decoded)) throw new Error("Invalid WWW-Authenticate parameter");
+	return decoded;
+}
+
+export interface McpOAuthChallenge {
+	resourceMetadataUrl?: string;
+	scope?: string;
+}
+
+/** Parse Bearer auth-params from an MCP 401 WWW-Authenticate value. */
+export function parseMcpOAuthChallenge(header: string): McpOAuthChallenge | undefined {
+	if (header.length > 8192 || /[\r\n]/.test(header)) throw new Error("Invalid WWW-Authenticate header");
+	let scheme: string | undefined;
+	const result: McpOAuthChallenge = {};
+	const parts = splitAuthenticateHeader(header);
+	if (parts.length > 64) throw new Error("WWW-Authenticate contains too many parameters");
+	for (const part of parts) {
+		const challenge = part.match(/^([A-Za-z][A-Za-z0-9!#$%&'*+.^_`|~-]*)\s+(.+)$/);
+		let parameter = part;
+		if (challenge && !challenge[2].trimStart().startsWith("=")) {
+			scheme = challenge[1].toLowerCase();
+			parameter = challenge[2];
+		}
+		if (scheme !== "bearer") continue;
+		const equals = parameter.indexOf("=");
+		if (equals < 1) continue;
+		const name = parameter.slice(0, equals).trim().toLowerCase();
+		if (name !== "resource_metadata" && name !== "scope") continue;
+		const value = decodeAuthParameter(parameter.slice(equals + 1).trim());
+		if (!value) throw new Error(`Bearer ${name} is empty`);
+		if (value.length > 4096) throw new Error(`Bearer ${name} is too long`);
+		if (
+			name === "scope" &&
+			(value.split(/\s+/).length > 128 || value.split(/\s+/).some((scope) => scope.length > 256))
+		) {
+			throw new Error("Bearer scope is invalid");
+		}
+		const key = name === "resource_metadata" ? "resourceMetadataUrl" : "scope";
+		const previous = result[key];
+		if (previous && previous !== value) throw new Error(`Conflicting Bearer ${name} values`);
+		result[key] = value;
+	}
+	return result.resourceMetadataUrl || result.scope ? result : undefined;
+}
+
+/** Extract only the RFC 9728 resource_metadata URL for compatibility callers. */
+export function parseMcpOAuthResourceMetadataChallenge(header: string): string | undefined {
+	return parseMcpOAuthChallenge(header)?.resourceMetadataUrl;
+}
+
+function displayOAuthUrl(rawUrl: string): string {
+	try {
+		const url = new URL(rawUrl);
+		return `${url.origin}${url.pathname}`;
+	} catch {
+		return "(invalid OAuth URL)";
+	}
 }
 
 function protectedResourceCandidates(url: URL): string[] {
@@ -106,23 +208,60 @@ function isAuthServerMetadata(value: unknown): value is AuthServerMetadata {
 	return typeof metadata.authorization_endpoint === "string" && typeof metadata.token_endpoint === "string";
 }
 
+function optionalStringArray(value: unknown, field: string): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (
+		!Array.isArray(value) ||
+		value.length > 128 ||
+		value.some((item) => typeof item !== "string" || item.length === 0 || item.length > 2048)
+	) {
+		throw new Error(`Invalid OAuth metadata ${field}`);
+	}
+	return value.length > 0 ? [...new Set(value)] : undefined;
+}
+
+async function validateAuthorizationServerMetadata(
+	metadata: AuthServerMetadata,
+	issuer: string,
+	policy: OAuthFetchPolicy,
+): Promise<void> {
+	if (metadata.issuer !== issuer) {
+		throw new Error(`OAuth metadata issuer mismatch (expected ${issuer}, received ${String(metadata.issuer)})`);
+	}
+	const methods = metadata.code_challenge_methods_supported;
+	if (!Array.isArray(methods) || !methods.includes("S256")) {
+		throw new Error("OAuth authorization server does not advertise required PKCE S256 support");
+	}
+	const issuerOrigin = new URL(issuer).origin;
+	const endpoints = [metadata.authorization_endpoint, metadata.token_endpoint];
+	if (metadata.registration_endpoint !== undefined) {
+		if (typeof metadata.registration_endpoint !== "string") throw new Error("Invalid OAuth registration_endpoint");
+		endpoints.push(metadata.registration_endpoint);
+	}
+	for (const endpoint of endpoints) {
+		const validated = await validateOAuthNetworkUrl(endpoint, policy);
+		if (validated.origin !== issuerOrigin) {
+			throw new Error("OAuth endpoints must share the validated issuer origin");
+		}
+	}
+}
+
 async function discoverAuthorizationServer(
 	issuer: string,
 	attempts: string[],
 	errors: string[],
+	policy: OAuthFetchPolicy,
 ): Promise<AuthServerMetadata | undefined> {
+	await validateOAuthNetworkUrl(issuer, policy);
 	for (const candidate of authorizationServerCandidates(issuer)) {
-		attempts.push(candidate);
+		attempts.push(displayOAuthUrl(candidate));
 		try {
-			const metadata = await fetchJson(candidate);
+			const metadata = await safeFetchJson(candidate, undefined, policy);
 			if (!isAuthServerMetadata(metadata)) {
-				errors.push(`${candidate}: missing authorization_endpoint or token_endpoint`);
+				errors.push(`${displayOAuthUrl(candidate)}: missing authorization_endpoint or token_endpoint`);
 				continue;
 			}
-			if (metadata.issuer !== issuer) {
-				errors.push(`${candidate}: issuer mismatch (expected ${issuer}, received ${String(metadata.issuer)})`);
-				continue;
-			}
+			await validateAuthorizationServerMetadata(metadata, issuer, policy);
 			return metadata;
 		} catch (error) {
 			errors.push(String(error));
@@ -132,49 +271,73 @@ async function discoverAuthorizationServer(
 }
 
 /** Follow RFC 9728 resource metadata, then fall back to co-located AS discovery. */
-async function discover(url: string): Promise<AuthServerMetadata> {
+async function discover(
+	url: string,
+	resourcePolicy: OAuthFetchPolicy,
+	oauthPolicy: OAuthFetchPolicy,
+	authorizationChallenge?: string,
+): Promise<OAuthDiscovery> {
 	const resourceUrl = new URL(url);
 	resourceUrl.hash = "";
 	const resourceIdentifier = resourceUrl.toString();
 	const attempts: string[] = [];
 	const errors: string[] = [];
+	let sawAdvertisedIssuers = false;
+	const challenge = authorizationChallenge ? parseMcpOAuthChallenge(authorizationChallenge) : undefined;
+	const resourceCandidates = [
+		...new Set([
+			...(challenge?.resourceMetadataUrl ? [challenge.resourceMetadataUrl] : []),
+			...protectedResourceCandidates(resourceUrl),
+		]),
+	];
 
-	for (const candidate of protectedResourceCandidates(resourceUrl)) {
-		attempts.push(candidate);
+	for (const candidate of resourceCandidates) {
+		attempts.push(displayOAuthUrl(candidate));
+		let resource: ProtectedResourceMetadata;
 		try {
-			const resource = (await fetchJson(candidate)) as ProtectedResourceMetadata;
-			if (resource?.resource !== resourceIdentifier) {
-				errors.push(
-					`${candidate}: resource mismatch (expected ${resourceIdentifier}, received ${String(resource?.resource)})`,
-				);
-				continue;
-			}
-			const issuers = Array.isArray(resource.authorization_servers)
-				? [
-						...new Set(
-							resource.authorization_servers.filter((issuer): issuer is string => typeof issuer === "string"),
-						),
-					].slice(0, 10)
-				: [];
-			if (issuers.length === 0) {
-				errors.push(`${candidate}: missing authorization_servers`);
-				continue;
-			}
-			for (const issuer of issuers) {
-				try {
-					const metadata = await discoverAuthorizationServer(issuer, attempts, errors);
-					if (metadata) return metadata;
-				} catch (error) {
-					errors.push(`${issuer}: ${String(error)}`);
-				}
-			}
+			resource = (await safeFetchJson(candidate, undefined, resourcePolicy)) as ProtectedResourceMetadata;
 		} catch (error) {
 			errors.push(String(error));
+			continue;
+		}
+		if (resource?.resource !== resourceIdentifier) {
+			throw new Error(
+				`${displayOAuthUrl(candidate)}: resource mismatch (expected ${resourceIdentifier}, received ${String(resource?.resource)})`,
+			);
+		}
+		const issuers = optionalStringArray(resource.authorization_servers, "authorization_servers")?.slice(0, 10) ?? [];
+		if (issuers.length === 0) {
+			errors.push(`${displayOAuthUrl(candidate)}: missing authorization_servers`);
+			continue;
+		}
+		sawAdvertisedIssuers = true;
+		const resourceScopes = optionalStringArray(resource.scopes_supported, "scopes_supported");
+		for (const issuer of [...new Set(issuers)]) {
+			try {
+				const metadata = await discoverAuthorizationServer(issuer, attempts, errors, oauthPolicy);
+				if (metadata) {
+					return {
+						metadata,
+						resource: resourceIdentifier,
+						resourceScopes,
+						challengedScope: challenge?.scope,
+					};
+				}
+			} catch (error) {
+				errors.push(`${displayOAuthUrl(issuer)}: ${String(error)}`);
+			}
 		}
 	}
 
-	const colocated = await discoverAuthorizationServer(resourceUrl.origin, attempts, errors);
-	if (colocated) return colocated;
+	if (sawAdvertisedIssuers) {
+		throw new Error(
+			`Could not discover OAuth metadata for ${resourceUrl.origin}. ` +
+				`Tried ${attempts.join(", ")}. Errors: ${errors.join("; ")}`,
+		);
+	}
+
+	const colocated = await discoverAuthorizationServer(resourceUrl.origin, attempts, errors, oauthPolicy);
+	if (colocated) return { metadata: colocated, resource: resourceIdentifier };
 
 	throw new Error(
 		`Could not discover OAuth metadata for ${resourceUrl.origin}. ` +
@@ -183,7 +346,7 @@ async function discover(url: string): Promise<AuthServerMetadata> {
 }
 
 /** Dynamic client registration (RFC 7591). Returns the issued client_id. */
-async function registerClient(registrationEndpoint: string, label: string): Promise<string> {
+async function registerClient(registrationEndpoint: string, label: string, policy: OAuthFetchPolicy): Promise<string> {
 	const body = {
 		client_name: label,
 		redirect_uris: ALL_REDIRECT_URIS,
@@ -191,13 +354,19 @@ async function registerClient(registrationEndpoint: string, label: string): Prom
 		response_types: ["code"],
 		token_endpoint_auth_method: "none",
 	};
-	const data = (await fetchJson(registrationEndpoint, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(body),
-	})) as { client_id?: string };
-	if (!data.client_id) {
-		throw new Error(`Dynamic client registration at ${registrationEndpoint} returned no client_id`);
+	const data = (await safeFetchJson(
+		registrationEndpoint,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		},
+		policy,
+	)) as { client_id?: string };
+	if (typeof data.client_id !== "string" || data.client_id.length === 0 || data.client_id.length > 4096) {
+		throw new Error(
+			`Dynamic client registration at ${displayOAuthUrl(registrationEndpoint)} returned no valid client_id`,
+		);
 	}
 	return data.client_id;
 }
@@ -307,26 +476,45 @@ function parseRedirectInput(input: string, expectedState: string): { code: strin
 	return { code, state: state ?? expectedState };
 }
 
+interface TokenResponse {
+	access_token: string;
+	refresh_token?: string;
+	expires_in?: number;
+}
+
 async function exchangeToken(
 	tokenEndpoint: string,
 	params: Record<string, string>,
-): Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> {
-	const res = await fetch(tokenEndpoint, {
-		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
-		body: new URLSearchParams(params).toString(),
-	});
-	const text = await res.text();
-	if (!res.ok) {
-		throw new Error(`Token request to ${tokenEndpoint} failed: ${res.status} ${text}`);
+	policy: OAuthFetchPolicy,
+): Promise<TokenResponse> {
+	const data = await safeFetchJson(
+		tokenEndpoint,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams(params).toString(),
+		},
+		policy,
+	);
+	if (!data || typeof data !== "object" || typeof (data as Partial<TokenResponse>).access_token !== "string") {
+		throw new Error("OAuth token endpoint returned an invalid token response");
 	}
-	return JSON.parse(text);
+	const token = data as TokenResponse;
+	if (token.refresh_token !== undefined && typeof token.refresh_token !== "string") {
+		throw new Error("OAuth token endpoint returned an invalid refresh_token");
+	}
+	if (token.expires_in !== undefined && (!Number.isFinite(token.expires_in) || token.expires_in <= 0)) {
+		throw new Error("OAuth token endpoint returned an invalid expires_in");
+	}
+	return token;
 }
 
 function toCredentials(
-	token: { access_token: string; refresh_token?: string; expires_in?: number },
+	token: TokenResponse,
 	tokenEndpoint: string,
 	clientId: string,
+	issuer: string,
+	resource: string,
 	previousRefresh?: string,
 ): McpCredentials {
 	return {
@@ -338,15 +526,20 @@ function toCredentials(
 			: Date.now() + 3600 * 1000 - TOKEN_EXPIRY_BUFFER_MS,
 		tokenEndpoint,
 		clientId,
+		issuer,
+		resource,
 	};
 }
 
 /** Build a provider for one MCP server. Register it with registerOAuthProvider(). */
 export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInterface {
 	const label = config.label ?? config.server;
+	const resourcePolicy = createOAuthFetchPolicy(config.url);
+	const oauthPolicy: OAuthFetchPolicy = {};
 
 	async function login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-		const meta = await discover(config.url);
+		const discovery = await discover(config.url, resourcePolicy, oauthPolicy, config.authorizationChallenge);
+		const meta = discovery.metadata;
 		callbacks.onProgress?.(`Discovered ${meta.issuer ?? new URL(config.url).origin}`);
 
 		let clientId = config.clientId;
@@ -358,28 +551,32 @@ export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInt
 				);
 			}
 			callbacks.onProgress?.("Registering OAuth client…");
-			clientId = await registerClient(meta.registration_endpoint, `Prime Agent (${label})`);
+			clientId = await registerClient(meta.registration_endpoint, `Prime Agent (${label})`, oauthPolicy);
 		}
 
 		const { verifier, challenge } = await generatePKCE();
 		// `state` must be independent of the PKCE verifier — the verifier is the
 		// secret used at token exchange, while `state` is echoed on the redirect URL.
 		const state = randomState();
-		const scope = config.scopes ?? meta.scopes_supported?.join(" ");
+		const scope = discovery.challengedScope ?? config.scopes ?? discovery.resourceScopes?.join(" ");
 		const cb = await startCallbackServer(label);
 		try {
-			const authParams = new URLSearchParams({
+			const authorizationUrl = new URL(meta.authorization_endpoint);
+			for (const [name, value] of Object.entries({
 				client_id: clientId,
 				response_type: "code",
 				redirect_uri: cb.redirectUri,
 				code_challenge: challenge,
 				code_challenge_method: "S256",
 				state,
-			});
-			if (scope) authParams.set("scope", scope);
+				resource: discovery.resource,
+			})) {
+				authorizationUrl.searchParams.set(name, value);
+			}
+			if (scope) authorizationUrl.searchParams.set("scope", scope);
 
 			callbacks.onAuth({
-				url: `${meta.authorization_endpoint}?${authParams.toString()}`,
+				url: authorizationUrl.toString(),
 				instructions:
 					"Complete login in your browser. If the browser is on another machine, paste the final redirect URL here.",
 			});
@@ -436,14 +633,19 @@ export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInt
 			}
 
 			callbacks.onProgress?.("Exchanging authorization code for tokens…");
-			const token = await exchangeToken(meta.token_endpoint, {
-				grant_type: "authorization_code",
-				code: result.code,
-				redirect_uri: cb.redirectUri,
-				client_id: clientId,
-				code_verifier: verifier,
-			});
-			return toCredentials(token, meta.token_endpoint, clientId);
+			const token = await exchangeToken(
+				meta.token_endpoint,
+				{
+					grant_type: "authorization_code",
+					code: result.code,
+					redirect_uri: cb.redirectUri,
+					client_id: clientId,
+					code_verifier: verifier,
+					resource: discovery.resource,
+				},
+				oauthPolicy,
+			);
+			return toCredentials(token, meta.token_endpoint, clientId, meta.issuer!, discovery.resource);
 		} finally {
 			cb.server.close();
 		}
@@ -451,17 +653,35 @@ export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInt
 
 	async function refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
 		const creds = credentials as McpCredentials;
-		const tokenEndpoint = creds.tokenEndpoint ?? (await discover(config.url)).token_endpoint;
-		const clientId = creds.clientId ?? config.clientId;
 		if (!creds.refresh) {
 			throw new Error(`No refresh token stored for ${label}; re-run /mcp login ${config.server}`);
 		}
-		const token = await exchangeToken(tokenEndpoint, {
-			grant_type: "refresh_token",
-			refresh_token: creds.refresh,
-			...(clientId ? { client_id: clientId } : {}),
-		});
-		return toCredentials(token, tokenEndpoint, clientId ?? "", creds.refresh);
+		if (!creds.resource || !creds.issuer || !creds.tokenEndpoint) {
+			throw new Error(`OAuth credential binding is missing for ${label}; re-run /mcp login ${config.server}`);
+		}
+		const discovery = await discover(config.url, resourcePolicy, oauthPolicy, config.authorizationChallenge);
+		const meta = discovery.metadata;
+		if (creds.resource && creds.resource !== discovery.resource) {
+			throw new Error(`OAuth resource changed for ${label}; re-run /mcp login ${config.server}`);
+		}
+		if (creds.issuer && creds.issuer !== meta.issuer) {
+			throw new Error(`OAuth issuer changed for ${label}; re-run /mcp login ${config.server}`);
+		}
+		if (creds.tokenEndpoint && creds.tokenEndpoint !== meta.token_endpoint) {
+			throw new Error(`OAuth token endpoint changed for ${label}; re-run /mcp login ${config.server}`);
+		}
+		const clientId = creds.clientId ?? config.clientId;
+		const token = await exchangeToken(
+			meta.token_endpoint,
+			{
+				grant_type: "refresh_token",
+				refresh_token: creds.refresh,
+				resource: discovery.resource,
+				...(clientId ? { client_id: clientId } : {}),
+			},
+			oauthPolicy,
+		);
+		return toCredentials(token, meta.token_endpoint, clientId ?? "", meta.issuer!, discovery.resource, creds.refresh);
 	}
 
 	return {
