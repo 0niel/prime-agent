@@ -246,6 +246,14 @@ For a persisted root session, the relevant layout is:
 
 Exact artifact files are created only when their features are used. Non-persistent sessions place RLM directories under the OS temporary directory and do not gain revivable session artifacts.
 
+## Role-policy rollout and rollback
+
+When the server-side `PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY` flag is unset or `0`, role-policy admission is disabled and legacy `rlm.run(name=..., model=...)` behavior remains in effect. A configured policy is retained but not consulted. With `=1`, a valid policy may bind a new child to a user-defined role, exact authenticated `provider/model` profile, requested decision/implementation scopes, explicitly supplied bounded context capsules, and the intersection of role and parent tools.
+
+The policy is not a sandbox. It narrows existing tool names only; shell-capable tools still have the worker OS identity's permissions. Project policy is not authority by default: it is selected only if valid global policy explicitly sets `trustProjectPolicy: true`. Malformed or untrusted policy fails closed for role-policy admission and never falls back to a model or profile.
+
+For an approved rollback, preserve assignment-specific records and session artifacts, cleanly stop affected workers, set `PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY=0`, then restart. This affects only new admissions. Do not edit a retained assignment or policy snapshot to widen an existing child; re-enable only with `=1` to create fresh assignments from a newly validated snapshot.
+
 ## Trust Boundary
 
 IPython executes model-generated Python and shell-magics with the worker's OS permissions. The kernel boundary isolates protocol and lifecycle concerns; it is not a security sandbox. Installed Python packages, skills, and extensions are trusted code. Use an external sandbox or restricted execution environment when the workspace or generated code is untrusted.
