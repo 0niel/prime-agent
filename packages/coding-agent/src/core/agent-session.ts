@@ -4908,7 +4908,8 @@ export class AgentSession {
 		});
 	}
 
-	async restoreSessionActions(snapshot: SessionActionRecoverySnapshot): Promise<number> {
+	/** Restores queued work and returns the exact durable IDs admitted to the scheduler. */
+	async restoreSessionActions(snapshot: SessionActionRecoverySnapshot): Promise<readonly string[]> {
 		if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
 			throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
 		}
@@ -4990,7 +4991,7 @@ export class AgentSession {
 			};
 		});
 		for (const action of actions) this._admitSessionInput(action, { restore: true });
-		return actions.length;
+		return actions.map((action) => action.id);
 	}
 
 	private _restoreSessionCommand(
@@ -10439,6 +10440,11 @@ export class AgentSession {
 	/** Whether auto-retry is currently in progress */
 	get isRetrying(): boolean {
 		return this._retryPromise !== undefined;
+	}
+
+	/** Durable IDs of every action that has not reached its own terminal release. */
+	get unfinishedActionIds(): readonly string[] {
+		return this._actionStore.unfinishedActions().map((action) => action.id);
 	}
 
 	/** Whether an accepted prompt is still running or waiting for retry completion. */

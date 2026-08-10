@@ -33,9 +33,7 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 		const journal = new WorkerRecoveryJournal(path());
 		journal.record({ ...base, busy: true });
 		journal.record({ ...base, busy: false });
-		expect(journal.getLatest()).toEqual([
-			expect.objectContaining({ busy: false, operationId: operationA, generation: generationA }),
-		]);
+		expect(journal.getLatest()).toEqual([]);
 	});
 
 	it("does not let an unstarted v2 completion manufacture a clear", () => {
@@ -49,9 +47,7 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 		journal.record({ ...base, busy: true });
 		journal.record({ ...base, busy: true, operationId: operationB });
 		journal.record({ ...base, busy: false, operationId: operationA });
-		expect(journal.getLatest()).toEqual([
-			expect.objectContaining({ busy: true, operationId: operationB, generation: generationA }),
-		]);
+		expect(journal.getLatest()).toEqual([expect.objectContaining({ busy: true, operationId: operationB })]);
 	});
 
 	it("refuses a stale operation completion while retaining another generation", () => {
@@ -60,12 +56,9 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 		journal.record({ ...base, busy: false, operationId: operationB });
 		journal.record({ ...base, busy: true, generation: generationB });
 		journal.record({ ...base, busy: false, generation: generationB });
-		expect(journal.getLatest()).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({ busy: true, operationId: operationA, generation: generationA }),
-				expect.objectContaining({ busy: false, operationId: operationA, generation: generationB }),
-			]),
-		);
+		expect(journal.getLatest()).toEqual([
+			expect.objectContaining({ busy: true, operationId: operationA, generation: generationA }),
+		]);
 	});
 
 	it("keeps v1 uncertain and malformed tails recoverable without letting them replace v2", () => {
@@ -88,20 +81,55 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 		const file = path();
 		const journal = new WorkerRecoveryJournal(file);
 		// Same session, generation and operation family: only the UUID separates
-		// overlapping queued turns.  This is the daemon scheduler's A/B ordering.
+		// overlapping queued turns. This is the daemon scheduler's A/B ordering.
 		journal.record({ ...base, busy: true, operationId: operationA });
 		journal.record({ ...base, busy: true, operationId: operationB });
 		journal.record({ ...base, busy: false, operationId: operationA });
-		expect(journal.getLatest()).toEqual([
-			expect.objectContaining({ busy: true, operationId: operationB, generation: generationA }),
-		]);
+		expect(journal.getLatest()).toEqual([expect.objectContaining({ busy: true, operationId: operationB })]);
 
-		// A restart reads B as crash evidence.  A cancellation/terminal callback
-		// carrying A remains stale, while B's exact terminal token clears B.
+		// A restart reads B as crash evidence. A's stale callback cannot clear B.
 		const restarted = new WorkerRecoveryJournal(file);
 		restarted.record({ ...base, busy: false, operationId: operationA });
 		expect(restarted.getLatest()).toEqual([expect.objectContaining({ busy: true, operationId: operationB })]);
 		restarted.record({ ...base, busy: false, operationId: operationB });
-		expect(restarted.getLatest()).toEqual([expect.objectContaining({ busy: false, operationId: operationB })]);
+		expect(restarted.getLatest()).toEqual([]);
+	});
+
+	it("prunes completed v2 history inherited from an older journal on restart", () => {
+		const file = path();
+		for (let index = 0; index < 128; index++) {
+			const operationId = `77777777-7777-4777-8777-${String(index).padStart(12, "0")}`;
+			appendFileSync(
+				file,
+				`${JSON.stringify({ version: 2, ...base, busy: false, operationId, recordedAt: new Date().toISOString() })}\n`,
+			);
+		}
+		const restarted = new WorkerRecoveryJournal(file);
+		expect(restarted.getLatest()).toEqual([]);
+		expect(WorkerRecoveryJournal.readLatest(file)).toEqual([]);
+	});
+
+	it("bounds completed v2 history while retaining all busy operations and legacy uncertainty", () => {
+		const file = path();
+		const journal = new WorkerRecoveryJournal(file);
+		const busyOperation = "55555555-5555-4555-8555-555555555555";
+		journal.record({ ...base, busy: true, operationId: busyOperation });
+		for (let index = 0; index < 128; index++) {
+			const operationId = `66666666-6666-4666-8666-${String(index).padStart(12, "0")}`;
+			journal.record({ ...base, busy: true, operationId });
+			journal.record({ ...base, busy: false, operationId });
+		}
+		appendFileSync(
+			file,
+			`${JSON.stringify({ version: 1, activeSessionId: "legacy", sessionId: "old", busy: true, operation: "unknown", recordedAt: new Date().toISOString() })}\n`,
+		);
+		const restarted = new WorkerRecoveryJournal(file);
+		expect(restarted.getLatest()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ version: 2, operationId: busyOperation, busy: true }),
+				expect.objectContaining({ version: 1, activeSessionId: "legacy", busy: true }),
+			]),
+		);
+		expect(restarted.getLatest()).toHaveLength(2);
 	});
 });

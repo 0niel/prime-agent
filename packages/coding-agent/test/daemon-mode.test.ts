@@ -12,6 +12,7 @@ import {
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
+import type { SessionActionRecoverySnapshot } from "../src/core/agent-session.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
 import {
@@ -105,17 +106,14 @@ describe("daemon mode helpers", () => {
 			internals.checkpointWorkerRecoveryEvent(state, "turn_start");
 			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
 			const afterA = WorkerRecoveryJournal.readLatest(journalPath);
-			expect(afterA).toHaveLength(1);
-			expect(afterA[0]).toMatchObject({ busy: true, operation: "prompt" });
+			expect(afterA).toEqual([expect.objectContaining({ busy: true, operation: "prompt" })]);
 
 			// A fresh reader models a worker restart. It still sees B, then B's own
 			// terminal event clears it; no mutable operation-family current map exists.
 			expect(new WorkerRecoveryJournal(journalPath).getLatest()).toEqual(afterA);
 			internals.checkpointWorkerRecoveryEvent(state, "turn_start");
 			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([
-				expect.objectContaining({ busy: false, operation: "prompt" }),
-			]);
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 		} finally {
 			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
@@ -153,7 +151,7 @@ describe("daemon mode helpers", () => {
 			const abandonedPrompt = internals.beginWorkerRecoveryOperation(state, "prompt");
 			internals.queueWorkerRecoveryTurn(state, abandonedPrompt);
 			internals.cancelQueuedWorkerRecoveryTurn(state, abandonedPrompt);
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 
 			// A steer while A's turn is active is attached to A, not queued for a
 			// nonexistent next turn. turn_end clears every exact token for that turn.
@@ -163,30 +161,18 @@ describe("daemon mode helpers", () => {
 			const activeSteer = internals.beginWorkerRecoveryOperation(state, "steer_queued");
 			expect(internals.attachWorkerRecoveryToActiveTurn(state, activeSteer)).toBe(true);
 			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: false,
-				operation: "steer_queued",
-			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 
 			// A rejected paired command exact-clears the token it began.
 			const rejected = internals.beginWorkerRecoveryOperation(state, "steer_queued");
 			internals.completeWorkerRecoveryOperation(state, rejected);
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: false,
-				operation: "steer_queued",
-			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 
 			// Observation events retain durable evidence but cannot strand busy work.
 			internals.checkpointWorkerRecoveryEvent(state, "session_action_update");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: false,
-				operation: "session_action_update",
-			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 			internals.checkpointWorkerRecoveryEvent(state, "rlm_child_update");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: false,
-				operation: "rlm_child_update",
-			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 		} finally {
 			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
@@ -233,29 +219,32 @@ describe("daemon mode helpers", () => {
 				activeSessionId: "active",
 				message: "reject",
 			});
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: true,
-				operation: "steer_queued",
-			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+				expect.arrayContaining([expect.objectContaining({ busy: true, operation: "steer_queued" })]),
+			);
 			steerResult.reject(new Error("steer rejected"));
 			await expect(rejectedSteer).rejects.toThrow("steer rejected");
 
 			// B is exact-cleared at its own rejection, and the still-live A is
 			// republished immediately rather than waiting for any turn terminal.
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+				expect.arrayContaining([expect.objectContaining({ busy: true, operation: "prompt" })]),
+			);
 			const afterRejection = readFileSync(journalPath, "utf8")
 				.trim()
 				.split("\n")
 				.map((line) => JSON.parse(line)) as Array<{ busy: boolean; operation: string }>;
-			expect(afterRejection).toContainEqual(expect.objectContaining({ busy: false, operation: "steer_queued" }));
+			expect(afterRejection).toEqual([expect.objectContaining({ busy: true, operation: "prompt" })]);
 
 			// An unrelated nested terminal cannot resurrect B; A remains owned until
 			// A's own terminal, which is the first point that clears it.
 			checkpoint(state, "turn_start");
 			checkpoint(state, "turn_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+				expect.arrayContaining([expect.objectContaining({ busy: true, operation: "prompt" })]),
+			);
 			checkpoint(state, "turn_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 		} finally {
 			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
@@ -307,14 +296,16 @@ describe("daemon mode helpers", () => {
 			terminal.resolve();
 			await Promise.resolve();
 			// Acceptance releases only the response/admission plumbing, never the queued token.
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+				expect.arrayContaining([expect.objectContaining({ busy: true, operation: "prompt" })]),
+			);
 			const checkpoint = Reflect.get(daemon, "checkpointWorkerRecoveryEvent").bind(daemon) as (
 				state: ActiveSessionState,
 				event: "turn_start" | "turn_end",
 			) => void;
 			checkpoint(state, "turn_start");
 			checkpoint(state, "turn_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 		} finally {
 			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
@@ -360,24 +351,20 @@ describe("daemon mode helpers", () => {
 				busy: boolean;
 				operation: string;
 			}>;
-			expect(nestedTurnRecords).toContainEqual(
-				expect.objectContaining({ busy: false, operation: "follow_up_queued" }),
+			expect(nestedTurnRecords).toEqual([expect.objectContaining({ busy: true, operation: "prompt" })]);
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+				expect.arrayContaining([expect.objectContaining({ busy: true, operation: "prompt" })]),
 			);
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
 			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 			internals.checkpointWorkerRecoveryEvent(state, "message_start");
 			internals.checkpointWorkerRecoveryEvent(state, "message_start");
 			internals.checkpointWorkerRecoveryEvent(state, "message_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: true,
-				operation: "message_start",
-			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+				expect.arrayContaining([expect.objectContaining({ busy: true, operation: "message_start" })]),
+			);
 			internals.checkpointWorkerRecoveryEvent(state, "message_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: false,
-				operation: "message_start",
-			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 		} finally {
 			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
@@ -385,7 +372,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("republishes active recovery evidence after instantaneous observations", () => {
+	it("preserves active recovery evidence across instantaneous observations", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-observation-recovery-"));
 		const journalPath = join(root, "worker-recovery.jsonl");
 		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
@@ -419,16 +406,17 @@ describe("daemon mode helpers", () => {
 
 			for (const observation of ["session_action_update", "rlm_child_update"] as const) {
 				internals.checkpointWorkerRecoveryEvent(state, observation);
-				expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-					busy: true,
-					operation: "tool_execution_start",
-				});
+				expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+					expect.arrayContaining([expect.objectContaining({ busy: true, operation: "tool_execution_start" })]),
+				);
 			}
 
 			internals.checkpointWorkerRecoveryEvent(state, "tool_execution_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+				expect.arrayContaining([expect.objectContaining({ busy: true, operation: "prompt" })]),
+			);
 			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 		} finally {
 			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
@@ -461,12 +449,7 @@ describe("daemon mode helpers", () => {
 			const prompt = internals.beginWorkerRecoveryOperation(state, "prompt");
 			internals.completeWorkerRecoveryOperation(state, prompt);
 			const latest = WorkerRecoveryJournal.readLatest(journalPath);
-			expect(latest).toHaveLength(1);
-			expect(latest[0]).toMatchObject({
-				busy: false,
-				generation: "22222222-2222-4222-8222-222222222222",
-				operation: "prompt",
-			});
+			expect(latest).toEqual([]);
 		} finally {
 			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
@@ -516,17 +499,128 @@ describe("daemon mode helpers", () => {
 				message: "race",
 			});
 			// The turn terminal ran before the awaited followUp promise settled.
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: false,
-				operation: "follow_up_queued",
-			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
 			held.resolve(true);
 			await pending;
 			// No token was appended after the turn, so a later unrelated terminal cannot consume it.
-			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
-				busy: false,
-				operation: "follow_up_queued",
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("derives compatibility ready records from live busy state instead of stranding idle sessions", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-ready-recovery-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-ready-recovery.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
 			});
+			const state = makeState("active");
+			Object.assign(state.runtime, {
+				session: {
+					sessionId: "session",
+					isStreaming: false,
+					isCompacting: false,
+					isRetrying: false,
+					hasAcceptedPromptInFlight: false,
+				},
+			});
+			const record = Reflect.get(daemon, "recordWorkerRecoveryState").bind(daemon) as (
+				state: ActiveSessionState,
+				operation: "ready",
+			) => void;
+			record(state, "ready");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
+			Object.assign(state.runtime.session, { isRetrying: true });
+			record(state, "ready");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual(
+				expect.arrayContaining([expect.objectContaining({ operation: "ready", busy: true })]),
+			);
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps restored action identities until their own terminal or cancellation", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-restore-action-recovery-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-restore-action-recovery.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			const actionIds = ["restored-a", "restored-b"];
+			let unfinished = [...actionIds];
+			const restoreSessionActions = vi.fn(async (snapshot: SessionActionRecoverySnapshot) =>
+				snapshot.actions.map((action) => action.id),
+			);
+			Object.assign(state.runtime, {
+				session: {
+					sessionId: "session",
+					get unfinishedActionCount() {
+						return unfinished.length;
+					},
+					get unfinishedActionIds() {
+						return unfinished;
+					},
+					restoreSessionActions,
+				},
+			});
+			Reflect.get(daemon, "sessions").set("active", state);
+			const handle = Reflect.get(daemon, "handleCommand").bind(daemon) as (
+				client: DaemonSocketClient,
+				command: DaemonCommand,
+			) => Promise<unknown>;
+			const snapshot = {
+				formatVersion: 1 as const,
+				actions: actionIds.map((id) => ({ id })),
+			} as unknown as SessionActionRecoverySnapshot;
+			// N=0 clears the exact admission synchronously; restore failure does the
+			// same, without touching a later successful restore's identities.
+			await handle(makeClient("client", "active"), {
+				type: "restore_actions",
+				activeSessionId: "active",
+				snapshot: { formatVersion: 1, actions: [] },
+			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath).filter((record) => record.busy)).toHaveLength(0);
+			restoreSessionActions.mockRejectedValueOnce(new Error("restore failed"));
+			await expect(
+				handle(makeClient("client", "active"), { type: "restore_actions", activeSessionId: "active", snapshot }),
+			).rejects.toThrow("restore failed");
+			expect(WorkerRecoveryJournal.readLatest(journalPath).filter((record) => record.busy)).toHaveLength(0);
+			// Return a deliberately reordered partial result: action IDs, not array
+			// positions, must own their exact recovery identities.
+			restoreSessionActions.mockResolvedValueOnce(["restored-b"]);
+			await handle(makeClient("client", "active"), { type: "restore_actions", activeSessionId: "active", snapshot });
+			const busyAfterPartialRestore = WorkerRecoveryJournal.readLatest(journalPath).filter((record) => record.busy);
+			expect(busyAfterPartialRestore).toEqual([expect.objectContaining({ operation: "actions_restored" })]);
+			unfinished = ["restored-a"];
+			Reflect.get(daemon, "checkpointWorkerRecoveryEvent").call(daemon, state, "session_action_update");
+			// restored-a was declared but not returned by this partial restore, so it
+			// cannot keep or clear restored-b's token.
+			expect(WorkerRecoveryJournal.readLatest(journalPath).filter((record) => record.busy)).toHaveLength(0);
+			unfinished = [...actionIds];
+			await handle(makeClient("client", "active"), { type: "restore_actions", activeSessionId: "active", snapshot });
+			expect(WorkerRecoveryJournal.readLatest(journalPath).filter((record) => record.busy)).toHaveLength(2);
+			unfinished = ["restored-b"];
+			Reflect.get(daemon, "checkpointWorkerRecoveryEvent").call(daemon, state, "session_action_update");
+			expect(WorkerRecoveryJournal.readLatest(journalPath).filter((record) => record.busy)).toHaveLength(1);
+			unfinished = [];
+			Reflect.get(daemon, "checkpointWorkerRecoveryEvent").call(daemon, state, "session_action_update");
+			expect(WorkerRecoveryJournal.readLatest(journalPath).filter((record) => record.busy)).toHaveLength(0);
 		} finally {
 			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;

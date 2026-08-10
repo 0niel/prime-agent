@@ -547,6 +547,14 @@ export class AgentDaemon {
 		ActiveSessionState,
 		{ pending: RecoveryOperationToken[]; active: RecoveryOperationToken[][] }
 	>();
+	/**
+	 * Restored actions do not have a command response lifetime: they remain queued
+	 * until their individual scheduler actions terminally settle or are cancelled.
+	 */
+	private readonly restoredActionRecoveries = new WeakMap<
+		ActiveSessionState,
+		Array<{ tokensByActionId: Map<string, RecoveryOperationToken> }>
+	>();
 	private readonly recoveryEventOperations = new WeakMap<ActiveSessionState, Map<string, RecoveryOperationToken[]>>();
 	private recoveryOperationSequence = 0;
 	private readonly workerGeneration: string;
@@ -4236,12 +4244,50 @@ export class AgentDaemon {
 
 			case "restore_actions": {
 				const state = this.getSessionState(command.activeSessionId);
-				const recoveryToken = this.beginWorkerRecoveryOperation(state, "actions_restored");
+				// Allocate one durable identity per declared action before restore can
+				// mutate the scheduler. This leaves crash evidence fail-closed if the
+				// worker dies between admission and its response.
+				const recoveryTokens = new Map<string, RecoveryOperationToken>();
+				for (const action of command.snapshot.actions) {
+					recoveryTokens.set(action.id, this.beginWorkerRecoveryOperation(state, "actions_restored"));
+				}
+				const emptyRecoveryToken =
+					command.snapshot.actions.length === 0
+						? this.beginWorkerRecoveryOperation(state, "actions_restored")
+						: undefined;
 				try {
-					const restored = await state.runtime.session.restoreSessionActions(command.snapshot);
-					return success(command.id, "restore_actions", { restored });
-				} finally {
-					this.completeWorkerRecoveryOperation(state, recoveryToken);
+					const restoredActionIds = await state.runtime.session.restoreSessionActions(command.snapshot);
+					const declaredActionIds = new Set(command.snapshot.actions.map((action) => action.id));
+					if (
+						new Set(restoredActionIds).size !== restoredActionIds.length ||
+						restoredActionIds.some((actionId) => !declaredActionIds.has(actionId))
+					) {
+						throw new Error("Restored session action IDs do not match the recovery snapshot");
+					}
+					if (emptyRecoveryToken) this.completeWorkerRecoveryOperation(state, emptyRecoveryToken);
+					const tokensByActionId = new Map<string, RecoveryOperationToken>();
+					for (const actionId of restoredActionIds) {
+						const token = recoveryTokens.get(actionId);
+						if (!token) throw new Error(`Missing recovery token for restored action ${actionId}`);
+						tokensByActionId.set(actionId, token);
+						recoveryTokens.delete(actionId);
+					}
+					// The restore result identifies every admitted durable action. Bind its
+					// preallocated token by ID, never snapshot/result position or a global
+					// unfinished-count delta. This remains correct for partial restores.
+					if (tokensByActionId.size > 0) {
+						const recoveries = this.restoredActionRecoveries.get(state) ?? [];
+						recoveries.push({ tokensByActionId });
+						this.restoredActionRecoveries.set(state, recoveries);
+					}
+					for (const token of recoveryTokens.values()) this.completeWorkerRecoveryOperation(state, token);
+					return success(command.id, "restore_actions", { restored: restoredActionIds.length });
+				} catch (error) {
+					// Failure has no reliable action-to-token mapping. Clear only the exact
+					// identities begun by this call; another restore remains independent.
+					for (const token of recoveryTokens.values()) this.completeWorkerRecoveryOperation(state, token);
+					if (emptyRecoveryToken) this.completeWorkerRecoveryOperation(state, emptyRecoveryToken);
+					throw error;
 				}
 			}
 
@@ -6650,20 +6696,6 @@ export class AgentDaemon {
 		}
 	}
 
-	private republishCurrentWorkerRecoveryOperation(state: ActiveSessionState): void {
-		let current: RecoveryOperationToken | undefined;
-		const consider = (token: RecoveryOperationToken | undefined): void => {
-			if (token && (!current || token.sequence > current.sequence)) current = token;
-		};
-		for (const frame of this.recoveryTurnsFor(state).active) {
-			for (const token of frame) consider(token);
-		}
-		for (const queue of this.recoveryEventOperations.get(state)?.values() ?? []) {
-			consider(queue.at(-1));
-		}
-		if (current) this.writeWorkerRecoveryOperation(state, current, true);
-	}
-
 	private recoveryTurnsFor(state: ActiveSessionState): {
 		pending: RecoveryOperationToken[];
 		active: RecoveryOperationToken[][];
@@ -6711,20 +6743,36 @@ export class AgentDaemon {
 		}
 		if (!removed) return;
 		this.completeWorkerRecoveryOperation(state, token);
+	}
 
-		// Completing the latest token must not erase another exact operation that
-		// is still active in this worker attempt.
-		this.republishCurrentWorkerRecoveryOperation(state);
+	private settleRestoredActionRecoveries(state: ActiveSessionState): void {
+		const recoveries = this.restoredActionRecoveries.get(state);
+		if (!recoveries) return;
+		// The action store reports every queued, selected, running, failed, and
+		// cancelled action as unfinished until it reaches its own terminal release.
+		// Compare exact durable action IDs, so A's cancellation cannot terminally
+		// settle B merely because both restores share a session.
+		const unfinished = new Set(state.runtime.session.unfinishedActionIds);
+		for (const recovery of recoveries) {
+			for (const [actionId, token] of recovery.tokensByActionId) {
+				if (unfinished.has(actionId)) continue;
+				this.completeWorkerRecoveryOperation(state, token);
+				recovery.tokensByActionId.delete(actionId);
+			}
+		}
+		const pending = recoveries.filter((recovery) => recovery.tokensByActionId.size > 0);
+		if (pending.length > 0) this.restoredActionRecoveries.set(state, pending);
+		else this.restoredActionRecoveries.delete(state);
 	}
 
 	private checkpointWorkerRecoveryEvent(state: ActiveSessionState, operation: WorkerRecoveryOperation): void {
+		if (operation === "session_action_update") this.settleRestoredActionRecoveries(state);
 		const match = /^(.*)_(start|end)$/.exec(operation);
 		if (!match) {
 			// These are observations inside a turn/tool, not independently live work.
 			// Preserve the fsync evidence without stranding a permanent busy record.
 			const token = this.beginWorkerRecoveryOperation(state, operation);
 			this.completeWorkerRecoveryOperation(state, token);
-			this.republishCurrentWorkerRecoveryOperation(state);
 			return;
 		}
 		const [, family, edge] = match;
@@ -6736,10 +6784,6 @@ export class AgentDaemon {
 			} else {
 				const tokens = turns.active.pop();
 				for (const token of tokens ?? []) this.completeWorkerRecoveryOperation(state, token);
-				// A nested B terminal must not erase still-active A crash evidence.
-				// Complete B first (with B's immutable token), then republish the
-				// parent frame's existing token(s), never a synthesized identity.
-				this.republishCurrentWorkerRecoveryOperation(state);
 			}
 			return;
 		}
@@ -6754,8 +6798,6 @@ export class AgentDaemon {
 		else {
 			const token = queue.pop();
 			if (token) this.completeWorkerRecoveryOperation(state, token);
-			// Preserve the newest exact operation still active across every family.
-			this.republishCurrentWorkerRecoveryOperation(state);
 		}
 	}
 
@@ -6779,8 +6821,26 @@ export class AgentDaemon {
 			identity,
 			sequence: ++this.recoveryOperationSequence,
 		};
-		if (busyOverride === false) this.completeWorkerRecoveryOperation(state, token);
-		else this.beginWorkerRecoveryOperation(state, token.operation, token.identity);
+		const session = state.runtime.session;
+		// A compatibility ready record has no lifecycle owner. Its busyness must
+		// reflect live runtime state, rather than defaulting to a sticky busy bit.
+		const busy =
+			busyOverride ??
+			(session.isStreaming ||
+				session.isCompacting ||
+				session.isRetrying ||
+				session.hasAcceptedPromptInFlight ||
+				this.agentMessageAcceptingTargets.has(state.activeSessionId) ||
+				(this.agentMessagePreparingTargets.get(state.activeSessionId) ?? 0) > 0);
+		if (!busy) {
+			// Compatibility records without an existing identity still need a
+			// durable non-busy checkpoint. Exact terminal callers must not invent a
+			// begin, because the journal itself is their stale-callback fence.
+			if (!exactIdentity) this.beginWorkerRecoveryOperation(state, token.operation, token.identity);
+			this.completeWorkerRecoveryOperation(state, token);
+		} else {
+			this.beginWorkerRecoveryOperation(state, token.operation, token.identity);
+		}
 		return { operation: token.operation, operationId: token.identity.operationId };
 	}
 

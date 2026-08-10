@@ -81,8 +81,8 @@ interface ParsedRecords {
 	hasInvalidRecords: boolean;
 }
 
-const v2Key = (record: Pick<WorkerRecoveryRecord, "activeSessionId" | "generation">) =>
-	`${record.activeSessionId}\u0000${record.generation}`;
+const v2Key = (record: Pick<WorkerRecoveryRecord, "activeSessionId" | "generation" | "operationId">) =>
+	`${record.activeSessionId}\u0000${record.generation}\u0000${record.operationId}`;
 const legacyKey = (record: Pick<LegacyWorkerRecoveryRecord, "activeSessionId">) =>
 	`legacy\u0000${record.activeSessionId}`;
 
@@ -152,6 +152,9 @@ export class WorkerRecoveryJournal {
 		const parsed = parseRecords(path);
 		this.latest = parsed.latest;
 		this.hasInvalidRecords = parsed.hasInvalidRecords;
+		// Upgrade journals written before completed v2 identities were pruned.
+		// A restart must not expose their historical terminal records forever.
+		if ([...this.latest.values()].some((record) => isV2(record) && !record.busy)) this.compact();
 	}
 
 	/**
@@ -183,8 +186,12 @@ export class WorkerRecoveryJournal {
 			return;
 		this.append(record);
 		this.latest.set(key, record);
-		// Never compact away v1 crash evidence. It is conservative recovery input.
-		if ([...this.latest.values()].every((entry) => !isV2(entry) || !entry.busy)) this.compact();
+		// A terminal v2 operation is only a stale-callback fence while the append
+		// above is durable. It is not recovery evidence. Compact it immediately so
+		// operationId cardinality cannot turn completed work into unbounded journal
+		// or getLatest history. v1 remains conservative uncertainty; every busy v2
+		// identity remains exact crash evidence.
+		if (!record.busy) this.compact();
 	}
 
 	getLatest(): ReadWorkerRecoveryRecord[] {
@@ -211,10 +218,16 @@ export class WorkerRecoveryJournal {
 	}
 
 	private compact(): void {
+		// Completed v2 operations are deliberately omitted. Keeping their UUID-keyed
+		// terminal entries would make a long-lived idle worker retain one record per
+		// historical operation. v1 has no identity fence and is therefore preserved
+		// verbatim as uncertain legacy recovery evidence.
+		const retained = [...this.latest.entries()].filter(([, record]) => !isV2(record) || record.busy);
+		this.latest.clear();
+		for (const [key, record] of retained) this.latest.set(key, record);
 		const tempPath = `${this.path}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${[...this.latest.values()].map((record) => JSON.stringify(record)).join("\n")}\n`, {
-			mode: 0o600,
-		});
+		const contents = retained.map(([, record]) => JSON.stringify(record)).join("\n");
+		writeFileSync(tempPath, contents ? `${contents}\n` : "", { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, this.path);
 	}
