@@ -263,7 +263,11 @@ class McpIntegration:
                     t.name: {
                         "name": t.name,
                         "description": getattr(t, "description", "") or "",
-                        "inputSchema": getattr(t, "inputSchema", None) or {},
+                        # mcp.types.Tool exposes the Python attribute as
+                        # input_schema; inputSchema is only its wire alias.
+                        "inputSchema": getattr(t, "input_schema", None)
+                        or getattr(t, "inputSchema", None)
+                        or {},
                     }
                     for t in resp.tools
                 }

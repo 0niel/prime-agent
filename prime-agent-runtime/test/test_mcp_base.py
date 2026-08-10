@@ -32,7 +32,9 @@ class _FakeSession:
             t = Tool()
             t.name = name
             t.description = desc
-            t.inputSchema = schema
+            # Match mcp.types.Tool: inputSchema is a validation/serialization
+            # alias, while Python code reads the snake_case field.
+            t.input_schema = schema
             return t
 
         resp = type("Resp", (), {})()
@@ -168,6 +170,17 @@ class McpIntegrationTest(unittest.TestCase):
             out = _run(integration.list_issues(team="Eng"))
         self.assertEqual(out, {"issues": [1, 2]})
         self.assertEqual(session.calls, [("list_issues", {"team": "Eng"})])
+
+    def test_list_tools_preserves_sdk_input_schema(self):
+        schema = {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        }
+        session = _FakeSession(tools=[("search", "Search", schema)], result=None)
+        with self._patch_session(session):
+            tools = _run(_Integration().list_tools())
+        self.assertEqual(tools, [{"name": "search", "description": "Search", "inputSchema": schema}])
 
     def test_unknown_tool_raises_with_available_list(self):
         session = _FakeSession(tools=[("list_issues", "", {})], result=None)
