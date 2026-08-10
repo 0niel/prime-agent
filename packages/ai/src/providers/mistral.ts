@@ -24,7 +24,11 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
-import { createStreamingJsonParseState, type StreamingJsonParseState } from "../utils/json-parse.js";
+import {
+	createStreamingJsonParseState,
+	discardStreamingJsonParseState,
+	type StreamingJsonParseState,
+} from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -93,6 +97,8 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
+				const parser = (block as { parser?: StreamingJsonParseState<unknown> }).parser;
+				if (parser) discardStreamingJsonParseState(parser);
 				delete (block as { parser?: StreamingJsonParseState<Record<string, unknown>> }).parser;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";

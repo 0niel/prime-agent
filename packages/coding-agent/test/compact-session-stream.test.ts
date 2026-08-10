@@ -189,4 +189,29 @@ describe("compact daemon assistant streaming", () => {
 		reconstructor.clear("legacy-tool");
 		expect(reconstructor.reconstruct(delta)).toBeUndefined();
 	});
+	it("clears fallback parser state for every compact terminal lifecycle event", () => {
+		for (const terminal of ["message_end", "session_replaced", "session_resynced", "session_closed"] as const) {
+			const reconstructor = new CompactAssistantStreamReconstructor();
+			reconstructor.observe({
+				type: "session_event",
+				activeSessionId: terminal,
+				event: { type: "message_start", message: assistant([]) },
+			});
+			const start = {
+				type: "assistant_stream_delta" as const,
+				activeSessionId: terminal,
+				contentStart: { type: "toolCall" as const, id: "tool", name: "search", arguments: {} },
+				assistantMessageEvent: { type: "toolcall_start" as const, contentIndex: 0 },
+			};
+			expect(reconstructor.reconstruct(start)).toBeDefined();
+			if (terminal === "message_end")
+				reconstructor.observe({
+					type: "session_event",
+					activeSessionId: terminal,
+					event: { type: "message_end" },
+				} as DaemonOutbound);
+			else reconstructor.observe({ type: terminal, activeSessionId: terminal } as DaemonOutbound);
+			expect(reconstructor.reconstruct(start)).toBeUndefined();
+		}
+	});
 });

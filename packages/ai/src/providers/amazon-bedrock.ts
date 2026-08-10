@@ -41,7 +41,11 @@ import type {
 	ToolResultMessage,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
-import { createStreamingJsonParseState, type StreamingJsonParseState } from "../utils/json-parse.js";
+import {
+	createStreamingJsonParseState,
+	discardStreamingJsonParseState,
+	type StreamingJsonParseState,
+} from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.js";
@@ -274,6 +278,8 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 		} catch (error) {
 			for (const block of output.content) {
 				delete (block as Block).index;
+				const parser = (block as Block).parser;
+				if (parser) discardStreamingJsonParseState(parser);
 				delete (block as Block).parser;
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";

@@ -33,7 +33,11 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
-import { createStreamingJsonParseState, type StreamingJsonParseState } from "../utils/json-parse.js";
+import {
+	createStreamingJsonParseState,
+	discardStreamingJsonParseState,
+	type StreamingJsonParseState,
+} from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -401,6 +405,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 		} catch (error) {
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
+				const parser = (block as { parser?: StreamingJsonParseState<unknown> }).parser;
+				if (parser) discardStreamingJsonParseState(parser);
 				delete (block as { parser?: StreamingJsonParseState<Record<string, unknown>> }).parser;
 				delete (block as { streamIndex?: number }).streamIndex;
 			}

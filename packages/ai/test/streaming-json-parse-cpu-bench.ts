@@ -1,67 +1,92 @@
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
-import { createStreamingJsonParseState, parseStreamingJson } from "../src/utils/json-parse.js";
+import { cpus, release, type } from "node:os";
+import {
+	createStreamingJsonParseState,
+	getLegacyStreamingJsonInputExaminedForTesting,
+	getStreamingJsonInputExaminedForTesting,
+	parseStreamingJson,
+	resetStreamingJsonParseInstrumentationForTesting,
+} from "../src/utils/json-parse.js";
 
 const args = process.argv.slice(2);
 const name = args[args.indexOf("--name") + 1];
 const output = args[args.indexOf("--json") + 1];
 if (name !== "N01-streaming-structured-output-parse-cpu" || !output)
 	throw new Error("Use --name N01-streaming-structured-output-parse-cpu --json FILE");
+
 function corpus(bytes: number, unicode: boolean): string {
-	const unit = unicode ? "😀\\u2028 nested é " : '\\"escaped\\n nested ';
+	const unit = unicode ? "😀\u2028 nested é " : '\\"escaped\\n nested ';
 	return JSON.stringify({
 		outer: Array.from({ length: Math.ceil(bytes / unit.length) }, (_, index) => ({ index, text: unit })),
 	});
 }
-function measure(document: string, size: number, incremental: boolean) {
-	const chunks = Array.from({ length: Math.ceil(document.length / size) }, (_, i) =>
-		document.slice(i * size, (i + 1) * size),
-	);
-	const before = process.cpuUsage();
-	const start = process.hrtime.bigint();
-	let final: unknown;
-	if (incremental) {
-		const state = createStreamingJsonParseState();
-		for (const chunk of chunks) state.append(chunk);
-		final = state.finalize();
-	} else {
+function chunks(document: string, size: number): string[] {
+	return Array.from({ length: Math.ceil(document.length / size) }, (_, i) => document.slice(i * size, (i + 1) * size));
+}
+function measured(document: string, chunkSize: number, mode: "legacy" | "incremental") {
+	const input = chunks(document, chunkSize);
+	resetStreamingJsonParseInstrumentationForTesting();
+	const cpuBefore = process.cpuUsage();
+	const wallBefore = process.hrtime.bigint();
+	let result: unknown;
+	let examined: number;
+	if (mode === "legacy") {
 		let prefix = "";
-		for (const chunk of chunks) {
+		for (const chunk of input) {
 			prefix += chunk;
 			parseStreamingJson(prefix);
 		}
-		final = JSON.parse(prefix);
+		result = JSON.parse(prefix);
+		examined = getLegacyStreamingJsonInputExaminedForTesting() + document.length;
+	} else {
+		const state = createStreamingJsonParseState();
+		for (const chunk of input) state.append(chunk);
+		result = state.finalize();
+		examined = getStreamingJsonInputExaminedForTesting(state).total;
 	}
-	const cpu = process.cpuUsage(before);
-	const wallNs = Number(process.hrtime.bigint() - start);
-	if (JSON.stringify(final) !== document) throw new Error("parser paths differ");
+	if (JSON.stringify(result) !== document) throw new Error(`${mode} result differs from source document`);
+	const cpu = process.cpuUsage(cpuBefore);
 	return {
-		wallNs,
+		wallNs: Number(process.hrtime.bigint() - wallBefore),
 		cpuUs: cpu.user + cpu.system,
-		chunks: chunks.length,
-		inputExamined: incremental ? document.length * 2 : (document.length * chunks.length) / 2,
+		inputExamined: examined,
+		chunkCount: input.length,
 	};
 }
 function stats(values: number[]) {
-	const ordered = [...values].sort((a, b) => a - b);
-	return { min: ordered[0], median: ordered[Math.floor(ordered.length / 2)], max: ordered.at(-1) };
+	const sorted = [...values].sort((a, b) => a - b);
+	return { min: sorted[0], median: sorted[Math.floor(sorted.length / 2)], max: sorted.at(-1) };
 }
-const corpora = [
-	{ name: "1MiB-escaped-nested-64", document: corpus(1024 * 1024, false), size: 64 },
-	{ name: "256KiB-unicode-nested-7", document: corpus(256 * 1024, true), size: 7 },
-];
-const results = corpora.map(({ name, document, size }) => {
-	measure(document, size, true); // unreported warm-up
-	const legacy = Array.from({ length: 7 }, () => measure(document, size, false));
-	const incremental = Array.from({ length: 7 }, () => measure(document, size, true));
+const repetitions = 7;
+const results = [
+	{ name: "1MiB-escaped-nested-64", document: corpus(1024 * 1024, false), chunkSize: 64 },
+	{ name: "256KiB-unicode-nested-7", document: corpus(256 * 1024, true), chunkSize: 7 },
+].map(({ name: corpusName, document, chunkSize }) => {
+	measured(document, chunkSize, "legacy");
+	measured(document, chunkSize, "incremental"); // unreported warm-ups
+	const legacy = Array.from({ length: repetitions }, () => measured(document, chunkSize, "legacy"));
+	const incremental = Array.from({ length: repetitions }, () => measured(document, chunkSize, "incremental"));
+	const legacyCpuUs = stats(legacy.map((sample) => sample.cpuUs));
+	const incrementalCpuUs = stats(incremental.map((sample) => sample.cpuUs));
+	if (incremental[0].inputExamined !== document.length * 2)
+		throw new Error("incremental input examination is not linear");
+	if (incrementalCpuUs.median >= legacyCpuUs.median)
+		throw new Error("incremental median CPU did not beat legacy replay");
 	return {
-		name,
+		name: corpusName,
 		inputHash: createHash("sha256").update(document).digest("hex"),
-		chunkCount: incremental[0].chunks,
-		legacy: { wallNs: stats(legacy.map((x) => x.wallNs)), cpuUs: stats(legacy.map((x) => x.cpuUs)) },
+		inputLength: document.length,
+		chunkCount: incremental[0].chunkCount,
+		repetitions,
+		legacy: {
+			wallNs: stats(legacy.map((sample) => sample.wallNs)),
+			cpuUs: legacyCpuUs,
+			inputExamined: legacy[0].inputExamined,
+		},
 		incremental: {
-			wallNs: stats(incremental.map((x) => x.wallNs)),
-			cpuUs: stats(incremental.map((x) => x.cpuUs)),
+			wallNs: stats(incremental.map((sample) => sample.wallNs)),
+			cpuUs: incrementalCpuUs,
 			inputExamined: incremental[0].inputExamined,
 		},
 	};
@@ -71,11 +96,16 @@ writeFileSync(
 	JSON.stringify(
 		{
 			name,
-			node: process.version,
-			platform: process.platform,
-			arch: process.arch,
-			cpu: process.arch,
 			command: process.argv.join(" "),
+			node: process.version,
+			os: {
+				platform: process.platform,
+				release: release(),
+				version: process.version,
+				arch: process.arch,
+				type: type(),
+			},
+			cpu: cpus()[0]?.model ?? "unknown",
 			results,
 		},
 		null,

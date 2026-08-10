@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	createStreamingJsonParseState,
+	getStreamingJsonInputExaminedForTesting,
 	getStreamingJsonStrictValidationCountForTesting,
 	parseStreamingJson,
 } from "../src/utils/json-parse.js";
@@ -61,6 +62,43 @@ describe("incremental streaming JSON parse state", () => {
 			expect(() => state.finalize()).toThrow();
 			expect(getStreamingJsonStrictValidationCountForTesting(state)).toBe(1);
 		}
+	});
+
+	it("differentially matches legacy for every prefix of invalid escapes, unicode splits, and malformed structures", () => {
+		const documents = [
+			'{"escape":"\\q"}',
+			'{"unicode":"\\u12x"}',
+			'{"unicode":"\\uD83D\\uDE00"}',
+			'{"split":"😀"}',
+			'{"nested":[{"x":1},]}',
+			'{"number":1e+}',
+			'{"junk":true} trailing',
+			'{"unterminated": [1, {"x": "value',
+		];
+		for (const document of documents) {
+			const state = createStreamingJsonParseState<Record<string, unknown>>();
+			for (let end = 1; end <= document.length; end++) {
+				const prefix = document.slice(0, end);
+				expect(state.append(document.slice(end - 1, end))).toEqual(parseStreamingJson(prefix));
+			}
+		}
+	});
+
+	it("accounts for only new input until its one strict terminal parse", () => {
+		const document = JSON.stringify({ payload: "x".repeat(128 * 1024), nested: [{ ok: true }] });
+		const state = createStreamingJsonParseState();
+		for (const chunk of chunks(document, [1, 7, 31, 257])) state.append(chunk);
+		expect(getStreamingJsonInputExaminedForTesting(state)).toEqual({
+			incremental: document.length,
+			final: 0,
+			total: document.length,
+		});
+		state.finalize();
+		expect(getStreamingJsonInputExaminedForTesting(state)).toEqual({
+			incremental: document.length,
+			final: document.length,
+			total: document.length * 2,
+		});
 	});
 
 	it("handles depth 64 incrementally", () => {

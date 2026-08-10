@@ -471,6 +471,13 @@ export async function processResponsesStream<TApi extends Api>(
 			} else if (item.type === "function_call") {
 				let toolCall: ToolCall;
 				if (currentBlock?.type === "toolCall") {
+					const accumulated = getStreamingJsonRawForProviderCheck(currentBlock.parser);
+					if (accumulated.length === 0)
+						currentBlock.arguments = currentBlock.parser.append(item.arguments || "{}");
+					else if (!item.arguments.startsWith(accumulated))
+						throw new Error("OpenAI Responses function-call item replaced a streamed prefix");
+					else if (item.arguments.length > accumulated.length)
+						currentBlock.arguments = currentBlock.parser.append(item.arguments.slice(accumulated.length));
 					currentBlock.arguments = currentBlock.parser.finalize();
 					delete (currentBlock as { parser?: StreamingJsonParseState<Record<string, unknown>> }).parser;
 					toolCall = currentBlock;
