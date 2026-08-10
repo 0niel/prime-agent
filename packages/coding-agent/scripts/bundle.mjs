@@ -16,8 +16,10 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { verifyBundleProviderAssets } from "./verify-bundle-assets.mjs";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const aiPackageDir = join(packageDir, "..", "ai");
 const outdir = join(packageDir, "dist", "bundle");
 let buildId;
 try {
@@ -32,7 +34,10 @@ try {
 rmSync(outdir, { recursive: true, force: true });
 
 await build({
-	entryPoints: [join(packageDir, "dist", "cli.js")],
+	entryPoints: {
+		cli: join(packageDir, "dist", "cli.js"),
+		"amazon-bedrock": join(aiPackageDir, "dist", "providers", "amazon-bedrock.js"),
+	},
 	outdir,
 	bundle: true,
 	splitting: true,
@@ -48,5 +53,6 @@ await build({
 	logLevel: "warning",
 });
 
+await verifyBundleProviderAssets(outdir);
 chmodSync(join(outdir, "cli.js"), 0o755);
-console.log("bundled dist/cli.js -> dist/bundle/");
+console.log("bundled dist/cli.js and node-only providers -> dist/bundle/");

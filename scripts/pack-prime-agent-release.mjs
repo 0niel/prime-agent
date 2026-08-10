@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { verifyBundleProviderAssets } from "../packages/coding-agent/scripts/verify-bundle-assets.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultOutputDir = join(root, "packages", "coding-agent", "release");
@@ -235,7 +236,7 @@ function sha256File(path) {
 	return hash.digest("hex");
 }
 
-function main() {
+async function main() {
 	const args = parseArgs(process.argv.slice(2));
 	const sourcePackages = new Map(
 		releasePackages.map((releasePackage) => [
@@ -294,6 +295,9 @@ function main() {
 		);
 
 		copyPackageContents(packagePath(releasePackage.packageDir), stagingDir, packageJson);
+		if (releasePackage.packageDir === "coding-agent") {
+			await verifyBundleProviderAssets(join(stagingDir, "dist", "bundle"));
+		}
 
 		const tarballName = run("npm", ["pack", stagingDir, "--pack-destination", artifactsDir, "--silent"], root)
 			.split("\n")
@@ -345,7 +349,7 @@ function main() {
 }
 
 try {
-	main();
+	await main();
 } catch (error) {
 	console.error(error instanceof Error ? error.message : String(error));
 	process.exit(1);
