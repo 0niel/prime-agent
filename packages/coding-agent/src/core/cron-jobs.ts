@@ -234,7 +234,7 @@ export class AgentCronJobStore {
 			return false;
 		}
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
-		if (!parsed || typeof parsed !== "object") {
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 			return true;
 		}
 		const file = parsed as CronJobsFile;

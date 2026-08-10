@@ -258,10 +258,14 @@ interface ResidentWorker {
 	recovery?: Promise<void>;
 	/** Coalesces concurrent explicit requests to revive a metadata-only root. */
 	wake?: Promise<void>;
-	/** A stop owns its tombstone, archive, and descriptor deletion until it settles. */
-	stop?: Promise<void>;
-	/** Prevents a stale routing reference from reviving a worker after deletion. */
+	/** Every active stop finalization. This is only a wake fence: each caller still executes its own stop request. */
+	stopFinalizations?: Set<Promise<void>>;
+	/** The one archival side effect may be shared, without sharing the callers' stop results. */
+	archiveFinalization?: Promise<void>;
+	/** Prevents a stale routing reference from reviving a worker after a completed stop. */
 	stopFinalized?: boolean;
+	/** A partial stop is a durable tombstone until an explicit retry clears it safely. */
+	stopFailure?: Error;
 	deferredRecovery?: Promise<void>;
 	intentionalStop: boolean;
 	stopRevision: number;
@@ -1624,8 +1628,18 @@ export class DaemonSupervisor {
 				);
 				const worker = direct ?? (await this.findWorkerForClient(client, command.activeSessionId)).worker;
 				this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);
-				const stopFence = this.stopFenceForWake(worker);
-				if (stopFence) await stopFence;
+				// Retry is the sole deliberate way to clear a failed stop tombstone. It
+				// must wait for every already-started finalization and never revive a
+				// worker whose process may still be alive.
+				const finalizations = this.waitForStopFinalizations(worker);
+				if (finalizations) await finalizations;
+				if (worker.stopFinalized) throw new Error(`Session worker ${worker.descriptor.workerId} was stopped`);
+				const processless = worker.descriptor.lifecycle === "passivated" || worker.descriptor.pid === undefined;
+				if (!processless && isProcessAlive(worker.descriptor.pid!)) {
+					throw new Error(`Session worker ${worker.descriptor.workerId} is still running; cannot retry its stop`);
+				}
+				worker.stopFailure = undefined;
+				worker.archiveFinalization = undefined;
 				worker.intentionalStop = false;
 				worker.descriptor.stopRequestedAt = undefined;
 				worker.descriptor.archiveOnStop = undefined;
@@ -2144,14 +2158,21 @@ export class DaemonSupervisor {
 		}
 	}
 
-	/** Return the in-flight stop that owns this descriptor, or fail a stale route. */
+	/** Wait for active stop finalizations without inheriting any caller's result. */
+	private waitForStopFinalizations(worker: ResidentWorker): Promise<void> | undefined {
+		const finalizations = [...(worker.stopFinalizations ?? [])];
+		return finalizations.length > 0 ? Promise.allSettled(finalizations).then(() => undefined) : undefined;
+	}
+
+	/** Return the wake fence for a stop, or fail a stale/failed route. */
 	private stopFenceForWake(worker: ResidentWorker): Promise<void> | undefined {
-		if (worker.stop) {
-			return worker.stop.then(() => {
+		const finalizations = this.waitForStopFinalizations(worker);
+		if (finalizations) {
+			return finalizations.then(() => {
 				throw new Error(`Session worker ${worker.descriptor.workerId} was stopped`);
 			});
 		}
-		if (worker.stopFinalized) {
+		if (worker.stopFinalized || worker.stopFailure || worker.descriptor.stopRequestedAt !== undefined) {
 			throw new Error(`Session worker ${worker.descriptor.workerId} was stopped`);
 		}
 		return undefined;
@@ -4756,15 +4777,43 @@ export class DaemonSupervisor {
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
 	): Promise<void> {
-		// A single stop owns the passive tombstone through archive/delete. This is
-		// deliberately per-worker: unrelated session routing stays concurrent.
-		if (worker.stop) return worker.stop;
-		const stop = this.stopWorkerOnce(worker, removeDescriptor, force, archiveSession, recoveryCleanup, directChild);
-		worker.stop = stop;
+		// Do not coalesce stop calls. Their remove/force/archive/recovery/direct-child
+		// arguments are intentional and a later caller must not silently inherit the
+		// first caller's policy. The set is only a fence for a stale passive wake.
+		if (worker.stopFinalized) throw new Error(`Session worker ${worker.descriptor.workerId} was stopped`);
+		// Defer entry one microtask so every stop dispatched in the same turn records
+		// its immutable request before any one can begin final deletion.
+		const stop = Promise.resolve().then(() =>
+			this.stopWorkerOnce(worker, removeDescriptor, force, archiveSession, recoveryCleanup, directChild),
+		);
+		const finalizations = worker.stopFinalizations ??= new Set();
+		finalizations.add(stop);
 		try {
 			await stop;
+		} catch (error) {
+			const failure = error instanceof Error ? error : new Error(String(error));
+			// A prior successful concurrent deletion may already have removed this
+			// object. Restore the failed-stop fence so a fresh lookup cannot wake it.
+			this.workers.set(worker.descriptor.workerId, worker);
+			worker.stopFailure = failure;
+			worker.intentionalStop = true;
+			try {
+				if (removeDescriptor) {
+					this.persistWorkerStopTombstone(worker, archiveSession);
+				} else {
+					worker.descriptor.lifecycle = "failed";
+					worker.descriptor.lastError = failure.message;
+					this.persistWorker(worker);
+				}
+			} catch (persistError) {
+				this.reportCleanupFailure(`worker stop failure fence ${worker.descriptor.workerId}`, persistError);
+			}
+			throw error;
 		} finally {
-			if (worker.stop === stop) worker.stop = undefined;
+			finalizations.delete(stop);
+			if (finalizations.size === 0 && worker.stopFinalizations === finalizations) {
+				worker.stopFinalizations = undefined;
+			}
 		}
 	}
 
@@ -4869,13 +4918,16 @@ export class DaemonSupervisor {
 			if (force) {
 				this.reclaimStoppedWorkerCronLock(worker);
 			}
-			await this.finalizeArchivedWorkerStop(worker);
+			// Archive is the one destructive side effect that may be shared. This does
+			// not share stop results: every caller still performed its own policy above.
+			worker.archiveFinalization ??= this.finalizeArchivedWorkerStop(worker);
+			await worker.archiveFinalization;
 		}
+		// A stopped resident is never routable again. Keep its descriptor only for a
+		// replacement supervisor/update hand-off, not as a stale in-memory route.
+		worker.stopFinalized = true;
+		this.workers.delete(worker.descriptor.workerId);
 		if (removeDescriptor) {
-			// Leave an immutable marker for any route that captured this worker before
-			// descriptor deletion. A later create/retry must resolve a fresh route.
-			worker.stopFinalized = true;
-			this.workers.delete(worker.descriptor.workerId);
 			this.deleteWorkerDescriptor(worker);
 		}
 		if (!this.shuttingDown) {
