@@ -140,34 +140,53 @@ describe("compact daemon assistant streaming", () => {
 		});
 	});
 
-	it("continues tool arguments after reconstructing from a snapshot", () => {
+	it("requests resync when a raw suffix follows an authoritative snapshot", () => {
 		const reconstructor = new CompactAssistantStreamReconstructor();
 		reconstructor.seed(
 			"active-tool",
 			assistant([{ type: "toolCall", id: "tool-1", name: "search", arguments: { query: "hel" } }]),
 		);
 		const updated = assistant([{ type: "toolCall", id: "tool-1", name: "search", arguments: { query: "hello" } }]);
-		const delta = createCompactAssistantDelta({
+		const snapshot = createCompactAssistantDelta({
 			type: "session_event",
 			activeSessionId: "active-tool",
 			event: {
 				type: "message_update",
 				message: updated,
-				assistantMessageEvent: {
-					type: "toolcall_delta",
-					contentIndex: 0,
-					delta: 'lo"}',
-					partial: updated,
-				},
+				assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: 'lo"}', partial: updated },
 			},
 		});
-
-		expect(reconstructor.reconstruct(delta!)).toMatchObject({
-			event: {
-				message: {
-					content: [{ type: "toolCall", id: "tool-1", name: "search", arguments: { query: "hello" } }],
-				},
-			},
+		expect(reconstructor.reconstruct(snapshot!)).toBeDefined();
+		const rawSuffix = {
+			type: "assistant_stream_delta" as const,
+			activeSessionId: "active-tool",
+			assistantMessageEvent: { type: "toolcall_delta" as const, contentIndex: 0, delta: " " },
+		};
+		expect(reconstructor.reconstruct(rawSuffix)).toBeUndefined();
+	});
+	it("reconstructs legacy raw tool deltas incrementally", () => {
+		const reconstructor = new CompactAssistantStreamReconstructor();
+		reconstructor.observe({
+			type: "session_event",
+			activeSessionId: "legacy-tool",
+			event: { type: "message_start", message: assistant([]) },
 		});
+		const start = {
+			type: "assistant_stream_delta" as const,
+			activeSessionId: "legacy-tool",
+			contentStart: { type: "toolCall" as const, id: "tool", name: "search", arguments: {} },
+			assistantMessageEvent: { type: "toolcall_start" as const, contentIndex: 0 },
+		};
+		expect(reconstructor.reconstruct(start)).toBeDefined();
+		const delta = {
+			type: "assistant_stream_delta" as const,
+			activeSessionId: "legacy-tool",
+			assistantMessageEvent: { type: "toolcall_delta" as const, contentIndex: 0, delta: '{"query":"hello"}' },
+		};
+		expect(reconstructor.reconstruct(delta)).toMatchObject({
+			event: { message: { content: [{ arguments: { query: "hello" } }] } },
+		});
+		reconstructor.clear("legacy-tool");
+		expect(reconstructor.reconstruct(delta)).toBeUndefined();
 	});
 });
