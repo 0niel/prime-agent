@@ -1794,6 +1794,70 @@ describe("InteractiveMode connection events", () => {
 		}
 	});
 
+	test("preserves a cap-drained pre-replacement batch ahead of replacement while new generation progress remains live", async () => {
+		vi.useFakeTimers();
+		try {
+			type Event =
+				| { type: "session_event"; event: AgentConnectionSessionEvent }
+				| { type: "session_replaced"; state: AgentConnectionState };
+			let listener: ((event: Event) => Promise<void>) | undefined;
+			const handled: string[] = [];
+			const fakeThis = {
+				agentConnection: {
+					subscribe: (callback: (event: Event) => Promise<void>) => {
+						listener = callback;
+						return vi.fn();
+					},
+				},
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				progressFlushGeneration: 0,
+				progressFlushStopped: false,
+				handleEvent: vi.fn(async (event: { type: string; toolCallId?: string }) => {
+					handled.push(event.toolCallId ?? event.type);
+				}),
+				resetSideQuestion: vi.fn(),
+				resetExtensionUI: vi.fn(),
+				applyConnectionStateSnapshot: vi.fn(),
+				resetCurrentSessionRenderState: vi.fn(),
+				rebindCurrentSession: vi.fn(async () => {}),
+				renderInitialMessages: vi.fn(async () => {
+					handled.push("session_replaced");
+				}),
+				ui: { requestRender: vi.fn() },
+				showError: vi.fn(),
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			(
+				InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }
+			).subscribeToAgent.call(fakeThis);
+			const progress = (toolCallId: string) =>
+				listener?.({
+					type: "session_event",
+					event: { type: "tool_execution_update", toolCallId, partialResult: { content: [] } },
+				} as Event);
+
+			// The 129th distinct entity drains the first full batch. Immediately replace
+			// before any queued handler can run, reproducing the cap/replacement race.
+			for (let index = 0; index <= 128; index++) progress(`old-${index}`);
+			const replacement = listener?.({ type: "session_replaced", state: createConnectionState() });
+			await replacement;
+			expect(handled).toEqual([...Array.from({ length: 129 }, (_, index) => `old-${index}`), "session_replaced"]);
+
+			// The replacement still fences the old session while admitting new progress.
+			await progress("new-generation");
+			await vi.runAllTimersAsync();
+			await (fakeThis as unknown as { sessionEventQueue: Promise<void> }).sessionEventQueue;
+			expect(handled).toEqual([
+				...Array.from({ length: 129 }, (_, index) => `old-${index}`),
+				"session_replaced",
+				"new-generation",
+			]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("surfaces timer and explicit progress flush failures while recovering the queue", async () => {
 		vi.useFakeTimers();
 		try {

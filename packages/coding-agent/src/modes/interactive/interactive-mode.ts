@@ -5135,8 +5135,13 @@ export class InteractiveMode {
 		} else if (pending.size >= MAX_PENDING_PROGRESS_EVENTS) {
 			// Do not evict UI entities. Put this complete ordered batch onto the
 			// existing UI tail now, then retain the new entity for its scheduled flush.
-			// This bounds only local coalescing memory, never provider/agent work.
-			this.enqueueFlushedProgress(this.drainPendingProgressEvents(), sessionGeneration);
+			// The batch was received before any later replacement, so it must retain
+			// that ordering even when the replacement advances the generation before
+			// this queued UI work gets a turn. This bounds only local coalescing
+			// memory, never provider/agent work.
+			this.enqueueFlushedProgress(this.drainPendingProgressEvents(), sessionGeneration, {
+				preserveAcrossReplacement: true,
+			});
 		}
 		pending.set(key, event);
 		if (this.progressFlushTimer) return;
