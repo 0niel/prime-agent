@@ -330,6 +330,73 @@ describe("Codex WebSocket cancellation regressions", () => {
 		expect(constructed).toBe(2);
 	});
 
+	it("does not abort a pending pure SSE request through the public websocket closer", async () => {
+		let responseController: ReadableStreamDefaultController<Uint8Array> | undefined;
+		let requestSignal: AbortSignal | null | undefined;
+		global.fetch = vi.fn(async (_input: unknown, init?: RequestInit) => {
+			requestSignal = init?.signal;
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						responseController = controller;
+					},
+				}),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+		const sessionId = "pending-pure-sse";
+		const pending = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			sessionId,
+		}).result();
+		await vi.waitFor(() => expect(responseController).toBeDefined());
+
+		closeOpenAICodexWebSocketSessions(sessionId);
+		expect(requestSignal?.aborted).toBe(false);
+		const payload = `${responseEvents("still-running")
+			.map((event) => `data: ${event}`)
+			.join("\n\n")}\n\n`;
+		responseController?.enqueue(new TextEncoder().encode(payload));
+		responseController?.close();
+		const result = await pending;
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([expect.objectContaining({ type: "text", text: "still-running" })]);
+	});
+
+	it("aborts a pending pure SSE request through internal session cleanup", async () => {
+		let started: (() => void) | undefined;
+		const didStart = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		global.fetch = vi.fn(async (_input: unknown, init?: RequestInit) => {
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						started?.();
+						init?.signal?.addEventListener(
+							"abort",
+							() => controller.error(new DOMException("Request was aborted", "AbortError")),
+							{ once: true },
+						);
+					},
+				}),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+		const sessionId = "cleanup-pure-sse";
+		const pending = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			sessionId,
+		}).result();
+		await didStart;
+		cleanupSessionResources(sessionId);
+		const result = await pending;
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Request was aborted");
+	});
+
 	it("aborts a request cleaned up while its websocket is still connecting", async () => {
 		let socket: MockWebSocket | undefined;
 		let constructed: (() => void) | undefined;

@@ -147,7 +147,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 	options?: OpenAICodexResponsesOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
-	const activeRequest = registerActiveWebSocketRequest(options?.sessionId);
+	const activeRequest = registerActiveCodexRequest(options?.sessionId, (options?.transport ?? "auto") !== "sse");
 	const effectiveSignal = options?.signal
 		? AbortSignal.any([options.signal, activeRequest.controller.signal])
 		: activeRequest.controller.signal;
@@ -699,41 +699,50 @@ export interface OpenAICodexWebSocketDebugStats {
 const websocketSessionCache = new Map<string, CachedWebSocketConnection>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
 const websocketSseFallbackSessions = new Set<string>();
-const activeWebSocketRequests = new Map<string | undefined, Set<AbortController>>();
-
-function registerActiveWebSocketRequest(sessionId: string | undefined): {
+interface ActiveCodexRequest {
 	controller: AbortController;
-	unregister: () => void;
-} {
-	const controller = new AbortController();
-	let requests = activeWebSocketRequests.get(sessionId);
+	websocketEligible: boolean;
+}
+
+const activeCodexRequests = new Map<string | undefined, Set<ActiveCodexRequest>>();
+
+function registerActiveCodexRequest(
+	sessionId: string | undefined,
+	websocketEligible: boolean,
+): { controller: AbortController; unregister: () => void } {
+	const request: ActiveCodexRequest = { controller: new AbortController(), websocketEligible };
+	let requests = activeCodexRequests.get(sessionId);
 	if (!requests) {
 		requests = new Set();
-		activeWebSocketRequests.set(sessionId, requests);
+		activeCodexRequests.set(sessionId, requests);
 	}
-	requests.add(controller);
+	requests.add(request);
 	return {
-		controller,
+		controller: request.controller,
 		unregister: () => {
-			requests.delete(controller);
-			if (requests.size === 0 && activeWebSocketRequests.get(sessionId) === requests) {
-				activeWebSocketRequests.delete(sessionId);
+			requests.delete(request);
+			if (requests.size === 0 && activeCodexRequests.get(sessionId) === requests) {
+				activeCodexRequests.delete(sessionId);
 			}
 		},
 	};
 }
 
-function abortActiveWebSocketRequests(sessionId?: string): void {
-	const abortRequests = (requests: Set<AbortController> | undefined) => {
-		for (const controller of requests ?? []) controller.abort(createAbortError());
+function abortActiveCodexRequests(sessionId: string | undefined, includePureSse: boolean): void {
+	const abortRequests = (key: string | undefined, requests: Set<ActiveCodexRequest> | undefined) => {
+		if (!requests) return;
+		for (const request of [...requests]) {
+			if (!includePureSse && !request.websocketEligible) continue;
+			requests.delete(request);
+			request.controller.abort(createAbortError());
+		}
+		if (requests.size === 0 && activeCodexRequests.get(key) === requests) activeCodexRequests.delete(key);
 	};
 	if (sessionId !== undefined) {
-		abortRequests(activeWebSocketRequests.get(sessionId));
-		activeWebSocketRequests.delete(sessionId);
+		abortRequests(sessionId, activeCodexRequests.get(sessionId));
 		return;
 	}
-	for (const requests of activeWebSocketRequests.values()) abortRequests(requests);
-	activeWebSocketRequests.clear();
+	for (const [key, requests] of [...activeCodexRequests]) abortRequests(key, requests);
 }
 
 function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats {
@@ -770,7 +779,7 @@ export function resetOpenAICodexWebSocketDebugStats(sessionId?: string): void {
 }
 
 export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
-	abortActiveWebSocketRequests(sessionId);
+	abortActiveCodexRequests(sessionId, false);
 	const closeEntry = (entry: CachedWebSocketConnection) => {
 		if (entry.idleTimer) clearTimeout(entry.idleTimer);
 		closeWebSocketSilently(entry.socket, 1000, "debug_close");
@@ -791,7 +800,12 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 	websocketSseFallbackSessions.clear();
 }
 
-registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
+registerSessionResourceCleanup((sessionId) => {
+	// Internal session teardown owns all Codex transports, while the public
+	// WebSocket-only closer must not interrupt explicit SSE requests.
+	abortActiveCodexRequests(sessionId, true);
+	closeOpenAICodexWebSocketSessions(sessionId);
+});
 
 function isWebSocketSseFallbackActive(sessionId: string | undefined): boolean {
 	return sessionId ? websocketSseFallbackSessions.has(sessionId) : false;
