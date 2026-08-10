@@ -5891,9 +5891,31 @@ export class AgentDaemon {
 			currentState ?? [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
 		const listed = current ? await this.createAgentMessageListResult(current) : { agents: [] };
 		const remotePeers = new Set(this.remoteAgentPeers.values());
+		// A live C03 deletion immediately closes its public registry row but retains
+		// the cancelled runtime until its exact terminal hand-off is durable. Exclude
+		// only that deleted durable incarnation from family-name authority, allowing B
+		// to reuse A's public selector while A completes its private discard path.
+		const deletedC03Operations = new Set(
+			current
+				? (await this.readLatestRlmSubagentRegistry(current))
+						.filter((entry) => this.isAuthoritativeC03RegistryEntry(entry) && entry.status === "deleted")
+						.map((entry) => `${entry.assignmentId}\u0000${entry.operationId}`)
+				: [],
+		);
+		const visibleLocalAgents = listed.agents.filter((agent) => {
+			if (remotePeers.has(agent)) return false;
+			const state = this.sessions.get(agent.activeSessionId);
+			const metadata = state?.runtime.metadata;
+			return !(
+				metadata?.kind === "subagent" &&
+				metadata.assignmentId !== undefined &&
+				metadata.operationId !== undefined &&
+				deletedC03Operations.has(`${metadata.assignmentId}\u0000${metadata.operationId}`)
+			);
+		});
 		const localAgents = current
-			? [this.createAgentMessageAgentSummary(current), ...listed.agents.filter((agent) => !remotePeers.has(agent))]
-			: listed.agents.filter((agent) => !remotePeers.has(agent));
+			? [this.createAgentMessageAgentSummary(current), ...visibleLocalAgents]
+			: visibleLocalAgents;
 		const activePaths = new Set(
 			localAgents.flatMap((agent) => (agent.sessionPath ? [canonicalSessionPath(agent.sessionPath)] : [])),
 		);

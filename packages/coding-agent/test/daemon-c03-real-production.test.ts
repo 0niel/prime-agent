@@ -373,7 +373,7 @@ describe("C03 real daemon production recovery", () => {
 		await internals.closeSession(parentState, "shutdown");
 	}, 20_000);
 
-	it("keeps deleted A durable facts separate when B reuses the same public selector", async () => {
+	it("keeps a real cancelled A fenced while B reuses its public selector", async () => {
 		const root = await mkdtemp(join(tmpdir(), "prime-agent-c03-real-reuse-"));
 		const aRequest = "request-9002";
 		const bRequest = "request-9003";
@@ -395,7 +395,7 @@ describe("C03 real daemon production recovery", () => {
 				[bRequest]: [
 					{
 						requestId: bRequest,
-						blocks: [{ type: "text", chunks: ["B completed"] }],
+						blocks: [{ type: "text", chunks: ["B remains running"] }],
 						usage: usage(13, 9),
 						responseModel: "c03-real-reuse-model",
 						waitForRelease: true,
@@ -414,8 +414,6 @@ describe("C03 real daemon production recovery", () => {
 			name,
 			model: "c03-real-reuse-scripted/c03-real-reuse-model",
 		});
-		// A's provider entry is sufficient to make cancellation real, but B must not be
-		// admitted until the public delete has hidden the exact A incarnation.
 		await vi.waitFor(() => expect(scripted.observations()).toHaveLength(1));
 		const artifacts = parent.sessionManager.getSessionArtifactDir();
 		const parentFile = parent.sessionFile;
@@ -424,58 +422,100 @@ describe("C03 real daemon production recovery", () => {
 			(candidate) => candidate.childId === a.rlm_child_id,
 		);
 		if (!aOperation) throw new Error("Missing real A operation");
-		await parent.deleteRlmSubagent(name);
-		await vi.waitFor(async () => expect((await parent.listRlmSubagents()).subagents).toHaveLength(0));
+
+		// This wraps the actual daemon host, after the public delete has fsynced its
+		// intent and closed A's registry row, but before its terminal hand-off.
+		const daemonHost = (
+			parent as unknown as { _subagentRuntimeHost?: import("../src/core/rlm-runtime.js").SubagentRuntimeHost }
+		)._subagentRuntimeHost;
+		const realDeliver = daemonHost?.deliverRlmSubagentTerminal;
+		if (!daemonHost || !realDeliver) throw new Error("Missing real daemon terminal host");
+		const aTerminalEntered = deferred<void>();
+		const releaseATerminal = deferred<void>();
+		daemonHost.deliverRlmSubagentTerminal = async (runtime, options, terminal, message) => {
+			if (terminal === "cancelled" && options.operationId === aOperation.operationId) {
+				aTerminalEntered.resolve();
+				await releaseATerminal.promise;
+			}
+			return await realDeliver.call(daemonHost, runtime, options, terminal, message);
+		};
+		cleanups.push(() => {
+			daemonHost.deliverRlmSubagentTerminal = realDeliver;
+		});
+
+		const deleteA = parent.deleteRlmSubagent(name);
+		await aTerminalEntered.promise;
+		const whileAHeld = realRegistry(artifacts);
+		expect(whileAHeld.operations.get(aOperation.key)).toMatchObject({
+			lifecycle: "delete_intent",
+			deleteIntent: true,
+		});
+		expect(
+			[...whileAHeld.deliveries.values()].find((delivery) => delivery.deliveryId === aOperation.deliveryId),
+		).toBeUndefined();
+		const aRegistryRows = (await readFile(join(artifacts, "rlm-subagents.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		expect(aRegistryRows.at(-1)).toMatchObject({
+			childId: a.rlm_child_id,
+			assignmentId: aOperation.assignmentId,
+			operationId: aOperation.operationId,
+			status: "deleted",
+		});
 		const b = await parent.runRlmChild(`C03 replacement B ${bRequest}`, {
 			name,
 			model: "c03-real-reuse-scripted/c03-real-reuse-model",
 		});
 		expect(b.rlm_child_id).not.toBe(a.rlm_child_id);
 		await scripted.open;
-		scripted.release([bRequest]);
-		await vi.waitFor(() => {
-			const registry = realRegistry(artifacts);
-			const candidate = [...registry.operations.values()].find((operation) => operation.childId === b.rlm_child_id);
-			expect(candidate).toMatchObject({ lifecycle: "terminal_recorded" });
-			expect(candidate && terminalEntries(parent, candidate.deliveryId)).toHaveLength(1);
-		});
-		const beforeACompletes = realRegistry(artifacts);
-		const bOperation = [...beforeACompletes.operations.values()].find(
-			(candidate) => candidate.childId === b.rlm_child_id,
-		);
-		if (!bOperation) throw new Error("Missing B operation");
-		const bDelivery = [...beforeACompletes.deliveries.values()].find(
-			(candidate) => candidate.deliveryId === bOperation.deliveryId,
-		);
 		const bState = await internals.getOrHydrateBoundSessionState(b.rlm_child_id);
 		const bFile = bState.runtime.session.sessionFile;
 		if (!bFile) throw new Error("Missing B session file");
+		const bRegistryBefore = realRegistry(artifacts);
+		const bOperation = [...bRegistryBefore.operations.values()].find(
+			(operation) => operation.childId === b.rlm_child_id,
+		);
+		if (!bOperation) throw new Error("Missing real B operation");
+		const bDeliveryBefore = [...bRegistryBefore.deliveries.values()].find(
+			(delivery) => delivery.deliveryId === bOperation.deliveryId,
+		);
+		expect(bDeliveryBefore).toBeUndefined();
 		const bSessionBefore = await readFile(bFile, "utf8");
+		const bRegistryFileBefore = await readFile(join(artifacts, "rlm-subagents.jsonl"), "utf8");
 		const parentTranscriptBefore = await readFile(parentFile, "utf8");
-
-		// A's exact durable deletion is independent of B's reused public selector.
-		await vi.waitFor(() => {
-			const registry = realRegistry(artifacts);
-			expect(registry.operations.get(aOperation.key)).toMatchObject({ lifecycle: "deleted", deleteIntent: true });
-			expect(
-				[...registry.deliveries.values()].find((delivery) => delivery.deliveryId === aOperation.deliveryId),
-			).toMatchObject({
-				consumed: "discarded",
-			});
+		expect(await parent.listRlmSubagents()).toMatchObject({
+			subagents: [expect.objectContaining({ rlm_child_id: b.rlm_child_id, session_name: name, status: "running" })],
 		});
-		const afterACompletes = realRegistry(artifacts);
-		expect(afterACompletes.operations.get(bOperation.key)).toEqual(beforeACompletes.operations.get(bOperation.key));
-		expect(
-			[...afterACompletes.deliveries.values()].find((delivery) => delivery.deliveryId === bOperation.deliveryId),
-		).toEqual(bDelivery);
+
+		releaseATerminal.resolve();
+		await deleteA;
+		await vi.waitFor(() => {
+			const after = realRegistry(artifacts);
+			expect(after.operations.get(aOperation.key)).toMatchObject({ lifecycle: "deleted", deleteIntent: true });
+			expect(
+				[...after.deliveries.values()].find((delivery) => delivery.deliveryId === aOperation.deliveryId),
+			).toMatchObject({ consumed: "discarded" });
+		});
+		const afterA = realRegistry(artifacts);
+		expect(afterA.operations.get(bOperation.key)).toEqual(bRegistryBefore.operations.get(bOperation.key));
+		expect([...afterA.deliveries.values()].find((delivery) => delivery.deliveryId === bOperation.deliveryId)).toEqual(
+			bDeliveryBefore,
+		);
 		expect(await readFile(bFile, "utf8")).toBe(bSessionBefore);
+		expect(await readFile(join(artifacts, "rlm-subagents.jsonl"), "utf8")).toBe(bRegistryFileBefore);
 		expect(await readFile(parentFile, "utf8")).toBe(parentTranscriptBefore);
 		expect(terminalEntries(parent, aOperation.deliveryId)).toHaveLength(0);
-		expect(terminalEntries(parent, bOperation.deliveryId)).toHaveLength(1);
-		expect(afterACompletes.operations.get(aOperation.key)).not.toMatchObject({ lifecycle: "delete_intent" });
+		expect(parent.messages.filter((message) => message.role === "custom")).toHaveLength(0);
 		expect(await parent.listRlmSubagents()).toMatchObject({
-			subagents: [expect.objectContaining({ rlm_child_id: b.rlm_child_id, session_name: name })],
+			subagents: [expect.objectContaining({ rlm_child_id: b.rlm_child_id, session_name: name, status: "running" })],
 		});
+		expect(scripted.observations()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ requestId: aRequest, terminal: "aborted", signalAborted: true }),
+				expect.objectContaining({ requestId: bRequest, signalAborted: false }),
+			]),
+		);
 		await internals.closeSession(parentState, "shutdown");
 	}, 20_000);
 });

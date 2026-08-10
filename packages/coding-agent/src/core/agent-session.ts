@@ -9349,6 +9349,11 @@ export class AgentSession {
 				recorded.has(childId) ||
 				this._isRlmChildDeleting(childId, this._rlmChildSessionAssignments.get(childId)) ||
 				this._deletedRlmChildIds.has(this._rlmAssignmentKey(childId, this._currentRlmAssignment(childId))) ||
+				// A daemon catalog summary does not expose C03's assignment. Once the
+				// parent has removed A's local tracking during an explicit delete, retain
+				// its exact child-id tombstone rather than looking it up as legacy; B has
+				// a new child id even when it reuses A's public session name.
+				[...this._deletedRlmChildIds].some((key) => key.startsWith(`${childId}\u0000`)) ||
 				this._rlmChildCleanupFailures.has(childId) ||
 				!daemonChild.sessionDir
 			) {
