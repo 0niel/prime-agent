@@ -16,6 +16,10 @@
 
 Record the Prime Agent and Verifiers SHAs together. Do not substitute a branch name, abbreviated SHA, mutable release pointer, or later rebuild.
 
+### Production release tags
+
+Production `vX.Y.Z` tags are protected, immutable release identities. The release workflow peels every tag to its commit, including annotated tags, and accepts an existing tag only when it peels exactly to the selected source SHA. A manual production release may create a missing valid tag with GitHub's non-force ref API, but it never updates, moves, or force-pushes an existing release tag. Repository protection must prohibit release-tag mutation and deletion for the release workflow credential. The workflow re-fetches and rechecks the remote tag immediately before advancing stable pointers and again after GitHub release publication, failing on any mismatch.
+
 ## 2. Fixed evaluation plan
 
 | Control | Required value |

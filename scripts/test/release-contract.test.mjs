@@ -9,6 +9,8 @@ import test from "node:test";
 const root = new URL("../..", import.meta.url);
 const packer = new URL("../pack-prime-agent-release.mjs", import.meta.url);
 const verifier = new URL("../verify-prime-agent-release.mjs", import.meta.url);
+const releaseVersion = new URL("../read-release-version.mjs", import.meta.url);
+const githubApiPathSegment = new URL("../encode-github-api-path-segment.mjs", import.meta.url);
 const workflow = new URL("../../.github/workflows/build-binaries.yml", import.meta.url);
 const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
 const version = "0.7.1";
@@ -159,4 +161,82 @@ test("workflow rechecks the remote protected tag before stable pointers and afte
 	assert.match(source, /# Re-fetch at the stable-pointer boundary/);
 	assert.match(source, /changed during release publication/);
 	assert.doesNotMatch(source, /^\s*queue:/m);
+});
+
+test("release version reader emits exactly one canonical semver line", () => {
+	const directory = mkdtempSync(join(tmpdir(), "prime-agent-release-version-"));
+	try {
+		const packageJson = join(directory, "package.json");
+		writeFileSync(packageJson, JSON.stringify({ version: "1.2.3" }));
+		const result = spawnSync(process.execPath, [releaseVersion.pathname, packageJson], { encoding: "utf8" });
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(result.stdout, "1.2.3\n");
+	} finally { cleanup(directory); }
+});
+
+test("release version reader rejects multiline values and output injection", () => {
+	const directory = mkdtempSync(join(tmpdir(), "prime-agent-release-version-injection-"));
+	try {
+		for (const versionValue of ["1.2.3\nproduction_version=9.9.9", "1.2.3\rpublish_beta=true", "1.2.3\n", "1.2.3\u0000x"]) {
+			const packageJson = join(directory, `${Buffer.from(versionValue).toString("hex")}.json`);
+			writeFileSync(packageJson, JSON.stringify({ version: versionValue }));
+			const result = spawnSync(process.execPath, [releaseVersion.pathname, packageJson], { encoding: "utf8" });
+			assert.notEqual(result.status, 0, versionValue);
+			assert.equal(result.stdout, "", versionValue);
+			assert.match(result.stderr, /Invalid package\.json version/, versionValue);
+		}
+	} finally { cleanup(directory); }
+});
+
+test("release version reader rejects malformed or non-canonical semver", () => {
+	const directory = mkdtempSync(join(tmpdir(), "prime-agent-release-version-malformed-"));
+	try {
+		for (const versionValue of ["01.2.3", "1.02.3", "1.2.03", "v1.2.3", "1.2", "1.2.3-beta.1", "1.2.3+build", "1.2.3;echo pwned"]) {
+			const packageJson = join(directory, `${Buffer.from(versionValue).toString("hex")}.json`);
+			writeFileSync(packageJson, JSON.stringify({ version: versionValue }));
+			const result = spawnSync(process.execPath, [releaseVersion.pathname, packageJson], { encoding: "utf8" });
+			assert.notEqual(result.status, 0, versionValue);
+			assert.match(result.stderr, /canonical plain semver/, versionValue);
+		}
+	} finally { cleanup(directory); }
+});
+
+test("release version reader rejects invalid JSON and non-string version fields", () => {
+	const directory = mkdtempSync(join(tmpdir(), "prime-agent-release-version-json-"));
+	try {
+		for (const contents of ["{", JSON.stringify({}), JSON.stringify({ version: 123 })]) {
+			const packageJson = join(directory, `${Buffer.from(contents).toString("hex")}.json`);
+			writeFileSync(packageJson, contents);
+			const result = spawnSync(process.execPath, [releaseVersion.pathname, packageJson], { encoding: "utf8" });
+			assert.notEqual(result.status, 0, contents);
+			assert.equal(result.stdout, "", contents);
+			assert.match(result.stderr, /Invalid package\.json version/, contents);
+		}
+	} finally { cleanup(directory); }
+});
+
+test("GitHub commits refs are percent-encoded as one REST path segment", () => {
+	for (const [ref, encoded] of [["feature/release", "feature%2Frelease"], ["release#candidate", "release%23candidate"], ["release?candidate", "release%3Fcandidate"], ["release /#?", "release%20%2F%23%3F"]]) {
+		const result = spawnSync(process.execPath, [githubApiPathSegment.pathname, ref], { encoding: "utf8" });
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(result.stdout, `${encoded}\n`);
+	}
+});
+
+test("workflow validates package version before output and binds production tags to it", () => {
+	const source = readFileSync(workflow, "utf8");
+	const outputIndex = source.indexOf('echo "beta_version=$beta_version" >> "$GITHUB_OUTPUT"');
+	const packageVersionIndex = source.indexOf("package_version=$(node scripts/read-release-version.mjs package.json)");
+	assert.ok(packageVersionIndex >= 0 && packageVersionIndex < outputIndex, "package version must be validated before any context output");
+	assert.match(source, /production_version="\$\{INPUT_RELEASE_TAG#v\}"\n            if \[ "\$production_version" != "\$package_version" \]/);
+	assert.match(source, /production_version="\$\{REF_NAME#v\}"\n            if \[ "\$production_version" != "\$package_version" \]/);
+	assert.match(source, /production_version="\$package_version"\n            source_sha=/);
+	assert.match(source, /previous_version=\$\(node scripts\/read-release-version\.mjs \/tmp\/previous-package\.json\)/);
+});
+
+test("workflow uses the encoded default branch in the GitHub commits API", () => {
+	const source = readFileSync(workflow, "utf8");
+	assert.match(source, /encoded_default_branch=\$\(node scripts\/encode-github-api-path-segment\.mjs "\$DEFAULT_BRANCH"\)/);
+	assert.match(source, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/commits\/\$\{encoded_default_branch\}" --jq \.sha/);
+	assert.doesNotMatch(source, /commits\/\$\{DEFAULT_BRANCH\}/);
 });

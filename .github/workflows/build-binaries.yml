@@ -52,6 +52,10 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
+          # This emits exactly one LF-terminated plain-semver line, and rejects
+          # missing, duplicate, multiline, or non-canonical package versions before
+          # any release value can be derived or written to GITHUB_OUTPUT.
+          package_version=$(node scripts/read-release-version.mjs package.json)
           beta_version=
           source_sha=
           production_version=
@@ -79,6 +83,10 @@ jobs:
               echo "Manual release will create immutable production tag $INPUT_RELEASE_TAG for $source_sha."
             fi
             production_version="${INPUT_RELEASE_TAG#v}"
+            if [ "$production_version" != "$package_version" ]; then
+              echo "Manual release tag $INPUT_RELEASE_TAG is incompatible with package.json version $package_version." >&2
+              exit 1
+            fi
             publish_production=true
           elif [ "$REF_TYPE" = tag ]; then
             if ! printf '%s\n' "$REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -92,9 +100,13 @@ jobs:
               exit 1
             fi
             production_version="${REF_NAME#v}"
+            if [ "$production_version" != "$package_version" ]; then
+              echo "Production tag $REF_NAME is incompatible with package.json version $package_version." >&2
+              exit 1
+            fi
             publish_production=true
           else
-            production_version=$(node -p "require('./package.json').version")
+            production_version="$package_version"
             source_sha="$GITHUB_SHA_VALUE"
             beta_version="${production_version}-beta.${RUN_NUMBER}.${RUN_ATTEMPT}.${GITHUB_SHA_VALUE::7}"
             publish_beta=true
@@ -102,7 +114,7 @@ jobs:
             previous_version=
             if [ -n "$BEFORE_SHA" ] && ! printf '%s\n' "$BEFORE_SHA" | grep -Eq '^0+$' && git cat-file -e "${BEFORE_SHA}:package.json"; then
               git show "${BEFORE_SHA}:package.json" > /tmp/previous-package.json
-              previous_version=$(node -p "require('/tmp/previous-package.json').version")
+              previous_version=$(node scripts/read-release-version.mjs /tmp/previous-package.json)
             fi
 
             if [ -z "$previous_version" ] || [ "$production_version" != "$previous_version" ]; then
@@ -458,7 +470,11 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          latest_main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${DEFAULT_BRANCH}" --jq .sha)
+          # DEFAULT_BRANCH is a Git ref, not an already-safe URL path. Encode it as
+          # one segment so slashes, fragments, queries, and control characters cannot
+          # change the commits API path.
+          encoded_default_branch=$(node scripts/encode-github-api-path-segment.mjs "$DEFAULT_BRANCH")
+          latest_main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${encoded_default_branch}" --jq .sha)
           if [ "$latest_main_sha" != "$SOURCE_SHA" ]; then
             echo "A newer main commit exists; keeping its beta pointers in place."
             exit 0
