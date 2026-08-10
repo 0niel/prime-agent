@@ -2,6 +2,18 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const workerSpawn = vi.hoisted(() =>
+	vi.fn(() => {
+		throw new Error("unexpected worker spawn");
+	}),
+);
+
+vi.mock("node:child_process", async (importOriginal) => ({
+	...(await importOriginal()),
+	spawn: workerSpawn,
+}));
+
 import { SessionManager } from "../src/core/session-manager.js";
 import { DAEMON_UPDATE_RESTART_FORMAT_VERSION } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
@@ -479,21 +491,63 @@ describe("daemon supervisor restart passivation", () => {
 		expect(supervisor.workers.get("busy")?.descriptor.lifecycle).toBe("recovering");
 	});
 
-	it("keeps a dead client-owned root recoverable without persisting its launch environment", async () => {
+	it("does not recover a saved processless client-owned passive root until its owner attaches with env", async () => {
 		const fixture = fixtureRoot();
 		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
-		const entry = { ...descriptor(fixture, "client-owned", session), ownerClientId: "owner-client" };
+		const entry = {
+			...descriptor(fixture, "client-owned", session),
+			ownerClientId: "owner-client",
+			lifecycle: "passivated" as const,
+		};
+		delete entry.pid;
 		writeFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), JSON.stringify(entry));
 
 		const supervisor = new DaemonSupervisor(fixture.socketPath, {
 			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
 			descriptorDir: fixture.descriptorDir,
-		}) as unknown as SupervisorInternals;
+		}) as unknown as SupervisorInternals & {
+			attachClient(
+				client: { id: string },
+				command: { type: "attach"; activeSessionId: string; launchEnv?: Record<string, string> },
+			): Promise<unknown>;
+		};
+		supervisor.recoverWorker = vi.fn(async () => {
+			const worker = supervisor.workers.get(entry.workerId);
+			if (!worker) throw new Error("missing worker");
+			worker.descriptor.lifecycle = "ready";
+			worker.client = {
+				request: vi.fn(async () => ({
+					success: true,
+					data: {
+						activeSessionId: entry.rootActiveSessionId,
+						snapshot: { summary: {}, messages: [] },
+						client: {},
+					},
+				})),
+			};
+		});
+		workerSpawn.mockClear();
 		await supervisor.loadWorkerDescriptors();
 
-		expect(supervisor.workers.get(entry.workerId)?.descriptor.lifecycle).toBe("recovering");
+		const passive = supervisor.workers.get(entry.workerId);
+		expect(passive?.descriptor.lifecycle).toBe("passivated");
+		expect(passive?.client).toBeUndefined();
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+		expect(workerSpawn).not.toHaveBeenCalled();
 		const persisted = readFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), "utf8");
+		expect(JSON.parse(persisted)).toMatchObject({ lifecycle: "passivated", ownerClientId: "owner-client" });
 		expect(persisted).not.toContain("launchEnv");
+
+		await supervisor.attachClient(
+			{
+				id: "owner-client",
+				attachedActiveSessionIds: new Set(),
+				capabilities: new Set(),
+				supportsExtensionUi: false,
+			},
+			{ type: "attach", activeSessionId: entry.rootActiveSessionId, launchEnv: { HERDR_PANE_ID: "pane" } },
+		);
+		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
 	});
 
 	it("stops a passivated descriptor without probing or signaling its stale pid", async () => {
