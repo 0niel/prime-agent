@@ -21,6 +21,10 @@ import {
 	writeSync,
 } from "node:fs";
 import { basename, dirname, join, parse, relative, resolve } from "node:path";
+import {
+	createRlmSafeTerminalResultTerminalMessage,
+	MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES,
+} from "./rlm-durable-operations.js";
 
 export const CHILD_RESULT_SCHEMA_VERSION = 1 as const;
 /** C04's opaque projection must still fit C03's 64 KiB full envelope.
@@ -38,7 +42,10 @@ export const MAX_ARTIFACT_BYTES_PER_CHILD_SESSION = 2 * 1024 * 1024 * 1024;
 export const MAX_STREAM_CHUNK_BYTES = 64 * 1024;
 export const DEFAULT_CHILD_RESULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+/** Result and object handles are random UUIDv4. Authority-issued session and
+ * operation identities accept the canonical UUID versions used by C01/C03. */
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const statuses = new Set(["completed", "failed", "cancelled", "timed_out", "stalled", "unknown_after_crash"]);
 const kinds = new Set(["terminal_output", "diagnostic", "trajectory", "attachment"]);
@@ -155,11 +162,13 @@ interface StoredChildResult extends C04ChildResultReference {
 	committedAt: string;
 	retention: { disposition: "retain_until"; expiresAt: string };
 	requestDigest: string;
+	/** Increments for every retention disposition and fences a resolved read. */
+	generation: number;
 }
 type AuditAction = "created" | "linked" | "read_allowed" | "read_denied" | "expired" | "deleted" | "uncertain";
 const capabilities = new WeakMap<
 	object,
-	{ root: string; owner: C04ChildResultOwner; handleId: string; resultId: string }
+	{ root: string; owner: C04ChildResultOwner; handleId: string; resultId: string; generation: number }
 >();
 
 /**
@@ -192,6 +201,7 @@ export async function createOrGetTerminalChildResult(
 	const release = reserveOperationAndQuota(root, owner, indexPath);
 	const resultId = randomUuid();
 	const artifacts: C04OpaqueArtifactReference[] = [];
+	let committed = false;
 	let reservedBytes = aggregateBytes(root, owner);
 	try {
 		for (const artifact of [
@@ -239,8 +249,13 @@ export async function createOrGetTerminalChildResult(
 				expiresAt: new Date(now.getTime() + DEFAULT_CHILD_RESULT_RETENTION_MS).toISOString(),
 			},
 			requestDigest,
+			generation: 0,
 		};
 		assertStored(stored);
+		// C03's cap applies to its stable serialized envelope, not merely this
+		// projection. Check the actual C03 constructor before publishing any C04
+		// authority record; escaped quotes/backslashes are therefore charged.
+		assertC03EnvelopeFits(projection(stored));
 		// Initial result publication is immutable: a final name is never rename-overwritten.
 		atomicExclusiveJson(safePath(root, "results", `${resultId}.json`), stored);
 		for (const artifact of artifacts)
@@ -260,10 +275,15 @@ export async function createOrGetTerminalChildResult(
 			appendAudit(root, "uncertain", "immutable_conflict", owner.operationId);
 			throw error;
 		}
+		committed = true;
 		appendAudit(root, "created", "committed", resultId);
 		appendAudit(root, "linked", "operation_indexed", resultId);
 		return projection(stored);
 	} catch (error) {
+		// Before an operation index exists these files have no public authority.
+		// They were created under this random result/handle identity only, so an
+		// unsuccessful producer may clean them without ever touching a winner.
+		if (!committed) cleanUnindexedOwnedAttempt(root, owner, resultId, artifacts);
 		if (!(error instanceof Error && error.message === "C04 immutable operation conflict"))
 			appendAudit(root, "uncertain", "storage_failed", owner.operationId);
 		throw error;
@@ -312,7 +332,13 @@ export function resolveOwnedChildResult(
 		const artifact = current.artifacts.find((value) => value.handleId === handleId);
 		if (!artifact || artifact.retentionState !== "retained") return denied(root, "unavailable");
 		const capability = Object.freeze({});
-		capabilities.set(capability, { root, owner: current.owner, handleId, resultId: current.resultId });
+		capabilities.set(capability, {
+			root,
+			owner: current.owner,
+			handleId,
+			resultId: current.resultId,
+			generation: current.generation,
+		});
 		appendAudit(root, "read_allowed", "resolved", handleId);
 		return { result: projection(current), capability };
 	} catch {
@@ -362,11 +388,23 @@ export function readOwnedArtifact(
 			const bytes = Buffer.allocUnsafe(Math.min(range.length, artifact.byteLength - range.offset));
 			const read = readSync(fd, bytes, 0, bytes.length, range.offset);
 			const final = fstatSync(fd);
+			// The disposition record is authoritative over a prior capability. Re-read
+			// it after the range read and require its generation, retained state,
+			// digest and inode to be unchanged before exposing any bytes.
+			const finalResult = readStored(grant.root, grant.resultId);
+			const finalArtifact = finalResult.artifacts.find((a) => a.handleId === grant.handleId);
 			if (
 				final.size !== artifact.byteLength ||
 				final.dev !== before.dev ||
 				final.ino !== before.ino ||
-				hashOpenFile(fd, artifact.byteLength) !== artifact.sha256
+				hashOpenFile(fd, artifact.byteLength) !== artifact.sha256 ||
+				!sameOwner(finalResult.owner, grant.owner) ||
+				finalResult.generation !== grant.generation ||
+				finalResult.retentionState !== "retained" ||
+				!finalArtifact ||
+				finalArtifact.retentionState !== "retained" ||
+				finalArtifact.sha256 !== artifact.sha256 ||
+				finalArtifact.byteLength !== artifact.byteLength
 			)
 				return denied(grant.root, "integrity");
 			appendAudit(grant.root, "read_allowed", "read", artifact.handleId);
@@ -402,6 +440,7 @@ export function recordChildResultDisposition(
 				...result,
 				artifacts: changed,
 				retentionState: input.disposition,
+				generation: result.generation + 1,
 			});
 			appendAudit(root, input.disposition, input.disposition, input.handleId ?? input.resultId);
 			for (const artifact of changed)
@@ -454,7 +493,7 @@ function validateOwner(value: C04ChildResultOwner): C04ChildResultOwner {
 	)
 		throw new Error("invalid C04 owner");
 	for (const key of ["parentSessionId", "childSessionId", "assignmentId", "operationId", "deliveryId"] as const)
-		if (!isUuid(value[key])) throw new Error(`invalid C04 owner ${key}`);
+		if (!isCanonicalUuid(value[key])) throw new Error(`invalid C04 owner ${key}`);
 	if (
 		typeof value.childSessionFile !== "string" ||
 		!value.childSessionFile ||
@@ -847,12 +886,51 @@ function setExpired(root: string, result: StoredChildResult): StoredChildResult 
 		...result,
 		retentionState: "expired" as const,
 		artifacts: result.artifacts.map((a) => ({ ...a, retentionState: "expired" as const })),
+		generation: result.generation + 1,
 	};
 	atomicJson(safePath(root, "results", `${result.resultId}.json`), expired);
 	appendAudit(root, "expired", "retention_elapsed", result.resultId);
 	for (const a of expired.artifacts) safeUnlink(safePath(root, "objects", `${a.handleId}.blob`));
 	return expired;
 }
+function assertC03EnvelopeFits(reference: C04ChildResultReference): void {
+	const projection = Buffer.from(canonicalChildResultBytes(reference)).toString("utf8");
+	// This invokes C03's own stable serializer and byte accounting. The fixed
+	// content/timestamp are deliberately the producer's canonical envelope.
+	const envelope = createRlmSafeTerminalResultTerminalMessage(
+		"Child completed; bounded result available.",
+		projection,
+		0,
+	);
+	if (Buffer.byteLength(canonicalJson(envelope), "utf8") > MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES)
+		throw new Error("C04 projection exceeds C03 safe-terminal envelope");
+}
+function cleanUnindexedOwnedAttempt(
+	root: string,
+	owner: C04ChildResultOwner,
+	resultId: string,
+	artifacts: readonly C04OpaqueArtifactReference[],
+): void {
+	try {
+		const index = readIndex(safePath(root, "operation-index", `${owner.operationId}.json`));
+		if (index) return; // A winner was published; never clean around it.
+		for (const artifact of artifacts) {
+			const handlePath = safePath(root, "handle-index", `${artifact.handleId}.json`);
+			let ours = false;
+			try {
+				const handle = readHandleIndex(root, artifact.handleId);
+				ours = handle.resultId === resultId && sameOwner(handle.owner, owner);
+				if (ours) safeUnlink(handlePath);
+			} catch {}
+			if (ours) safeUnlink(safePath(root, "objects", `${artifact.handleId}.blob`));
+		}
+		try {
+			const stored = readStored(root, resultId);
+			if (sameOwner(stored.owner, owner)) safeUnlink(safePath(root, "results", `${resultId}.json`));
+		} catch {}
+	} catch {}
+}
+
 function projection(result: StoredChildResult): C04ChildResultReference {
 	const {
 		schemaVersion: _schemaVersion,
@@ -862,6 +940,7 @@ function projection(result: StoredChildResult): C04ChildResultReference {
 		committedAt: _committedAt,
 		retention: _retention,
 		requestDigest: _requestDigest,
+		generation: _generation,
 		...reference
 	} = result;
 	assertReference(reference);
@@ -887,6 +966,7 @@ function assertStored(value: unknown): asserts value is StoredChildResult {
 			"committedAt",
 			"retention",
 			"requestDigest",
+			"generation",
 			...optionalKeys(value, ["error"]),
 		])
 	)
@@ -903,6 +983,8 @@ function assertStored(value: unknown): asserts value is StoredChildResult {
 		retentionState: value.retentionState,
 	});
 	const storedOwner = validateOwner(value.owner as C04ChildResultOwner);
+	if (!Number.isSafeInteger(value.generation) || value.generation < 0)
+		throw new Error("invalid C04 result generation");
 	for (const artifact of value.artifacts as C04OpaqueArtifactReference[]) {
 		if (
 			artifact.creatorAssignmentId !== storedOwner.assignmentId ||
@@ -1184,7 +1266,10 @@ function randomUuid(): string {
 	return randomUUID();
 }
 function isUuid(value: unknown): value is string {
-	return typeof value === "string" && UUID.test(value);
+	return typeof value === "string" && UUID_V4.test(value);
+}
+function isCanonicalUuid(value: unknown): value is string {
+	return typeof value === "string" && CANONICAL_UUID.test(value);
 }
 function isObject(value: unknown): value is Record<string, any> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);

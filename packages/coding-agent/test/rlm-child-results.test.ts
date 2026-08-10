@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	canonicalChildResultBytes,
 	createOrGetTerminalChildResult,
 	getChildResultProjection,
 	MAX_STREAM_CHUNK_BYTES,
@@ -10,6 +11,7 @@ import {
 	recordChildResultDisposition,
 	resolveOwnedChildResult,
 } from "../src/core/rlm-child-results.js";
+import { createRlmSafeTerminalResultTerminalMessage } from "../src/core/rlm-durable-operations.js";
 
 const ids = [
 	"11111111-1111-4111-8111-111111111111",
@@ -217,6 +219,62 @@ describe("C04 bounded child results", () => {
 				recordChildResultDisposition(input.owner, { resultId: result.resultId, disposition: "deleted" }, artifacts),
 			).toBe(true);
 			expect(readOwnedArtifact(grant.capability, { offset: 0, length: 7 })).toBeUndefined();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("accepts authority UUIDv7 identities while preserving random v4 result/handle IDs", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-v7-"));
+		const childV7 = "019a8f42-1234-7000-8000-123456789abc";
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", childV7);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${childV7}.jsonl`);
+		writeFileSync(file, "{}\n");
+		try {
+			const result = await createOrGetTerminalChildResult({
+				owner: {
+					parentSessionId: "019a8f42-1234-7000-8000-123456789abd",
+					childSessionId: childV7,
+					childSessionFile: file,
+					assignmentId: "019a8f42-1234-7000-8000-123456789abe",
+					operationId: "019a8f42-1234-7000-8000-123456789abf",
+					deliveryId: "019a8f42-1234-7000-8000-123456789ac0",
+				},
+				childArtifactRoot: artifacts,
+				candidate: { status: "completed", summary: "done", preview: "safe" },
+			});
+			expect(result.resultId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("measures quote/backslash worst case through C03's stable envelope before commit", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-c03-cap-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, "{}\n");
+		try {
+			const result = await createOrGetTerminalChildResult({
+				owner: owner(file),
+				childArtifactRoot: artifacts,
+				candidate: {
+					status: "completed",
+					summary: '\\"'.repeat(2_048),
+					preview: '\\"'.repeat(1_024),
+				},
+			});
+			const projection = Buffer.from(canonicalChildResultBytes(result)).toString("utf8");
+			const envelope = createRlmSafeTerminalResultTerminalMessage(
+				"Child completed; bounded result available.",
+				projection,
+				0,
+			);
+			expect(Buffer.byteLength(JSON.stringify(envelope))).toBeLessThanOrEqual(64 * 1024);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
