@@ -215,6 +215,7 @@ import {
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
+	type C04ChildResultReference,
 	type C04ChildResultStatus,
 	canonicalChildResultBytes,
 	createOrGetTerminalChildResult,
@@ -1076,21 +1077,51 @@ export function rlmChildLabel(prompt: string): string {
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
 }
 
-/** C04 receives producer-time terminal blocks only. Do not scan a session
- * transcript or encode a whole block: both make a terminal's memory use depend
- * on historical conversation size. */
-async function* streamAssistantTerminalOutput(message: AssistantMessage | undefined): AsyncGenerator<Uint8Array> {
-	if (!message) return;
-	const encoder = new TextEncoder();
-	for (const block of message.content) {
-		if (block.type !== "text") continue;
-		// Keep each UTF-8 conversion comfortably below C04's 64 KiB chunk limit.
-		for (let offset = 0; offset < block.text.length; offset += 8_192) {
-			const text = block.text.slice(offset, offset + 8_192);
-			const bytes = encoder.encode(text);
-			for (let byteOffset = 0; byteOffset < bytes.length; byteOffset += 64 * 1024)
-				yield bytes.subarray(byteOffset, byteOffset + 64 * 1024);
+/** C04 terminal bytes are accepted exactly at the producer event boundary. This
+ * queue never consults a completed AssistantMessage, transcript, or prompt
+ * result; backpressure is the C04 artifact writer's bounded chunk contract. */
+class C04ProducerSink implements AsyncIterable<Uint8Array> {
+	private static readonly MAX_BUFFERED_BYTES = 2 * 64 * 1024;
+	private readonly chunks: Uint8Array[] = [];
+	private readonly waiters: Array<() => void> = [];
+	private bufferedBytes = 0;
+	private failure: Error | undefined;
+	private closed = false;
+	push(text: string): void {
+		if (this.closed || !text) return;
+		const bytes = new TextEncoder().encode(text);
+		if (this.bufferedBytes + bytes.length > C04ProducerSink.MAX_BUFFERED_BYTES) {
+			this.failure = new Error("C04 producer sink exceeded its bounded buffer");
+			this.closed = true;
+			this.wake();
+			return;
 		}
+		for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
+			const chunk = bytes.slice(offset, offset + 64 * 1024);
+			this.chunks.push(chunk);
+			this.bufferedBytes += chunk.length;
+		}
+		this.wake();
+	}
+	close(): void {
+		this.closed = true;
+		this.wake();
+	}
+	private wake(): void {
+		for (const waiter of this.waiters.splice(0)) waiter();
+	}
+	async *[Symbol.asyncIterator](): AsyncIterator<Uint8Array> {
+		while (!this.closed || this.chunks.length > 0) {
+			const chunk = this.chunks.shift();
+			if (chunk) {
+				this.bufferedBytes -= chunk.length;
+				yield chunk;
+				continue;
+			}
+			if (this.failure) throw this.failure;
+			await new Promise<void>((resolve) => this.waiters.push(resolve));
+		}
+		if (this.failure) throw this.failure;
 	}
 }
 /** A bounded sanitized presentation is maintained while the child produces it. */
@@ -10070,7 +10101,8 @@ export class AgentSession {
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
 		let answerPreview: string | undefined;
-		let terminalAssistantOutput: AssistantMessage | undefined;
+		let terminalOutputSink: C04ProducerSink | undefined;
+		let terminalOutputCommit: Promise<C04ChildResultReference> | undefined;
 		let durationMs: number | undefined;
 		let toolUseCount = 0;
 		let runningToolCount = 0;
@@ -10181,7 +10213,12 @@ export class AgentSession {
 
 		/** C04 commits a bounded projection before daemon C03 sees any terminal envelope. */
 		const createDaemonTerminalResultMessage = async (): Promise<RlmTerminalMessage | undefined> => {
-			if (!this._subagentRuntimeHost?.assignmentIdentityFenced || !childSession) return undefined;
+			const isCurrent = () =>
+				this._activeRlmChildRuns.get(run.id) === run &&
+				this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
+				this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId &&
+				childSession?.sessionManager.getSessionFile?.() !== undefined;
+			if (!this._subagentRuntimeHost?.assignmentIdentityFenced || !childSession || !isCurrent()) return undefined;
 			const childFile = childSession.sessionManager.getSessionFile?.();
 			const childArtifactDir = childSession.sessionManager.getSessionArtifactDir?.();
 			if (!childFile || !childArtifactDir) return undefined;
@@ -10189,48 +10226,52 @@ export class AgentSession {
 				run.status === "done" ? "completed" : run.status === "cancelled" ? "cancelled" : "failed";
 			const terminalModel = childSession.model ?? modelSelection.model;
 			try {
-				const reference = await createOrGetTerminalChildResult({
-					owner: {
-						parentSessionId: this.sessionId,
-						childSessionId: childSession.sessionId,
-						childSessionFile: childFile,
-						assignmentId: run.assignmentId,
-						operationId: run.operationId,
-						deliveryId: run.deliveryId,
-					},
-					childArtifactRoot: childArtifactDir,
-					candidate: {
-						status,
-						summary: status === "completed" ? "Child completed." : "Child terminal result is unavailable.",
-						preview: answerPreview || "No bounded terminal preview is available.",
-						...(status === "completed"
-							? {
-									artifacts: [
-										{
-											kind: "terminal_output" as const,
-											contentType: "text/plain" as const,
-											data: streamAssistantTerminalOutput(terminalAssistantOutput),
-										},
-									],
-								}
-							: {}),
-						...(status === "completed"
-							? {}
-							: {
-									error: {
-										code: status === "cancelled" ? "cancelled" : "terminal_storage_failed",
-										message:
-											status === "cancelled"
-												? "Child was cancelled."
-												: "Child failed without a publishable diagnostic.",
-									},
-								}),
-						model: {
-							initialResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
-							terminalResolvedSelector: `${terminalModel.provider}/${terminalModel.id}`,
-						},
-					},
-				});
+				const reference = terminalOutputCommit
+					? await terminalOutputCommit
+					: await createOrGetTerminalChildResult({
+							owner: {
+								parentSessionId: this.sessionId,
+								childSessionId: childSession.sessionId,
+								childSessionFile: childFile,
+								assignmentId: run.assignmentId,
+								operationId: run.operationId,
+								deliveryId: run.deliveryId,
+							},
+							childArtifactRoot: childArtifactDir,
+							isCurrent,
+							candidate: {
+								status,
+								summary: status === "completed" ? "Child completed." : "Child terminal result is unavailable.",
+								preview: answerPreview || "No bounded terminal preview is available.",
+								...(status === "completed"
+									? {
+											artifacts: [
+												{
+													kind: "terminal_output" as const,
+													contentType: "text/plain" as const,
+													data: terminalOutputSink ?? new C04ProducerSink(),
+												},
+											],
+										}
+									: {}),
+								...(status === "completed"
+									? {}
+									: {
+											error: {
+												code: status === "cancelled" ? "cancelled" : "terminal_storage_failed",
+												message:
+													status === "cancelled"
+														? "Child was cancelled."
+														: "Child failed without a publishable diagnostic.",
+											},
+										}),
+								model: {
+									initialResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+									terminalResolvedSelector: `${terminalModel.provider}/${terminalModel.id}`,
+								},
+							},
+						});
+				if (!isCurrent()) return undefined;
 				// C03 treats this as opaque bytes. C04 is the only parser/codec authority.
 				const projection = Buffer.from(canonicalChildResultBytes(reference)).toString("utf8");
 				const content =
@@ -10395,13 +10436,52 @@ export class AgentSession {
 								}
 							}
 						}
-						terminalAssistantOutput = assistant;
 						const text = safeAssistantPreview(assistant);
 						if (text) answerPreview = text;
 						void flushAgentTraceUpload(child.sessionManager).catch(() => undefined);
 						emitChildUpdate();
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
+							if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+								if (!terminalOutputSink) {
+									terminalOutputSink = new C04ProducerSink();
+									const childFile = child.sessionManager.getSessionFile?.();
+									const childArtifactDir = child.sessionManager.getSessionArtifactDir?.();
+									if (this._subagentRuntimeHost?.assignmentIdentityFenced && childFile && childArtifactDir) {
+										const sink = terminalOutputSink;
+										terminalOutputCommit = createOrGetTerminalChildResult({
+											owner: {
+												parentSessionId: this.sessionId,
+												childSessionId: child.sessionId,
+												childSessionFile: childFile,
+												assignmentId: run.assignmentId,
+												operationId: run.operationId,
+												deliveryId: run.deliveryId,
+											},
+											childArtifactRoot: childArtifactDir,
+											isCurrent: () =>
+												this._activeRlmChildRuns.get(run.id) === run &&
+												this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
+												this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId &&
+												child.sessionManager.getSessionFile?.() === childFile &&
+												child.sessionManager.getSessionArtifactDir?.() === childArtifactDir,
+											candidate: {
+												status: "completed",
+												summary: "Child completed.",
+												preview: "Child output is streaming.",
+												artifacts: [{ kind: "terminal_output", contentType: "text/plain", data: sink }],
+												model: {
+													initialResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+													terminalResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+												},
+											},
+										}).catch((error) => {
+											throw error;
+										});
+									}
+								}
+								terminalOutputSink.push(event.assistantMessageEvent.delta);
+							}
 							const text = safeAssistantPreview(event.message as AssistantMessage);
 							if (text) answerPreview = text;
 							activity = { kind: "writing" };
@@ -10451,6 +10531,7 @@ export class AgentSession {
 					customMessage: spawnMessage,
 				});
 				if (run.error) throw new Error(run.error);
+				terminalOutputSink?.close();
 				run.status = "done";
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
@@ -10484,6 +10565,7 @@ export class AgentSession {
 				}
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
+				terminalOutputSink?.close();
 				run.publication.reject(runError);
 				if (run.status !== "cancelled") {
 					run.status = "error";

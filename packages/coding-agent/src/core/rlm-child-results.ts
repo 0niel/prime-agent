@@ -17,6 +17,7 @@ import {
 	readSync,
 	realpathSync,
 	renameSync,
+	statSync,
 	unlinkSync,
 	writeSync,
 } from "node:fs";
@@ -152,6 +153,8 @@ export interface C04CreateTerminalChildResultInput {
 	candidate: C04TerminalCandidate;
 	/** Trusted SessionManager child artifact directory; callers never pass a relative object path. */
 	childArtifactRoot: string;
+	/** Captured runtime/assignment capability, rechecked before durable publication. */
+	isCurrent?: () => boolean;
 	now?: () => Date;
 }
 interface StoredChildResult extends C04ChildResultReference {
@@ -179,6 +182,7 @@ export async function createOrGetTerminalChildResult(
 	input: C04CreateTerminalChildResultInput,
 ): Promise<C04ChildResultReference> {
 	const owner = validateOwner(input.owner);
+	if (input.isCurrent && !input.isCurrent()) throw new Error("stale C04 child result capability");
 	// Bind before creating C04 state: an untrusted sibling/renamed root never gets
 	// a durable directory merely because it was supplied by a caller.
 	validateChildBinding(owner, input.childArtifactRoot);
@@ -187,6 +191,7 @@ export async function createOrGetTerminalChildResult(
 	if (!Number.isFinite(now.getTime())) throw new Error("C04 time is invalid");
 	const candidate = validateCandidate(input.candidate);
 	const indexPath = safePath(root, "operation-index", `${owner.operationId}.json`);
+	reconcileAbandonedReservation(root, owner, indexPath);
 	const existing = readIndex(indexPath);
 	// A committed operation is immutable.  We do not touch a retry stream until its
 	// operation identity has been resolved, avoiding a concurrent writer consuming it.
@@ -198,8 +203,9 @@ export async function createOrGetTerminalChildResult(
 			throw immutableConflict(root, owner.operationId);
 		return projection(readStored(root, existing.resultId));
 	}
-	const release = reserveOperationAndQuota(root, owner, indexPath);
-	const resultId = randomUuid();
+	const reservation = reserveOperationAndQuota(root, owner, indexPath);
+	const release = reservation.release;
+	const resultId = reservation.resultId;
 	const artifacts: C04OpaqueArtifactReference[] = [];
 	let committed = false;
 	let reservedBytes = aggregateBytes(root, owner);
@@ -213,6 +219,9 @@ export async function createOrGetTerminalChildResult(
 			reservedBytes += written.byteLength;
 			artifacts.push(written);
 		}
+		// Stream waits may have yielded while the parent/runtime was replaced. Never
+		// publish such an attempt; catch cleanup is restricted to its random names.
+		if (input.isCurrent && !input.isCurrent()) throw new Error("stale C04 child result capability");
 		const diagnostic = candidate.error?.diagnostic ? artifacts.at(-1) : undefined;
 		const requestDigest = digestableCandidateDigest(owner, candidate, artifacts);
 		const facts = candidate.facts.map((fact) => ({
@@ -693,9 +702,24 @@ function aggregateBytes(root: string, owner: C04ChildResultOwner): number {
 	return total;
 }
 const operationReservations = new Set<string>();
-/** Reservation ownership is a nonce-bound fact. A losing writer never unlinks
- * a name it did not create, including during the create-one/create-two cut. */
-function reserveOperationAndQuota(root: string, owner: C04ChildResultOwner, indexPath: string): () => void {
+/** A reservation is a durable, authenticated ownership journal. Its nonce, PID
+ * and start time make restart reconciliation distinguish a live writer from a
+ * dead attempt; its result ID makes every publish cut recoverable. */
+interface ReservationJournal {
+	version: 1;
+	owner: C04ChildResultOwner;
+	indexPath: string;
+	nonce: string;
+	pid: number;
+	startedAt: string;
+	progress: "reserved" | "publishing";
+	resultId: string;
+}
+function reserveOperationAndQuota(
+	root: string,
+	owner: C04ChildResultOwner,
+	indexPath: string,
+): { release: () => void; resultId: string } {
 	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}:${owner.assignmentId}`;
 	if (operationReservations.has(key)) throw immutableConflict(root, owner.operationId);
 	const reservation = safePath(root, "operation-index", `.${owner.operationId}.reserve`);
@@ -704,8 +728,17 @@ function reserveOperationAndQuota(root: string, owner: C04ChildResultOwner, inde
 		"operation-index",
 		`.quota.${owner.childSessionId}.${owner.assignmentId}.reserve`,
 	);
-	const nonce = randomUuid();
-	const token = canonicalJson({ version: 1, owner, indexPath, nonce });
+	const journal: ReservationJournal = {
+		version: 1,
+		owner,
+		indexPath,
+		nonce: randomUuid(),
+		pid: process.pid,
+		startedAt: new Date().toISOString(),
+		progress: "reserved",
+		resultId: randomUuid(),
+	};
+	const token = canonicalJson(journal);
 	let operationFd: number | undefined;
 	let quotaFd: number | undefined;
 	try {
@@ -727,12 +760,96 @@ function reserveOperationAndQuota(root: string, owner: C04ChildResultOwner, inde
 		unlinkReservationIfOwned(quotaReservation, token);
 		throw immutableConflict(root, owner.operationId);
 	}
-	return () => {
-		operationReservations.delete(key);
-		unlinkReservationIfOwned(reservation, token);
-		unlinkReservationIfOwned(quotaReservation, token);
-		fsyncDirectory(dirname(reservation));
+	return {
+		resultId: journal.resultId,
+		release: () => {
+			operationReservations.delete(key);
+			unlinkReservationIfOwned(reservation, token);
+			unlinkReservationIfOwned(quotaReservation, token);
+			fsyncDirectory(dirname(reservation));
+		},
 	};
+}
+/** Restart recovery never deletes a competing result. A dead attempt is either
+ * completed from its exact durable cross-indexes or tombstoned after removing
+ * only names authenticated by that attempt's random result/handle identities. */
+function reconcileAbandonedReservation(root: string, owner: C04ChildResultOwner, indexPath: string): void {
+	const path = safePath(root, "operation-index", `.${owner.operationId}.reserve`);
+	let journal: ReservationJournal | undefined;
+	let token = "";
+	try {
+		const stat = lstatSync(path);
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8192) return;
+		token = readFileSync(path, "utf8");
+		const value = JSON.parse(token) as ReservationJournal;
+		if (
+			value.version !== 1 ||
+			!sameOwner(validateOwner(value.owner), owner) ||
+			realpathSync(dirname(value.indexPath)) !== realpathSync(dirname(indexPath)) ||
+			basename(value.indexPath) !== basename(indexPath) ||
+			!isUuid(value.nonce) ||
+			!isUuid(value.resultId) ||
+			!Number.isSafeInteger(value.pid) ||
+			value.pid < 1 ||
+			Number.isNaN(Date.parse(value.startedAt)) ||
+			value.progress !== "reserved"
+		)
+			return;
+		journal = value;
+	} catch {
+		return;
+	}
+	let live = false;
+	try {
+		process.kill(journal.pid, 0);
+		live = true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw immutableConflict(root, owner.operationId);
+	}
+	if (live) throw immutableConflict(root, owner.operationId);
+	try {
+		const result = readStored(root, journal.resultId);
+		if (!sameOwner(result.owner, owner)) throw new Error("foreign result");
+		// A durable result is sufficient to reconstruct every missing cross-index.
+		for (const artifact of result.artifacts) {
+			const blob = safePath(root, "objects", `${artifact.handleId}.blob`);
+			const st = statSync(blob);
+			if (!st.isFile() || st.size !== artifact.byteLength) throw new Error("missing blob");
+			const handle = safePath(root, "handle-index", `${artifact.handleId}.json`);
+			if (!readHandleIndexIfMatching(root, artifact.handleId, result.resultId, owner))
+				atomicExclusiveJson(handle, { version: 1, resultId: result.resultId, owner, handleId: artifact.handleId });
+		}
+		if (!readIndex(indexPath))
+			atomicExclusiveJson(indexPath, {
+				version: 1,
+				resultId: result.resultId,
+				owner,
+				requestDigest: result.requestDigest,
+			});
+		appendAudit(root, "linked", "restart_reconciled", result.resultId);
+	} catch {
+		cleanUnindexedOwnedAttempt(root, owner, journal.resultId, []);
+		appendAudit(root, "uncertain", "restart_tombstoned", journal.resultId);
+	}
+	unlinkReservationIfOwned(path, token);
+	unlinkReservationIfOwned(
+		safePath(root, "operation-index", `.quota.${owner.childSessionId}.${owner.assignmentId}.reserve`),
+		token,
+	);
+	fsyncDirectory(dirname(path));
+}
+function readHandleIndexIfMatching(
+	root: string,
+	handleId: string,
+	resultId: string,
+	owner: C04ChildResultOwner,
+): boolean {
+	try {
+		const value = readHandleIndex(root, handleId);
+		return value.resultId === resultId && sameOwner(value.owner, owner);
+	} catch {
+		return false;
+	}
 }
 function unlinkReservationIfOwned(path: string, token: string): void {
 	try {
@@ -749,6 +866,14 @@ function immutableConflict(root: string, operationId: string): Error {
 function validateChildBinding(owner: C04ChildResultOwner, childArtifactRoot: string): void {
 	const file = canonicalExistingRegularFile(owner.childSessionFile);
 	if (!file) throw new Error("C04 child session file is not a stable regular file");
+	// Re-read the SessionManager-issued header, rather than trusting a pathname.
+	try {
+		const header = JSON.parse(readFileSync(file, "utf8").split(/\r?\n/, 1)[0] ?? "");
+		if (!isObject(header) || header.type !== "session" || header.id !== owner.childSessionId)
+			throw new Error("invalid session header");
+	} catch {
+		throw new Error("C04 child session header binding is invalid");
+	}
 	const root = canonicalDirectoryNoSymlinks(childArtifactRoot);
 	const sessionId = owner.childSessionId;
 	// This is the one layout SessionManager publishes. IDs and paths are all

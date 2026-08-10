@@ -12,6 +12,7 @@ import {
 	resolveOwnedChildResult,
 } from "../src/core/rlm-child-results.js";
 import { createRlmSafeTerminalResultTerminalMessage } from "../src/core/rlm-durable-operations.js";
+import { SessionManager } from "../src/core/session-manager.js";
 
 const ids = [
 	"11111111-1111-4111-8111-111111111111",
@@ -39,7 +40,7 @@ describe("C04 bounded child results", () => {
 		mkdirSync(sessions, { recursive: true });
 		mkdirSync(artifacts, { recursive: true });
 		const file = join(sessions, `${ids[1]}.jsonl`);
-		writeFileSync(file, "{}\n");
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
 		try {
 			const input = {
 				owner: owner(file),
@@ -102,7 +103,7 @@ describe("C04 bounded child results", () => {
 		mkdirSync(sessions, { recursive: true });
 		mkdirSync(artifacts, { recursive: true });
 		const file = join(sessions, `${ids[1]}.jsonl`);
-		writeFileSync(file, "{}\n");
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
 		const stream = (text: string) =>
 			(async function* () {
 				yield new TextEncoder().encode(text);
@@ -148,7 +149,7 @@ describe("C04 bounded child results", () => {
 		mkdirSync(artifacts, { recursive: true });
 		mkdirSync(sibling, { recursive: true });
 		const file = join(sessions, `${ids[1]}.jsonl`);
-		writeFileSync(file, "{}\n");
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
 		const base = {
 			owner: owner(file),
 			childArtifactRoot: artifacts,
@@ -193,7 +194,7 @@ describe("C04 bounded child results", () => {
 		mkdirSync(sessions, { recursive: true });
 		mkdirSync(artifacts, { recursive: true });
 		const file = join(sessions, `${ids[1]}.jsonl`);
-		writeFileSync(file, "{}\n");
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
 		const input = {
 			owner: owner(file),
 			childArtifactRoot: artifacts,
@@ -231,7 +232,7 @@ describe("C04 bounded child results", () => {
 		mkdirSync(sessions, { recursive: true });
 		mkdirSync(artifacts, { recursive: true });
 		const file = join(sessions, `${childV7}.jsonl`);
-		writeFileSync(file, "{}\n");
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: childV7 })}\n`);
 		try {
 			const result = await createOrGetTerminalChildResult({
 				owner: {
@@ -257,7 +258,7 @@ describe("C04 bounded child results", () => {
 		mkdirSync(sessions, { recursive: true });
 		mkdirSync(artifacts, { recursive: true });
 		const file = join(sessions, `${ids[1]}.jsonl`);
-		writeFileSync(file, "{}\n");
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
 		try {
 			const result = await createOrGetTerminalChildResult({
 				owner: owner(file),
@@ -275,6 +276,72 @@ describe("C04 bounded child results", () => {
 				0,
 			);
 			expect(Buffer.byteLength(JSON.stringify(envelope))).toBeLessThanOrEqual(64 * 1024);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses a real SessionManager-issued session header binding", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-real-session-manager-"));
+		const sessions = join(root, "sessions");
+		const manager = SessionManager.create(root, sessions);
+		manager.flushNow();
+		const file = manager.getSessionFile()!;
+		const artifacts = manager.getSessionArtifactDir()!;
+		mkdirSync(artifacts, { recursive: true });
+		try {
+			const result = await createOrGetTerminalChildResult({
+				owner: { ...owner(file), childSessionId: manager.getSessionId() },
+				childArtifactRoot: artifacts,
+				candidate: { status: "completed", summary: "done", preview: "safe" },
+			});
+			expect(
+				getChildResultProjection(
+					{ ...owner(file), childSessionId: manager.getSessionId() },
+					result.resultId,
+					artifacts,
+				),
+			).toEqual(result);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reconciles a dead reservation after the result and blobs were durable but indexes were not", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-reconcile-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
+		const base = {
+			owner: owner(file),
+			childArtifactRoot: artifacts,
+			candidate: { status: "completed" as const, summary: "done", preview: "safe" },
+		};
+		try {
+			const result = await createOrGetTerminalChildResult(base);
+			const resultRoot = join(artifacts, "rlm-child-results");
+			const index = join(resultRoot, "operation-index", `${ids[3]}.json`);
+			const reservation = join(resultRoot, "operation-index", `.${ids[3]}.reserve`);
+			const quota = join(resultRoot, "operation-index", `.quota.${ids[1]}.${ids[2]}.reserve`);
+			const journal = {
+				version: 1,
+				owner: base.owner,
+				indexPath: index,
+				nonce: ids[4],
+				pid: 999999,
+				startedAt: new Date().toISOString(),
+				progress: "reserved",
+				resultId: result.resultId,
+			};
+			writeFileSync(reservation, JSON.stringify(journal));
+			writeFileSync(quota, JSON.stringify(journal));
+			rmSync(index);
+			const again = await createOrGetTerminalChildResult({ ...base, candidate: { ...base.candidate } });
+			expect(again).toEqual(result);
+			expect(getChildResultProjection(base.owner, result.resultId, artifacts)).toEqual(result);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
