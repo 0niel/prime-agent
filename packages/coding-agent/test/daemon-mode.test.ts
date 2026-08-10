@@ -5573,6 +5573,57 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("quarantines malformed registry rows without losing slash-bearing model IDs on a later complete replay", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-registry-replay-model-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir, { modelId: "org/scripted" });
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const valid = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			valid.model = { provider: "test", modelId: "org/scripted" };
+			const malformed = { ...valid, status: "interrupted" };
+			writeFileSync(registryPath, `${JSON.stringify(valid)}\n${JSON.stringify(malformed)}\n`);
+			const internals = fixture.daemon as unknown as {
+				readLatestRlmSubagentRegistryPath(
+					path: string,
+				): Promise<Array<{ childId: string; model?: { provider: string; modelId: string } }>>;
+			};
+
+			// A corrupt later row fences the prior incarnation rather than reviving it.
+			expect(await internals.readLatestRlmSubagentRegistryPath(registryPath)).toEqual([]);
+
+			// A complete later replay deliberately republishes the child and preserves
+			// model IDs whose provider/model boundary is the first slash only.
+			writeFileSync(registryPath, `${readFileSync(registryPath, "utf8")}${JSON.stringify(valid)}\n`);
+			expect(await internals.readLatestRlmSubagentRegistryPath(registryPath)).toEqual([
+				expect.objectContaining({
+					childId: fixture.childId,
+					model: { provider: "test", modelId: "org/scripted" },
+				}),
+			]);
+			const parentState = await (
+				fixture.daemon as unknown as {
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+					createAgentMessageController(
+						getCurrentState: () => ActiveSessionState | undefined,
+					): AgentSessionMessageController;
+				}
+			).createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await (
+				fixture.daemon as unknown as {
+					createAgentMessageController(
+						getCurrentState: () => ActiveSessionState | undefined,
+					): AgentSessionMessageController;
+				}
+			)
+				.createAgentMessageController(() => parentState)
+				.sendAgentMessage({ target: "renamed-worker", message: "rehydrate model" });
+			expect(fixture.modelRegistry.find).toHaveBeenCalledWith("test", "org/scripted");
+			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions?.model).toBe(fixture.model);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rehydrates a legacy child with depth inferred from its session file path", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-legacy-rlm-depth-"));
 		try {
@@ -9648,6 +9699,7 @@ function makePersistedRlmDaemonFixture(
 		childDisposeGate?: Promise<void>;
 		childAdmissionStarted?: () => void;
 		childAdmissionGate?: Promise<void>;
+		modelId?: string;
 	} = {},
 ) {
 	const sessionDir = join(tempDir, "sessions");
@@ -9723,6 +9775,13 @@ function makePersistedRlmDaemonFixture(
 `,
 	);
 
+	const model = { provider: "test", id: options.modelId ?? "model" } as Model<Api>;
+	const modelRegistry = {
+		find: vi.fn((provider: string, modelId: string) =>
+			provider === model.provider && modelId === model.id ? model : undefined,
+		),
+		canUseModel: vi.fn(async () => true),
+	};
 	const acceptAgentMessagePrompt = vi.fn(
 		async (_message: string, promptOptions?: { preflightResult?: (didSucceed: boolean) => void }) => {
 			if (options.childAdmissionGate) {
@@ -9775,7 +9834,7 @@ function makePersistedRlmDaemonFixture(
 			extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
 				ReturnType<CreateAgentSessionRuntimeFactory>
 			>["extensionsResult"],
-			services: { cwd: runtimeOptions.cwd, agentDir: runtimeOptions.agentDir } as Awaited<
+			services: { cwd: runtimeOptions.cwd, agentDir: runtimeOptions.agentDir, modelRegistry } as Awaited<
 				ReturnType<CreateAgentSessionRuntimeFactory>
 			>["services"],
 			diagnostics: [],
@@ -9789,6 +9848,8 @@ function makePersistedRlmDaemonFixture(
 		daemon,
 		createRuntime,
 		runtimeSessions,
+		model,
+		modelRegistry,
 		acceptAgentMessagePrompt,
 		parentSessionFile,
 		parentArtifactDir,

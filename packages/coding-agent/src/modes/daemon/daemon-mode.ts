@@ -987,6 +987,14 @@ export class AgentDaemon {
 			return [];
 		}
 		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
+		// A malformed append is a tombstone for its selector, not an invitation to
+		// revive the older snapshot. This keeps replay deterministic when an
+		// append-only registry is interrupted or partially corrupted.
+		const quarantineMalformedEntry = (entry: Partial<PersistedRlmSubagentRegistryEntry> | undefined) => {
+			if (typeof entry?.childId === "string") {
+				latest.delete(entry.childId);
+			}
+		};
 		let lines: string[];
 		try {
 			lines = (await readFile(path, "utf8")).split(/\r?\n/);
@@ -1005,8 +1013,9 @@ export class AgentDaemon {
 			if (!trimmed) {
 				continue;
 			}
+			let entry: Partial<PersistedRlmSubagentRegistryEntry> | undefined;
 			try {
-				const entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
+				entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
 				if (
 					entry.type !== "rlm_subagent" ||
 					typeof entry.childId !== "string" ||
@@ -1017,10 +1026,14 @@ export class AgentDaemon {
 					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
 					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
 				) {
+					quarantineMalformedEntry(entry);
 					continue;
 				}
-				latest.set(entry.childId, entry as PersistedRlmSubagentRegistryEntry);
+				const persisted = entry as PersistedRlmSubagentRegistryEntry;
+				// Only a complete later row deliberately republishes a quarantined child.
+				latest.set(persisted.childId, persisted);
 			} catch (error) {
+				quarantineMalformedEntry(entry);
 				this.log(
 					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
 				);
