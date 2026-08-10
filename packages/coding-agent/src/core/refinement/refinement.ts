@@ -1,19 +1,10 @@
-import { randomUUID } from "node:crypto";
-import {
-	appendFileSync,
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	renameSync,
-	statSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../../config.js";
+import { appendPrivateFile, readPrivateFile, writePrivateFileAtomic } from "../../utils/private-files.js";
 import { serializeConversation } from "../compaction/utils.js";
 import { convertToLlm } from "../messages.js";
 import type { CustomEntry } from "../session-manager.js";
@@ -288,7 +279,7 @@ export function loadHarnessState(
 	}
 	let parsed: Partial<HarnessState>;
 	try {
-		const raw = JSON.parse(readFileSync(statePath, "utf8"));
+		const raw = JSON.parse(readPrivateFile(statePath, "utf8"));
 		// loadHarnessState runs on every system-prompt build and before each /refine, so
 		// a corrupt or unreadable (or non-object) state file must degrade to empty rather
 		// than throw and break the session. The next saveHarnessState rewrites it cleanly.
@@ -344,17 +335,7 @@ export function mergeHarnessStates(globalState: HarnessState, localState?: Harne
 
 export function saveHarnessState(harnessStateDir: string, state: HarnessState): string {
 	const statePath = getHarnessStatePath(harnessStateDir);
-	const tempPath = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
-	mkdirSync(harnessStateDir, { recursive: true });
-	try {
-		const mode = existsSync(statePath) ? statSync(statePath).mode & 0o777 : 0o600;
-		writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode });
-		renameSync(tempPath, statePath);
-	} finally {
-		if (existsSync(tempPath)) {
-			unlinkSync(tempPath);
-		}
-	}
+	writePrivateFileAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`);
 	return statePath;
 }
 
@@ -373,8 +354,7 @@ function isRefinementResult(data: unknown): data is RefinementResult {
  */
 export function appendGlobalRefinement(harnessStateDir: string, result: RefinementResult): string {
 	const historyPath = getRefinementHistoryPath(harnessStateDir);
-	mkdirSync(harnessStateDir, { recursive: true });
-	appendFileSync(historyPath, `${JSON.stringify(result)}\n`, "utf8");
+	appendPrivateFile(historyPath, `${JSON.stringify(result)}\n`);
 	return historyPath;
 }
 
@@ -384,7 +364,7 @@ export function loadGlobalRefinementHistory(harnessStateDir: string = getGlobalH
 		return [];
 	}
 	const results: RefinementResult[] = [];
-	for (const line of readFileSync(historyPath, "utf8").split("\n")) {
+	for (const line of readPrivateFile(historyPath, "utf8").split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
 		try {
