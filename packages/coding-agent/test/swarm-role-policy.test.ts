@@ -112,15 +112,15 @@ describe("swarm role policy", () => {
 		});
 	});
 
-	it("projects a bounded sorted minimal role catalog", () => {
-		const snapshot = parseSwarmRolePolicy(policy);
-		expect(projectSwarmRoleMetadata(snapshot)).toEqual([
-			{
-				id: "reviewer_1",
-				modelProfile: "neutral_profile",
-				decisionScopes: ["review"],
-				implementationScopes: ["patch"],
+	it("projects a bounded codepoint-sorted minimal role catalog", () => {
+		const snapshot = parseSwarmRolePolicy({
+			...policy,
+			roles: {
+				Zebra: policy.roles.reviewer_1,
+				alphabet: policy.roles.reviewer_1,
+				reviewer_1: policy.roles.reviewer_1,
 			},
-		]);
+		});
+		expect(projectSwarmRoleMetadata(snapshot).map((role) => role.id)).toEqual(["Zebra", "alphabet", "reviewer_1"]);
 	});
 });

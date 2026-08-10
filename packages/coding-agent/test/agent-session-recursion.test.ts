@@ -35,6 +35,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager, type SettingsStorage } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+import { parseSwarmRolePolicy } from "../src/core/swarm-role-policy.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
@@ -3467,6 +3468,58 @@ print(_result.name)
 			vi.unstubAllEnvs();
 			hostedChild?.dispose();
 			root.dispose();
+		}
+	});
+
+	it("refuses delegation from a policy-bound child after policy replacement", async () => {
+		const settingsManager = SettingsManager.inMemory({
+			swarmRolePolicy: {
+				version: 1,
+				modelProfiles: { exact: { model: `${model.provider}/${model.id}` } },
+				roles: {
+					worker: {
+						modelProfile: "exact",
+						decisionScopes: [],
+						implementationScopes: [],
+						allowedToolNames: [],
+						delegableRoleIds: ["worker"],
+						sharedContext: { maxItems: 0, maxBytes: 2 },
+					},
+				},
+			},
+		});
+		let root: AgentSession | undefined;
+		try {
+			vi.stubEnv("PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY", "1");
+			root = createSession({ settingsManager });
+			const handle = await root.runRlmChild("first policy child", { role: "worker" });
+			await vi.waitFor(() => expect(root!.getRlmChildSession(handle.rlm_child_id)).toBeDefined());
+			const child = root.getRlmChildSession(handle.rlm_child_id)!;
+			vi.spyOn(settingsManager, "getSwarmRolePolicy").mockReturnValue({
+				snapshot: parseSwarmRolePolicy({
+					version: 1,
+					modelProfiles: { exact: { model: `${model.provider}/${model.id}` } },
+					roles: {
+						worker: {
+							modelProfile: "exact",
+							decisionScopes: ["changed"],
+							implementationScopes: [],
+							allowedToolNames: [],
+							delegableRoleIds: ["worker"],
+							sharedContext: { maxItems: 0, maxBytes: 2 },
+						},
+					},
+				}),
+				source: "global",
+			});
+			const modelCatalog = vi.spyOn(child.modelRegistry, "getExecutableModels");
+			await expect(child.runRlmChild("must reject replaced policy", { role: "worker" })).rejects.toThrow(
+				"after swarm role policy replacement",
+			);
+			expect(modelCatalog).not.toHaveBeenCalled();
+		} finally {
+			vi.unstubAllEnvs();
+			root?.dispose();
 		}
 	});
 

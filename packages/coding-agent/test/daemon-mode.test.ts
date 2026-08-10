@@ -1586,6 +1586,24 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("quarantines an invalid registry row instead of retaining its older assignment snapshot", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-invalid-registry-row-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const valid = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			writeFileSync(registryPath, `${JSON.stringify(valid)}\n${JSON.stringify({ ...valid, status: "invalid" })}\n`);
+			const read = (
+				fixture.daemon as unknown as {
+					readLatestRlmSubagentRegistryPath(path: string): Promise<unknown[]>;
+				}
+			).readLatestRlmSubagentRegistryPath.bind(fixture.daemon);
+			expect(await read(registryPath)).toEqual([]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps B authoritative when A policy assignment reaches its terminal delete boundary", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-policy-assignment-boundary-"));
 		try {

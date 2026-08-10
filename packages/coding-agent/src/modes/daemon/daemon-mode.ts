@@ -417,8 +417,7 @@ function isPersistedSwarmRecord(value: unknown): value is Record<string, unknown
 
 /** The journal is untrusted input, including values written by older daemon versions. */
 function persistedSwarmString(value: unknown, label: string): string {
-	if (typeof value !== "string" || value !== value.normalize("NFC"))
-		throw new Error(`invalid persisted swarm assignment ${label}`);
+	if (typeof value !== "string") throw new Error(`invalid persisted swarm assignment ${label}`);
 	return value;
 }
 function persistedSwarmIdentifier(value: unknown, label: string, reserved = false): string {
@@ -1301,6 +1300,17 @@ export class AgentDaemon {
 								entry.assignmentId,
 							)))
 				) {
+					// A malformed update must not fall through to an older snapshot of the
+					// same durable assignment. It is quarantined until a later complete row
+					// deliberately republishes that assignment.
+					if (typeof rawEntry.childId === "string") {
+						latest.delete(
+							this.rlmAssignmentKey({
+								childId: rawEntry.childId,
+								assignmentId: rawEntry.assignmentId,
+							}),
+						);
+					}
 					continue;
 				}
 				latest.set(

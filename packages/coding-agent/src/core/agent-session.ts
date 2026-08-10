@@ -9869,6 +9869,8 @@ export class AgentSession {
 			if (policyEnabled) {
 				const policy = this.settingsManager.getSwarmRolePolicy();
 				if (!policy.snapshot) throw new Error(policy.diagnostic ?? "No valid swarm role policy is configured");
+				if (this._swarmRoleAssignment && policy.snapshot.digest !== this._swarmRoleAssignment.policyDigest)
+					throw new Error("RLM child admission is unavailable after swarm role policy replacement");
 				const assignmentId = randomUUID();
 				const authenticatedModels = await this._authenticatedRlmModels();
 				swarmRoleAssignment = resolveSwarmRoleAssignment({

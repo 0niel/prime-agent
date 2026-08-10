@@ -264,7 +264,7 @@ export function parseSwarmRolePolicy(value: unknown): SwarmRolePolicySnapshot {
 
 export function projectSwarmRoleMetadata(snapshot: SwarmRolePolicySnapshot): SwarmRoleMetadata[] {
 	return Object.entries(snapshot.policy.roles)
-		.sort(([a], [b]) => a.localeCompare(b))
+		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
 		.slice(0, SWARM_ROLE_MAX_ROLES)
 		.map(([id, role]) =>
 			freeze({
