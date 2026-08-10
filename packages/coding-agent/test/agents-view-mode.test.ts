@@ -676,6 +676,119 @@ describe("AgentsViewMode persistent catalog state", () => {
 
 		expect(runs).toBe(2);
 	});
+
+	it("anchors ctrl+n session creation to the scoped parent", async () => {
+		const scopeRoot = summary({ rlmDepth: 0 });
+		const created = summary({
+			id: "created-active",
+			activeSessionId: "created-active",
+			sessionId: "created-session",
+			sessionFile: "/tmp/created.jsonl",
+		});
+		modeMocks.clientRequest.mockResolvedValue({
+			type: "response",
+			command: "create",
+			success: true,
+			data: created,
+		});
+		const self = {
+			creatingNewSession: false,
+			stopped: false,
+			scopeRootSummary: scopeRoot,
+			options: { config: {} },
+			connectDedicatedClient: async () => ({
+				request: modeMocks.clientRequest,
+				close: vi.fn(),
+				supportsServerCapability: () => true,
+			}),
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			finish: vi.fn(),
+		};
+
+		await expect(invoke("createNewSession", self)).resolves.toBe(true);
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledWith(
+			expect.objectContaining({
+				type: "create",
+				runtimeMetadata: expect.objectContaining({
+					kind: "subagent",
+					createdAt: expect.any(Number),
+					parentSessionId: scopeRoot.sessionId,
+					parentActiveSessionId: scopeRoot.activeSessionId,
+					parentSessionFile: scopeRoot.sessionFile,
+				}),
+			}),
+		);
+		expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
+	});
+
+	it("creates a top-level session from a scoped view when the daemon lacks scoped_session_create", async () => {
+		const created = summary({
+			id: "created-active",
+			activeSessionId: "created-active",
+			sessionId: "created-session",
+		});
+		modeMocks.clientRequest.mockResolvedValue({
+			type: "response",
+			command: "create",
+			success: true,
+			data: created,
+		});
+		const self = {
+			creatingNewSession: false,
+			stopped: false,
+			scopeRootSummary: summary({ rlmDepth: 0 }),
+			options: { config: {} },
+			connectDedicatedClient: async () => ({
+				request: modeMocks.clientRequest,
+				close: vi.fn(),
+				supportsServerCapability: () => false,
+			}),
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			finish: vi.fn(),
+		};
+
+		await expect(invoke("createNewSession", self)).resolves.toBe(true);
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledWith(
+			expect.not.objectContaining({ runtimeMetadata: expect.anything() }),
+		);
+		expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
+	});
+
+	it("creates a top-level session from the global agents view", async () => {
+		const created = summary({
+			id: "created-active",
+			activeSessionId: "created-active",
+			sessionId: "created-session",
+		});
+		modeMocks.clientRequest.mockResolvedValue({
+			type: "response",
+			command: "create",
+			success: true,
+			data: created,
+		});
+		const self = {
+			creatingNewSession: false,
+			stopped: false,
+			scopeRootSummary: undefined,
+			options: { config: {} },
+			connectDedicatedClient: async () => ({ request: modeMocks.clientRequest, close: vi.fn() }),
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			finish: vi.fn(),
+		};
+
+		await expect(invoke("createNewSession", self)).resolves.toBe(true);
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledWith(expect.objectContaining({ type: "create" }));
+		expect(modeMocks.clientRequest).toHaveBeenCalledWith(
+			expect.not.objectContaining({ runtimeMetadata: expect.anything() }),
+		);
+		expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
+	});
 });
 
 describe("agents view startup notices", () => {

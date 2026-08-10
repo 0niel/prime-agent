@@ -96,7 +96,10 @@ export type DaemonServerCapability =
 	// identity). Clients must check before sending.
 	| "transient_bash"
 	| "session_input_admission"
-	| "prompt_admission_cancellation";
+	| "prompt_admission_cancellation"
+	// The daemon interprets create.runtimeMetadata subagent linkage to anchor a
+	// fresh session under a parent. Clients must check before depending on it.
+	| "scoped_session_create";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -134,6 +137,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"transient_bash",
 	"session_input_admission",
 	"prompt_admission_cancellation",
+	"scoped_session_create",
 ];
 
 export interface DaemonRuntimeIdentity {

@@ -900,6 +900,71 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("creates a scoped child with parent header linkage from create runtimeMetadata", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-scoped-create-"));
+		try {
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
+				session: makeRuntimeSession(options.sessionManager),
+				extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["extensionsResult"],
+				services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["services"],
+				diagnostics: [],
+			}));
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: join(tempDir, "sessions") },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				isDiscardableDraft(state: ActiveSessionState): boolean;
+			};
+			const parentState = await internals.createRuntime({ type: "create" });
+			Object.assign(parentState.runtime.session, { rlmDepth: 0 });
+			const parentSessionFile = parentState.runtime.session.sessionFile;
+			if (!parentSessionFile) throw new Error("Missing parent session file");
+
+			const childState = await internals.createRuntime({
+				type: "create",
+				runtimeMetadata: {
+					kind: "subagent",
+					createdAt: Date.now(),
+					parentSessionId: parentState.runtime.session.sessionId,
+					parentActiveSessionId: parentState.activeSessionId,
+					parentSessionFile,
+				},
+			});
+
+			expect(childState.runtime.session.sessionManager.getHeader()).toMatchObject({
+				parentSession: parentSessionFile,
+				rlmDepth: 1,
+			});
+			expect(childState.runtime.metadata).toMatchObject({
+				kind: "subagent",
+				parentActiveSessionId: parentState.activeSessionId,
+				parentSessionId: parentState.runtime.session.sessionId,
+				parentSessionFile,
+			});
+
+			Object.assign(childState.runtime.session, {
+				isBashRunning: false,
+				isSessionActive: false,
+				hasRunningRlmChildren: () => false,
+			});
+			expect(internals.isDiscardableDraft(childState)).toBe(true);
+
+			const kernelChildState = await internals.createRuntime({
+				type: "create",
+				runtimeMetadata: { kind: "subagent", createdAt: Date.now(), rlmChildId: "kernel-child" },
+			});
+			expect(internals.isDiscardableDraft(kernelChildState)).toBe(false);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("defers RLM heartbeats while a subagent is binding", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-binding-heartbeat-"));
 		let releaseChildBinding: (() => void) | undefined;
@@ -4261,6 +4326,7 @@ describe("daemon mode helpers", () => {
 			},
 		});
 		const state = makeState("active");
+		state.runtime.metadata.rlmChildId = "child-1";
 		state.extensionUiRequests = new Map();
 		const socketState = { destroyed: false };
 		const socket = Object.assign(new EventEmitter(), {
