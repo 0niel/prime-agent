@@ -2804,7 +2804,40 @@ export class AgentDaemon {
 					// A materialized live child cannot yet be `deleted`: retain an exact
 					// intent through cancellation. The terminal owner converts it to deleted
 					// before any inbox import, while C01 deletion/close proceeds normally.
-					const store = durableStore();
+					// A passive C03 incarnation has no resident runtime, so bind its exact
+					// already-selected registry tuple through SessionManager before reading
+					// its private outbox.  This is a manager-owned materialization check,
+					// never an assignment-only/ledger-path fallback.
+					const store = persisted
+						? openRlmDurableOperationStore(artifactDir, {
+								trustedChildRecoveryRoots: (candidate) => {
+									if (
+										candidate.parentSessionId !== parent.sessionId ||
+										candidate.assignmentId !== assignmentId ||
+										candidate.operationId !== operationId ||
+										persisted.assignmentId !== assignmentId ||
+										persisted.operationId !== operationId ||
+										persisted.deliveryId !== candidate.deliveryId
+									)
+										return undefined;
+									try {
+										const manager = SessionManager.open(persisted.sessionFile);
+										const childFile = manager.getSessionFile();
+										const childArtifactDir = manager.getSessionArtifactDir();
+										if (!childFile || !childArtifactDir) return undefined;
+										return {
+											childSessionId: manager.getSessionId(),
+											childSessionFile: childFile,
+											childSessionRoot: dirname(childFile),
+											childArtifactDir,
+											childArtifactRoot: dirname(childArtifactDir),
+										};
+									} catch {
+										return undefined;
+									}
+								},
+							})
+						: durableStore();
 					const operation = store
 						.rebuild()
 						.operations.get(JSON.stringify([parent.sessionId, assignmentId, operationId]));
