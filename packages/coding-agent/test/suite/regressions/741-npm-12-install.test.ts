@@ -74,6 +74,27 @@ install_prime_agent_package "/tmp/prime-agent-0.7.1.tgz"
 	return readFileSync(logPath, "utf8");
 }
 
+function renderInstallerPromptDetail(detail: string): string[] {
+	const directory = tempDir();
+	const harnessPath = join(directory, "prompt-harness.sh");
+	writeFileSync(
+		harnessPath,
+		`${installerWithoutMain}
+prime_agent_screen_question="Install? [Y/n]"
+prime_agent_screen_title="Install Prime Agent?"
+prime_agent_screen_detail="$1"
+printf '%s\n' "$(prime_agent_content_height)"
+prime_agent_content_line 1
+printf '%s\n' "$prime_agent_content_text"
+prime_agent_content_line 2
+printf '%s\n' "$prime_agent_content_text"
+`,
+	);
+	const result = spawnSync("sh", [harnessPath, detail], { encoding: "utf8" });
+	expect(result.status, result.stderr).toBe(0);
+	return result.stdout.trim().split("\n");
+}
+
 afterEach(() => {
 	if (originalExecPath) Object.defineProperty(process, "execPath", originalExecPath);
 	if (originalPackageDir === undefined) delete process.env.PI_PACKAGE_DIR;
@@ -85,11 +106,16 @@ describe("issue #741 npm 12 release installs", () => {
 	it("scopes remote and postinstall access to npm 12 installer invocations", () => {
 		expect(runInstallerInstall("11.17.0")).toBe("remote=\nscripts=\n");
 		expect(runInstallerInstall("12.0.2")).toBe("remote=all\nscripts=file:/tmp/prime-agent-0.7.1.tgz\n");
-		expect(installerSource).toContain("permits unverified dependency URLs at any depth/host");
+		expect(installerSource).toContain("allow-remote=all allows unverified URLs from any host/depth");
 		expect(installerSource).toContain("permits dependencies at any depth to download from any URL host");
 		expect(installerSource).toContain(
 			"Only the Prime Agent archive is checksum-verified; remote dependency archives are not.",
 		);
+	});
+
+	it("renders the npm 12 risk disclosure before interactive consent", () => {
+		const detail = "npm 12: allow-remote=all allows unverified URLs from any host/depth.";
+		expect(renderInstallerPromptDetail(detail)).toEqual(["3", detail, "Press Enter to continue; type n to cancel."]);
 	});
 
 	it("adds the npm 12 remote grant to self-update commands only", () => {

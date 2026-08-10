@@ -339,6 +339,9 @@ prime_agent_render_screen() {
 
 prime_agent_content_height() {
 	height=2
+	if [ -n "$prime_agent_screen_question" ] && [ -n "$prime_agent_screen_detail" ]; then
+		height=3
+	fi
 	if prime_agent_show_logo; then
 		height=$((height + 15))
 	fi
@@ -381,13 +384,20 @@ prime_agent_content_line() {
 	fi
 
 	if [ "$index" -eq 1 ]; then
-		if [ -n "$prime_agent_screen_question" ]; then
+		if [ -n "$prime_agent_screen_question" ] && [ -n "$prime_agent_screen_detail" ]; then
+			prime_agent_set_text_line "$prime_agent_screen_detail" "$prime_agent_color_muted"
+		elif [ -n "$prime_agent_screen_question" ]; then
 			prime_agent_set_text_line "Press Enter to continue; type n to cancel." "$prime_agent_color_muted"
 		elif [ -n "$prime_agent_screen_detail" ]; then
 			prime_agent_set_text_line "$prime_agent_screen_detail" "$prime_agent_color_muted"
 		else
 			prime_agent_set_blank_line
 		fi
+		return
+	fi
+
+	if [ "$index" -eq 2 ] && [ -n "$prime_agent_screen_question" ] && [ -n "$prime_agent_screen_detail" ]; then
+		prime_agent_set_text_line "Press Enter to continue; type n to cancel." "$prime_agent_color_muted"
 		return
 	fi
 }
@@ -1530,7 +1540,7 @@ confirm_install() {
 	tarball_url="$2"
 	install_detail="Downloads the verified release and runs npm install -g."
 	if prime_agent_npm_requires_remote_access; then
-		install_detail="npm 12: allow-remote=all permits unverified dependency URLs at any depth/host."
+		install_detail="npm 12: allow-remote=all allows unverified URLs from any host/depth."
 	fi
 
 	if prime_agent_prompt_yes_no \
