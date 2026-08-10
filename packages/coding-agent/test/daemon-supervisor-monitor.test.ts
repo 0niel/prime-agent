@@ -857,7 +857,10 @@ describe("daemon worker supervisor monitoring", () => {
 			syncAgentPeers: vi.fn(async () => undefined),
 			broadcastHeartbeatsChanged: vi.fn(),
 			log: vi.fn(),
-		}) as { recoverWorker(worker: ExistingLaunchWorker): Promise<void> };
+		}) as {
+			recoverWorker(worker: ExistingLaunchWorker): Promise<void>;
+			isWorkerRecoveryEligible(worker: ExistingLaunchWorker): boolean;
+		};
 
 		const recovery = supervisor.recoverWorker(worker);
 		await vi.runAllTimersAsync();
@@ -867,6 +870,50 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workerLaunchTestState.spawned).toHaveLength(2);
 		expect(worker.descriptor.lifecycle).toBe("ready");
 		expect(worker.descriptor.process).toMatchObject({ pid: workerLaunchTestState.spawned[1]!.child.pid });
+		// The first failed launch adopted its generation, then the retry published
+		// another one. Its completed join handle must still be released.
+		expect(worker.recovery).toBeUndefined();
+		expect(supervisor.isWorkerRecoveryEligible(worker)).toBe(true);
+
+		// A later safe recovery is consequently admitted rather than being stranded
+		// behind the resolved first recovery promise.
+		worker.descriptor.lifecycle = "recovering";
+		const subsequentRecovery = supervisor.recoverWorker(worker);
+		await vi.runAllTimersAsync();
+		await subsequentRecovery;
+		expect(connectionCount).toBe(3);
+		expect(workerLaunchTestState.spawned).toHaveLength(2);
+		expect(worker.descriptor.lifecycle).toBe("ready");
+		expect(worker.recovery).toBeUndefined();
+	});
+
+	it("does not let a settled recovery erase a newer recovery join handle", async () => {
+		vi.useFakeTimers();
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-recovery-join-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		const worker = createExistingLaunchWorker(root, descriptorDir);
+		worker.descriptor.generation = randomUUID();
+		delete worker.descriptor.pid;
+		worker.descriptor.lifecycle = "recovering";
+		const workers = new Map<string, typeof worker>([[worker.descriptor.workerId, worker]]);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			workers,
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+		}) as { recoverWorker(worker: ExistingLaunchWorker): Promise<void> };
+
+		const oldRecovery = supervisor.recoverWorker(worker);
+		const newerRecovery = Promise.resolve();
+		worker.recovery = newerRecovery;
+		// Finish the old cycle after it has been superseded. Exact promise equality
+		// is required so its finalizer cannot clear the newer join handle.
+		worker.intentionalStop = true;
+		await vi.runAllTimersAsync();
+		await oldRecovery;
+		expect(worker.recovery).toBe(newerRecovery);
 	});
 
 	it("keeps a failed fresh launch process and ends recovery when cleanup cannot be verified", async () => {
@@ -919,6 +966,8 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await supervisor.recoverWorker(worker);
 
+		// Adopting the failed generation must release even the no-retry path.
+		expect(worker.recovery).toBeUndefined();
 		expect(stopWorker).toHaveBeenCalledOnce();
 		expect(workerLaunchTestState.spawned).toHaveLength(1);
 		expect(worker.descriptor.lifecycle).toBe("failed");

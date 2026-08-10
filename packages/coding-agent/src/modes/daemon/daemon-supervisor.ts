@@ -3409,6 +3409,13 @@ export class DaemonSupervisor {
 							return;
 						}
 						if (!this.isWorkerRecoveryCancelled(worker, generation)) {
+							// Keep diagnostics in memory until the next launch publishes a
+							// process-bearing descriptor. Persisting this processless recovery
+							// intent would make a crash-recoverable record without process
+							// identity authority.
+							worker.descriptor.consecutiveFailures++;
+							worker.descriptor.lastFailureAt = new Date().toISOString();
+							worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
 							// Cleanup proved the fresh process is gone. Keep its
 							// processless recovering state in memory and immediately
 							// proceed to the next retry; such a state is intentionally
@@ -3447,7 +3454,12 @@ export class DaemonSupervisor {
 			await this.syncAgentPeers().catch(() => undefined);
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
 		})().finally(() => {
-			if (this.matchesCurrentWorker(worker, generation) && worker.recovery === recovery) {
+			// `recovery` is only a join handle. A retry can legitimately publish a
+			// newer generation before this cycle settles, so its pre-retry generation
+			// is not release authority. The resident-object and exact-promise fences
+			// release this completed cycle without clearing a replacement worker or a
+			// newer recovery cycle that took over the join slot.
+			if (this.workers.get(worker.descriptor.workerId) === worker && worker.recovery === recovery) {
 				worker.recovery = undefined;
 			}
 		});
