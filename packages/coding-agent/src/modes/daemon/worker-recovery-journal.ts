@@ -216,11 +216,18 @@ export class WorkerRecoveryJournal {
 		const key = v2Key(record);
 		const previous = this.latest.get(key);
 		// A completion is never an admission. It must replace a *busy* v2 record
-		// for this exact operation incarnation; in particular a random/new ID must
-		// not manufacture a clear when no begin was durably observed.
+		// for this exact operation incarnation, including every immutable session
+		// and operation token field; in particular a random/new ID must not
+		// manufacture a clear when no begin was durably observed.
 		if (
 			!record.busy &&
-			(!previous || !isV2(previous) || !previous.busy || previous.operationId !== record.operationId)
+			(!previous ||
+				!isV2(previous) ||
+				!previous.busy ||
+				previous.operationId !== record.operationId ||
+				previous.operation !== record.operation ||
+				previous.sessionId !== record.sessionId ||
+				previous.sessionFile !== record.sessionFile)
 		)
 			return;
 		if (

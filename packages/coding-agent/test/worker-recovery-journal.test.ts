@@ -112,6 +112,33 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 		expect(journal.getLatest()).toEqual([]);
 	});
 
+	it("retains a busy operation across restart when a different allowed operation replays its terminal token", () => {
+		const file = path();
+		const journal = new WorkerRecoveryJournal(file);
+		journal.record({ ...base, busy: true });
+
+		// The token values match exactly; only the allowed operation differs.
+		journal.record({ ...base, busy: false, operation: "tool_execution" });
+		expect(journal.getLatest()).toEqual([
+			expect.objectContaining({
+				busy: true,
+				operation: "prompt",
+				activeSessionId: base.activeSessionId,
+				generation: generationA,
+				operationId: operationA,
+			}),
+		]);
+
+		// Replay after a crash/restart must remain unable to erase the original evidence.
+		const restarted = new WorkerRecoveryJournal(file);
+		restarted.record({ ...base, busy: false, operation: "tool_execution" });
+		expect(restarted.getLatest()).toEqual([
+			expect.objectContaining({ busy: true, operation: "prompt", operationId: operationA }),
+		]);
+		restarted.record({ ...base, busy: false });
+		expect(restarted.getLatest()).toEqual([]);
+	});
+
 	it("does not let an unstarted v2 completion manufacture a clear", () => {
 		const journal = new WorkerRecoveryJournal(path());
 		journal.record({ ...base, busy: false });
