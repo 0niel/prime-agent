@@ -518,17 +518,51 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
-export function isWorkerDescriptorProcessAlive(
+export type WorkerProcessIdentityStatus = "exited" | "match" | "mismatch" | "unknown";
+
+export interface WorkerProcessIdentityProbe {
+	status(forceIdentityCheck?: boolean): WorkerProcessIdentityStatus;
+	isAlive(forceIdentityCheck?: boolean): boolean;
+}
+
+export function createWorkerProcessIdentityProbe(
 	descriptor: Pick<DaemonWorkerDescriptor, "pid" | "processStartId">,
-): boolean {
-	if (!isProcessAlive(descriptor.pid)) {
-		return false;
-	}
-	if (!descriptor.processStartId) {
-		return true;
-	}
-	const observedProcessStartId = getProcessStartId(descriptor.pid);
-	return observedProcessStartId === undefined || observedProcessStartId === descriptor.processStartId;
+	identityPollIntervalMs = 1000,
+): WorkerProcessIdentityProbe {
+	let lastStatus: WorkerProcessIdentityStatus | undefined;
+	let nextIdentityCheckAt = 0;
+	const status = (forceIdentityCheck = false): WorkerProcessIdentityStatus => {
+		if (!isProcessAlive(descriptor.pid)) {
+			lastStatus = "exited";
+			return lastStatus;
+		}
+		if (!descriptor.processStartId) {
+			lastStatus = "unknown";
+			return lastStatus;
+		}
+		if (lastStatus === "mismatch") {
+			return lastStatus;
+		}
+		const now = Date.now();
+		if (forceIdentityCheck || lastStatus === undefined || now >= nextIdentityCheckAt) {
+			nextIdentityCheckAt = now + identityPollIntervalMs;
+			const observedProcessStartId = getProcessStartId(descriptor.pid);
+			lastStatus =
+				observedProcessStartId === undefined
+					? "unknown"
+					: observedProcessStartId === descriptor.processStartId
+						? "match"
+						: "mismatch";
+		}
+		return lastStatus;
+	};
+	return {
+		status,
+		isAlive: (forceIdentityCheck = false) => {
+			const current = status(forceIdentityCheck);
+			return current === "match" || current === "unknown";
+		},
+	};
 }
 
 function isFinalizedTranscriptEvent(eventType: string | undefined): boolean {
@@ -1644,7 +1678,10 @@ export class DaemonSupervisor {
 					return this.forwardToWorker(match.worker, command);
 				}
 				const workers = [...this.workers.values()].filter(
-					(worker) => this.isVisibleWorker(worker) && worker.descriptor.lifecycle !== "failed",
+					(worker) =>
+						this.isVisibleWorker(worker) &&
+						(worker.descriptor.lifecycle !== "failed" ||
+							(worker.heartbeatSnapshot !== undefined && worker.heartbeatSnapshotStale !== true)),
 				);
 				const heartbeats = new Map<string, AgentConnectionHeartbeat>();
 				const snapshots: Array<{ heartbeats?: AgentConnectionHeartbeat[]; response?: DaemonResponse }> =
@@ -2394,7 +2431,10 @@ export class DaemonSupervisor {
 			try {
 				// A tombstoned worker must not run long enough to elect another
 				// supervisor while its intentional stop is being adopted.
-				signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+				const identity = createWorkerProcessIdentityProbe(worker.descriptor);
+				if (identity.status(true) === "match") {
+					signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+				}
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
 				this.log(`Completed intentional stop for worker ${worker.descriptor.workerId} during supervisor adoption`);
 			} catch (error) {
@@ -4566,6 +4606,7 @@ export class DaemonSupervisor {
 		worker.transcriptCaches.clear();
 		worker.snapshotCache.clear();
 		worker.snapshotGenerations?.clear();
+		const workerProcessIdentity = directChild ? undefined : createWorkerProcessIdentityProbe(worker.descriptor);
 		if (worker.client) {
 			if (archiveSession) {
 				await worker.client
@@ -4578,29 +4619,39 @@ export class DaemonSupervisor {
 			worker.client = undefined;
 		} else if (directChild) {
 			directChild.child.kill("SIGTERM");
-		} else if (isWorkerDescriptorProcessAlive(worker.descriptor)) {
+		} else if (workerProcessIdentity?.status(true) === "match") {
 			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGTERM");
 		}
-		const isWorkerProcessAlive = () =>
+		const isWorkerProcessAlive = (forceIdentityCheck = false) =>
 			directChild
 				? directChild.child.exitCode === null && directChild.child.signalCode === null
-				: isWorkerDescriptorProcessAlive(worker.descriptor);
+				: (workerProcessIdentity?.isAlive(forceIdentityCheck) ?? false);
 		const gracefulDeadline = Date.now() + (force ? 500 : 2000);
 		while (isWorkerProcessAlive() && Date.now() < gracefulDeadline) {
 			await delay(25);
 		}
-		if (force && isWorkerProcessAlive()) {
+		if (force) {
+			let waitForForcedStop = false;
 			if (directChild) {
-				directChild.child.kill("SIGKILL");
+				if (isWorkerProcessAlive()) {
+					directChild.child.kill("SIGKILL");
+					waitForForcedStop = true;
+				}
 			} else {
-				signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+				const identityStatus = workerProcessIdentity?.status(true);
+				if (identityStatus === "match") {
+					signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+				}
+				waitForForcedStop = identityStatus === "match" || identityStatus === "unknown";
 			}
-			const forceDeadline = Date.now() + 1000;
-			while (isWorkerProcessAlive() && Date.now() < forceDeadline) {
-				await delay(25);
+			if (waitForForcedStop) {
+				const forceDeadline = Date.now() + 1000;
+				while (isWorkerProcessAlive() && Date.now() < forceDeadline) {
+					await delay(25);
+				}
 			}
 		}
-		if (isWorkerProcessAlive()) {
+		if (isWorkerProcessAlive(true)) {
 			worker.intentionalStop = worker.descriptor.stopRequestedAt !== undefined;
 			throw new Error(`Session worker ${worker.descriptor.workerId} did not stop${force ? " after SIGKILL" : ""}`);
 		}

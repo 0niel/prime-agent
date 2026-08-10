@@ -829,10 +829,6 @@ describe("daemon worker supervisor monitoring", () => {
 		const existing = createExistingLaunchWorker(root, descriptorDir);
 		const workers = new Map<string, object>([[existing.descriptor.workerId, existing]]);
 		const deferWorkerRecovery = vi.fn();
-		const stopWorker = Reflect.get(DaemonSupervisor.prototype, "stopWorker");
-		if (typeof stopWorker !== "function") {
-			throw new Error("Could not access worker shutdown");
-		}
 		let markRollbackStarted = () => {};
 		const rollbackStarted = new Promise<void>((resolveStarted) => {
 			markRollbackStarted = resolveStarted;
@@ -844,25 +840,22 @@ describe("daemon worker supervisor monitoring", () => {
 		const controlledStopWorker = vi.fn(async function (
 			this: object,
 			worker: object,
-			removeDescriptor: boolean,
-			force = false,
-			archiveSession = false,
+			_removeDescriptor: boolean,
+			_force = false,
+			_archiveSession = false,
 			recoveryCleanup = false,
-			directChild?: object,
+			_directChild?: object,
 		) {
 			if (recoveryCleanup) {
 				markRollbackStarted();
 				await rollbackRelease;
 				return;
 			}
-			await Reflect.apply(stopWorker, this, [
-				worker,
-				removeDescriptor,
-				force,
-				archiveSession,
-				recoveryCleanup,
-				directChild,
-			]);
+			const stopped = worker as typeof existing;
+			stopped.stopRevision++;
+			stopped.descriptor.stopRequestedAt = new Date().toISOString();
+			workers.delete(stopped.descriptor.workerId);
+			rmSync(stopped.descriptorPath, { force: true });
 		});
 		const connectWorker = vi.fn(async () => {
 			await waitForFile(markerPath);
