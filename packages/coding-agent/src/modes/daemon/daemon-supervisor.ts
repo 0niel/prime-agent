@@ -256,6 +256,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+type WorkerProcessIdentityState = "exact" | "dead" | "recycled" | "unreadable";
+
 interface ResidentWorker {
 	/** Normalized, generation-bearing runtime state; reader compatibility never escapes loading. */
 	descriptor: ResidentDaemonWorkerDescriptor;
@@ -2854,11 +2856,36 @@ export class DaemonSupervisor {
 		}
 	}
 
-	/** C01 process fence: legacy descriptor fields are deliberately never signal authority. */
-	private workerProcessIdentity(worker: ResidentWorker): ProcessIdentity | undefined {
-		if (worker.quarantined) return undefined;
+	/**
+	 * C01 process fence. A missing start-id observation is deliberately not a
+	 * death observation: process metadata can be transiently unreadable while a
+	 * just-started worker is still live. Only ESRCH independently proves death.
+	 */
+	private classifyWorkerProcessIdentity(worker: ResidentWorker): WorkerProcessIdentityState {
+		if (worker.quarantined) return "unreadable";
 		const identity = worker.descriptor.process;
-		return identity && isCurrentProcessIdentity(identity) ? identity : undefined;
+		if (
+			!identity ||
+			!Number.isInteger(identity.pid) ||
+			identity.pid <= 0 ||
+			!identity.processStartId
+		) {
+			return "unreadable";
+		}
+		let observedProcessStartId: string | undefined;
+		try {
+			observedProcessStartId = getProcessStartId(identity.pid);
+		} catch {
+			return "unreadable";
+		}
+		if (observedProcessStartId === identity.processStartId) return "exact";
+		if (observedProcessStartId !== undefined) return "recycled";
+		try {
+			process.kill(identity.pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return "dead";
+		}
+		return "unreadable";
 	}
 
 	private matchesCurrentWorker(worker: ResidentWorker, generation: string): boolean {
@@ -2871,23 +2898,28 @@ export class DaemonSupervisor {
 		return this.matchesCurrentWorker(worker, generation) && (client === undefined || worker.client === client);
 	}
 
-	private signalTrackedWorker(worker: ResidentWorker, generation: string, signal: NodeJS.Signals): boolean {
+	private signalTrackedWorkerState(
+		worker: ResidentWorker,
+		generation: string,
+		signal: NodeJS.Signals,
+	): WorkerProcessIdentityState {
 		if (!this.matchesCurrentWorker(worker, generation)) {
 			this.log(`Refusing ${signal}: stale worker generation for ${worker.descriptor.workerId}`);
-			return false;
+			return "unreadable";
 		}
-		const identity = this.workerProcessIdentity(worker);
-		if (!identity) {
-			this.log(`Refusing ${signal}: unverified process identity for ${worker.descriptor.workerId}`);
-			return false;
+		// Re-read immediately before signaling. In particular, an unreadable
+		// process-start value never becomes permission to signal or finalize.
+		const state = this.classifyWorkerProcessIdentity(worker);
+		if (state !== "exact") {
+			this.log(`Refusing ${signal}: ${state} process identity for ${worker.descriptor.workerId}`);
+			return state;
 		}
-		// Re-read immediately before signaling; PID reuse must be fail-closed.
-		if (!isCurrentProcessIdentity(identity)) {
-			this.log(`Refusing ${signal}: process identity changed for ${worker.descriptor.workerId}`);
-			return false;
-		}
-		signalProcessGroupOrProcess(identity.pid, signal);
-		return true;
+		signalProcessGroupOrProcess(worker.descriptor.process!.pid, signal);
+		return state;
+	}
+
+	private signalTrackedWorker(worker: ResidentWorker, generation: string, signal: NodeJS.Signals): boolean {
+		return this.signalTrackedWorkerState(worker, generation, signal) === "exact";
 	}
 
 	private async adoptOrRecoverWorker(worker: ResidentWorker): Promise<void> {
@@ -5433,29 +5465,41 @@ export class DaemonSupervisor {
 			worker.client = undefined;
 		} else if (directChild) {
 			directChild.child.kill("SIGTERM");
-		} else if (!processless && isProcessAlive(worker.descriptor.process!.pid)) {
-			this.signalTrackedWorker(worker, worker.descriptor.generation ?? "", "SIGTERM");
+		} else if (!processless) {
+			this.signalTrackedWorkerState(worker, worker.descriptor.generation, "SIGTERM");
 		}
-		const isWorkerProcessAlive = () =>
+		const processIdentityFailure = (state: WorkerProcessIdentityState) =>
+			new Error(
+				`Session worker ${worker.descriptor.workerId} process identity is ${state}; retaining stop tombstone for retry`,
+			);
+		const workerProcessState = (): WorkerProcessIdentityState =>
 			directChild
 				? directChild.child.exitCode === null && directChild.child.signalCode === null
-				: !processless && this.workerProcessIdentity(worker) !== undefined;
-		const gracefulDeadline = Date.now() + (force ? 500 : 2000);
-		while (isWorkerProcessAlive() && Date.now() < gracefulDeadline) {
-			await delay(25);
-		}
-		if (force && isWorkerProcessAlive()) {
+					? "exact"
+					: "dead"
+				: processless
+					? "dead"
+					: this.classifyWorkerProcessIdentity(worker);
+		const waitForWorkerStop = async (deadline: number): Promise<WorkerProcessIdentityState> => {
+			let state = workerProcessState();
+			while (state === "exact" && Date.now() < deadline) {
+				await delay(25);
+				state = workerProcessState();
+			}
+			if (state === "unreadable") throw processIdentityFailure(state);
+			return state;
+		};
+		let processState = await waitForWorkerStop(Date.now() + (force ? 500 : 2000));
+		if (force && processState === "exact") {
 			if (directChild) {
 				directChild.child.kill("SIGKILL");
 			} else {
-				this.signalTrackedWorker(worker, worker.descriptor.generation ?? "", "SIGKILL");
+				const signalState = this.signalTrackedWorkerState(worker, worker.descriptor.generation, "SIGKILL");
+				if (signalState === "unreadable") throw processIdentityFailure(signalState);
 			}
-			const forceDeadline = Date.now() + 1000;
-			while (isWorkerProcessAlive() && Date.now() < forceDeadline) {
-				await delay(25);
-			}
+			processState = await waitForWorkerStop(Date.now() + 1000);
 		}
-		if (isWorkerProcessAlive()) {
+		if (processState === "exact") {
 			worker.intentionalStop = worker.descriptor.stopRequestedAt !== undefined;
 			throw new Error(`Session worker ${worker.descriptor.workerId} did not stop${force ? " after SIGKILL" : ""}`);
 		}

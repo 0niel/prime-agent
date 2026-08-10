@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const processState = vi.hoisted(() => ({ startId: "start-a" as string | undefined }));
+const processState = vi.hoisted(() => ({
+	startId: "start-a" as string | undefined,
+	unreadableAfterSignal: false,
+}));
 const signals = vi.hoisted(() => [] as Array<{ pid: number; signal: NodeJS.Signals }>);
 
 vi.mock("../src/core/session-lease.js", async (importOriginal) => {
@@ -12,7 +15,10 @@ vi.mock("../src/utils/child-process.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../src/utils/child-process.js")>();
 	return {
 		...actual,
-		signalProcessGroupOrProcess: (pid: number, signal: NodeJS.Signals) => signals.push({ pid, signal }),
+		signalProcessGroupOrProcess: (pid: number, signal: NodeJS.Signals) => {
+		signals.push({ pid, signal });
+		if (processState.unreadableAfterSignal) processState.startId = undefined;
+	},
 	};
 });
 
@@ -23,6 +29,7 @@ const generationB = "22222222-2222-4222-8222-222222222222";
 
 afterEach(() => {
 	processState.startId = "start-a";
+	processState.unreadableAfterSignal = false;
 	signals.splice(0);
 });
 
@@ -37,6 +44,39 @@ function supervisorFor(target: ReturnType<typeof worker>) {
 		workers: new Map([["worker", target]]),
 		log: vi.fn(),
 	}) as DaemonSupervisor;
+}
+
+function stopWorkerFixture() {
+	const target = {
+		descriptor: {
+			workerId: "worker",
+			generation: generationA,
+			lifecycle: "ready",
+			process: { pid: 4321, processStartId: "start-a" },
+		},
+		descriptorPath: "/descriptor/worker.json",
+		summaries: new Map(),
+		snapshotCache: new Map(),
+		transcriptCaches: new Map(),
+		snapshotGenerations: new Map(),
+		intentionalStop: false,
+		stopRevision: 0,
+	} as any;
+	const persistWorker = vi.fn();
+	const deleteWorkerDescriptor = vi.fn();
+	const supervisor = Object.assign(supervisorFor(target), {
+		persistWorker,
+		persistWorkerStopTombstone: vi.fn((resident: typeof target, archiveSession = false) => {
+			resident.intentionalStop = true;
+			resident.descriptor.stopRequestedAt ??= new Date().toISOString();
+			resident.descriptor.archiveOnStop ||= archiveSession;
+			persistWorker(resident);
+		}),
+		deleteWorkerDescriptor,
+		syncAgentPeers: vi.fn(async () => undefined),
+		broadcastHeartbeatsChanged: vi.fn(),
+	}) as any;
+	return { supervisor, target, persistWorker, deleteWorkerDescriptor };
 }
 
 describe("daemon supervisor C01 process identity fencing", () => {
@@ -92,6 +132,42 @@ describe("daemon supervisor C01 process identity fencing", () => {
 		const supervisor = supervisorFor(target) as any;
 		expect(supervisor.signalTrackedWorker(target, generationA, "SIGKILL")).toBe(false);
 		expect(signals).toEqual([]);
+	});
+
+	it("retains a stop tombstone when a live worker becomes transiently unreadable after signaling", async () => {
+		const { supervisor, target, deleteWorkerDescriptor } = stopWorkerFixture();
+		const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+		try {
+			// The immediate pre-signal reread is exact; the next reread loses
+			// start-id visibility, modeling a transient process-start lookup failure.
+			processState.unreadableAfterSignal = true;
+			await expect(supervisor.stopWorker(target, true, true)).rejects.toThrow("process identity is unreadable");
+			expect(target.descriptor.stopRequestedAt).toEqual(expect.any(String));
+			expect(supervisor.workers.get("worker")).toBe(target);
+			expect(target.stopFinalized).toBeUndefined();
+			expect(deleteWorkerDescriptor).not.toHaveBeenCalled();
+			expect(signals).toEqual([{ pid: 4321, signal: "SIGTERM" }]);
+
+			// A later exact observation may complete cleanup. This simulates the
+			// original PID having exited and then being observably recycled.
+			processState.unreadableAfterSignal = false;
+			processState.startId = "reused";
+			await expect(supervisor.stopWorker(target, true, true)).resolves.toBeUndefined();
+			expect(target.stopFinalized).toBe(true);
+			expect(deleteWorkerDescriptor).toHaveBeenCalledWith(target);
+		} finally {
+			kill.mockRestore();
+		}
+	});
+
+	it("finalizes a verified recycled PID without signaling it", async () => {
+		const { supervisor, target, deleteWorkerDescriptor } = stopWorkerFixture();
+		processState.startId = "reused";
+		await expect(supervisor.stopWorker(target, true, true)).resolves.toBeUndefined();
+		expect(signals).toEqual([]);
+		expect(target.stopFinalized).toBe(true);
+		expect(supervisor.workers.has("worker")).toBe(false);
+		expect(deleteWorkerDescriptor).toHaveBeenCalledWith(target);
 	});
 
 	it("uses a new generation for a later launch incarnation", () => {
