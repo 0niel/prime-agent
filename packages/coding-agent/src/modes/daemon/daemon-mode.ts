@@ -410,6 +410,7 @@ type PassiveRlmSubagent = PassiveRlmRoot & {
 interface RecoveryOperationToken {
 	operation: WorkerRecoveryOperation;
 	identity: OperationIdentity;
+	sequence: number;
 }
 
 class RuntimeOpenCancelledError extends Error {}
@@ -547,6 +548,7 @@ export class AgentDaemon {
 		{ pending: RecoveryOperationToken[]; active: RecoveryOperationToken[][] }
 	>();
 	private readonly recoveryEventOperations = new WeakMap<ActiveSessionState, Map<string, RecoveryOperationToken[]>>();
+	private recoveryOperationSequence = 0;
 	private readonly workerGeneration: string;
 
 	constructor(
@@ -6566,7 +6568,7 @@ export class AgentDaemon {
 		operation: WorkerRecoveryOperation,
 		identity: OperationIdentity = { operationId: randomUUID(), generation: this.workerGeneration },
 	): RecoveryOperationToken {
-		const token: RecoveryOperationToken = { operation, identity };
+		const token: RecoveryOperationToken = { operation, identity, sequence: ++this.recoveryOperationSequence };
 		this.writeWorkerRecoveryOperation(state, token, true);
 		return token;
 	}
@@ -6593,6 +6595,20 @@ export class AgentDaemon {
 		} catch (error) {
 			this.log(`could not checkpoint worker operation state: ${String(error)}`);
 		}
+	}
+
+	private republishCurrentWorkerRecoveryOperation(state: ActiveSessionState): void {
+		let current: RecoveryOperationToken | undefined;
+		const consider = (token: RecoveryOperationToken | undefined): void => {
+			if (token && (!current || token.sequence > current.sequence)) current = token;
+		};
+		for (const frame of this.recoveryTurnsFor(state).active) {
+			for (const token of frame) consider(token);
+		}
+		for (const queue of this.recoveryEventOperations.get(state)?.values() ?? []) {
+			consider(queue.at(-1));
+		}
+		if (current) this.writeWorkerRecoveryOperation(state, current, true);
 	}
 
 	private recoveryTurnsFor(state: ActiveSessionState): {
@@ -6643,17 +6659,9 @@ export class AgentDaemon {
 		if (!removed) return;
 		this.completeWorkerRecoveryOperation(state, token);
 
-		// Completing the most recently journaled token would otherwise leave the
-		// one-record journal clear even though an enclosing active turn remains
-		// live. Republish that frame's actual current token, never a synthesized
-		// replacement or a pending future turn.
-		for (let frameIndex = turns.active.length - 1; frameIndex >= 0; frameIndex--) {
-			const current = turns.active[frameIndex].at(-1);
-			if (current) {
-				this.writeWorkerRecoveryOperation(state, current, true);
-				break;
-			}
-		}
+		// Completing the latest token must not erase another exact operation that
+		// is still active in this worker attempt.
+		this.republishCurrentWorkerRecoveryOperation(state);
 	}
 
 	private checkpointWorkerRecoveryEvent(state: ActiveSessionState, operation: WorkerRecoveryOperation): void {
@@ -6663,6 +6671,7 @@ export class AgentDaemon {
 			// Preserve the fsync evidence without stranding a permanent busy record.
 			const token = this.beginWorkerRecoveryOperation(state, operation);
 			this.completeWorkerRecoveryOperation(state, token);
+			this.republishCurrentWorkerRecoveryOperation(state);
 			return;
 		}
 		const [, family, edge] = match;
@@ -6677,7 +6686,7 @@ export class AgentDaemon {
 				// A nested B terminal must not erase still-active A crash evidence.
 				// Complete B first (with B's immutable token), then republish the
 				// parent frame's existing token(s), never a synthesized identity.
-				for (const token of turns.active.at(-1) ?? []) this.writeWorkerRecoveryOperation(state, token, true);
+				this.republishCurrentWorkerRecoveryOperation(state);
 			}
 			return;
 		}
@@ -6692,9 +6701,8 @@ export class AgentDaemon {
 		else {
 			const token = queue.pop();
 			if (token) this.completeWorkerRecoveryOperation(state, token);
-			// Preserve the exact outer event while its nested event has ended.
-			const parent = queue.at(-1);
-			if (parent) this.writeWorkerRecoveryOperation(state, parent, true);
+			// Preserve the newest exact operation still active across every family.
+			this.republishCurrentWorkerRecoveryOperation(state);
 		}
 	}
 
@@ -6713,7 +6721,11 @@ export class AgentDaemon {
 			operationId: operationIdentity?.operationId ?? exactIdentity?.operationId ?? randomUUID(),
 			generation: this.workerGeneration,
 		};
-		const token: RecoveryOperationToken = { operation: exactIdentity?.operation ?? operation, identity };
+		const token: RecoveryOperationToken = {
+			operation: exactIdentity?.operation ?? operation,
+			identity,
+			sequence: ++this.recoveryOperationSequence,
+		};
 		if (busyOverride === false) this.completeWorkerRecoveryOperation(state, token);
 		else this.beginWorkerRecoveryOperation(state, token.operation, token.identity);
 		return { operation: token.operation, operationId: token.identity.operationId };

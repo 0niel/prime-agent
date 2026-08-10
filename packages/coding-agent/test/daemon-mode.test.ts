@@ -385,6 +385,57 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("republishes active recovery evidence after instantaneous observations", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-observation-recovery-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-observation-recovery.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state.runtime, { session: { sessionId: "session" } });
+			const internals = daemon as unknown as {
+				beginWorkerRecoveryOperation(state: ActiveSessionState, operation: "prompt"): unknown;
+				queueWorkerRecoveryTurn(state: ActiveSessionState, token: unknown): void;
+				checkpointWorkerRecoveryEvent(
+					state: ActiveSessionState,
+					event:
+						| "turn_start"
+						| "turn_end"
+						| "tool_execution_start"
+						| "tool_execution_end"
+						| "session_action_update"
+						| "rlm_child_update",
+				): void;
+			};
+			const prompt = internals.beginWorkerRecoveryOperation(state, "prompt");
+			internals.queueWorkerRecoveryTurn(state, prompt);
+			internals.checkpointWorkerRecoveryEvent(state, "turn_start");
+			internals.checkpointWorkerRecoveryEvent(state, "tool_execution_start");
+
+			for (const observation of ["session_action_update", "rlm_child_update"] as const) {
+				internals.checkpointWorkerRecoveryEvent(state, observation);
+				expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+					busy: true,
+					operation: "tool_execution_start",
+				});
+			}
+
+			internals.checkpointWorkerRecoveryEvent(state, "tool_execution_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("uses the worker generation for ready and terminal recovery records", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-worker-generation-"));
 		const journalPath = join(root, "worker-recovery.jsonl");
