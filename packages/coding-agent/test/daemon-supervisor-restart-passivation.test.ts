@@ -19,6 +19,8 @@ interface WorkerFixture {
 	summaries: Map<string, unknown>;
 	client?: object;
 	wake?: Promise<void>;
+	stop?: Promise<void>;
+	stopFinalized?: boolean;
 }
 
 interface SupervisorInternals {
@@ -26,8 +28,9 @@ interface SupervisorInternals {
 	loadWorkerDescriptors(): Promise<void>;
 	wakePassivatedWorker(worker: WorkerFixture): Promise<void>;
 	forwardToWorker(worker: WorkerFixture, command: object): Promise<unknown>;
-	stopWorker(worker: WorkerFixture, removeDescriptor: boolean): Promise<void>;
+	stopWorker(worker: WorkerFixture, removeDescriptor: boolean, force?: boolean, archiveSession?: boolean): Promise<void>;
 	recoverWorker: ReturnType<typeof vi.fn>;
+	catalog: { archive(sessionFile: string, sessionId: string): Promise<void> };
 }
 
 function fixtureRoot(): {
@@ -439,6 +442,60 @@ describe("daemon supervisor restart passivation", () => {
 			kill.mockRestore();
 		}
 	});
+	it("fences a concurrent explicit wake until passive stop archive/delete finalizes", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const worker = {
+			descriptor: (() => {
+				const { pid: _pid, processStartId: _processStartId, ...passivated } = descriptor(fixture, "stop-wake-race", session);
+				return { ...passivated, lifecycle: "passivated" as const };
+			})(),
+			descriptorPath: join(fixture.descriptorDir, "stop-wake-race.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
+		supervisor.workers.set("stop-wake-race", worker);
+		let finishArchive: () => void = () => undefined;
+		const archiveStarted = new Promise<void>((resolve) => {
+			supervisor.catalog.archive = vi.fn(async () => {
+				resolve();
+				await new Promise<void>((finish) => {
+					finishArchive = finish;
+				});
+			});
+		});
+		supervisor.recoverWorker = vi.fn();
+
+		const stopping = supervisor.stopWorker(worker, true, false, true);
+		await archiveStarted;
+		const concurrentStop = supervisor.stopWorker(worker, true, false, true);
+		let wakeSettled = false;
+		const waking = supervisor.wakePassivatedWorker(worker).finally(() => {
+			wakeSettled = true;
+		});
+		await Promise.resolve();
+		expect(wakeSettled).toBe(false);
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+		expect(supervisor.catalog.archive).toHaveBeenCalledTimes(1);
+
+		finishArchive();
+		await Promise.all([stopping, concurrentStop]);
+		await expect(waking).rejects.toThrow("was stopped");
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+		expect(supervisor.workers.has("stop-wake-race")).toBe(false);
+		expect(() => readFileSync(worker.descriptorPath)).toThrow();
+	});
+
 	it("recovers rather than passivating malformed or stale durable task verdicts", async () => {
 		const fixture = fixtureRoot();
 		const malformed = persistSession(fixture.sessionDir, fixture.root, "completed");
