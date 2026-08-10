@@ -75,24 +75,46 @@ function statMetadataIfPresent(path: string): { mode: number; uid: number; gid: 
 	}
 }
 
-/** Write a buffer completely: Node's synchronous write may still make short progress. */
-function writeAllSync(fd: number, bytes: Buffer): void {
-	let offset = 0;
-	while (offset < bytes.length) {
-		const written = writeSync(fd, bytes, offset, bytes.length - offset);
-		if (written <= 0) throw new Error("Session persistence made no write progress");
-		offset += written;
-	}
-}
+/**
+ * Private persistence cut points. They are intentionally narrower than fs: the
+ * only supported test fault injections are the five durability boundaries C03
+ * relies upon. Production always uses the synchronous Node primitives below.
+ */
+type SessionDurabilityIo = {
+	writeAll(fd: number, bytes: Buffer): void;
+	fileFsync(fd: number): void;
+	tempFsync(fd: number): void;
+	rename(tempPath: string, targetPath: string): void;
+	directoryFsync(directory: string): void;
+};
 
-function fsyncDirectorySync(directory: string): void {
-	const fd = openSync(directory, "r");
-	try {
+const productionSessionDurabilityIo: SessionDurabilityIo = {
+	writeAll(fd, bytes) {
+		let offset = 0;
+		while (offset < bytes.length) {
+			const written = writeSync(fd, bytes, offset, bytes.length - offset);
+			if (written <= 0) throw new Error("Session persistence made no write progress");
+			offset += written;
+		}
+	},
+	fileFsync(fd) {
 		fsyncSync(fd);
-	} finally {
-		closeSync(fd);
-	}
-}
+	},
+	tempFsync(fd) {
+		fsyncSync(fd);
+	},
+	rename(tempPath, targetPath) {
+		renameSync(tempPath, targetPath);
+	},
+	directoryFsync(directory) {
+		const fd = openSync(directory, "r");
+		try {
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+	},
+};
 
 export interface SessionHeader {
 	type: "session";
@@ -1242,6 +1264,22 @@ async function listSessionsFromDir(
  * handles compaction summaries and follows the path from root to current leaf.
  */
 export class SessionManager {
+	private static durabilityIo: SessionDurabilityIo = productionSessionDurabilityIo;
+
+	/**
+	 * Test-only, process-local C03 durability seam. This is deliberately not
+	 * exported from the package surface; callers get a restore closure so a cut
+	 * cannot leak into another test or into a later retry.
+	 */
+	// biome-ignore lint/correctness/noUnusedPrivateClassMembers: tests invoke the deliberately private seam through a narrowed cast.
+	private static _setDurabilityIoForTest(overrides: Partial<SessionDurabilityIo>): () => void {
+		const previous = SessionManager.durabilityIo;
+		SessionManager.durabilityIo = { ...previous, ...overrides };
+		return () => {
+			SessionManager.durabilityIo = previous;
+		};
+	}
+
 	private sessionId: string = "";
 	private sessionFile: string | undefined;
 	private sessionDir: string;
@@ -1411,17 +1449,17 @@ export class SessionManager {
 			const metadata = statMetadataIfPresent(targetPath);
 			const fd = openSync(tempPath, "wx", metadata?.mode ?? 0o600);
 			try {
-				writeAllSync(fd, bytes);
+				SessionManager.durabilityIo.writeAll(fd, bytes);
 				if (metadata !== undefined) {
 					chownSync(tempPath, metadata.uid, metadata.gid);
 					chmodSync(tempPath, metadata.mode);
 				}
-				fsyncSync(fd);
+				SessionManager.durabilityIo.tempFsync(fd);
 			} finally {
 				closeSync(fd);
 			}
-			renameSync(tempPath, targetPath);
-			fsyncDirectorySync(directory);
+			SessionManager.durabilityIo.rename(tempPath, targetPath);
+			SessionManager.durabilityIo.directoryFsync(directory);
 		} finally {
 			rmSync(tempPath, { force: true });
 		}
@@ -1896,8 +1934,8 @@ export class SessionManager {
 			} else {
 				const fd = openSync(file, "a");
 				try {
-					writeAllSync(fd, Buffer.from(`${JSON.stringify(entry)}\n`));
-					fsyncSync(fd);
+					SessionManager.durabilityIo.writeAll(fd, Buffer.from(`${JSON.stringify(entry)}\n`));
+					SessionManager.durabilityIo.fileFsync(fd);
 				} finally {
 					closeSync(fd);
 				}
