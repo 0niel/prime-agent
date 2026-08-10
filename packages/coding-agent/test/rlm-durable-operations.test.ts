@@ -755,4 +755,56 @@ describe("RLM durable operation store", () => {
 			}),
 		).toBe("already_materialized");
 	});
+	it("retains a live exact delete intent until terminal, then deletes and discards without materialization", () => {
+		const f = fixture();
+		const store = openRlmDurableOperationStore(f.parentArtifacts, { trustedChildRecoveryRoots: trustedRoots(f) });
+		store.admit(f.admission);
+		materialize(store, f);
+		expect(
+			store.recordDeleteIntent({ parentSessionId: parentId, assignmentId: assignment, operationId: operation }),
+		).toBe(true);
+		expect(
+			store.recordRelease(
+				{ parentSessionId: parentId, assignmentId: assignment, operationId: operation },
+				"deleted",
+			),
+		).toBe(false);
+		store.appendOutbox(outbox(f, "cancelled"));
+		expect(
+			store.recordTerminal({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				deliveryId: delivery,
+				terminal: "cancelled",
+			}),
+		).toBe(true);
+		expect(
+			store.recordRelease(
+				{ parentSessionId: parentId, assignmentId: assignment, operationId: operation },
+				"deleted",
+			),
+		).toBe(true);
+		expect(store.importPendingOutboxes()).toBe(1);
+		expect(store.pendingInbox()).toHaveLength(1);
+		expect(
+			store.markDiscardedDelivery({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				deliveryId: delivery,
+				reason: "deleted",
+			}),
+		).toBe("new");
+		const registry = store.rebuild();
+		expect(registry.operations.get(JSON.stringify([parentId, assignment, operation]))).toMatchObject({
+			lifecycle: "deleted",
+			deleteIntent: true,
+		});
+		expect(
+			registry.deliveries.get(JSON.stringify([JSON.stringify([parentId, assignment, operation]), delivery])),
+		).toMatchObject({
+			consumed: "discarded",
+		});
+	});
 });

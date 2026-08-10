@@ -4625,7 +4625,14 @@ export class AgentSession {
 	 * C03's no-prompt persistence seam. It deliberately appends an ordinary custom
 	 * session message and emits ordinary message events; it never schedules a turn.
 	 */
-	async appendDurableRlmTerminalMessage(message: RlmTerminalMessage, deliveryId: string): Promise<boolean> {
+	async appendDurableRlmTerminalMessage(
+		message: RlmTerminalMessage,
+		deliveryId: string,
+		current: () => boolean = () => true,
+	): Promise<boolean> {
+		// The daemon supplies the complete parent/child incarnation fence. Check at
+		// the immediate mutation seam rather than only before awaiting this method.
+		if (!current()) return false;
 		const id = materializedTerminalMessageId(deliveryId);
 		const hasId = (candidate: unknown): boolean =>
 			typeof candidate === "object" &&
@@ -10300,7 +10307,22 @@ export class AgentSession {
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
-				if (!run.detachedDeletion) {
+				// A live explicit deletion still needs its exact cancellation hand-off:
+				// the daemon's durable delete intent turns it into deleted/discarded.
+				// Do not suppress this merely because UI cleanup is detached.
+				if (
+					run.status === "cancelled" &&
+					(!run.detachedDeletion || this._subagentRuntimeHost?.assignmentIdentityFenced)
+				) {
+					await deliverTerminalMessageToParent(
+						createRlmChildTerminalNoticeMessage({
+							kind: "cancelled",
+							childId: run.id,
+							sessionName,
+							reason: run.error,
+						}),
+					);
+				} else if (!run.detachedDeletion) {
 					if (run.status === "error") {
 						await deliverTerminalMessageToParent(
 							createRlmChildFailureMessage({

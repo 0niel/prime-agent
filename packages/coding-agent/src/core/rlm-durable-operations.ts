@@ -88,7 +88,7 @@ export interface RlmOperationTerminalRecordedRecord {
 }
 export interface RlmOperationReleasedRecord {
 	version: 1;
-	type: "released" | "deleted";
+	type: "delete_intent" | "released" | "deleted";
 	parentSessionId: string;
 	assignmentId: string;
 	operationId: string;
@@ -207,7 +207,9 @@ export interface RlmDurableOperation {
 	childArtifactDir?: string;
 	childArtifactRoot?: string;
 	terminal?: RlmChildTerminalStatus;
-	lifecycle: "admitted" | "materialized" | "terminal_recorded" | "released" | "deleted";
+	lifecycle: "admitted" | "materialized" | "delete_intent" | "terminal_recorded" | "released" | "deleted";
+	/** A live explicit deletion is durably retained until its terminal hand-off can be deleted. */
+	deleteIntent: boolean;
 	uncertain: boolean;
 }
 export interface RlmDurableDelivery {
@@ -243,6 +245,8 @@ export interface RlmDurableOperationStore {
 	importPendingOutboxes(): number;
 	/** Owner-only pending bodies, after durable inbox reduction. */
 	pendingInbox(): readonly RlmTerminalInboxRecord[];
+	/** Exact-key live-delete fence, retained through cancellation until terminal hand-off. */
+	recordDeleteIntent(input: Pick<RlmOperationTerminal, "parentSessionId" | "assignmentId" | "operationId">): boolean;
 	/** Exact-key terminal-only lifecycle transition for daemon adapters. */
 	recordRelease(
 		input: Pick<RlmOperationTerminal, "parentSessionId" | "assignmentId" | "operationId">,
@@ -438,7 +442,7 @@ class Store implements RlmDurableOperationStore {
 		if (
 			!operation ||
 			operation.uncertain ||
-			operation.lifecycle !== "materialized" ||
+			(operation.lifecycle !== "materialized" && operation.lifecycle !== "delete_intent") ||
 			!operation.childSessionFile ||
 			operation.deliveryId !== input.deliveryId
 		)
@@ -570,6 +574,26 @@ class Store implements RlmDurableOperationStore {
 		const registry = this.reduce();
 		this.writeIndex(registry); // cache failure cannot undo an fsynced authority append.
 		return registry;
+	}
+
+	/** Durable exact-key delete request for a live operation. It is not completion. */
+	recordDeleteIntent(input: Pick<RlmOperationTerminal, "parentSessionId" | "assignmentId" | "operationId">): boolean {
+		assertOperationInput(input);
+		const operation = this.reduce().operations.get(
+			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
+		);
+		if (!operation || operation.uncertain) return false;
+		if (operation.lifecycle === "deleted") return true;
+		if (operation.deleteIntent) return true;
+		if (
+			operation.lifecycle !== "admitted" &&
+			operation.lifecycle !== "materialized" &&
+			operation.lifecycle !== "terminal_recorded"
+		)
+			return false;
+		this.append(this.path(LEDGER), { version: 1, type: "delete_intent", ...input, recordedAt: this.now() });
+		this.afterAppend();
+		return true;
 	}
 
 	/** Releases/deletes are deliberately internal helpers for later host integration. */
@@ -815,6 +839,7 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 				rlmDepth: record.rlmDepth,
 				rlmMaxDepth: record.rlmMaxDepth,
 				lifecycle: "admitted",
+				deleteIntent: false,
 				uncertain: false,
 			});
 		} else if (!sameAdmitted(existing, record)) markOperationUncertain(existing, registry, "conflicting admission");
@@ -854,7 +879,7 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 	if (raw.type === "terminal_recorded") {
 		if (
 			!validTerminalRecorded(raw) ||
-			operation.lifecycle !== "materialized" ||
+			(operation.lifecycle !== "materialized" && operation.lifecycle !== "delete_intent") ||
 			!operation.childSessionFile ||
 			raw.deliveryId !== operation.deliveryId
 		) {
@@ -866,6 +891,25 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 			operation.lifecycle = "terminal_recorded";
 		} else if (operation.terminal !== raw.terminal)
 			markOperationUncertain(operation, registry, "conflicting terminal");
+		return;
+	}
+	if (raw.type === "delete_intent") {
+		if (!validDeleteIntent(raw)) {
+			markOperationUncertain(operation, registry, "invalid delete intent");
+			return;
+		}
+		if (operation.lifecycle === "deleted") return;
+		if (operation.deleteIntent) return;
+		if (
+			operation.lifecycle !== "admitted" &&
+			operation.lifecycle !== "materialized" &&
+			operation.lifecycle !== "terminal_recorded"
+		) {
+			markOperationUncertain(operation, registry, "delete intent after release");
+			return;
+		}
+		operation.deleteIntent = true;
+		if (operation.lifecycle !== "terminal_recorded") operation.lifecycle = "delete_intent";
 		return;
 	}
 	if (raw.type === "released" || raw.type === "deleted") {
@@ -1356,6 +1400,14 @@ function validMaterialized(value: Record<string, unknown>): value is Record<stri
 		["childSessionFile", "childSessionRoot", "childArtifactDir", "childArtifactRoot"].every(
 			(key) => typeof value[key] === "string" && isAbsolute(value[key] as string),
 		) &&
+		validStamped(value)
+	);
+}
+function validDeleteIntent(value: Record<string, unknown>): boolean {
+	return (
+		exactKeys(value, ["version", "type", "parentSessionId", "assignmentId", "operationId", "recordedAt"]) &&
+		hasOperationIdentity(value) &&
+		value.type === "delete_intent" &&
 		validStamped(value)
 	);
 }

@@ -1522,11 +1522,15 @@ describe("daemon mode helpers", () => {
 			const childBSessionFile = childBManager.getSessionFile();
 			if (!childBSessionFile) throw new Error("Missing B session file");
 			const assignmentB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+			const operationB = "bbbbbbbb-bbbb-4bbb-8bbb-000000000010";
+			const deliveryB = "bbbbbbbb-bbbb-4bbb-8bbb-000000000020";
 			writeFileSync(
 				registryPath,
 				`${JSON.stringify(a)}\n${JSON.stringify({
 					...a,
 					assignmentId: assignmentB,
+					operationId: operationB,
+					deliveryId: deliveryB,
 					sessionName: "reused-B",
 					sessionDir: childBSessionDir,
 					sessionFile: childBSessionFile,
@@ -1534,6 +1538,19 @@ describe("daemon mode helpers", () => {
 					status: "completed",
 					createdAt: 3,
 					updatedAt: "2026-01-01T00:00:03.000Z",
+				})}\n${JSON.stringify({
+					...a,
+					assignmentId: assignmentB,
+					operationId: operationB,
+					// A corrupt late partial must never replace B for hydrate/delete.
+					deliveryId: undefined,
+					sessionName: "partial-late-A",
+					sessionDir: childBSessionDir,
+					sessionFile: childBSessionFile,
+					parentSessionId: childBManager.getSessionId(),
+					status: "completed",
+					createdAt: 4,
+					updatedAt: "2026-01-01T00:00:04.000Z",
 				})}\n`,
 			);
 			const internals = fixture.daemon as unknown as {
@@ -11123,7 +11140,7 @@ describe("C03 durable daemon publication", () => {
 			expect(fixture.createRuntime).toHaveBeenCalledTimes(factoryCallsBeforeWake + 1);
 			const append = restartedParent.runtime.session.appendDurableRlmTerminalMessage as ReturnType<typeof vi.fn>;
 			expect(append).toHaveBeenCalledTimes(1);
-			expect(append).toHaveBeenCalledWith(message, deliveryId);
+			expect(append).toHaveBeenCalledWith(message, deliveryId, expect.any(Function));
 			expect(
 				store
 					.rebuild()

@@ -178,6 +178,7 @@ import {
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
+import { assertRlmRegistryWriteIdentity, classifyRlmRegistryIdentity } from "./daemon-rlm-registry-identity.js";
 import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import {
 	buildRlmChildSnapshots,
@@ -938,34 +939,40 @@ export class AgentDaemon {
 		return join(artifactDir, RLM_SUBAGENT_REGISTRY_FILE);
 	}
 
-	private rlmAssignmentKey(entry: Pick<PersistedRlmSubagentRegistryEntry, "childId" | "assignmentId">): string {
-		// Missing assignment is a legacy display identity and is deliberately never
-		// equal to a C01 UUID callback identity.
-		return `${entry.childId}\u0000${entry.assignmentId ?? "legacy"}`;
+	private rlmRegistryIncarnationKey(entry: PersistedRlmSubagentRegistryEntry): string | undefined {
+		const identity = classifyRlmRegistryIdentity(entry);
+		switch (identity.kind) {
+			case "legacy-display":
+				return `${entry.childId}\u0000legacy`;
+			case "assignment-display":
+				return `${entry.childId}\u0000assignment-display\u0000${identity.assignmentId}`;
+			case "c03":
+				return `${entry.childId}\u0000${identity.assignmentId}\u0000${identity.operationId}\u0000${identity.deliveryId}`;
+			case "invalid":
+				return undefined;
+		}
 	}
 
-	/**
-	 * Registry entries retain one terminal state per durable assignment, ordered
-	 * by the assignment's first durable publication. A later terminal update for
-	 * old A must not make A the public incarnation after B reuses its childId.
-	 */
+	/** Only a complete C03 tuple is daemon authority, including passive hydrate/delete selection. */
+	private isAuthoritativeC03RegistryEntry(entry: PersistedRlmSubagentRegistryEntry): boolean {
+		return classifyRlmRegistryIdentity(entry).kind === "c03";
+	}
+
 	private currentRlmSubagentRegistryEntry(
 		entries: readonly PersistedRlmSubagentRegistryEntry[],
 		childId: string,
 	): PersistedRlmSubagentRegistryEntry | undefined {
-		for (let index = entries.length - 1; index >= 0; index--) {
-			const entry = entries[index];
-			if (entry?.childId === childId) return entry;
-		}
-		return undefined;
+		return this.currentLiveRlmSubagentRegistryEntries(entries).find((entry) => entry.childId === childId);
 	}
 
-	/** The sole public/passive row for each reused child selector. */
+	/** The sole authoritative C03 row for each reused child selector. */
 	private currentLiveRlmSubagentRegistryEntries(
 		entries: readonly PersistedRlmSubagentRegistryEntry[],
 	): PersistedRlmSubagentRegistryEntry[] {
 		const currentByChildId = new Map<string, PersistedRlmSubagentRegistryEntry>();
-		for (const entry of entries) currentByChildId.set(entry.childId, entry);
+		for (const entry of entries) {
+			if (this.isAuthoritativeC03RegistryEntry(entry)) currentByChildId.set(entry.childId, entry);
+		}
 		return [...currentByChildId.values()].filter((entry) => entry.status !== "deleted");
 	}
 
@@ -973,6 +980,7 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		entry: PersistedRlmSubagentRegistryEntry,
 	): boolean {
+		assertRlmRegistryWriteIdentity(entry);
 		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
 		if (!path) {
 			return true;
@@ -1017,6 +1025,7 @@ export class AgentDaemon {
 			createdAt?: number;
 		},
 	): boolean {
+		assertRlmRegistryWriteIdentity(input);
 		const parentSession = parentState.runtime.session;
 		return this.appendRlmSubagentRegistryEntry(parentState, {
 			type: "rlm_subagent",
@@ -1113,39 +1122,22 @@ export class AgentDaemon {
 					typeof entry.sessionFile !== "string" ||
 					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
 					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
-					(entry.rlmMaxDepth !== undefined &&
-						(!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0)) ||
-					(entry.assignmentId !== undefined &&
-						(typeof entry.assignmentId !== "string" ||
-							!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-								entry.assignmentId,
-							))) ||
-					(entry.operationId !== undefined &&
-						(typeof entry.operationId !== "string" || !assertFreshUuid(entry.operationId))) ||
-					(entry.deliveryId !== undefined &&
-						(typeof entry.deliveryId !== "string" || !assertFreshUuid(entry.deliveryId)))
+					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
 				) {
 					continue;
 				}
-				latest.set(
-					this.rlmAssignmentKey(entry as PersistedRlmSubagentRegistryEntry),
-					entry as PersistedRlmSubagentRegistryEntry,
-				);
+				const authoritative = entry as PersistedRlmSubagentRegistryEntry;
+				const key = this.rlmRegistryIncarnationKey(authoritative);
+				// Partial/malformed identities never enter reduction, so a late corrupt
+				// row cannot overwrite a complete C03 incarnation.
+				if (key) latest.set(key, authoritative);
 			} catch (error) {
 				this.log(
 					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
 		}
-		const entries = [...latest.values()];
-		// Once an explicit hydrate has durably rebound an old display-only row,
-		// suppress that legacy duplicate from catalog traversal. Its late callbacks
-		// still cannot match the assigned row because callback matching is exact.
-		return entries.filter(
-			(entry) =>
-				entry.assignmentId !== undefined ||
-				!entries.some((candidate) => candidate.childId === entry.childId && candidate.assignmentId !== undefined),
-		);
+		return [...latest.values()];
 	}
 
 	/** Read only selectable catalog incarnations; exact lifecycle operations use the full reader above. */
@@ -2372,8 +2364,19 @@ export class AgentDaemon {
 			parentState.eventGeneration === generation &&
 			!this.closingSessions.has(parentState.activeSessionId) &&
 			parentState.runtime.session === parent &&
-			child.session.sessionId !== "";
+			child.session.sessionId !== "" &&
+			[...this.sessions.values()].some(
+				(state) =>
+					state.runtime.metadata.kind === "subagent" &&
+					state.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+					state.runtime.metadata.rlmChildId === identity.childId &&
+					state.runtime.metadata.assignmentId === identity.assignmentId &&
+					state.runtime.metadata.operationId === identity.operationId &&
+					state.runtime.metadata.deliveryId === identity.deliveryId &&
+					state.runtime.session === child.session,
+			);
 		const work = (async () => {
+			// Every mutation is preceded by the complete parent + resident child fence.
 			if (!current()) return;
 			store.importPendingOutboxes();
 			if (!current()) return;
@@ -2393,6 +2396,7 @@ export class AgentDaemon {
 				// Only the exact deleted durable incarnation is discardable. A replacement
 				// selector assignment remains unrelated and cannot suppress this record.
 				if (operation?.lifecycle === "deleted") {
+					if (!current()) return;
 					store.markDiscardedDelivery({
 						parentSessionId: parent.sessionId,
 						assignmentId: identity.assignmentId,
@@ -2403,7 +2407,7 @@ export class AgentDaemon {
 					continue;
 				}
 				if (!current()) return;
-				await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId);
+				await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId, current);
 				if (!current()) return;
 				store.markMaterializedDelivery({
 					parentSessionId: parent.sessionId,
@@ -2511,7 +2515,6 @@ export class AgentDaemon {
 			},
 			deliverRlmSubagentTerminal: async (runtime, options, terminal, message) => {
 				if (
-					!current(options, runtime) ||
 					!parentFile ||
 					!parentArtifactDir ||
 					!options.assignmentId ||
@@ -2519,6 +2522,15 @@ export class AgentDaemon {
 					!options.deliveryId
 				)
 					return;
+				const store = durableStore();
+				const durableOperation = () =>
+					store
+						.rebuild()
+						.operations.get(JSON.stringify([parent.sessionId, options.assignmentId!, options.operationId!]));
+				// A live explicit delete closes C01 before its cancelled task unwinds. Its
+				// exact intent can finish only A's outbox/terminal/deleted/discarded chain.
+				const deleteIntent = () => durableOperation()?.deleteIntent === true;
+				if (!current(options, runtime) && !deleteIntent()) return;
 				const child = runtime.session;
 				const childFile = child.sessionManager.getSessionFile?.();
 				const childArtifactDir = child.sessionManager.getSessionArtifactDir?.();
@@ -2540,7 +2552,6 @@ export class AgentDaemon {
 					terminal,
 					message,
 				};
-				const store = durableStore();
 				store.appendOutbox(outbox); // child outbox fsync happens before parent ledger.
 				if (
 					!store.recordTerminal({
@@ -2552,6 +2563,37 @@ export class AgentDaemon {
 					})
 				)
 					return;
+				// An explicit live delete is a durable intent, not an early deleted
+				// transition. Once its terminal hand-off is fsynced, make deleted legal
+				// before the importer can materialize this exact delivery.
+				const operation = durableOperation();
+				if (operation?.deleteIntent) {
+					if (
+						!store.recordRelease(
+							{
+								parentSessionId: parent.sessionId,
+								assignmentId: options.assignmentId,
+								operationId: options.operationId,
+							},
+							"deleted",
+						)
+					) {
+						// Keep the exact outbox/terminal/intent pending for recovery rather than
+						// falsely materializing a delete whose terminal transition is uncertain.
+						return;
+					}
+					// Do not require A to remain resident after live close: deleted delivery
+					// has no parent transcript mutation and is consumed exactly once.
+					store.importPendingOutboxes();
+					store.markDiscardedDelivery({
+						parentSessionId: parent.sessionId,
+						assignmentId: options.assignmentId,
+						operationId: options.operationId,
+						deliveryId: options.deliveryId,
+						reason: "deleted",
+					});
+					return;
+				}
 				if (!current(options, runtime)) return;
 				// The owner-local join imports the fsynced outbox, then performs the
 				// normal no-turn transcript append before the consumed fsync.
@@ -2756,14 +2798,27 @@ export class AgentDaemon {
 				if (assignmentId && operationId) {
 					const artifactDir = parent.sessionManager.getSessionArtifactDir?.();
 					if (!artifactDir) throw new Error("Durable RLM deletion requires parent artifact");
-					// The exact C03 lifecycle transition precedes the C01 deletion and close.
+					// A materialized live child cannot yet be `deleted`: retain an exact
+					// intent through cancellation. The terminal owner converts it to deleted
+					// before any inbox import, while C01 deletion/close proceeds normally.
+					const store = durableStore();
+					const operation = store
+						.rebuild()
+						.operations.get(JSON.stringify([parent.sessionId, assignmentId, operationId]));
+					// A full registry tuple without a durable ledger operation is passive
+					// historical display only: it has no live cancellation hand-off to
+					// complete. Preserve its ordinary C01 tombstone behavior. A real
+					// durable operation must retain its exact intent or remain live.
 					if (
-						!openRlmDurableOperationStore(artifactDir).recordRelease(
-							{ parentSessionId: parent.sessionId, assignmentId, operationId },
-							"deleted",
-						)
-					)
-						throw new Error(`Failed to persist durable deletion for RLM subagent ${childId}`);
+						operation &&
+						!store.recordDeleteIntent({ parentSessionId: parent.sessionId, assignmentId, operationId })
+					) {
+						const refreshed = store
+							.rebuild()
+							.operations.get(JSON.stringify([parent.sessionId, assignmentId, operationId]));
+						if (!refreshed?.deleteIntent && refreshed?.lifecycle !== "deleted")
+							throw new Error(`Failed to retain durable deletion intent for RLM subagent ${childId}`);
+					}
 				}
 				if (assignmentId) await this.recordRlmSubagentDeletion(parentState, childId, assignmentId, operationId);
 				// C01 append awaited above; reject a late A before it can close B.

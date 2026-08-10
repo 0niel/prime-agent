@@ -6,7 +6,7 @@ import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
-import { assertFreshUuid } from "./daemon-lifecycle-identity.js";
+import { classifyRlmRegistryIdentity } from "./daemon-rlm-registry-identity.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 
@@ -71,24 +71,23 @@ interface SavedRlmSubagentRegistryEntry {
 }
 
 function hasCanonicalC03Identity(entry: SavedRlmSubagentRegistryEntry): boolean {
-	return (
-		assertFreshUuid(entry.assignmentId) && assertFreshUuid(entry.operationId) && assertFreshUuid(entry.deliveryId)
-	);
+	return classifyRlmRegistryIdentity(entry).kind === "c03";
 }
 
 /** Read-only, private registry incarnation key. Legacy rows remain display-only. */
 function savedRlmIncarnationKey(entry: SavedRlmSubagentRegistryEntry): string | undefined {
 	if (typeof entry.childId !== "string") return undefined;
-	if (entry.assignmentId === undefined && entry.operationId === undefined && entry.deliveryId === undefined)
-		return `${entry.childId}\0legacy`;
-	// Pre-C03 C01 rows have a canonical assignment but no durable operation or
-	// delivery. Keep those as display-only history with their own incarnation key.
-	if (entry.operationId === undefined && entry.deliveryId === undefined && assertFreshUuid(entry.assignmentId))
-		return `${entry.childId}\0legacy-assignment\0${entry.assignmentId}`;
-	// C03 durable identities are opaque canonical UUIDs. Any partial or malformed
-	// triple is untrusted registry history, not an alternative current incarnation.
-	if (!hasCanonicalC03Identity(entry)) return undefined;
-	return `${entry.childId}\0${entry.assignmentId}\0${entry.operationId}\0${entry.deliveryId}`;
+	const identity = classifyRlmRegistryIdentity(entry);
+	switch (identity.kind) {
+		case "legacy-display":
+			return `${entry.childId}\0legacy`;
+		case "assignment-display":
+			return `${entry.childId}\0legacy-assignment\0${identity.assignmentId}`;
+		case "c03":
+			return `${entry.childId}\0${identity.assignmentId}\0${identity.operationId}\0${identity.deliveryId}`;
+		case "invalid":
+			return undefined;
+	}
 }
 
 export async function listSavedSessionSiblings(sessionPath: string): Promise<SessionInfo[]> {
