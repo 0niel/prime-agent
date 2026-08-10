@@ -215,7 +215,6 @@ import {
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
-	type C04ChildResultReference,
 	type C04ChildResultStatus,
 	canonicalChildResultBytes,
 	createOrGetTerminalChildResult,
@@ -10105,7 +10104,6 @@ export class AgentSession {
 		// before a child can stream. Its key bytes never leave SessionManager.
 		const parentRecoveryAuthority = this.sessionManager.getC04ParentRecoveryAuthority();
 		let terminalOutputSink: C04ProducerSink | undefined;
-		let terminalOutputCommit: Promise<C04ChildResultReference> | undefined;
 		let durationMs: number | undefined;
 		let toolUseCount = 0;
 		let runningToolCount = 0;
@@ -10235,61 +10233,59 @@ export class AgentSession {
 				run.status === "done" ? "completed" : run.status === "cancelled" ? "cancelled" : "failed";
 			const terminalModel = childSession.model ?? modelSelection.model;
 			try {
-				const reference = terminalOutputCommit
-					? await terminalOutputCommit
-					: await createOrGetTerminalChildResult({
-							owner: {
-								parentSessionId: this.sessionId,
-								childSessionId: childSession.sessionId,
-								childSessionFile: childFile,
-								assignmentId: run.assignmentId,
-								operationId: run.operationId,
-								deliveryId: run.deliveryId,
-							},
-							childArtifactRoot: childArtifactDir,
-							parentRecoveryAuthority,
-							isCurrent,
-							candidate: {
-								status,
-								summary: status === "completed" ? "Child completed." : "Child terminal result is unavailable.",
-								preview: answerPreview || "No bounded terminal preview is available.",
-								...(status === "completed"
-									? {
-											artifacts: [
-												{
-													kind: "terminal_output" as const,
-													contentType: "text/plain" as const,
-													data: (() => {
-														// A producer opened by a text delta remains live until the child has
-														// actually finished.  Empty and tool-only completions have no such
-														// producer, so their fallback must already be closed: otherwise C04
-														// correctly waits forever for bytes that can never arrive.
-														if (terminalOutputSink) return terminalOutputSink;
-														const emptyTerminalOutput = new C04ProducerSink();
-														emptyTerminalOutput.close();
-														return emptyTerminalOutput;
-													})(),
-												},
-											],
-										}
-									: {}),
-								...(status === "completed"
-									? {}
-									: {
-											error: {
-												code: status === "cancelled" ? "cancelled" : "terminal_storage_failed",
-												message:
-													status === "cancelled"
-														? "Child was cancelled."
-														: "Child failed without a publishable diagnostic.",
-											},
-										}),
-								model: {
-									initialResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
-									terminalResolvedSelector: `${terminalModel.provider}/${terminalModel.id}`,
-								},
-							},
-						});
+				const reference = await createOrGetTerminalChildResult({
+					owner: {
+						parentSessionId: this.sessionId,
+						childSessionId: childSession.sessionId,
+						childSessionFile: childFile,
+						assignmentId: run.assignmentId,
+						operationId: run.operationId,
+						deliveryId: run.deliveryId,
+					},
+					childArtifactRoot: childArtifactDir,
+					parentRecoveryAuthority,
+					isCurrent,
+					candidate: {
+						status,
+						summary: status === "completed" ? "Child completed." : "Child terminal result is unavailable.",
+						preview: answerPreview || "No bounded terminal preview is available.",
+						...(status === "completed"
+							? {
+									artifacts: [
+										{
+											kind: "terminal_output" as const,
+											contentType: "text/plain" as const,
+											data: (() => {
+												// A producer opened by a text delta remains live until the child has
+												// actually finished.  Empty and tool-only completions have no such
+												// producer, so their fallback must already be closed: otherwise C04
+												// correctly waits forever for bytes that can never arrive.
+												if (terminalOutputSink) return terminalOutputSink;
+												const emptyTerminalOutput = new C04ProducerSink();
+												emptyTerminalOutput.close();
+												return emptyTerminalOutput;
+											})(),
+										},
+									],
+								}
+							: {}),
+						...(status === "completed"
+							? {}
+							: {
+									error: {
+										code: status === "cancelled" ? "cancelled" : "terminal_storage_failed",
+										message:
+											status === "cancelled"
+												? "Child was cancelled."
+												: "Child failed without a publishable diagnostic.",
+									},
+								}),
+						model: {
+							initialResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+							terminalResolvedSelector: `${terminalModel.provider}/${terminalModel.id}`,
+						},
+					},
+				});
 				if (!isCurrent()) return undefined;
 				// C03 treats this as opaque bytes. C04 is the only parser/codec authority.
 				const projection = Buffer.from(canonicalChildResultBytes(reference)).toString("utf8");
@@ -10462,49 +10458,7 @@ export class AgentSession {
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
 							if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-								if (!terminalOutputSink) {
-									terminalOutputSink = new C04ProducerSink();
-									const childFile = child.sessionManager.getSessionFile?.();
-									const childArtifactDir = child.sessionManager.getSessionArtifactDir?.();
-									if (
-										this._subagentRuntimeHost?.assignmentIdentityFenced &&
-										parentRecoveryAuthority &&
-										childFile &&
-										childArtifactDir
-									) {
-										const sink = terminalOutputSink;
-										terminalOutputCommit = createOrGetTerminalChildResult({
-											owner: {
-												parentSessionId: this.sessionId,
-												childSessionId: child.sessionId,
-												childSessionFile: childFile,
-												assignmentId: run.assignmentId,
-												operationId: run.operationId,
-												deliveryId: run.deliveryId,
-											},
-											childArtifactRoot: childArtifactDir,
-											parentRecoveryAuthority,
-											isCurrent: () =>
-												this._activeRlmChildRuns.get(run.id) === run &&
-												this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
-												this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId &&
-												child.sessionManager.getSessionFile?.() === childFile &&
-												child.sessionManager.getSessionArtifactDir?.() === childArtifactDir,
-											candidate: {
-												status: "completed",
-												summary: "Child completed.",
-												preview: "Child output is streaming.",
-												artifacts: [{ kind: "terminal_output", contentType: "text/plain", data: sink }],
-												model: {
-													initialResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
-													terminalResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
-												},
-											},
-										}).catch((error) => {
-											throw error;
-										});
-									}
-								}
+								if (!terminalOutputSink) terminalOutputSink = new C04ProducerSink();
 								terminalOutputSink.push(event.assistantMessageEvent.delta);
 							}
 							const text = safeAssistantPreview(event.message as AssistantMessage);

@@ -9,6 +9,7 @@ import {
 	constants,
 	fstatSync,
 	fsyncSync,
+	ftruncateSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
@@ -21,7 +22,7 @@ import {
 	unlinkSync,
 	writeSync,
 } from "node:fs";
-import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import {
 	createRlmSafeTerminalResultTerminalMessage,
 	MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES,
@@ -226,7 +227,7 @@ export async function createOrGetTerminalChildResult(
 			...(candidate.error?.diagnostic ? [candidate.error.diagnostic] : []),
 		]) {
 			if (artifacts.length >= MAX_ARTIFACTS_PER_RESULT) throw new Error("artifact count exceeds C04 limit");
-			const written = await writeArtifact(root, owner, resultId, artifact, reservedBytes);
+			const written = await writeArtifact(root, owner, resultId, artifact, reservedBytes, reservation.recordHandle);
 			reservedBytes += written.byteLength;
 			artifacts.push(written);
 		}
@@ -451,30 +452,67 @@ export function recordChildResultDisposition(
 	try {
 		const verified = validateOwner(owner);
 		const root = prepareBoundRoot(verified, childArtifactRoot, false);
-		const result = readStored(root, input.resultId);
-		if (!sameOwner(result.owner, verified)) return false;
-		if (input.handleId && !result.artifacts.some((a) => a.handleId === input.handleId)) return false;
-		const changed = result.artifacts.map((artifact) =>
-			artifact.handleId === input.handleId || !input.handleId
-				? { ...artifact, retentionState: input.disposition }
-				: artifact,
-		);
-		if (canonicalJson(changed) !== canonicalJson(result.artifacts)) {
-			// State and audit are durable before bytes become unreachable.
+		return withDispositionLock(root, input.resultId, () => {
+			// Re-read *under* the inter-process lock. This is a generation-CAS
+			// equivalent: no contender can base its transition on an older record.
+			const result = readStored(root, input.resultId);
+			if (!sameOwner(result.owner, verified)) return false;
+			if (input.handleId && !result.artifacts.some((a) => a.handleId === input.handleId)) return false;
+			const changed = result.artifacts.map((artifact) =>
+				artifact.handleId === input.handleId || !input.handleId
+					? { ...artifact, retentionState: input.disposition }
+					: artifact,
+			);
+			const anyRetained = changed.some((artifact) => artifact.retentionState === "retained");
+			const resultState = anyRetained ? "retained" : input.disposition;
+			const stateChanged =
+				canonicalJson(changed) !== canonicalJson(result.artifacts) || result.retentionState !== resultState;
+			if (!stateChanged) return true;
+			// The replacement is durable before any corresponding blob is unlinked.
 			atomicJson(safePath(root, "results", `${result.resultId}.json`), {
 				...result,
 				artifacts: changed,
-				retentionState: input.disposition,
+				retentionState: resultState,
 				generation: result.generation + 1,
 			});
 			appendAudit(root, input.disposition, input.disposition, input.handleId ?? input.resultId);
 			for (const artifact of changed)
 				if (artifact.retentionState !== "retained")
 					safeUnlink(safePath(root, "objects", `${artifact.handleId}.blob`));
-		}
-		return true;
+			return true;
+		});
 	} catch {
 		return false;
+	}
+}
+
+/** A filesystem lock serializes retention writers across daemon processes.
+ * It is intentionally result-scoped (rather than a client-wide limiter), and
+ * every writer rereads the generation after acquiring it. */
+function withDispositionLock<T>(root: string, resultId: string, action: () => T): T {
+	if (!isUuid(resultId)) throw new Error("invalid result ID");
+	const path = safePath(root, "operation-index", `.disposition.${resultId}.lock`);
+	let fd: number | undefined;
+	for (let attempt = 0; attempt < 400; attempt++) {
+		try {
+			fd = openSyncNoFollow(path, "wx", 0o600);
+			writeAll(fd, Buffer.from(`${process.pid}\n`));
+			fsyncSync(fd);
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			// Synchronous public APIs cannot await; Atomics.wait yields the worker
+			// without spinning and allows a competing process to release promptly.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+		}
+	}
+	if (fd === undefined) throw new Error("C04 disposition lock unavailable");
+	try {
+		return action();
+	} finally {
+		closeSync(fd);
+		safeUnlink(path);
+		fsyncDirectory(dirname(path));
 	}
 }
 
@@ -519,11 +557,7 @@ function validateOwner(value: C04ChildResultOwner): C04ChildResultOwner {
 		throw new Error("invalid C04 owner");
 	for (const key of ["parentSessionId", "childSessionId", "assignmentId", "operationId", "deliveryId"] as const)
 		if (!isCanonicalUuid(value[key])) throw new Error(`invalid C04 owner ${key}`);
-	if (
-		typeof value.childSessionFile !== "string" ||
-		!value.childSessionFile ||
-		!resolve(value.childSessionFile).startsWith("/")
-	)
+	if (typeof value.childSessionFile !== "string" || !value.childSessionFile || !isAbsolute(value.childSessionFile))
 		throw new Error("invalid C04 child session file");
 	return { ...value, childSessionFile: resolve(value.childSessionFile) };
 }
@@ -588,14 +622,14 @@ function validateCandidate(
 		if (value.error.diagnostic) error.diagnostic = validateArtifact(value.error.diagnostic);
 	}
 	const model = validateModel(value.model);
-	const artifacts =
-		value.artifacts === undefined
-			? []
-			: Array.isArray(value.artifacts) && value.artifacts.length <= MAX_ARTIFACTS_PER_RESULT
-				? value.artifacts.map(validateArtifact)
-				: (() => {
-						throw new Error("invalid C04 artifacts");
-					})();
+	// A diagnostic is materialized as an artifact. Validate the complete set before
+	// consuming any producer so a 17th artifact can never fail halfway through a stream.
+	const rawArtifacts = value.artifacts === undefined ? [] : value.artifacts;
+	if (!Array.isArray(rawArtifacts) || rawArtifacts.length > MAX_ARTIFACTS_PER_RESULT)
+		throw new Error("invalid C04 artifacts");
+	if (rawArtifacts.length + (error?.diagnostic ? 1 : 0) > MAX_ARTIFACTS_PER_RESULT)
+		throw new Error("C04 artifact count reserves a diagnostic slot");
+	const artifacts = rawArtifacts.map(validateArtifact);
 	return { status, summary, preview, facts: normalizedFacts, nextActions: normalizedNext, error, model, artifacts };
 }
 function validateModel(value: unknown): C04ModelMetadata {
@@ -650,8 +684,10 @@ async function writeArtifact(
 	resultId: string,
 	artifact: C04ArtifactInput,
 	used = aggregateBytes(root, owner),
+	recordHandle?: (handleId: string) => void,
 ): Promise<C04OpaqueArtifactReference> {
 	const handleId = randomUuid();
+	recordHandle?.(handleId);
 	const finalPath = safePath(root, "objects", `${handleId}.blob`);
 	const temp = safePath(root, "objects", `.${handleId}.${randomUuid()}.tmp`);
 	let fd: number | undefined;
@@ -672,7 +708,6 @@ async function writeArtifact(
 		closeSync(fd);
 		fd = undefined;
 		publishExclusive(temp, finalPath);
-		fsyncDirectory(dirname(finalPath));
 		return {
 			version: 1,
 			handleId,
@@ -707,8 +742,7 @@ function aggregateBytes(root: string, owner: C04ChildResultOwner): number {
 			if (
 				r.owner.parentSessionId === owner.parentSessionId &&
 				r.owner.childSessionId === owner.childSessionId &&
-				r.owner.childSessionFile === owner.childSessionFile &&
-				r.owner.assignmentId === owner.assignmentId
+				r.owner.childSessionFile === owner.childSessionFile
 			)
 				total += r.artifacts.reduce((n, a) => n + (a.retentionState === "retained" ? a.byteLength : 0), 0);
 		} catch {
@@ -731,6 +765,8 @@ interface ReservationJournalPayload {
 	processStartId: string;
 	progress: "reserved" | "publishing";
 	resultId: string;
+	/** Every generated blob handle is journaled before its destination exists. */
+	handleIds?: string[];
 }
 interface ReservationJournal extends ReservationJournalPayload {
 	/** HMAC-SHA256 over the canonical payload. Never project this or the key. */
@@ -771,15 +807,11 @@ function reserveOperationAndQuota(
 	owner: C04ChildResultOwner,
 	indexPath: string,
 	recoveryKey: Buffer,
-): { release: () => void; resultId: string } {
+): { release: () => void; resultId: string; recordHandle: (handleId: string) => void } {
 	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}:${owner.assignmentId}`;
 	if (operationReservations.has(key)) throw immutableConflict(root, owner.operationId);
 	const reservation = safePath(root, "operation-index", `.${owner.operationId}.reserve`);
-	const quotaReservation = safePath(
-		root,
-		"operation-index",
-		`.quota.${owner.childSessionId}.${owner.assignmentId}.reserve`,
-	);
+	const quotaReservation = safePath(root, "operation-index", `.quota.${owner.childSessionId}.reserve`);
 	const identity = processIdentitySeam.captureCurrent();
 	if (!identity || !Number.isSafeInteger(identity.pid) || identity.pid < 1 || !identity.processStartId)
 		throw new Error("C04 exact process identity is unavailable");
@@ -792,8 +824,9 @@ function reserveOperationAndQuota(
 		processStartId: identity.processStartId,
 		progress: "reserved",
 		resultId: randomUuid(),
+		handleIds: [],
 	};
-	const journal: ReservationJournal = { ...payload, mac: reservationMac(recoveryKey, payload) };
+	let journal: ReservationJournal = { ...payload, mac: reservationMac(recoveryKey, payload) };
 	const token = canonicalJson(journal);
 	let operationFd: number | undefined;
 	let quotaFd: number | undefined;
@@ -816,11 +849,32 @@ function reserveOperationAndQuota(
 		unlinkReservationIfOwned(quotaReservation, token);
 		throw immutableConflict(root, owner.operationId);
 	}
+	let currentToken = token;
 	return {
 		resultId: journal.resultId,
+		recordHandle: (handleId: string) => {
+			if (!isUuid(handleId) || (journal.handleIds ?? []).includes(handleId))
+				throw new Error("invalid C04 journal handle");
+			journal = { ...journal, progress: "publishing", handleIds: [...(journal.handleIds ?? []), handleId] };
+			journal.mac = reservationMac(recoveryKey, journal);
+			const next = canonicalJson(journal);
+			// Reservation ownership is still protected by the O_EXCL name. Update it
+			// durably before publishing the random blob name, so crash recovery owns
+			// the same-attempt orphan even if no result record was written.
+			const update = openSyncNoFollow(reservation, "r+");
+			try {
+				ftruncateSync(update, 0);
+				writeAll(update, Buffer.from(next));
+				fsyncSync(update);
+			} finally {
+				closeSync(update);
+			}
+			currentToken = next;
+		},
 		release: () => {
 			operationReservations.delete(key);
-			unlinkReservationIfOwned(reservation, token);
+			unlinkReservationIfOwned(reservation, currentToken);
+			// quota is only an admission mutex, so its original authenticated body is sufficient.
 			unlinkReservationIfOwned(quotaReservation, token);
 			fsyncDirectory(dirname(reservation));
 		},
@@ -879,14 +933,16 @@ function reconcileAbandonedReservation(
 			});
 		appendAudit(root, "linked", "restart_reconciled", result.resultId);
 	} catch {
-		cleanUnindexedOwnedAttempt(root, owner, journal.resultId, []);
+		cleanUnindexedOwnedAttempt(
+			root,
+			owner,
+			journal.resultId,
+			(journal.handleIds ?? []).map((handleId) => ({ handleId }) as C04OpaqueArtifactReference),
+		);
 		appendAudit(root, "uncertain", "restart_tombstoned", journal.resultId);
 	}
 	unlinkReservationIfOwned(path, token);
-	unlinkReservationIfOwned(
-		safePath(root, "operation-index", `.quota.${owner.childSessionId}.${owner.assignmentId}.reserve`),
-		token,
-	);
+	unlinkReservationIfOwned(safePath(root, "operation-index", `.quota.${owner.childSessionId}.reserve`), token);
 	fsyncDirectory(dirname(path));
 }
 function reservationMac(key: Buffer, payload: ReservationJournalPayload): string {
@@ -905,16 +961,19 @@ function parseAuthenticatedReservation(token: string, key: Buffer): ReservationJ
 			"processStartId",
 			"progress",
 			"resultId",
+			...optionalKeys(value, ["handleIds"]),
 			"mac",
 		]) ||
 		value.version !== 1 ||
 		!isUuid(value.nonce) ||
 		!isUuid(value.resultId) ||
+		(value.handleIds !== undefined &&
+			(!Array.isArray(value.handleIds) || value.handleIds.some((handleId) => !isUuid(handleId)))) ||
 		!Number.isSafeInteger(value.pid) ||
 		value.pid < 1 ||
 		typeof value.processStartId !== "string" ||
 		!value.processStartId ||
-		value.progress !== "reserved" ||
+		(value.progress !== "reserved" && value.progress !== "publishing") ||
 		typeof value.mac !== "string" ||
 		!SHA256.test(value.mac)
 	)
@@ -930,6 +989,7 @@ function parseAuthenticatedReservation(token: string, key: Buffer): ReservationJ
 		processStartId: value.processStartId,
 		progress: value.progress,
 		resultId: value.resultId,
+		...(value.handleIds === undefined ? {} : { handleIds: value.handleIds as string[] }),
 	};
 	if (typeof payload.indexPath !== "string") throw new Error("invalid C04 reservation journal");
 	const expected = Buffer.from(reservationMac(key, payload), "hex");
@@ -1104,7 +1164,7 @@ function assertPrivateDirectory(path: string): string {
 function safePath(root: string, directory: string, name?: string): string {
 	if (
 		!/^[a-z-]+$/.test(directory) ||
-		(name !== undefined && (!/^[a-z0-9.-]+(?:\.(?:json|blob|tmp|reserve))?$/.test(name) || name.includes("..")))
+		(name !== undefined && (!/^[a-z0-9.-]+(?:\.(?:json|blob|tmp|reserve|lock))?$/.test(name) || name.includes("..")))
 	)
 		throw new Error("invalid C04 generated path");
 	const target = name === undefined ? join(root, directory) : join(root, directory, name);
@@ -1168,21 +1228,30 @@ function readHandleIndex(
 }
 
 function expireIfElapsed(root: string, result: StoredChildResult, now: Date): StoredChildResult {
-	if (Date.parse(result.retention.expiresAt) > now.getTime()) return result;
+	// Time is an input to a destructive retention transition. Invalid clocks and
+	// malformed timestamps fail closed: preserve bytes and authority rather than
+	// treating NaN as already expired.
+	const expiresAt = Date.parse(result.retention.expiresAt);
+	const current = now.getTime();
+	if (!Number.isFinite(expiresAt) || !Number.isFinite(current) || expiresAt > current) return result;
 	if (result.retentionState !== "retained") return result;
 	return setExpired(root, result);
 }
 function setExpired(root: string, result: StoredChildResult): StoredChildResult {
-	const expired = {
-		...result,
-		retentionState: "expired" as const,
-		artifacts: result.artifacts.map((a) => ({ ...a, retentionState: "expired" as const })),
-		generation: result.generation + 1,
-	};
-	atomicJson(safePath(root, "results", `${result.resultId}.json`), expired);
-	appendAudit(root, "expired", "retention_elapsed", result.resultId);
-	for (const a of expired.artifacts) safeUnlink(safePath(root, "objects", `${a.handleId}.blob`));
-	return expired;
+	return withDispositionLock(root, result.resultId, () => {
+		const current = readStored(root, result.resultId);
+		if (current.retentionState !== "retained") return current;
+		const expired = {
+			...current,
+			retentionState: "expired" as const,
+			artifacts: current.artifacts.map((a) => ({ ...a, retentionState: "expired" as const })),
+			generation: current.generation + 1,
+		};
+		atomicJson(safePath(root, "results", `${current.resultId}.json`), expired);
+		appendAudit(root, "expired", "retention_elapsed", current.resultId);
+		for (const a of expired.artifacts) safeUnlink(safePath(root, "objects", `${a.handleId}.blob`));
+		return expired;
+	});
 }
 function assertC03EnvelopeFits(reference: C04ChildResultReference): void {
 	const projection = Buffer.from(canonicalChildResultBytes(reference)).toString("utf8");
@@ -1212,7 +1281,11 @@ function cleanUnindexedOwnedAttempt(
 				const handle = readHandleIndex(root, artifact.handleId);
 				ours = handle.resultId === resultId && sameOwner(handle.owner, owner);
 				if (ours) safeUnlink(handlePath);
-			} catch {}
+			} catch {
+				// A handle named in the authenticated dead-attempt journal has never
+				// had a public index, and its random UUID belongs exclusively to it.
+				ours = true;
+			}
 			if (ours) safeUnlink(safePath(root, "objects", `${artifact.handleId}.blob`));
 		}
 		try {
@@ -1311,15 +1384,11 @@ function assertStored(value: unknown): asserts value is StoredChildResult {
 		!SHA256.test(value.requestDigest)
 	)
 		throw new Error("invalid C04 result record");
-	if (
-		value.retentionState === "retained" &&
-		(value.artifacts as C04OpaqueArtifactReference[]).some((a) => a.retentionState !== "retained")
-	)
-		throw new Error("C04 retention consistency mismatch");
-	if (
-		value.retentionState !== "retained" &&
-		(value.artifacts as C04OpaqueArtifactReference[]).some((a) => a.retentionState === "retained")
-	)
+	// A result remains retained while at least one artifact is retained. This
+	// permits an exact-handle disposition without falsely expiring its siblings.
+	const storedArtifacts = value.artifacts as C04OpaqueArtifactReference[];
+	const hasRetainedArtifact = storedArtifacts.some((a) => a.retentionState === "retained");
+	if ((value.retentionState === "retained") !== hasRetainedArtifact && storedArtifacts.length > 0)
 		throw new Error("C04 retention consistency mismatch");
 }
 function assertReference(value: unknown): asserts value is C04ChildResultReference {
@@ -1396,13 +1465,14 @@ function assertArtifactRef(value: unknown, resultId: string): asserts value is C
 		throw new Error("invalid C04 artifact reference");
 }
 function publishExclusive(temp: string, path: string): void {
-	// link(2) is an atomic no-replace publication. Node has no linkSync import
-	// here, so create the destination exclusively and copy from the private temp
-	// FD; a collision can never overwrite an immutable object name.
+	// Destination is opened O_EXCL. If copy/fsync fails, remove precisely that
+	// newly-created inode; an EEXIST winner is never opened or unlinked.
 	const source = openSyncNoFollow(temp, "r");
 	let destination: number | undefined;
+	let created = false;
 	try {
 		destination = openSyncNoFollow(path, "wx", 0o600);
+		created = true;
 		const buffer = Buffer.allocUnsafe(MAX_STREAM_CHUNK_BYTES);
 		for (;;) {
 			const count = readSync(source, buffer, 0, buffer.length, null);
@@ -1410,12 +1480,19 @@ function publishExclusive(temp: string, path: string): void {
 			writeAll(destination, buffer.subarray(0, count));
 		}
 		fsyncSync(destination);
+		fsyncDirectory(dirname(path));
+	} catch (error) {
+		if (destination !== undefined) closeSync(destination);
+		destination = undefined;
+		if (created) safeUnlink(path);
+		throw error;
 	} finally {
 		closeSync(source);
 		if (destination !== undefined) closeSync(destination);
 	}
 	safeUnlink(temp);
 }
+
 function atomicJson(path: string, value: unknown): void {
 	const temp = `${path}.${randomUuid()}.tmp`;
 	let fd: number | undefined;
@@ -1434,15 +1511,23 @@ function atomicJson(path: string, value: unknown): void {
 	}
 }
 function atomicExclusiveJson(path: string, value: unknown): void {
-	const fd = openSyncNoFollow(path, "wx", 0o600);
+	let fd: number | undefined;
+	let created = false;
 	try {
+		fd = openSyncNoFollow(path, "wx", 0o600);
+		created = true;
 		writeAll(fd, Buffer.from(canonicalJson(value)));
 		fsyncSync(fd);
-	} finally {
 		closeSync(fd);
+		fd = undefined;
+		fsyncDirectory(dirname(path));
+	} catch (error) {
+		if (fd !== undefined) closeSync(fd);
+		if (created) safeUnlink(path);
+		throw error;
 	}
-	fsyncDirectory(dirname(path));
 }
+
 function appendAudit(root: string, action: AuditAction, reason: string, id: string): void {
 	try {
 		const path = join(root, "audit.jsonl");
@@ -1495,13 +1580,15 @@ function openSyncNoFollow(path: string, flags: string, mode?: number): number {
 	const numeric =
 		flags === "r"
 			? constants.O_RDONLY
-			: flags === "a"
-				? constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY
-				: flags === "wx"
-					? constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
-					: (() => {
-							throw new Error("invalid C04 open mode");
-						})();
+			: flags === "r+"
+				? constants.O_RDWR
+				: flags === "a"
+					? constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY
+					: flags === "wx"
+						? constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
+						: (() => {
+								throw new Error("invalid C04 open mode");
+							})();
 	// O_NOFOLLOW closes the lstat/open race on platforms that support it.
 	return openSync(path, numeric | (constants.O_NOFOLLOW ?? 0), mode);
 }
