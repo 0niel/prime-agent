@@ -1,9 +1,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
-import { ENV_AGENT_DIR } from "../src/config.js";
+import { ENV_AGENT_DIR, getDaemonLogPath } from "../src/config.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
@@ -101,18 +102,42 @@ async function runRpcSmoke(
 	return { code, stdout, stderr };
 }
 
+async function verifyCatalogAfterStartupDeadline(socketPath: string, cwd: string, agentDir: string): Promise<void> {
+	// The catalog's startup timeout is five seconds. Waiting past it makes the
+	// subsequent list and log checks authoritative for the original child.
+	await delay(6000);
+	const client = new DaemonClient(socketPath);
+	try {
+		await client.connect(2000);
+		const response = await client.request({ type: "list", cwd }, 10_000);
+		expect(response.success, response.success ? undefined : response.error).toBe(true);
+	} finally {
+		client.close();
+	}
+	const previousAgentDir = process.env[ENV_AGENT_DIR];
+	process.env[ENV_AGENT_DIR] = agentDir;
+	try {
+		const daemonLog = readFileSync(getDaemonLogPath(socketPath), "utf8");
+		expect(daemonLog).not.toContain("Timed out starting daemon catalog");
+		expect(daemonLog).not.toContain("Could not start daemon catalog");
+	} finally {
+		if (previousAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+		else process.env[ENV_AGENT_DIR] = previousAgentDir;
+	}
+}
+
 describe.skipIf(process.platform !== "win32")("Windows daemon native smoke", () => {
-	it("starts a named-pipe supervisor, authenticates a real worker, and serves RPC state", async () => {
+	it("serves worker RPC and catalog operations over a named-pipe supervisor", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-windows-daemon-"));
 		tempRoots.add(root);
 		const socketPath = `\\\\.\\pipe\\prime-agent-ci-${process.pid}-${Date.now()}`;
 		daemonSockets.add(socketPath);
 
-		const result = await runRpcSmoke(join(root, "agent dir"), socketPath);
+		const agentDir = join(root, "agent dir");
+		const result = await runRpcSmoke(agentDir, socketPath);
 
 		expect(result.code, result.stderr).toBe(0);
 		expect(result.stdout).toContain('"command":"get_state","success":true');
-		expect(result.stderr).not.toContain("Timed out starting daemon catalog");
-		expect(result.stderr).not.toContain("Timed out connecting to daemon session worker");
+		await verifyCatalogAfterStartupDeadline(socketPath, root, agentDir);
 	}, 90_000);
 });
