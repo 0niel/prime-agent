@@ -3378,6 +3378,143 @@ print(_result.name)
 			stderrSpy.mockRestore();
 		}
 	});
+
+	it("keeps legacy admission strict when disabled and captures role policy before publishing a narrowed child", async () => {
+		const readTool = {
+			name: "read",
+			label: "Read",
+			description: "Read fixture",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], details: {} }),
+		};
+		const settingsManager = SettingsManager.inMemory({
+			swarmRolePolicy: {
+				version: 1,
+				modelProfiles: { exact: { model: `${model.provider}/${model.id}`, thinkingLevel: "low" } },
+				roles: {
+					reviewer: {
+						modelProfile: "exact",
+						decisionScopes: ["review"],
+						implementationScopes: ["patch"],
+						allowedToolNames: ["read"],
+						instructions: "Review only.",
+						sharedContext: { maxItems: 1, maxBytes: 256, allowedKinds: ["note"] },
+					},
+				},
+			},
+		});
+		const captured: Array<{ model: string; tools: string[]; preamble?: string }> = [];
+		let hostedChild: AgentSession | undefined;
+		const root = createSession({
+			settingsManager,
+			customTools: [readTool],
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async (options) => {
+					captured.push({
+						model: `${options.model.provider}/${options.model.id}`,
+						tools: options.activeToolNames,
+						preamble: options.policyPreamble,
+					});
+					hostedChild = createSession({ rlmSessionDir: options.sessionDir });
+					hostedChild.setSessionName(options.sessionName);
+					options.onSessionPublished?.(hostedChild);
+					return { session: hostedChild };
+				},
+				deleteRlmSubagentRuntime: async (_id, child) => child?.disposeAsync(),
+			},
+		});
+		try {
+			vi.stubEnv("PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY", "0");
+			const handlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
+			await expect(handlers["rlm.list_roles"]!({})).rejects.toThrow("disabled");
+			await expect(
+				root.runRlmChild("legacy exact", { model: `${model.provider}/${model.id}` }),
+			).resolves.toMatchObject({
+				model: `${model.provider}/${model.id}`,
+			});
+			await expect(root.runRlmChild("role rejected", { role: "reviewer" })).rejects.toThrow(
+				"require swarm role policy",
+			);
+
+			vi.stubEnv("PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY", "1");
+			await expect(handlers["rlm.list_roles"]!({})).resolves.toEqual({
+				roles: [
+					{
+						id: "reviewer",
+						model_profile: "exact",
+						decision_scopes: ["review"],
+						implementation_scopes: ["patch"],
+					},
+				],
+			});
+			const handle = await root.runRlmChild("policy exact", {
+				name: "reviewer-child",
+				role: "reviewer",
+				decision_scopes: ["review"],
+				implementation_scopes: ["patch"],
+				shared_context: [{ kind: "note", text: "untrusted context" }],
+			});
+			expect(handle.model).toBe(`${model.provider}/${model.id}`);
+			await vi.waitFor(() => expect(captured).toHaveLength(2));
+			expect(captured[1]).toMatchObject({
+				model: `${model.provider}/${model.id}`,
+				tools: ["read"],
+				preamble: expect.stringContaining("[swarm role assignment]"),
+			});
+			expect(captured[1]?.preamble).toContain("trusted role instructions:\nReview only.");
+			expect(captured[1]?.preamble).toContain("[note] untrusted context");
+		} finally {
+			vi.unstubAllEnvs();
+			hostedChild?.dispose();
+			root.dispose();
+		}
+	});
+
+	it("refuses a policy-bound child after rollback while a new legacy root still runs", async () => {
+		const settingsManager = SettingsManager.inMemory({
+			swarmRolePolicy: {
+				version: 1,
+				modelProfiles: { exact: { model: `${model.provider}/${model.id}` } },
+				roles: {
+					worker: {
+						modelProfile: "exact",
+						decisionScopes: [],
+						implementationScopes: [],
+						allowedToolNames: [],
+						sharedContext: { maxItems: 0, maxBytes: 0 },
+					},
+				},
+			},
+		});
+		let policyRoot: AgentSession | undefined;
+		let legacyRoot: AgentSession | undefined;
+		try {
+			vi.stubEnv("PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY", "1");
+			policyRoot = createSession({ settingsManager });
+			const policyHandle = await policyRoot.runRlmChild("first policy child", { role: "worker" });
+			await vi.waitFor(() => expect(policyRoot!.getRlmChildSession(policyHandle.rlm_child_id)).toBeDefined());
+			const policyChild = policyRoot.getRlmChildSession(policyHandle.rlm_child_id)!;
+			expect(policyChild.swarmRoleAssignment).toMatchObject({
+				roleId: "worker",
+				model: `${model.provider}/${model.id}`,
+			});
+
+			vi.stubEnv("PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY", "0");
+			await expect(policyChild.runRlmChild("must remain fenced")).rejects.toThrow(
+				"after swarm role policy rollback",
+			);
+			legacyRoot = createSession();
+			await expect(
+				legacyRoot.runRlmChild("legacy root continues", { model: `${model.provider}/${model.id}` }),
+			).resolves.toMatchObject({
+				model: `${model.provider}/${model.id}`,
+			});
+		} finally {
+			vi.unstubAllEnvs();
+			policyRoot?.dispose();
+			legacyRoot?.dispose();
+		}
+	});
 });
 
 interface InspectableRlmDirSession {
