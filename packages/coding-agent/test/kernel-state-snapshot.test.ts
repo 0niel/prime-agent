@@ -92,9 +92,13 @@ describe("buildSnapshotCode", () => {
 		expect(code).toContain(String(DEFAULT_SNAPSHOT_MAX_BYTES));
 	});
 
-	it("uses dill, an atomic write, and skips internal handles", () => {
+	it("uses dill with private exclusive atomic writes and skips internal handles", () => {
 		expect(code).toContain("import dill");
+		expect(code).toContain("os.O_EXCL");
+		expect(code).toContain('getattr(os, "O_NOFOLLOW", 0)');
 		expect(code).toContain("os.replace");
+		expect(code).toContain("os.chmod(out_dir, 0o700)");
+		expect(code).toContain('os.chmod("/state/sess.dill", 0o600)');
 		// rlm and the IPython display names must never be serialized.
 		expect(code).toContain('"rlm"');
 		expect(code).toContain(`print(${JSON.stringify(MARKER)}`);
@@ -104,9 +108,12 @@ describe("buildSnapshotCode", () => {
 describe("buildRestoreCode", () => {
 	const code = buildRestoreCode("/state/sess.dill");
 
-	it("embeds the input path and no-ops when the file is missing", () => {
+	it("embeds the input path and rejects non-regular or symlinked snapshot files", () => {
 		expect(code).toContain('"/state/sess.dill"');
 		expect(code).toContain("os.path.exists");
+		expect(code).toContain("os.lstat");
+		expect(code).toContain("S_ISREG");
+		expect(code).toContain('getattr(os, "O_NOFOLLOW", 0)');
 		expect(code).toContain("dill.loads");
 	});
 });
