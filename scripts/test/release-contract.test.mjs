@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -173,6 +173,38 @@ test("release verifier binds caller and manifest commits to authoritative HEAD",
 		assert.notEqual(spoofed.status, 0);
 		assert.match(spoofed.stderr, /--commit must exactly match authoritative source HEAD/);
 	} finally { cleanup(directory); }
+});
+
+test("release verifier rejects injected tarball properties", () => {
+	const directory = createArtifacts(({ tarballs }) => { tarballs[0].injected = "unexpected"; });
+	try {
+		const result = verify(directory);
+		assert.notEqual(result.status, 0);
+		assert.match(result.stderr, /Manifest tarball prime-agent-core-0\.7\.1\.tgz must exactly match/);
+	} finally { cleanup(directory); }
+});
+
+test("release verifier rejects symlinked artifact directories and entries", () => {
+	const target = createArtifacts();
+	const linkedDirectory = `${target}-link`;
+	try {
+		symlinkSync(target, linkedDirectory);
+		const directoryResult = verify(linkedDirectory);
+		assert.notEqual(directoryResult.status, 0);
+		assert.match(directoryResult.stderr, /Artifact directory must not be a symbolic link/);
+
+		const directory = createArtifacts();
+		try {
+			rmSync(join(directory, `prime-agent-${version}.tgz`));
+			symlinkSync(join(target, `prime-agent-${version}.tgz`), join(directory, `prime-agent-${version}.tgz`));
+			const entryResult = verify(directory);
+			assert.notEqual(entryResult.status, 0);
+			assert.match(entryResult.stderr, /must not be a symbolic link/);
+		} finally { cleanup(directory); }
+	} finally {
+		rmSync(linkedDirectory, { force: true });
+		cleanup(target);
+	}
 });
 
 test("release verifier rejects missing or substituted secondary components", () => {

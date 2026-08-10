@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { getPiUserAgent } from "./pi-user-agent.js";
 
 const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
@@ -111,6 +112,37 @@ function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefin
 	}
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function fetchReleaseDocument(
+	url: string,
+	currentVersion: string,
+	timeoutMs: number,
+): Promise<{ bytes: Buffer; data: Record<string, unknown> } | undefined> {
+	const response = await fetch(url, {
+		headers: {
+			"User-Agent": getPiUserAgent(currentVersion),
+			accept: "application/json",
+		},
+		signal: AbortSignal.timeout(timeoutMs),
+	});
+	if (!response.ok) return undefined;
+
+	const bytes = Buffer.from(await response.arrayBuffer());
+	try {
+		const data: unknown = JSON.parse(bytes.toString("utf8"));
+		return isRecord(data) ? { bytes, data } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function isManifestPointer(data: Record<string, unknown>): boolean {
+	return "manifest" in data || "sha256" in data;
+}
+
 export async function getLatestPiRelease(
 	currentVersion: string,
 	options: { timeoutMs?: number } = {},
@@ -118,21 +150,26 @@ export async function getLatestPiRelease(
 	if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
 
 	const baseUrl = getPrimeAgentDownloadBaseUrl();
-	const response = await fetch(`${baseUrl}/${getReleaseManifestPath(currentVersion)}`, {
-		headers: {
-			"User-Agent": getPiUserAgent(currentVersion),
-			accept: "application/json",
-		},
-		signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_VERSION_CHECK_TIMEOUT_MS),
-	});
-	if (!response.ok) return undefined;
+	const timeoutMs = options.timeoutMs ?? DEFAULT_VERSION_CHECK_TIMEOUT_MS;
+	const pointerOrManifest = await fetchReleaseDocument(
+		`${baseUrl}/${getReleaseManifestPath(currentVersion)}`,
+		currentVersion,
+		timeoutMs,
+	);
+	if (!pointerOrManifest) return undefined;
 
-	const data = (await response.json()) as {
-		package?: unknown;
-		packageName?: unknown;
-		tarball?: unknown;
-		version?: unknown;
-	};
+	let data = pointerOrManifest.data;
+	if (isManifestPointer(data)) {
+		if (typeof data.manifest !== "string" || typeof data.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(data.sha256)) {
+			return undefined;
+		}
+		const manifestUrl = resolveReleaseUrl(baseUrl, data.manifest);
+		if (!manifestUrl) return undefined;
+		const manifest = await fetchReleaseDocument(manifestUrl, currentVersion, timeoutMs);
+		if (!manifest || createHash("sha256").update(manifest.bytes).digest("hex") !== data.sha256) return undefined;
+		data = manifest.data;
+	}
+
 	if (typeof data.version !== "string" || !data.version.trim()) {
 		return undefined;
 	}

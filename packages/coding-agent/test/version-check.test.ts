@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	checkForNewPiVersion,
@@ -84,6 +85,45 @@ describe("version checks", () => {
 			packageName: "prime-agent",
 			version: "1.2.4",
 		});
+	});
+
+	it("dereferences an integrity-bound release manifest pointer", async () => {
+		const manifest = {
+			package: "prime-agent",
+			tarball: "releases/v1.2.4/prime-agent-1.2.4.tgz",
+			version: "v1.2.4",
+		};
+		const manifestBytes = JSON.stringify(manifest);
+		const pointer = {
+			manifest: "releases/v1.2.4/manifest.json",
+			sha256: createHash("sha256").update(manifestBytes).digest("hex"),
+		};
+		const fetchMock = vi.fn(async (url: string) => {
+			if (url === `${defaultPrimeAgentDownloadBaseUrl}/latest.json`) return new Response(JSON.stringify(pointer));
+			if (url === `${defaultPrimeAgentDownloadBaseUrl}/releases/v1.2.4/manifest.json`) return new Response(manifestBytes);
+			throw new Error(`unexpected fetch URL ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
+			installSpec: `${defaultPrimeAgentDownloadBaseUrl}/releases/v1.2.4/prime-agent-1.2.4.tgz`,
+			packageName: "prime-agent",
+			version: "1.2.4",
+		});
+		expect(fetchMock).toHaveBeenNthCalledWith(1, `${defaultPrimeAgentDownloadBaseUrl}/latest.json`, expect.any(Object));
+		expect(fetchMock).toHaveBeenNthCalledWith(2, `${defaultPrimeAgentDownloadBaseUrl}/releases/v1.2.4/manifest.json`, expect.any(Object));
+	});
+
+	it("rejects a release manifest pointer whose digest does not match", async () => {
+		const fetchMock = vi.fn(async (url: string) => {
+			if (url === `${defaultPrimeAgentDownloadBaseUrl}/latest.json`) {
+				return new Response(JSON.stringify({ manifest: "releases/v1.2.4/manifest.json", sha256: "0".repeat(64) }));
+			}
+			return new Response(JSON.stringify({ version: "v1.2.4" }));
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(getLatestPiRelease("1.2.3")).resolves.toBeUndefined();
 	});
 
 	it("skips api calls when version checks are disabled", async () => {
