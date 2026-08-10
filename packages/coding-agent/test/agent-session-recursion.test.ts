@@ -421,6 +421,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(child.rlmDepth).toBe(3);
 	});
 
+
 	it("lets the orchestrator choose a unique subagent session name", async () => {
 		const root = createSession();
 		const result = await root.runRlmChild("inspect the API", { name: "  api-reviewer  " });
@@ -2891,6 +2892,57 @@ describe("AgentSession rlm recursion", () => {
 
 		releaseChild();
 		await waitFor(() => rootRun.status === "done");
+	});
+
+	it("cancels an admitted child in promptAndWait when its kernel host is disposed", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				if (text === "kernel-owned shard") {
+					childStarted = true;
+					void release.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+					});
+				}
+				return stream;
+			},
+		});
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: (root as unknown as InspectableRlmSession)._createKernelHostHandlers(),
+		});
+		const replies: CapturedCommReply[] = [];
+		const kernel = manager as unknown as KernelCommTestApi;
+		kernel.sendCommMessage = async (commId, data) => {
+			replies.push({ commId, data });
+		};
+
+		try {
+			kernel.handleCommMessage(rlmCommOpen("comm-real-child", "kernel-owned shard"));
+			await waitFor(() => replies.some((reply) => reply.commId === "comm-real-child"));
+			await waitFor(() => childStarted);
+			const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
+			const run = [...runs.values()][0];
+			if (!run?.session) throw new Error("Missing admitted child session");
+			const childAbort = vi.spyOn(run.session, "abort");
+
+			await manager.dispose();
+
+			expect(run.status).toBe("cancelled");
+			expect(run.error).toBe("IPython kernel disposed");
+			expect(childAbort).toHaveBeenCalledTimes(1);
+			releaseChild();
+			await waitFor(() => !runs.has(run.id));
+		} finally {
+			releaseChild();
+			await manager.dispose();
+		}
 	});
 
 	it("runs parallel rlm comm requests independently", async () => {

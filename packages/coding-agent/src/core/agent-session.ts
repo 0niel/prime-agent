@@ -9665,6 +9665,15 @@ export class AgentSession {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 		};
 		this._activeRlmChildRuns.set(run.id, run);
+		const abortFromHost = () => {
+			const reason = signal?.reason;
+			this._cancelRlmChildRun(run, reason instanceof Error ? reason.message : "IPython kernel host request aborted");
+		};
+		if (signal?.aborted) {
+			abortFromHost();
+		} else {
+			signal?.addEventListener("abort", abortFromHost, { once: true });
+		}
 		const emitChildUpdate = () => {
 			const childModel = childSession?.model ?? modelSelection.model;
 			this._emit({
@@ -9919,6 +9928,7 @@ export class AgentSession {
 					}
 				}
 			} finally {
+				signal?.removeEventListener("abort", abortFromHost);
 				if (run.detachedDeletion && childRuntime) {
 					try {
 						await this._deleteRlmSubagentSession(run.id, childRuntime.session);
