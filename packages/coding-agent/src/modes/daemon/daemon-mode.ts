@@ -444,11 +444,15 @@ function persistedSwarmToolArray(value: unknown): string[] {
 	if (new Set(result).size !== result.length) throw new Error("invalid persisted swarm assignment allowedToolNames");
 	return result;
 }
+function splitSwarmModelSelector(model: string): { provider: string; modelId: string } {
+	const slash = model.indexOf("/");
+	return { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
+}
 function assertPersistedPolicyRegistryModelMatches(value: unknown, assignment: Readonly<SwarmRoleAssignment>): void {
 	if (value === undefined) return;
 	if (!isPersistedSwarmRecord(value) || typeof value.provider !== "string" || typeof value.modelId !== "string")
 		throw new Error("invalid persisted policy registry model");
-	const [provider, modelId] = assignment.model.split("/");
+	const { provider, modelId } = splitSwarmModelSelector(assignment.model);
 	if (value.provider !== provider || value.modelId !== modelId)
 		throw new Error("persisted policy swarm assignment model does not match registry model");
 }
@@ -3194,11 +3198,11 @@ export class AgentDaemon {
 				// A policy assignment is the immutable authority for a restored child.
 				// The registry model is only a legacy spawn display snapshot and must
 				// never select a policy child's provider or model.
-				const [provider, modelId] = entry.swarmRoleAssignment.model.split("/");
+				const { provider, modelId } = splitSwarmModelSelector(entry.swarmRoleAssignment.model);
 				if (entry.model && (entry.model.provider !== provider || entry.model.modelId !== modelId)) {
 					throw new Error("persisted policy swarm assignment model does not match registry model");
 				}
-				const resolved = modelRegistry.find(provider!, modelId!);
+				const resolved = modelRegistry.find(provider, modelId);
 				let available = false;
 				try {
 					available = resolved !== undefined && (await modelRegistry.canUseModel(resolved));

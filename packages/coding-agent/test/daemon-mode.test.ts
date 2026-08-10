@@ -1544,6 +1544,32 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("rehydrates a policy assignment with a slash-bearing model ID", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-slash-model-id-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir, { policyModelId: "org/scripted" });
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const row = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			row.model = { provider: "test", modelId: "org/scripted" };
+			row.swarmRoleAssignment = persistedSwarmAssignment(String(row.assignmentId), "test/org/scripted");
+			writeFileSync(registryPath, `${JSON.stringify(row)}\n`);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createAgentMessageController(
+					getCurrentState: () => ActiveSessionState | undefined,
+				): AgentSessionMessageController;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals
+				.createAgentMessageController(() => parent)
+				.sendAgentMessage({ target: "renamed-worker", message: "wake slash-bearing policy child" });
+			expect(fixture.modelRegistry.find).toHaveBeenCalledWith("test", "org/scripted");
+			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions?.model).toBe(fixture.policyModel);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("quarantines malformed or assignment-mismatched swarm registry rows without waking them", async () => {
 		for (const corrupt of [
 			(assignment: Record<string, unknown>) => ({ ...assignment, unexpected: true }),
@@ -10860,13 +10886,13 @@ function makeCronJob(input: {
 	};
 }
 
-function persistedSwarmAssignment(assignmentId: string): Record<string, unknown> {
+function persistedSwarmAssignment(assignmentId: string, model = "test/scripted"): Record<string, unknown> {
 	return {
 		assignmentId,
 		policyDigest: "a".repeat(64),
 		roleId: "reviewer",
 		modelProfile: "scripted",
-		model: "test/scripted",
+		model,
 		thinkingLevel: "low",
 		serviceTier: "flex",
 		decisionScopes: ["review"],
@@ -10891,6 +10917,7 @@ function makePersistedRlmDaemonFixture(
 		childAdmissionStarted?: () => void;
 		childAdmissionGate?: Promise<void>;
 		canUsePolicyModel?: boolean;
+		policyModelId?: string;
 	} = {},
 ) {
 	const sessionDir = join(tempDir, "sessions");
@@ -10968,7 +10995,7 @@ function makePersistedRlmDaemonFixture(
 `,
 	);
 
-	const policyModel = { provider: "test", id: "scripted" } as Model<Api>;
+	const policyModel = { provider: "test", id: options.policyModelId ?? "scripted" } as Model<Api>;
 	const modelRegistry = {
 		find: vi.fn((provider: string, modelId: string) =>
 			provider === policyModel.provider && modelId === policyModel.id ? policyModel : undefined,
