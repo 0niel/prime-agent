@@ -18,6 +18,18 @@ function chunks(input: string, sizes: number[]): string[] {
 	return result;
 }
 
+function expectLegacyParityAtEveryPrefix(document: string, finalValue?: unknown): void {
+	const state = createStreamingJsonParseState<Record<string, unknown>>();
+	for (let end = 1; end <= document.length; end++) {
+		const prefix = document.slice(0, end);
+		expect(state.append(document.slice(end - 1, end))).toEqual(parseStreamingJson(prefix));
+		expect(state.preview()).toEqual(parseStreamingJson(prefix));
+	}
+	if (finalValue === undefined) expect(() => state.finalize()).toThrow();
+	else expect(state.finalize()).toEqual(finalValue);
+	expect(getStreamingJsonStrictValidationCountForTesting(state)).toBe(1);
+}
+
 describe("incremental streaming JSON parse state", () => {
 	it("matches legacy previews and strictly validates exactly once", () => {
 		const document = JSON.stringify({ empty: {}, array: [true, null, { nested: [1, 2, "ok"] }], number: -12.5e2 });
@@ -32,6 +44,15 @@ describe("incremental streaming JSON parse state", () => {
 		expect(getStreamingJsonStrictValidationCountForTesting(state)).toBe(1);
 		expect(() => state.finalize()).toThrow();
 		expect(() => state.append(" ")).toThrow();
+	});
+
+	it("matches every prefix of a deterministic representative valid nested corpus", () => {
+		const document =
+			'{"outer":[{"empty":{},"array":[true,false,null,{"number":-12.5e2}],"escaped":"\\"\\\\\\/\\b\\f\\n\\r\\t","unicode":"\\uD83D\\uDE00","literal":"é😀é"}],"tail":{"ok":true}}';
+		const emoji = document.indexOf("😀");
+		expect(document.charCodeAt(emoji)).toBeGreaterThanOrEqual(0xd800);
+		expect(document.charCodeAt(emoji + 1)).toBeLessThanOrEqual(0xdfff);
+		expectLegacyParityAtEveryPrefix(document, JSON.parse(document));
 	});
 
 	it("preserves literal unicode, surrogate, and escape chunk boundaries", () => {
@@ -64,26 +85,24 @@ describe("incremental streaming JSON parse state", () => {
 		}
 	});
 
-	it("differentially matches legacy for every prefix of invalid escapes, unicode splits, and malformed structures", () => {
+	it("keeps unknown escapes and split Unicode boundaries legacy-compatible but rejects invalid finals", () => {
+		const document = '{"literal":"😀","escaped":"\\uD83D\\uDE00","unknown":"\\q"}';
+		const emoji = document.indexOf("😀");
+		expect(document.slice(emoji, emoji + 2)).toBe("😀");
+		expectLegacyParityAtEveryPrefix(document);
+	});
+
+	it("differentially matches legacy for every prefix of malformed structures", () => {
 		const documents = [
-			'{"escape":"\\q"}',
 			'{"unicode":"\\u12x"}',
-			'{"unicode":"\\uD83D\\uDE00"}',
 			'{"raw-control":"x\ny"}',
-			'{"line-separator":"x y"}',
-			'{"split":"😀"}',
 			'{"nested":[{"x":1},]}',
 			'{"number":1e+}',
 			'{"junk":true} trailing',
 			'{"unterminated": [1, {"x": "value',
 		];
-		for (const document of documents) {
-			const state = createStreamingJsonParseState<Record<string, unknown>>();
-			for (let end = 1; end <= document.length; end++) {
-				const prefix = document.slice(0, end);
-				expect(state.append(document.slice(end - 1, end))).toEqual(parseStreamingJson(prefix));
-			}
-		}
+		for (const document of documents) expectLegacyParityAtEveryPrefix(document);
+		expectLegacyParityAtEveryPrefix('{"line-separator":"x y"}', { "line-separator": "x y" });
 	});
 
 	it("accounts for only new input until its one strict terminal parse", () => {

@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { renameSync, writeFileSync } from "node:fs";
 import { cpus, release, type } from "node:os";
 import {
 	createStreamingJsonParseState,
@@ -9,11 +9,41 @@ import {
 	resetStreamingJsonParseInstrumentationForTesting,
 } from "../src/utils/json-parse.js";
 
-const args = process.argv.slice(2);
-const name = args[args.indexOf("--name") + 1];
-const output = args[args.indexOf("--json") + 1];
-if (name !== "N01-streaming-structured-output-parse-cpu" || !output)
-	throw new Error("Use --name N01-streaming-structured-output-parse-cpu --json FILE");
+const BENCHMARK_NAME = "N01-streaming-structured-output-parse-cpu";
+type Mode = "legacy" | "incremental";
+type Options = {
+	name: string;
+	output: string;
+	escapedBytes: number;
+	unicodeBytes: number;
+	repetitions: number;
+};
+
+function requiredOption(args: string[], name: string): string {
+	const index = args.indexOf(name);
+	if (index === -1 || args[index + 1] === undefined) throw new Error(`${name} requires a value`);
+	return args[index + 1];
+}
+
+function positiveIntegerOption(args: string[], name: string, defaultValue: number): number {
+	const index = args.indexOf(name);
+	if (index === -1) return defaultValue;
+	const parsed = Number(args[index + 1]);
+	if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
+	return parsed;
+}
+
+function parseOptions(args: string[]): Options {
+	const name = requiredOption(args, "--name");
+	if (name !== BENCHMARK_NAME) throw new Error(`--name must be ${BENCHMARK_NAME}`);
+	return {
+		name,
+		output: requiredOption(args, "--json"),
+		escapedBytes: positiveIntegerOption(args, "--escaped-bytes", 1024 * 1024),
+		unicodeBytes: positiveIntegerOption(args, "--unicode-bytes", 256 * 1024),
+		repetitions: positiveIntegerOption(args, "--repetitions", 7),
+	};
+}
 
 function corpus(bytes: number, unicode: boolean): string {
 	const unit = unicode ? "😀\u2028 nested é " : '\\"escaped\\n nested ';
@@ -21,13 +51,16 @@ function corpus(bytes: number, unicode: boolean): string {
 		outer: Array.from({ length: Math.ceil(bytes / unit.length) }, (_, index) => ({ index, text: unit })),
 	});
 }
+
 function chunks(document: string, size: number): string[] {
-	return Array.from({ length: Math.ceil(document.length / size) }, (_, i) => document.slice(i * size, (i + 1) * size));
+	return Array.from({ length: Math.ceil(document.length / size) }, (_, index) =>
+		document.slice(index * size, (index + 1) * size),
+	);
 }
-function measured(document: string, chunkSize: number, mode: "legacy" | "incremental") {
-	const input = chunks(document, chunkSize);
+
+function measured(document: string, input: string[], mode: Mode) {
 	resetStreamingJsonParseInstrumentationForTesting();
-	const cpuBefore = process.cpuUsage();
+	const resourcesBefore = process.resourceUsage();
 	const wallBefore = process.hrtime.bigint();
 	let result: unknown;
 	let examined: number;
@@ -46,94 +79,84 @@ function measured(document: string, chunkSize: number, mode: "legacy" | "increme
 		examined = getStreamingJsonInputExaminedForTesting(state).total;
 	}
 	if (JSON.stringify(result) !== document) throw new Error(`${mode} result differs from source document`);
-	const cpu = process.cpuUsage(cpuBefore);
+	const resourcesAfter = process.resourceUsage();
 	return {
 		wallNs: Number(process.hrtime.bigint() - wallBefore),
-		cpuUs: cpu.user + cpu.system,
+		cpuUs:
+			resourcesAfter.userCPUTime -
+			resourcesBefore.userCPUTime +
+			(resourcesAfter.systemCPUTime - resourcesBefore.systemCPUTime),
 		inputExamined: examined,
 		chunkCount: input.length,
 	};
 }
+
 function stats(values: number[]) {
 	const sorted = [...values].sort((a, b) => a - b);
 	return { min: sorted[0], median: sorted[Math.floor(sorted.length / 2)], max: sorted.at(-1) };
 }
-function option(name: string, defaultValue: number): number {
-	const index = args.indexOf(name);
-	if (index === -1) return defaultValue;
-	const value = args[index + 1];
-	if (value === undefined) throw new Error(`${name} requires a value`);
-	const parsed = Number(value);
-	if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
-	return parsed;
+
+function writeJsonAtomically(output: string, value: unknown): void {
+	const temporary = `${output}.${process.pid}.${randomUUID()}.tmp`;
+	writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	renameSync(temporary, output);
 }
 
-// Defaults are deliberately local-friendly: the legacy baseline reparses each
-// prefix, so small chunks make its examined-input total grow quadratically.
-// The remote command below retains the original 1 MiB corpus sizes.
-const repetitions = option("--repetitions", 5);
-const escapedBytes = option("--escaped-bytes", 32 * 1024);
-const unicodeBytes = option("--unicode-bytes", 8 * 1024);
-const escapedChunkSize = option("--escaped-chunk-size", 64);
-const unicodeChunkSize = option("--unicode-chunk-size", 7);
-const results = [
-	{
-		name: `escaped-nested-${escapedBytes}-${escapedChunkSize}`,
-		document: corpus(escapedBytes, false),
-		chunkSize: escapedChunkSize,
-	},
-	{
-		name: `unicode-nested-${unicodeBytes}-${unicodeChunkSize}`,
-		document: corpus(unicodeBytes, true),
-		chunkSize: unicodeChunkSize,
-	},
-].map(({ name: corpusName, document, chunkSize }) => {
-	measured(document, chunkSize, "legacy");
-	measured(document, chunkSize, "incremental"); // unreported warm-ups
-	const legacy = Array.from({ length: repetitions }, () => measured(document, chunkSize, "legacy"));
-	const incremental = Array.from({ length: repetitions }, () => measured(document, chunkSize, "incremental"));
-	const legacyCpuUs = stats(legacy.map((sample) => sample.cpuUs));
-	const incrementalCpuUs = stats(incremental.map((sample) => sample.cpuUs));
-	if (incremental[0].inputExamined !== document.length * 2)
-		throw new Error("incremental input examination is not linear");
-	if (incrementalCpuUs.median >= legacyCpuUs.median)
-		throw new Error("incremental median CPU did not beat legacy replay");
-	return {
-		name: corpusName,
-		inputHash: createHash("sha256").update(document).digest("hex"),
-		inputLength: document.length,
-		chunkCount: incremental[0].chunkCount,
-		repetitions,
-		legacy: {
-			wallNs: stats(legacy.map((sample) => sample.wallNs)),
-			cpuUs: legacyCpuUs,
-			inputExamined: legacy[0].inputExamined,
-		},
-		incremental: {
-			wallNs: stats(incremental.map((sample) => sample.wallNs)),
-			cpuUs: incrementalCpuUs,
-			inputExamined: incremental[0].inputExamined,
-		},
-	};
-});
-writeFileSync(
-	output,
-	JSON.stringify(
+function run(options: Options): void {
+	const results = [
 		{
-			name,
-			command: process.argv.join(" "),
-			node: process.version,
-			os: {
-				platform: process.platform,
-				release: release(),
-				version: process.version,
-				arch: process.arch,
-				type: type(),
-			},
-			cpu: cpus()[0]?.model ?? "unknown",
-			results,
+			name: `escaped-nested-${options.escapedBytes}-64`,
+			document: corpus(options.escapedBytes, false),
+			chunkSize: 64,
 		},
-		null,
-		2,
-	),
-);
+		{ name: `unicode-nested-${options.unicodeBytes}-7`, document: corpus(options.unicodeBytes, true), chunkSize: 7 },
+	].map(({ name, document, chunkSize }) => {
+		const input = chunks(document, chunkSize);
+		measured(document, input, "legacy");
+		measured(document, input, "incremental");
+		const samples: Record<Mode, ReturnType<typeof measured>[]> = { legacy: [], incremental: [] };
+		for (let repetition = 0; repetition < options.repetitions; repetition++) {
+			const order: Mode[] = repetition % 2 === 0 ? ["legacy", "incremental"] : ["incremental", "legacy"];
+			for (const mode of order) samples[mode].push(measured(document, input, mode));
+		}
+		const legacyCpuUs = stats(samples.legacy.map((sample) => sample.cpuUs));
+		const incrementalCpuUs = stats(samples.incremental.map((sample) => sample.cpuUs));
+		if (samples.incremental[0].inputExamined !== document.length * 2)
+			throw new Error("incremental input examination is not linear");
+		if (incrementalCpuUs.median >= legacyCpuUs.median)
+			throw new Error("incremental median CPU did not beat legacy replay");
+		return {
+			name,
+			inputHash: createHash("sha256").update(document).digest("hex"),
+			inputLength: document.length,
+			chunkCount: input.length,
+			repetitions: options.repetitions,
+			order: "alternating legacy/incremental by repetition",
+			legacy: {
+				wallNs: stats(samples.legacy.map((sample) => sample.wallNs)),
+				cpuUs: legacyCpuUs,
+				inputExamined: samples.legacy[0].inputExamined,
+			},
+			incremental: {
+				wallNs: stats(samples.incremental.map((sample) => sample.wallNs)),
+				cpuUs: incrementalCpuUs,
+				inputExamined: samples.incremental[0].inputExamined,
+			},
+		};
+	});
+	writeJsonAtomically(options.output, {
+		name: options.name,
+		command: process.argv.join(" "),
+		node: process.version,
+		os: {
+			platform: process.platform,
+			release: release(),
+			arch: process.arch,
+			type: type(),
+		},
+		cpu: cpus()[0]?.model ?? "unknown",
+		results,
+	});
+}
+
+run(parseOptions(process.argv.slice(2)));

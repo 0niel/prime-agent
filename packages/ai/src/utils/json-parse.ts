@@ -167,7 +167,7 @@ type StringToken = {
 	location?: ValueLocation;
 };
 type ValueLocation = { frame?: Frame; key?: string; arrayIndex?: number; root: boolean };
-type ScalarToken = { value: string; target: "value" };
+type ScalarToken = { value: string; target: "value"; location: ValueLocation };
 
 /**
  * The lexer deliberately advances UTF-16 code units: a surrogate pair split
@@ -316,8 +316,11 @@ class IncrementalStreamingJsonParseState<T> implements StreamingJsonParseState<T
 			}
 			return;
 		}
-		this.scalarToken = { target: "value", value: char };
-		this.beginValue(this.previewScalar(char));
+		const location = this.currentValueLocation();
+		const preview = this.previewScalar(char);
+		this.beginValue(preview === undefined ? {} : preview);
+		this.scalarToken = { target: "value", value: char, location };
+		if (preview === undefined) this.removeValue(location);
 	}
 
 	private consumeString(char: string): void {
@@ -455,7 +458,10 @@ class IncrementalStreamingJsonParseState<T> implements StreamingJsonParseState<T
 	}
 
 	private updateScalarPreview(): void {
-		this.replaceCurrentValue(this.previewScalar(this.scalarToken!.value));
+		const token = this.scalarToken!;
+		const preview = this.previewScalar(token.value);
+		if (preview === undefined) this.removeValue(token.location);
+		else this.setValue(token.location, preview);
 	}
 
 	private replaceCurrentValue(value: unknown): void {
@@ -503,7 +509,7 @@ class IncrementalStreamingJsonParseState<T> implements StreamingJsonParseState<T
 		if (this.frames.length === 0) this.rootComplete = true;
 	}
 
-	private previewScalar(value: string): unknown {
+	private previewScalar(value: string): unknown | undefined {
 		if (value === "true" || value === "t" || value === "tr" || value === "tru") return true;
 		if (value === "false" || value === "f" || value === "fa" || value === "fal" || value === "fals") return false;
 		if (value === "null" || value === "n" || value === "nu" || value === "nul") return null;
@@ -514,7 +520,7 @@ class IncrementalStreamingJsonParseState<T> implements StreamingJsonParseState<T
 		if (exponent > 0 && /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value.slice(0, exponent))) {
 			return Number(value.slice(0, exponent));
 		}
-		return {};
+		return undefined;
 	}
 }
 
