@@ -1,12 +1,12 @@
 /**
- * Disposable, test-only child supervisor for the PR-B00B RSS campaign.
+ * Disposable, test-only child supervisor for the B00B RSS campaign.
  * It deliberately has no provider imports, network client, daemon listener, or
- * persistent state.  The parent owns this process group and measures it.
+ * persistent state. The parent owns this process group and measures it.
  */
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
 
 interface WorkerOptions {
 	fanout: number;
@@ -17,7 +17,7 @@ interface WorkerOptions {
 }
 
 type WorkerMessage =
-	| { type: "boundary"; phase: "started" | "barrier-held" | "terminals" | "cleanup"; allocatedBytes: number }
+	| { type: "boundary"; phase: "started" | "barrier-held" | "terminals" | "cleanup"; allocatedBytes: number; memberPids: readonly number[] }
 	| { type: "result"; completed: number; failed: number; allocatedBytes: number };
 
 function option(name: string): string | undefined {
@@ -64,34 +64,38 @@ function safeEnvironment(worker: number, fanout: number, allocationBytes: number
 	return environment;
 }
 
-// This fixture is intentionally local and deterministic. An integration can
-// replace it with --fixture-command/--fixture-arg without the launcher ever
-// serializing that command, its arguments, or its output into campaign data.
 const BUILTIN_FIXTURE = [
 	"const bytes=Number(process.env.B00B_FIXTURE_ALLOCATION_BYTES||0);",
 	"const b=Buffer.allocUnsafe(bytes);for(let i=0;i<b.length;i+=4096)b[i]=1;",
 	"setTimeout(()=>process.exit(0),50);",
 ].join("");
 
-function runFixture(config: WorkerOptions, worker: number, allocationBytes: number): Promise<boolean> {
+interface Fixture {
+	pid: number;
+	exit: Promise<boolean>;
+}
+
+function launchFixture(config: WorkerOptions, worker: number, allocationBytes: number): Fixture | undefined {
 	const command = config.fixtureCommand ?? process.execPath;
 	const args = config.fixtureCommand ? [...config.fixtureArgs] : ["-e", BUILTIN_FIXTURE];
-	return new Promise((resolve) => {
-		let child: ChildProcess;
-		try {
-			child = spawn(command, args, {
-				cwd: process.cwd(),
-				detached: false,
-				env: safeEnvironment(worker, config.fanout, allocationBytes),
-				stdio: "ignore",
-			});
-		} catch {
-			resolve(false);
-			return;
-		}
-		child.once("error", () => resolve(false));
-		child.once("exit", (code, signal) => resolve(code === 0 && signal === null));
-	});
+	try {
+		const child: ChildProcess = spawn(command, args, {
+			cwd: process.cwd(),
+			detached: false,
+			env: safeEnvironment(worker, config.fanout, allocationBytes),
+			stdio: "ignore",
+		});
+		if (!child.pid) return undefined;
+		return {
+			pid: child.pid,
+			exit: new Promise((resolve) => {
+				child.once("error", () => resolve(false));
+				child.once("exit", (code, signal) => resolve(code === 0 && signal === null));
+			}),
+		};
+	} catch {
+		return undefined;
+	}
 }
 
 function send(message: WorkerMessage): void {
@@ -105,28 +109,25 @@ function pause(milliseconds: number): Promise<void> {
 async function main(): Promise<void> {
 	const config = options();
 	const allocationBytes = config.allocationMiB * 1024 * 1024;
-	// The supervisor allocation and each fixture allocation are touched so RSS
-	// has a deliberate, numeric-only allocation proof.
 	let allocation = Buffer.allocUnsafe(allocationBytes);
 	for (let index = 0; index < allocation.length; index += 4096) allocation[index] = 1;
 	const runtimeRoot = await mkdtemp(join(config.scratch, "b00b-rss-"));
 	try {
 		await Promise.all([mkdir(join(runtimeRoot, "agent")), mkdir(join(runtimeRoot, "socket")), mkdir(join(runtimeRoot, "output"))]);
-		send({ type: "boundary", phase: "started", allocatedBytes: allocationBytes });
-		const fixtures = Array.from({ length: config.fanout }, (_, index) => runFixture(config, index + 1, allocationBytes));
-		// All fixture entries are dispatched before this boundary. This is an
-		// observation boundary, never a permit, queue, or admission limiter.
-		send({ type: "boundary", phase: "barrier-held", allocatedBytes: allocationBytes * (config.fanout + 1) });
-		const results = await Promise.all(fixtures);
+		const fixtures = Array.from({ length: config.fanout }, (_, index) => launchFixture(config, index + 1, allocationBytes));
+		const memberPids = fixtures.flatMap((fixture) => (fixture ? [fixture.pid] : []));
+		send({ type: "boundary", phase: "started", allocatedBytes: allocationBytes, memberPids });
+		// Every fixture is dispatched before this observation boundary. It is never
+		// a permit, queue, semaphore, or admission limiter.
+		send({ type: "boundary", phase: "barrier-held", allocatedBytes: allocationBytes * (config.fanout + 1), memberPids });
+		const results = await Promise.all(fixtures.map((fixture) => fixture?.exit ?? Promise.resolve(false)));
 		const completed = results.filter(Boolean).length;
-		send({ type: "boundary", phase: "terminals", allocatedBytes: allocationBytes * (config.fanout + 1) });
-		// Hold the terminal boundary long enough for the 20 Hz parent sampler to
-		// capture it; this is post-terminal observation only, not admission.
+		send({ type: "boundary", phase: "terminals", allocatedBytes: allocationBytes * (config.fanout + 1), memberPids });
 		await pause(100);
 		allocation = Buffer.alloc(0);
 		global.gc?.();
 		await rm(runtimeRoot, { force: true, recursive: true });
-		send({ type: "boundary", phase: "cleanup", allocatedBytes: 0 });
+		send({ type: "boundary", phase: "cleanup", allocatedBytes: 0, memberPids });
 		send({ type: "result", completed, failed: config.fanout - completed, allocatedBytes: 0 });
 	} finally {
 		await rm(runtimeRoot, { force: true, recursive: true });
