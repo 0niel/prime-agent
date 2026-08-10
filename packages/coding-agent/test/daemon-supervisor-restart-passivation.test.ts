@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -135,6 +135,12 @@ describe("daemon supervisor restart passivation", () => {
 		).toHaveLength(2);
 		expect(supervisor.workers.get("completed")?.summaries.size).toBe(1);
 		expect(supervisor.workers.get("needs-input")?.summaries.size).toBe(1);
+		for (const workerId of ["completed", "needs-input"]) {
+			const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
+			expect(persisted.lifecycle).toBe("passivated");
+			expect(persisted).not.toHaveProperty("pid");
+			expect(persisted).not.toHaveProperty("processStartId");
+		}
 		expect(supervisor.workers.get("scheduled")?.descriptor.lifecycle).toBe("recovering");
 		expect(supervisor.workers.get("active")?.descriptor.lifecycle).toBe("recovering");
 	});
@@ -227,7 +233,10 @@ describe("daemon supervisor restart passivation", () => {
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
 		const worker = {
-			descriptor: { ...descriptor(fixture, "stop", session), pid: process.pid, lifecycle: "passivated" as const },
+			descriptor: (() => {
+				const { pid: _pid, processStartId: _processStartId, ...passivated } = descriptor(fixture, "stop", session);
+				return { ...passivated, lifecycle: "passivated" as const };
+			})(),
 			descriptorPath: join(fixture.descriptorDir, "stop.json"),
 			summaries: new Map(),
 			snapshotCache: new Map(),
@@ -246,6 +255,59 @@ describe("daemon supervisor restart passivation", () => {
 			expect(supervisor.workers.has("stop")).toBe(false);
 		} finally {
 			kill.mockRestore();
+		}
+	});
+	it("recovers rather than passivating malformed or stale durable task verdicts", async () => {
+		const fixture = fixtureRoot();
+		const malformed = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const stale = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const invalidLifecycle = persistSession(fixture.sessionDir, fixture.root, "completed");
+		for (const [workerId, session, status] of [
+			["malformed", malformed, { summary: "bad", taskState: "arbitrary_untrusted_value", basedOnMessageCount: 1 }],
+			["stale", stale, { summary: "stale", taskState: "completed", basedOnMessageCount: 0 }],
+		] as const) {
+			writeFileSync(
+				session.sessionFile,
+				`${JSON.stringify({
+					type: "agent_status",
+					id: `${workerId}-status`,
+					parentId: "root",
+					timestamp: new Date().toISOString(),
+					status,
+				})}\n`,
+				{ flag: "a" },
+			);
+			writeFileSync(
+				join(fixture.descriptorDir, `${workerId}.json`),
+				JSON.stringify(descriptor(fixture, workerId, session)),
+			);
+		}
+		writeFileSync(
+			invalidLifecycle.sessionFile,
+			`${JSON.stringify({
+				type: "session_state",
+				id: "invalid-lifecycle",
+				parentId: "root",
+				timestamp: new Date().toISOString(),
+				state: { status: "untrusted_lifecycle" },
+			})}\n`,
+			{ flag: "a" },
+		);
+		writeFileSync(
+			join(fixture.descriptorDir, "invalid-lifecycle.json"),
+			JSON.stringify(descriptor(fixture, "invalid-lifecycle", invalidLifecycle)),
+		);
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		await supervisor.loadWorkerDescriptors();
+		expect(supervisor.workers.get("malformed")?.descriptor.lifecycle).toBe("recovering");
+		expect(supervisor.workers.get("stale")?.descriptor.lifecycle).toBe("recovering");
+		expect(supervisor.workers.get("invalid-lifecycle")?.descriptor.lifecycle).toBe("recovering");
+		for (const workerId of ["malformed", "stale", "invalid-lifecycle"]) {
+			const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
+			expect(persisted.pid).toBe(999_999_999);
 		}
 	});
 });

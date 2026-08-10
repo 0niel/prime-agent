@@ -934,14 +934,15 @@ async function forceStopTrackedWorkers(
 	const failures: string[] = [];
 	for (const worker of findTrackedWorkers(supervisorSocketPath)) {
 		const { descriptor } = worker;
-		let cleanupWorkerRecords = await stopTrackedProcess(descriptor.pid, descriptor.processStartId, assertAdmission);
+		const pid = descriptor.pid!;
+		let cleanupWorkerRecords = await stopTrackedProcess(pid, descriptor.processStartId, assertAdmission);
 		if (!cleanupWorkerRecords) {
-			failures.push(`could not safely stop worker ${descriptor.workerId} (pid ${descriptor.pid})`);
+			failures.push(`could not safely stop worker ${descriptor.workerId} (pid ${pid})`);
 		}
 		if (descriptor.orphanProcessJournalPath) {
 			let orphans: ReturnType<typeof readActiveOrphanProcesses> = [];
 			try {
-				orphans = readActiveOrphanProcesses(descriptor.orphanProcessJournalPath, descriptor.pid);
+				orphans = readActiveOrphanProcesses(descriptor.orphanProcessJournalPath, pid);
 			} catch (error) {
 				failures.push(`could not read child process records for worker ${descriptor.workerId}: ${String(error)}`);
 			}
@@ -1030,6 +1031,7 @@ function isTrackedWorkerDescriptor(value: unknown): value is DaemonWorkerDescrip
 	const descriptor = value as Partial<DaemonWorkerDescriptor>;
 	return (
 		descriptor.version === 1 &&
+		descriptor.lifecycle !== "passivated" &&
 		typeof descriptor.supervisorSocketPath === "string" &&
 		typeof descriptor.workerId === "string" &&
 		Number.isInteger(descriptor.pid) &&

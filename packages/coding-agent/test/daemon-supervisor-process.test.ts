@@ -1258,7 +1258,7 @@ describe("daemon supervisor resident workers", () => {
 		let orphanPids: number[] = [];
 		const orphanDeadline = Date.now() + 5000;
 		while (orphanPids.length === 0 && Date.now() < orphanDeadline) {
-			orphanPids = readActiveOrphanProcesses(descriptor.orphanProcessJournalPath, descriptor.pid).map(
+			orphanPids = readActiveOrphanProcesses(descriptor.orphanProcessJournalPath, descriptor.pid!).map(
 				(orphan) => orphan.pid,
 			);
 			if (orphanPids.length === 0) {

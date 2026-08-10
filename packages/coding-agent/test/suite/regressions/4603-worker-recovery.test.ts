@@ -786,9 +786,9 @@ describe("ENG-4603 worker recovery convergence", () => {
 			await delay(25);
 		}
 		if (!replacement) throw new Error("Current supervisor did not publish a replacement worker");
-		expect(getProcessStartId(replacement.pid)).toBe(replacement.processStartId);
+		expect(getProcessStartId(replacement.pid!)).toBe(replacement.processStartId);
 		await delay(750);
-		expect(exactProcessIsAlive(replacement.pid, replacement.processStartId)).toBe(true);
+		expect(exactProcessIsAlive(replacement.pid!, replacement.processStartId)).toBe(true);
 		expect(readdirSync(paths.descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
 		const listed = await successorClient.request({ type: "list" });
 		if (!listed.success) throw new Error(listed.error);
@@ -813,7 +813,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 		successorClient.close();
 		predecessorClient.close();
 		await waitForExit(successor);
-		await waitForExactProcessExit(replacement.pid, replacement.processStartId);
+		await waitForExactProcessExit(replacement.pid!, replacement.processStartId);
 		await terminateTrackedFixtureProcess(predecessor);
 	}, 120_000);
 
