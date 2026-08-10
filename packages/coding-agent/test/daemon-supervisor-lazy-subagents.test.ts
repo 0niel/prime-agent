@@ -16,6 +16,8 @@ import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 interface SupervisorInternals {
 	workers: Map<string, WorkerFixture>;
 	refreshWorkerSummaries(worker: WorkerFixture): Promise<void>;
+	wakePassivatedWorker(worker: WorkerFixture): Promise<void>;
+	forwardToWorker(worker: WorkerFixture, command: Record<string, unknown>): Promise<unknown>;
 	syncAgentPeers(): Promise<void>;
 	findSummaryInWorker(worker: WorkerFixture, selector: string): SessionSummary | undefined;
 	createOrReuseWorker(
@@ -35,10 +37,12 @@ interface SupervisorInternals {
 interface WorkerFixture {
 	descriptor: {
 		workerId: string;
+		generation: string;
 		lifecycle: "ready";
 		rootActiveSessionId: string;
 		rootSessionId: string;
-		pid: number;
+		pid?: number;
+		process?: { pid: number; processStartId: string };
 		authenticationToken: string;
 		ownerClientId?: string;
 		createCommand: { config: { cwd: string } };
@@ -71,10 +75,15 @@ function summary(overrides: Partial<SessionSummary> & Pick<SessionSummary, "id" 
 	};
 }
 
-function worker(workerId: string, summaries: SessionSummary[] = []): WorkerFixture {
+function worker(
+	workerId: string,
+	summaries: SessionSummary[] = [],
+	generation = `${workerId}-generation`,
+): WorkerFixture {
 	return {
 		descriptor: {
 			workerId,
+			generation,
 			lifecycle: "ready",
 			rootActiveSessionId: `${workerId}-root-active`,
 			rootSessionId: `${workerId}-root-session`,
@@ -106,6 +115,274 @@ describe("daemon supervisor passive subagent topology", () => {
 		const resident = worker("first", [child]);
 
 		expect(supervisor.findSummaryInWorker(resident, "88889999cccc")).toBe(child);
+	});
+
+	it("fences stale assignment A lookup, hydration, and forwarding after B reuses its child selector", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-child-assignment-fence-"));
+		tempDirs.push(directory);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		const childSelector = "reused-child";
+		const staleRoot = summary({
+			id: "a-root-active",
+			activeSessionId: "a-root-active",
+			sessionId: "a-root-session",
+		});
+		const staleChild = summary({
+			id: "a-child-active",
+			activeSessionId: "a-child-active",
+			sessionId: "a-child-session",
+			sessionName: childSelector,
+			runtimeKind: "subagent",
+			rlmChildId: childSelector,
+		});
+		const replacementRoot = summary({
+			id: "b-root-active",
+			activeSessionId: "b-root-active",
+			sessionId: "b-root-session",
+		});
+		const replacementChild = summary({
+			id: "b-child-active",
+			activeSessionId: "b-child-active",
+			sessionId: "b-child-session",
+			sessionName: childSelector,
+			runtimeKind: "subagent",
+			rlmChildId: childSelector,
+		});
+		const stale = worker("shared-worker", [staleRoot, staleChild], "assignment-A");
+		const replacement = worker("shared-worker", [replacementRoot, replacementChild], "assignment-B");
+		let releaseStaleList!: () => void;
+		const staleList = new Promise<void>((resolve) => {
+			releaseStaleList = resolve;
+		});
+		let markStaleLookupStarted!: () => void;
+		const staleLookupStarted = new Promise<void>((resolve) => {
+			markStaleLookupStarted = resolve;
+		});
+		let releaseStaleForward!: () => void;
+		const staleForwardGate = new Promise<void>((resolve) => {
+			releaseStaleForward = resolve;
+		});
+		let markStaleForwardStarted!: () => void;
+		const staleForwardStarted = new Promise<void>((resolve) => {
+			markStaleForwardStarted = resolve;
+		});
+		stale.client.request.mockImplementation(async (command: { type: string }) => {
+			if (command.type === "list") {
+				markStaleLookupStarted();
+				await staleList;
+				return success(undefined, "list", { sessions: [staleRoot, staleChild] });
+			}
+			return success(undefined, "prompt");
+		});
+		replacement.client.request.mockResolvedValue(success(undefined, "prompt"));
+		supervisor.workers.set("shared-worker", stale);
+		const wake = vi.spyOn(supervisor, "wakePassivatedWorker").mockImplementation(async (candidate) => {
+			if (candidate === stale) {
+				markStaleForwardStarted();
+				await staleForwardGate;
+			}
+		});
+
+		// A has selected this public child selector while both its list/hydration
+		// callback and its explicit wake-to-forward callback are held.
+		expect(supervisor.findSummaryInWorker(stale, childSelector)).toBe(staleChild);
+		const staleHydration = supervisor.refreshWorkerSummaries(stale);
+		const staleForward = supervisor.forwardToWorker(stale, {
+			type: "prompt",
+			activeSessionId: staleChild.activeSessionId!,
+			message: "obsolete A",
+		});
+		await Promise.all([staleLookupStarted, staleForwardStarted]);
+
+		// B has the same public child selector but a distinct assignment/generation.
+		// Release both A continuations only after B is the registry resident.
+		supervisor.workers.set("shared-worker", replacement);
+		releaseStaleList();
+		releaseStaleForward();
+		await staleHydration;
+		await expect(staleForward).rejects.toThrow("superseded");
+
+		// Assignment A cannot join B, wake or forward through B, overwrite B's
+		// descriptor/child registry, or clear B's replacement child.
+		expect(wake).toHaveBeenCalledExactlyOnceWith(stale);
+		expect(stale.client.request).toHaveBeenCalledTimes(1);
+		expect(stale.client.request).toHaveBeenCalledWith({ type: "list" }, 5000);
+		expect(replacement.client.request).not.toHaveBeenCalled();
+		expect(supervisor.workers.get("shared-worker")).toBe(replacement);
+		expect(replacement.descriptor).toMatchObject({
+			generation: "assignment-B",
+			rootActiveSessionId: "shared-worker-root-active",
+			rootSessionId: "shared-worker-root-session",
+		});
+		expect(replacement.summaries.get("b-child-active")).toBe(replacementChild);
+		expect(replacement.summaries.has("a-child-active")).toBe(false);
+
+		// The matching B assignment is still allowed to wake and forward normally.
+		await expect(
+			supervisor.forwardToWorker(replacement, {
+				type: "prompt",
+				activeSessionId: replacementChild.activeSessionId!,
+				message: "continue B",
+			}),
+		).resolves.toMatchObject({ success: true, command: "prompt" });
+		expect(wake).toHaveBeenLastCalledWith(replacement);
+		expect(replacement.client.request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "prompt", activeSessionId: "b-child-active" }),
+			expect.any(Number),
+		);
+	});
+
+	it("rejects a request result when its assignment is replaced while the request is pending", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-request-assignment-fence-"));
+		tempDirs.push(directory);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		const stale = worker("shared-worker", [], "assignment-A");
+		const replacement = worker("shared-worker", [], "assignment-B");
+		let releaseRequest!: () => void;
+		const requestGate = new Promise<void>((resolve) => {
+			releaseRequest = resolve;
+		});
+		let markRequestStarted!: () => void;
+		const requestStarted = new Promise<void>((resolve) => {
+			markRequestStarted = resolve;
+		});
+		stale.client.request.mockImplementation(async (command: { type: string }) => {
+			if (command.type === "prompt") {
+				markRequestStarted();
+				await requestGate;
+			}
+			return success(undefined, "prompt");
+		});
+		replacement.client.request.mockResolvedValue(success(undefined, "prompt"));
+		const wake = vi.spyOn(supervisor, "wakePassivatedWorker").mockResolvedValue();
+		supervisor.workers.set("shared-worker", stale);
+
+		const staleForward = supervisor.forwardToWorker(stale, {
+			type: "prompt",
+			activeSessionId: "a-child-active",
+			message: "obsolete A",
+		});
+		await requestStarted;
+		supervisor.workers.set("shared-worker", replacement);
+		releaseRequest();
+
+		await expect(staleForward).rejects.toThrow("superseded");
+		expect(wake).toHaveBeenCalledExactlyOnceWith(stale);
+		expect(stale.client.request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "prompt", activeSessionId: "a-child-active" }),
+			expect.any(Number),
+		);
+		expect(replacement.client.request).not.toHaveBeenCalled();
+		expect(supervisor.workers.get("shared-worker")).toBe(replacement);
+
+		await expect(
+			supervisor.forwardToWorker(replacement, {
+				type: "prompt",
+				activeSessionId: "b-child-active",
+				message: "continue B",
+			}),
+		).resolves.toMatchObject({ success: true, command: "prompt" });
+	});
+
+	it("rejects a rename when its refresh is replaced while list hydration is pending", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-rename-assignment-fence-"));
+		tempDirs.push(directory);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		const staleRoot = summary({
+			id: "a-root-active",
+			activeSessionId: "a-root-active",
+			sessionId: "a-root-session",
+			sessionName: "A rename",
+		});
+		const replacementRoot = summary({
+			id: "b-root-active",
+			activeSessionId: "b-root-active",
+			sessionId: "b-root-session",
+			sessionName: "B original",
+		});
+		const stale = Object.assign(worker("shared-worker", [staleRoot], "assignment-A"), {
+			descriptorPath: join(directory, "assignment-A.json"),
+		});
+		stale.descriptor.rootActiveSessionId = "a-root-active";
+		stale.descriptor.rootSessionId = "a-root-session";
+		const replacement = Object.assign(
+			worker("shared-worker", [replacementRoot], "22222222-2222-4222-8222-222222222222"),
+			{
+				descriptorPath: join(directory, "assignment-B.json"),
+			},
+		);
+		replacement.descriptor.process = { pid: process.pid, processStartId: "test-process-start" };
+		delete replacement.descriptor.pid;
+		replacement.descriptor.rootActiveSessionId = "b-root-active";
+		replacement.descriptor.rootSessionId = "b-root-session";
+		let releaseList!: () => void;
+		const listGate = new Promise<void>((resolve) => {
+			releaseList = resolve;
+		});
+		let markListStarted!: () => void;
+		const listStarted = new Promise<void>((resolve) => {
+			markListStarted = resolve;
+		});
+		stale.client.request.mockImplementation(async (command: { type: string }) => {
+			if (command.type === "rename") return success(undefined, "rename", staleRoot);
+			if (command.type === "list") {
+				markListStarted();
+				await listGate;
+				return success(undefined, "list", { sessions: [staleRoot] });
+			}
+			throw new Error(`Unexpected stale request: ${command.type}`);
+		});
+		replacement.client.request.mockImplementation(async (command: { type: string }) => {
+			if (command.type === "rename") return success(undefined, "rename", replacementRoot);
+			if (command.type === "list") return success(undefined, "list", { sessions: [replacementRoot] });
+			throw new Error(`Unexpected replacement request: ${command.type}`);
+		});
+		vi.spyOn(supervisor, "wakePassivatedWorker").mockResolvedValue();
+		supervisor.workers.set("shared-worker", stale);
+
+		const staleRename = supervisor.forwardToWorker(stale, {
+			type: "rename",
+			activeSessionId: "a-root-active",
+			name: "obsolete A rename",
+		});
+		await listStarted;
+		supervisor.workers.set("shared-worker", replacement);
+		releaseList();
+
+		await expect(staleRename).rejects.toThrow("superseded");
+		expect(stale.client.request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "rename" }),
+			expect.any(Number),
+		);
+		expect(stale.client.request).toHaveBeenCalledWith({ type: "list" }, 5000);
+		expect(replacement.client.request).not.toHaveBeenCalled();
+		expect(replacement.summaries.get("b-root-active")).toBe(replacementRoot);
+		expect(replacement.summaries.has("a-root-active")).toBe(false);
+		expect(replacement.descriptor).toMatchObject({
+			generation: "22222222-2222-4222-8222-222222222222",
+			rootSessionId: "b-root-session",
+		});
+
+		await expect(
+			supervisor.forwardToWorker(replacement, {
+				type: "rename",
+				activeSessionId: "b-root-active",
+				name: "B rename",
+			}),
+		).resolves.toMatchObject({
+			success: true,
+			command: "rename",
+			data: expect.objectContaining({ id: "b-root-active" }),
+		});
 	});
 
 	it("rejects an explicit root name that collides with a saved root", async () => {

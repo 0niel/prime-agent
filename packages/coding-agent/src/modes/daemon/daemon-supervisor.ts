@@ -61,6 +61,7 @@ import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-r
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import { assertFreshUuid, isCurrentProcessIdentity, type ProcessIdentity } from "./daemon-lifecycle-identity.js";
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
@@ -123,6 +124,7 @@ import {
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerLifecycle,
+	type ResidentDaemonWorkerDescriptor,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
@@ -152,6 +154,7 @@ const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
 const CHILD_PASSIVATION_PER_WORKER_CAP = 2;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
+const C01_IDENTITY_FENCING_ENV = "PRIME_AGENT_ENABLE_C01_IDENTITY_FENCING";
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -254,8 +257,11 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 interface ResidentWorker {
-	descriptor: DaemonWorkerDescriptor;
+	/** Normalized, generation-bearing runtime state; reader compatibility never escapes loading. */
+	descriptor: ResidentDaemonWorkerDescriptor;
 	descriptorPath: string;
+	/** Untrusted legacy lifecycle evidence is visible but cannot be routed or rewritten. */
+	quarantined?: true;
 	client?: DaemonWorkerClient;
 	heartbeatSnapshot?: AgentConnectionHeartbeat[];
 	heartbeatSnapshotStale?: boolean;
@@ -378,7 +384,7 @@ function unrefDelay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms).unref());
 }
 
-function commitWorkerStartupGate(gate: Writable): Promise<void> {
+function commitWorkerStartupGate(gate: Writable, generation: string): Promise<void> {
 	return new Promise((resolveCommit, rejectCommit) => {
 		let settled = false;
 		const finish = (error?: Error | null) => {
@@ -395,7 +401,7 @@ function commitWorkerStartupGate(gate: Writable): Promise<void> {
 		const onError = (error: Error) => finish(error);
 		gate.on("error", onError);
 		gate.once("close", () => gate.off("error", onError));
-		gate.end(DAEMON_WORKER_STARTUP_GATE_COMMIT, (error?: Error | null) => finish(error));
+		gate.end(`${DAEMON_WORKER_STARTUP_GATE_COMMIT}${generation}\n`, (error?: Error | null) => finish(error));
 	});
 }
 
@@ -424,10 +430,17 @@ function isSessionSummary(value: unknown): value is SessionSummary {
 }
 
 function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is DaemonWorkerDescriptor {
-	if (!value || typeof value !== "object") {
-		return false;
-	}
+	if (!value || typeof value !== "object") return false;
 	const descriptor = value as Partial<DaemonWorkerDescriptor>;
+	const process = descriptor.process;
+	const validProcess =
+		!!process &&
+		Number.isInteger(process.pid) &&
+		process.pid > 0 &&
+		typeof process.processStartId === "string" &&
+		!!process.processStartId;
+	// Legacy records may be observed for conservative adoption only. They are never
+	// signal authority and are rewritten only after a fresh identity is observed.
 	const validLegacyProcess =
 		Number.isInteger(descriptor.pid) &&
 		(descriptor.pid ?? 0) > 0 &&
@@ -436,27 +449,31 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 	// process identity it retains, however, must be a complete, valid pair: a
 	// partial or object-shaped identity is untrusted input, not an invitation to
 	// probe, signal, or passivate an arbitrary process.
+	const noLegacyProcess = descriptor.pid === undefined && descriptor.processStartId === undefined;
+	const validCompleteLegacyProcess =
+		process === undefined &&
+		Number.isInteger(descriptor.pid) &&
+		(descriptor.pid ?? 0) > 0 &&
+		typeof descriptor.processStartId === "string" &&
+		descriptor.processStartId.length > 0;
 	const validRecoveringProcess =
-		(descriptor.pid === undefined && descriptor.processStartId === undefined) ||
-		(Number.isInteger(descriptor.pid) &&
-			(descriptor.pid ?? 0) > 0 &&
-			typeof descriptor.processStartId === "string" &&
-			descriptor.processStartId.length > 0);
+		(process === undefined && noLegacyProcess) || (validProcess && noLegacyProcess) || validCompleteLegacyProcess;
 	const knownLifecycle = isDaemonWorkerLifecycle(descriptor.lifecycle);
+	const passivated = descriptor.lifecycle === "passivated";
+	const validGeneration = descriptor.generation === undefined || assertFreshUuid(descriptor.generation);
 	return (
 		descriptor.version === 1 &&
 		descriptor.supervisorSocketPath === socketPath &&
 		typeof descriptor.workerId === "string" &&
-		// A passivated descriptor is intentionally processless. `recovering` is
-		// also processless after normalizing a legacy missing/unknown lifecycle:
-		// retaining it lets the next supervisor recover the root without treating
-		// a stale PID as safe to adopt or signal. Other lifecycle states still need
-		// a valid process identity, and unknown legacy states do too until their
-		// first normalization pass, so malformed input remains fail-closed.
+		// Early v1 records may lack a known lifecycle. Retain them only with a
+		// structurally valid process identity so load can normalize to recovery.
+		// Passivated rows and normalized processless recovering rows remain durable
+		// metadata, but no process field is signal authority until revalidated.
 		(knownLifecycle
-			? descriptor.lifecycle === "passivated" ||
-				(descriptor.lifecycle === "recovering" ? validRecoveringProcess : validLegacyProcess)
-			: validLegacyProcess) &&
+			? passivated ||
+				(descriptor.lifecycle === "recovering" ? validRecoveringProcess : validProcess || validLegacyProcess)
+			: validProcess || validLegacyProcess) &&
+		validGeneration &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
@@ -469,7 +486,6 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		descriptor.createCommand.type === "create"
 	);
 }
-
 function sessionSummariesFromResponse(response: DaemonResponse): SessionSummary[] {
 	if (!response.success || !response.data || typeof response.data !== "object" || !("sessions" in response.data)) {
 		throw new Error("Session worker returned an invalid list response");
@@ -653,6 +669,8 @@ export class DaemonSupervisor {
 	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
 	private idleEvictionSweep?: Promise<void>;
 	private idleEvictionFence?: Promise<void>;
+	// Private server-only incident escape hatch. It can relax callback rejection, never process identity/signal checks.
+	private readonly c01IdentityFencingEnabled = process.env[C01_IDENTITY_FENCING_ENV] !== "0";
 
 	constructor(
 		private readonly socketPath: string,
@@ -677,6 +695,11 @@ export class DaemonSupervisor {
 
 	async start(): Promise<void> {
 		try {
+			if (!this.c01IdentityFencingEnabled) {
+				this.log(
+					`${C01_IDENTITY_FENCING_ENV}=0: callback identity rejection is temporarily disabled; process identity and signal safety remain enforced`,
+				);
+			}
 			const agentDir = this.defaultSessionConfig.agentDir;
 			if (!agentDir) {
 				throw new Error("Daemon supervisor config is missing agentDir");
@@ -700,7 +723,7 @@ export class DaemonSupervisor {
 			this.commandJournal = new CommandRecoveryJournal(join(this.descriptorDir, "command-journal.jsonl"));
 			await this.loadWorkerDescriptors();
 			const workersToAdopt = [...this.workers.values()].filter(
-				(worker) => worker.descriptor.lifecycle !== "passivated",
+				(worker) => !worker.quarantined && worker.descriptor.lifecycle !== "passivated",
 			);
 
 			this.server = createServer((socket) => this.handleConnection(socket));
@@ -967,22 +990,78 @@ export class DaemonSupervisor {
 			if (name === SUPERVISOR_CONFIG_FILE_NAME || !name.endsWith(".json")) continue;
 			const path = join(this.descriptorDir, name);
 			try {
-				const descriptor: unknown = JSON.parse(readFileSync(path, "utf8"));
-				if (!isDaemonWorkerDescriptor(descriptor, this.socketPath)) continue;
+				const diskDescriptor: unknown = JSON.parse(readFileSync(path, "utf8"));
+				if (!isDaemonWorkerDescriptor(diskDescriptor, this.socketPath)) continue;
+				// Never mutate the parsed disk object: malformed lifecycle records are
+				// reader evidence, not a migration opportunity.
+				const descriptor = {
+					...diskDescriptor,
+					...(diskDescriptor.process ? { process: { ...diskDescriptor.process } } : {}),
+				} as DaemonWorkerDescriptor;
 				const malformedLifecycle = !isDaemonWorkerLifecycle(descriptor.lifecycle);
+				let descriptorMigrated = false;
+				let descriptorPersisted = false;
 				if (malformedLifecycle) {
-					// A legacy v1 descriptor can omit lifecycle (or contain a value from a
-					// newer writer). It is not evidence that the root is idle or stopped.
-					// Discard even a syntactically valid legacy PID before recovery: do not
-					// adopt, passivate, or signal a process based on malformed lifecycle.
+					// A missing or unknown lifecycle is neither process nor lifecycle
+					// authority. Keep a normalized in-memory view solely so operators can
+					// inspect it; no C01 path may adopt, wake, signal, or rewrite it.
 					descriptor.lifecycle = "recovering";
+					delete descriptor.process;
 					delete descriptor.pid;
 					delete descriptor.processStartId;
+					descriptor.generation = assertFreshUuid(descriptor.generation) ? descriptor.generation : randomUUID();
 				}
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
+				// Reader compatibility ends here. Normalize both old flat selectors and
+				// nested pre-C01 records before constructing a resident object. In
+				// particular, make this durable before any async summary/adoption work.
+				const alreadyPassivated = descriptor.lifecycle === "passivated";
+				// A nested selector with no generation predates C01 just as a flat PID
+				// does. It becomes process authority only after its exact start ID can
+				// be observed again; otherwise it is raw migration evidence.
+				const legacyNestedIdentity = descriptor.process !== undefined && descriptor.generation === undefined;
+				if (alreadyPassivated) {
+					if (descriptor.process || descriptor.pid !== undefined || descriptor.processStartId !== undefined) {
+						delete descriptor.process;
+						delete descriptor.pid;
+						delete descriptor.processStartId;
+						descriptorMigrated = true;
+					}
+				} else if (!descriptor.process && descriptor.pid !== undefined) {
+					// A v1 flat PID is evidence only. Promote it only after observing the
+					// same live start ID; it is never signal authority before that point.
+					const observedStartId = getProcessStartId(descriptor.pid);
+					if (
+						observedStartId &&
+						(descriptor.processStartId === undefined || descriptor.processStartId === observedStartId)
+					) {
+						descriptor.process = { pid: descriptor.pid, processStartId: observedStartId };
+					}
+					delete descriptor.pid;
+					delete descriptor.processStartId;
+					descriptorMigrated = true;
+				} else if (
+					legacyNestedIdentity &&
+					descriptor.process !== undefined &&
+					!isCurrentProcessIdentity(descriptor.process)
+				) {
+					// Do not turn an unobservable pre-C01 nested PID into a durable
+					// generation-bearing recovery record. If passive classification later
+					// rejects it because work is recoverable, quarantine keeps the exact
+					// raw disk evidence for explicit repair instead.
+					delete descriptor.process;
+					descriptorMigrated = true;
+				}
+				if (!descriptor.generation) {
+					// Both legacy forms receive a fresh incarnation before resident state
+					// exists. A dead/processless row still needs it because explicit wake
+					// and its callbacks use the same resident representation.
+					descriptor.generation = randomUUID();
+					descriptorMigrated = true;
+				}
 				const worker: ResidentWorker = {
-					descriptor,
+					descriptor: descriptor as ResidentDaemonWorkerDescriptor,
 					descriptorPath: path,
 					summaries: new Map(),
 					snapshotCache: new Map(),
@@ -993,53 +1072,63 @@ export class DaemonSupervisor {
 					stopRevision: 0,
 				};
 				if (malformedLifecycle) {
-					// The descriptor remains visible to startup recovery, but malformed
-					// lifecycle is never allowed to reach passivation classification.
-					this.persistWorker(worker);
+					// Quarantine before any asynchronous classification. In particular,
+					// leave the exact disk bytes unchanged across every supervisor reload.
+					worker.quarantined = true;
 					this.workers.set(descriptor.workerId, worker);
 					continue;
 				}
 				// Never passivate a live process: adoption is the only safe way to
-				// reconnect work that may still be running. A legacy passivated v1
-				// descriptor is deliberately migrated by discarding its stale identity.
-				const alreadyPassivated = descriptor.lifecycle === "passivated";
-				// Old C00 records could claim to be passivated while retaining a PID.
-				// Discard it before *any* recovery classification, including malformed
-				// JSONL that must recover, so no later consumer can act on it.
-				if (alreadyPassivated) {
-					delete descriptor.pid;
-					delete descriptor.processStartId;
-				}
+				// reconnect work that may still be running.
 				// A client-owned worker's launch environment is transient and deliberately
 				// never persisted. A processless descriptor therefore cannot be safely
 				// restarted at supervisor startup: only its owner can provide that env on a
 				// subsequent attach. Keep it processless, visible, and wakeable by that path.
-				const ownerOwnedProcessless = descriptor.ownerClientId !== undefined && descriptor.pid === undefined;
+				const ownerOwnedProcessless = descriptor.ownerClientId !== undefined && descriptor.process === undefined;
 				if (ownerOwnedProcessless && !descriptor.stopRequestedAt) {
-					// Fail closed even if the durable transcript is unreadable or has work
-					// pending. The owner attach path identifies this root from its descriptor
-					// and supplies launchEnv before it asks recovery to spawn anything.
-					descriptor.lifecycle = "passivated";
 					const passive = await this.passivatedSummaryForDescriptor(descriptor);
+					// Owner-owned C01 roots have no relaunch authority until the owner
+					// reconnects. That is distinct from a legacy selector whose identity
+					// could not be observed: if recovery work rejects passivation, retain
+					// the raw migration evidence instead of laundering it into a passive
+					// (and later processless recovering) C01 descriptor.
+					if (descriptorMigrated && !passive) {
+						worker.quarantined = true;
+						this.workers.set(descriptor.workerId, worker);
+						continue;
+					}
+					descriptor.lifecycle = "passivated";
 					if (passive) worker.summaries.set(descriptor.rootActiveSessionId, passive);
 					this.persistWorker(worker);
+					descriptorPersisted = true;
 				} else {
 					const passive =
 						descriptor.ownerClientId === undefined &&
 						!descriptor.stopRequestedAt &&
-						(alreadyPassivated || descriptor.pid === undefined || !isProcessAlive(descriptor.pid))
+						(alreadyPassivated || descriptor.process === undefined || !isProcessAlive(descriptor.process?.pid))
 							? await this.passivatedSummaryForDescriptor(descriptor)
 							: undefined;
 					if (passive) {
 						descriptor.lifecycle = "passivated";
+						delete descriptor.process;
 						delete descriptor.pid;
 						delete descriptor.processStartId;
 						worker.summaries.set(descriptor.rootActiveSessionId, passive);
 						this.persistWorker(worker);
+						descriptorPersisted = true;
 					} else {
 						descriptor.lifecycle = "recovering";
 					}
 				}
+				// A reader migration that cannot reach an explicitly passive state has
+				// lost process authority. It is evidence, not durable C01 recovery
+				// state: retain only a quarantined in-memory view and preserve raw disk.
+				if (descriptorMigrated && descriptor.process === undefined && descriptor.lifecycle !== "passivated") {
+					worker.quarantined = true;
+					this.workers.set(descriptor.workerId, worker);
+					continue;
+				}
+				if (descriptorMigrated && !descriptorPersisted) this.persistWorker(worker);
 				this.workers.set(descriptor.workerId, worker);
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
@@ -1117,9 +1206,42 @@ export class DaemonSupervisor {
 	}
 
 	private persistWorker(worker: ResidentWorker): void {
-		worker.descriptor.updatedAt = new Date().toISOString();
+		if (worker.quarantined) {
+			throw new Error(`Refusing to rewrite quarantined worker ${worker.descriptor.workerId}`);
+		}
+		const { descriptor } = worker;
+		if (!assertFreshUuid(descriptor.generation)) {
+			throw new Error(`Refusing to persist worker ${descriptor.workerId} without a canonical generation`);
+		}
+		const identity = descriptor.process;
+		const hasNestedProcess = identity !== undefined;
+		if (
+			hasNestedProcess &&
+			(!identity ||
+				!Number.isInteger(identity.pid) ||
+				identity.pid <= 0 ||
+				typeof identity.processStartId !== "string" ||
+				!identity.processStartId)
+		) {
+			throw new Error(`Refusing to persist worker ${descriptor.workerId} with an invalid process identity`);
+		}
+		// This is the C01 durable discriminator: only a deliberately passivated
+		// root may be processless. In particular, do not turn a pre-spawn recovery
+		// intent or failed launch into a durable recovering/failed descriptor.
+		if (descriptor.lifecycle !== "passivated" && !hasNestedProcess) {
+			throw new Error(
+				`Refusing to persist ${descriptor.lifecycle} worker ${descriptor.workerId} without a process identity`,
+			);
+		}
+		if (descriptor.lifecycle === "passivated" && hasNestedProcess) {
+			throw new Error(`Refusing to persist passivated worker ${descriptor.workerId} with a process identity`);
+		}
+		descriptor.updatedAt = new Date().toISOString();
+		// Keep the permissive v1 reader shape out of every C01 write, even if an
+		// untyped test/integration object accidentally reintroduces a legacy key.
+		const { pid: _legacyPid, processStartId: _legacyStartId, ...persisted } = descriptor;
 		const tempPath = `${worker.descriptorPath}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(worker.descriptor, null, 2)}\n`, { mode: 0o600 });
+		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, worker.descriptorPath);
 	}
@@ -1689,8 +1811,8 @@ export class DaemonSupervisor {
 				const finalizations = this.waitForStopFinalizations(worker);
 				if (finalizations) await finalizations;
 				if (worker.stopFinalized) throw new Error(`Session worker ${worker.descriptor.workerId} was stopped`);
-				const processless = worker.descriptor.lifecycle === "passivated" || worker.descriptor.pid === undefined;
-				if (!processless && isProcessAlive(worker.descriptor.pid!)) {
+				const processless = worker.descriptor.lifecycle === "passivated" || worker.descriptor.process === undefined;
+				if (!processless && isProcessAlive(worker.descriptor.process!.pid)) {
 					throw new Error(`Session worker ${worker.descriptor.workerId} is still running; cannot retry its stop`);
 				}
 				worker.stopFailure = undefined;
@@ -1700,7 +1822,7 @@ export class DaemonSupervisor {
 				worker.descriptor.archiveOnStop = undefined;
 				worker.descriptor.lifecycle = "recovering";
 				worker.descriptor.consecutiveFailures = 0;
-				this.persistWorker(worker);
+				// Retry shares wake's publication rule: launch publishes identity first.
 				await this.recoverWorker(worker);
 				if (this.workers.get(worker.descriptor.workerId)?.descriptor.lifecycle !== "ready") {
 					throw new Error(worker.descriptor.lastError ?? "Session worker recovery failed");
@@ -2239,6 +2361,9 @@ export class DaemonSupervisor {
 	}
 
 	private async wakePassivatedWorker(worker: ResidentWorker): Promise<void> {
+		if (worker.quarantined) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} is quarantined pending lifecycle repair`);
+		}
 		// Do not introduce an await when no stop exists: that would leave a gap in
 		// which a concurrent stop could install its tombstone before this wake starts.
 		const stopFence = this.stopFenceForWake(worker);
@@ -2256,7 +2381,9 @@ export class DaemonSupervisor {
 			worker.descriptor.archiveOnStop = undefined;
 			worker.descriptor.lifecycle = "recovering";
 			worker.descriptor.consecutiveFailures = 0;
-			this.persistWorker(worker);
+			// This is only an in-memory launch intent. The first wake write is
+			// launchWorker's identity-bearing `starting` record; never crash with a
+			// processless recovering descriptor merely because a wake was admitted.
 			await this.recoverWorker(worker);
 			// recoverWorker mutates lifecycle through the normal launch/adoption
 			// path; read it after await rather than retaining the narrowed value.
@@ -2346,13 +2473,15 @@ export class DaemonSupervisor {
 		const orphanProcessJournalPath =
 			existing?.descriptor.orphanProcessJournalPath ?? join(this.descriptorDir, `${workerId}.orphans.jsonl`);
 		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
+		// This gate is supervisor-only. Never leak an incident rollback control to a worker.
+		const workerEnvironment: NodeJS.ProcessEnv = { ...process.env, ...launchEnv };
+		delete workerEnvironment[C01_IDENTITY_FENCING_ENV];
 		await this.assertRecoveryAllowed();
 		const child: ChildProcess = spawn(launch.command, launch.args, {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
 			detached: true,
 			env: createCliSubprocessEnv({
-				...process.env,
-				...launchEnv,
+				...workerEnvironment,
 				[DAEMON_WORKER_ROLE_ENV]: "1",
 				[DAEMON_WORKER_TOKEN_ENV]: token,
 				[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
@@ -2384,6 +2513,7 @@ export class DaemonSupervisor {
 		let descriptorAssigned = false;
 		let childPid: number;
 		let childProcessStartId: string | undefined;
+		let workerGeneration: string;
 		let worker: ResidentWorker;
 		try {
 			if (!child.pid) {
@@ -2394,13 +2524,19 @@ export class DaemonSupervisor {
 			}
 			childPid = child.pid;
 			childProcessStartId = getProcessStartId(childPid);
+			if (!childProcessStartId) {
+				throw new Error("Cannot safely launch daemon session worker without a process start identity");
+			}
+			// This is deliberately after successful start-ID observation. The child
+			// cannot begin until the gate below forwards this committed value.
+			workerGeneration = randomUUID();
 			await this.assertRecoveryAllowed();
 
-			const descriptor: DaemonWorkerDescriptor = {
+			const descriptor: ResidentDaemonWorkerDescriptor = {
 				version: 1,
 				workerId,
-				pid: childPid,
-				...(childProcessStartId ? { processStartId: childProcessStartId } : {}),
+				process: { pid: childPid, processStartId: childProcessStartId },
+				generation: workerGeneration,
 				socketPath,
 				recoveryJournalPath,
 				orphanProcessJournalPath,
@@ -2437,6 +2573,13 @@ export class DaemonSupervisor {
 			if (startupGate instanceof Writable) {
 				startupGate.destroy();
 			}
+			// Publication has not happened. This direct child object is ours, unlike a
+			// descriptor PID, so terminate it rather than leaving a gate-dependent orphan.
+			try {
+				child.kill("SIGTERM");
+			} catch {
+				// It may have already observed the closed gate and exited.
+			}
 			await childClosed;
 			child.unref();
 			try {
@@ -2456,7 +2599,7 @@ export class DaemonSupervisor {
 
 		try {
 			try {
-				await commitWorkerStartupGate(startupGate);
+				await commitWorkerStartupGate(startupGate, workerGeneration);
 			} catch (error) {
 				startupGate.destroy();
 				await childClosed;
@@ -2465,6 +2608,9 @@ export class DaemonSupervisor {
 				child.unref();
 			}
 			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
+			if (!this.matchesCurrentWorker(worker, workerGeneration)) {
+				throw new Error(`Session worker ${workerId} launch was superseded`);
+			}
 			const response = await client.request(withoutCommandId(createCommand), WORKER_REQUEST_TIMEOUT_MS);
 			if (!response.success) {
 				throw deserializeDaemonError(response);
@@ -2473,6 +2619,9 @@ export class DaemonSupervisor {
 				throw new Error("Session worker returned an invalid create response");
 			}
 			const summary = response.data;
+			if (!this.matchesCurrentWorker(worker, workerGeneration)) {
+				throw new Error(`Session worker ${workerId} launch response was superseded`);
+			}
 			if ((summary.activeSessionId ?? summary.id) !== rootActiveSessionId) {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
@@ -2480,11 +2629,20 @@ export class DaemonSupervisor {
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
+			if (!this.matchesCurrentWorker(worker, workerGeneration)) {
+				throw new Error(`Session worker ${workerId} launch subscription was superseded`);
+			}
 			await this.refreshWorkerSummaries(worker, true);
-			if (existing && (this.isWorkerRecoveryCancelled(worker) || worker.stopRevision !== recoveryStopRevision)) {
-				throw new Error(`Session worker ${workerId} recovery was cancelled`);
+			if (
+				!this.matchesCurrentWorker(worker, workerGeneration) ||
+				(existing && (this.isWorkerRecoveryCancelled(worker) || worker.stopRevision !== recoveryStopRevision))
+			) {
+				throw new Error(`Session worker ${workerId} launch was superseded or cancelled`);
 			}
 			await this.assertRecoveryAllowed();
+			if (!this.matchesCurrentWorker(worker, workerGeneration)) {
+				throw new Error(`Session worker ${workerId} launch was superseded`);
+			}
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
 			worker.descriptor.lastError = undefined;
@@ -2556,23 +2714,33 @@ export class DaemonSupervisor {
 
 	private async connectWorker(worker: ResidentWorker, timeoutMs: number): Promise<DaemonWorkerClient> {
 		const deadline = Date.now() + timeoutMs;
+		const generation = worker.descriptor.generation;
+		if (!generation || !this.matchesCurrentWorker(worker, generation)) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} connect was superseded`);
+		}
 		let lastError: unknown;
 		while (Date.now() < deadline) {
 			await this.assertRecoveryAllowed();
+			if (!this.matchesCurrentWorker(worker, generation)) {
+				throw new Error(`Session worker ${worker.descriptor.workerId} connect was superseded`);
+			}
 			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
+				if (!this.matchesCurrentWorker(worker, generation)) throw new Error("Worker connect superseded");
 				await client.waitForHello(1000);
+				if (!this.matchesCurrentWorker(worker, generation)) throw new Error("Worker hello superseded");
 				await client.authenticateWorker(
 					worker.descriptor.authenticationToken,
 					this.supervisorAuthenticationClaim(),
 					1000,
 				);
 				await this.assertRecoveryAllowed();
-				client.onFrame((frame) => this.handleWorkerFrame(worker, frame));
-				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
+				if (!this.matchesCurrentWorker(worker, generation)) throw new Error("Worker authentication superseded");
 				worker.client?.close();
 				worker.client = client;
+				client.onFrame((frame) => this.handleWorkerFrame(worker, frame, generation, client));
+				client.onClose((error) => void this.handleWorkerClose(worker, client, error, generation));
 				return client;
 			} catch (error) {
 				lastError = error;
@@ -2606,12 +2774,51 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/** C01 process fence: legacy descriptor fields are deliberately never signal authority. */
+	private workerProcessIdentity(worker: ResidentWorker): ProcessIdentity | undefined {
+		if (worker.quarantined) return undefined;
+		const identity = worker.descriptor.process;
+		return identity && isCurrentProcessIdentity(identity) ? identity : undefined;
+	}
+
+	private matchesCurrentWorker(worker: ResidentWorker, generation: string): boolean {
+		return this.workers.get(worker.descriptor.workerId) === worker && worker.descriptor.generation === generation;
+	}
+
+	/** Callback fence only: the emergency gate never affects process/signal authority. */
+	private acceptsWorkerCallback(worker: ResidentWorker, generation: string, client?: DaemonWorkerClient): boolean {
+		if (!this.c01IdentityFencingEnabled) return client === undefined || worker.client === client;
+		return this.matchesCurrentWorker(worker, generation) && (client === undefined || worker.client === client);
+	}
+
+	private signalTrackedWorker(worker: ResidentWorker, generation: string, signal: NodeJS.Signals): boolean {
+		if (!this.matchesCurrentWorker(worker, generation)) {
+			this.log(`Refusing ${signal}: stale worker generation for ${worker.descriptor.workerId}`);
+			return false;
+		}
+		const identity = this.workerProcessIdentity(worker);
+		if (!identity) {
+			this.log(`Refusing ${signal}: unverified process identity for ${worker.descriptor.workerId}`);
+			return false;
+		}
+		// Re-read immediately before signaling; PID reuse must be fail-closed.
+		if (!isCurrentProcessIdentity(identity)) {
+			this.log(`Refusing ${signal}: process identity changed for ${worker.descriptor.workerId}`);
+			return false;
+		}
+		signalProcessGroupOrProcess(identity.pid, signal);
+		return true;
+	}
+
 	private async adoptOrRecoverWorker(worker: ResidentWorker): Promise<void> {
+		const generation = worker.descriptor.generation;
+		if (!generation || !this.matchesCurrentWorker(worker, generation)) return;
 		await this.assertRecoveryAllowed();
+		if (!this.matchesCurrentWorker(worker, generation)) return;
 		// A processless passivated descriptor (or a corrupt record that was
 		// conservatively moved to recovery) has no PID authority. Never feed an
 		// absent or stale identity into adoption/cleanup; recovery launches anew.
-		if (worker.descriptor.pid === undefined) {
+		if (worker.descriptor.process === undefined) {
 			if (worker.descriptor.stopRequestedAt) {
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
 			} else {
@@ -2623,7 +2830,7 @@ export class DaemonSupervisor {
 			try {
 				// A tombstoned worker must not run long enough to elect another
 				// supervisor while its intentional stop is being adopted.
-				signalProcessGroupOrProcess(worker.descriptor.pid!, "SIGKILL");
+				this.signalTrackedWorker(worker, worker.descriptor.generation ?? "", "SIGKILL");
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
 				this.log(`Completed intentional stop for worker ${worker.descriptor.workerId} during supervisor adoption`);
 			} catch (error) {
@@ -2635,17 +2842,24 @@ export class DaemonSupervisor {
 			return;
 		}
 		try {
-			if (!isProcessAlive(worker.descriptor.pid!)) {
+			if (!isProcessAlive(worker.descriptor.process!.pid)) {
 				throw new Error("Session worker process is no longer running");
 			}
-			const observedProcessStartId = getProcessStartId(worker.descriptor.pid!);
+			const observedProcessStartId = getProcessStartId(worker.descriptor.process!.pid);
+			if (observedProcessStartId !== worker.descriptor.process!.processStartId) {
+				throw new Error("Session worker process identity changed before adoption");
+			}
 			await this.connectWorker(worker, 2000);
+			if (!this.matchesCurrentWorker(worker, generation)) return;
 			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
+			if (!this.matchesCurrentWorker(worker, generation)) return;
 			await this.refreshWorkerSummaries(worker, true);
-			if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
-				worker.descriptor.processStartId = observedProcessStartId;
+			if (!this.matchesCurrentWorker(worker, generation)) return;
+			if (worker.descriptor.process?.processStartId === undefined && observedProcessStartId) {
+				if (worker.descriptor.process) worker.descriptor.process.processStartId = observedProcessStartId;
 			}
 			await this.assertRecoveryAllowed();
+			if (!this.matchesCurrentWorker(worker, generation)) return;
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
 			this.persistWorker(worker);
@@ -2659,8 +2873,13 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async handleWorkerClose(worker: ResidentWorker, client: DaemonWorkerClient, error: Error): Promise<void> {
-		if (worker.client !== client) {
+	private async handleWorkerClose(
+		worker: ResidentWorker,
+		client: DaemonWorkerClient,
+		error: Error,
+		generation?: string,
+	): Promise<void> {
+		if (generation !== undefined && !this.acceptsWorkerCallback(worker, generation, client)) {
 			return;
 		}
 		worker.client = undefined;
@@ -2703,7 +2922,10 @@ export class DaemonSupervisor {
 			}
 			return;
 		}
-		if (!this.isWorkerRecoveryEligible(worker)) {
+		if (
+			!this.isWorkerRecoveryEligible(worker) ||
+			(generation !== undefined && !this.acceptsWorkerCallback(worker, generation, client))
+		) {
 			return;
 		}
 		worker.descriptor.lifecycle = "recovering";
@@ -2719,6 +2941,7 @@ export class DaemonSupervisor {
 
 	private isWorkerRecoveryCandidate(worker: ResidentWorker): boolean {
 		return (
+			!worker.quarantined &&
 			!this.shuttingDown &&
 			!worker.intentionalStop &&
 			worker.descriptor.stopRequestedAt === undefined &&
@@ -2732,9 +2955,19 @@ export class DaemonSupervisor {
 		if (worker.deferredRecovery) {
 			return;
 		}
-		worker.deferredRecovery = this.resumeDeferredWorkerRecovery(worker, disconnectError).finally(() => {
-			worker.deferredRecovery = undefined;
+		const generation = worker.descriptor.generation;
+		let deferred!: Promise<void>;
+		deferred = this.resumeDeferredWorkerRecovery(worker, disconnectError).finally(() => {
+			// Legacy test harnesses may omit generation. Runtime descriptors cannot,
+			// but both forms need their settled deferred fence released.
+			if (
+				worker.deferredRecovery === deferred &&
+				(generation === undefined || this.matchesCurrentWorker(worker, generation))
+			) {
+				worker.deferredRecovery = undefined;
+			}
 		});
+		worker.deferredRecovery = deferred;
 	}
 
 	private async resumeDeferredWorkerRecovery(worker: ResidentWorker, disconnectError: Error): Promise<void> {
@@ -2950,14 +3183,41 @@ export class DaemonSupervisor {
 		}
 	}
 
+	/**
+	 * A wake/retry/owner-attach can intentionally be recovering in memory before
+	 * spawn has observed a new process identity. If that launch fails, return to
+	 * the only processless durable state instead of recording that transient
+	 * intent as recovering or failed on disk.
+	 */
+	private persistProcesslessRecoveryFailure(worker: ResidentWorker, error: unknown): void {
+		if (worker.descriptor.process !== undefined) {
+			this.persistWorker(worker);
+			return;
+		}
+		worker.descriptor.lifecycle = "passivated";
+		delete worker.descriptor.pid;
+		delete worker.descriptor.processStartId;
+		worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
+		this.persistWorker(worker);
+	}
+
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
-		if (this.isWorkerRecoveryCancelled(worker)) {
+		if (worker.quarantined) return;
+		const generation = worker.descriptor.generation;
+		// A live legacy selector can only occur in an unnormalized in-memory
+		// harness: loadWorkerDescriptors normalizes it before publication. Do not
+		// reconnect, replace, or signal it; preserve the conservative durable fail.
+		if (!generation && (worker.descriptor.process?.pid ?? worker.descriptor.pid) !== undefined) {
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = "Cannot recover a live legacy worker without a verified process identity";
+			// This reader-only legacy evidence has no C01 nested identity. Leave its
+			// durable bytes untouched rather than attempting a forbidden failed write.
 			return;
 		}
 		if (
 			worker.descriptor.ownerClientId &&
 			!worker.launchEnv &&
-			(worker.descriptor.pid === undefined || !isProcessAlive(worker.descriptor.pid))
+			(worker.descriptor.process === undefined || !isProcessAlive(worker.descriptor.process?.pid))
 		) {
 			// Never infer an owner environment or relaunch an owner-owned worker from
 			// persisted state. This includes processless/passivated descriptors, whose
@@ -2965,39 +3225,47 @@ export class DaemonSupervisor {
 			// processless descriptor until its identity is removed: otherwise a later
 			// recovery could probe or signal stale/recycled process metadata.
 			worker.descriptor.lifecycle = "passivated";
+			delete worker.descriptor.process;
 			delete worker.descriptor.pid;
 			delete worker.descriptor.processStartId;
 			worker.descriptor.lastError = "Waiting for the owning client to reconnect";
 			this.persistWorker(worker);
 			return;
 		}
+		// All remaining recovery continuations are asynchronous and need a
+		// published incarnation to fence their post-await mutations.
+		if (!generation || this.isWorkerRecoveryCancelled(worker, generation)) return;
 		if (worker.recovery) {
 			return worker.recovery;
 		}
-		worker.recovery = (async () => {
+		let recovery!: Promise<void>;
+		recovery = (async () => {
 			for (const [retryIndex, retryDelay] of WORKER_RETRY_DELAYS_MS.entries()) {
 				await delay(retryDelay);
-				if (this.isWorkerRecoveryCancelled(worker)) {
+				if (this.isWorkerRecoveryCancelled(worker, generation)) {
 					return;
 				}
 				try {
 					await this.assertRecoveryAllowed();
-					const pid = worker.descriptor.pid;
+					// A legacy PID is allowed only to establish that a live process exists
+					// and must not be replaced. It is never signal authority.
+					const pid = worker.descriptor.process?.pid ?? worker.descriptor.pid;
 					const processAlive = pid !== undefined && isProcessAlive(pid);
 					const observedProcessStartId = processAlive ? getProcessStartId(pid) : undefined;
 					const processIdentityMatches =
-						worker.descriptor.processStartId === undefined ||
-						observedProcessStartId === worker.descriptor.processStartId;
+						worker.descriptor.process !== undefined &&
+						observedProcessStartId === worker.descriptor.process.processStartId;
 					if (processAlive && processIdentityMatches) {
 						try {
 							await this.connectWorker(worker, 1500);
 							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
 							await this.refreshWorkerSummaries(worker, true);
-							if (this.isWorkerRecoveryCancelled(worker)) {
+							if (this.isWorkerRecoveryCancelled(worker, generation)) {
 								return;
 							}
-							if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
-								worker.descriptor.processStartId = observedProcessStartId;
+							if (worker.descriptor.process?.processStartId === undefined && observedProcessStartId) {
+								if (worker.descriptor.process)
+									worker.descriptor.process.processStartId = observedProcessStartId;
 							}
 							await this.assertRecoveryAllowed();
 							worker.descriptor.lifecycle = "ready";
@@ -3022,22 +3290,22 @@ export class DaemonSupervisor {
 					}
 					if (
 						processAlive &&
-						(worker.descriptor.processStartId === undefined || observedProcessStartId === undefined)
+						(worker.descriptor.process?.processStartId === undefined || observedProcessStartId === undefined)
 					) {
 						throw new Error(
 							`Cannot safely replace live session worker ${worker.descriptor.workerId} without a verified process identity`,
 						);
 					}
 					const safeToKillWorkerProcess =
-						processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined;
+						processAlive && processIdentityMatches && worker.descriptor.process?.processStartId !== undefined;
 					await this.recoverUncertainWorkerOperations(worker, safeToKillWorkerProcess);
-					if (this.isWorkerRecoveryCancelled(worker)) {
+					if (this.isWorkerRecoveryCancelled(worker, generation)) {
 						return;
 					}
 					await this.launchWorker(worker.descriptor.createCommand, worker);
 					return;
 				} catch (error) {
-					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker)) {
+					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker, generation)) {
 						return;
 					}
 					try {
@@ -3045,12 +3313,15 @@ export class DaemonSupervisor {
 					} catch {
 						return;
 					}
+					if (this.isWorkerRecoveryCancelled(worker, generation)) return;
 					worker.client?.close();
+					if (this.isWorkerRecoveryCancelled(worker, generation)) return;
 					worker.client = undefined;
 					worker.descriptor.consecutiveFailures++;
 					worker.descriptor.lastFailureAt = new Date().toISOString();
 					worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
-					this.persistWorker(worker);
+					if (this.isWorkerRecoveryCancelled(worker, generation)) return;
+					this.persistProcesslessRecoveryFailure(worker, error);
 				}
 			}
 			try {
@@ -3058,32 +3329,38 @@ export class DaemonSupervisor {
 			} catch {
 				return;
 			}
-			worker.descriptor.lifecycle = "failed";
-			this.persistWorker(worker);
+			if (this.isWorkerRecoveryCancelled(worker, generation)) return;
+			worker.descriptor.lifecycle = worker.descriptor.process === undefined ? "passivated" : "failed";
+			if (this.isWorkerRecoveryCancelled(worker, generation)) return;
+			this.persistProcesslessRecoveryFailure(worker, worker.descriptor.lastError ?? "Worker recovery failed");
 			await this.syncAgentPeers().catch(() => undefined);
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
 		})().finally(() => {
-			worker.recovery = undefined;
+			if (this.matchesCurrentWorker(worker, generation) && worker.recovery === recovery) {
+				worker.recovery = undefined;
+			}
 		});
-		return worker.recovery;
+		worker.recovery = recovery;
+		return recovery;
 	}
 
-	private isWorkerRecoveryCancelled(worker: ResidentWorker): boolean {
+	private isWorkerRecoveryCancelled(worker: ResidentWorker, generation?: string): boolean {
 		return (
 			this.shuttingDown ||
 			worker.intentionalStop ||
 			worker.descriptor.stopRequestedAt !== undefined ||
-			this.workers.get(worker.descriptor.workerId) !== worker
+			this.workers.get(worker.descriptor.workerId) !== worker ||
+			(generation !== undefined && worker.descriptor.generation !== generation)
 		);
 	}
 
 	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
 		await this.assertRecoveryAllowed();
 		if (killWorkerProcess) {
-			signalProcessGroupOrProcess(worker.descriptor.pid!, "SIGKILL");
+			this.signalTrackedWorker(worker, worker.descriptor.generation ?? "", "SIGKILL");
 		}
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
-		const pid = worker.descriptor.pid;
+		const pid = worker.descriptor.process?.pid;
 		// A processless passive record intentionally has no parent identity. Do
 		// not use a legacy/stale parent PID to reap anything while waking it.
 		if (orphanProcessJournalPath && pid !== undefined) {
@@ -3144,13 +3421,18 @@ export class DaemonSupervisor {
 			),
 		);
 		await this.assertRecoveryAllowed();
-		for (const record of latest) {
+		// Only a validated v2 begin can be completed. v1 is intentionally
+		// conservative evidence and must never be "cleared" by invented IDs.
+		for (const record of uncertain) {
+			if (record.version !== 2) continue;
 			journal.record({
 				activeSessionId: record.activeSessionId,
 				sessionId: record.sessionId,
 				...(record.sessionFile ? { sessionFile: record.sessionFile } : {}),
 				busy: false,
-				operation: "recovery_hold",
+				operation: record.operation,
+				operationId: record.operationId,
+				generation: record.generation,
 			});
 		}
 		this.log(
@@ -3161,13 +3443,20 @@ export class DaemonSupervisor {
 	}
 
 	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
-		if (!worker.client) {
-			throw new Error("Session worker is not connected");
+		const generation = worker.descriptor.generation;
+		const client = worker.client;
+		if (!client || !generation || !this.acceptsWorkerCallback(worker, generation, client)) {
+			throw new Error("Session worker is not connected or was superseded");
 		}
-		const response = await worker.client.request({ type: "list" }, 5000);
+		const response = await client.request({ type: "list" }, 5000);
+		// The list request may have been held while a new incarnation was published.
+		// Do not let A overwrite B's summaries or durable descriptor.
+		if (!this.acceptsWorkerCallback(worker, generation, client)) return;
 		const summaries = sessionSummariesFromResponse(response);
+		if (!this.acceptsWorkerCallback(worker, generation, client)) return;
 		worker.summaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
 		for (const summary of summaries) {
+			if (!this.acceptsWorkerCallback(worker, generation, client)) return;
 			const activeSessionId = summary.activeSessionId ?? summary.id;
 			if (summary.streamingMessage?.role === "assistant") {
 				this.streamReconstructor.seed(activeSessionId, summary.streamingMessage);
@@ -3177,20 +3466,17 @@ export class DaemonSupervisor {
 		}
 		const root = worker.summaries.get(worker.descriptor.rootActiveSessionId);
 		if (root) {
-			if (recovery) {
-				await this.assertRecoveryAllowed();
-			}
+			if (recovery) await this.assertRecoveryAllowed();
+			if (!this.acceptsWorkerCallback(worker, generation, client)) return;
 			worker.descriptor.rootSessionId = root.sessionId;
 			worker.descriptor.sessionFile = root.sessionFile;
 			worker.descriptor.createCommand = {
 				...worker.descriptor.createCommand,
 				sessionPath: root.sessionFile,
 				continueRecent: false,
-				config: {
-					...worker.descriptor.createCommand.config,
-					cwd: root.cwd,
-				},
+				config: { ...worker.descriptor.createCommand.config, cwd: root.cwd },
 			};
+			if (!this.acceptsWorkerCallback(worker, generation, client)) return;
 			this.persistWorker(worker);
 		}
 	}
@@ -3391,7 +3677,9 @@ export class DaemonSupervisor {
 			attachedClients: [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId))
 				.length,
 			workerState: worker.descriptor.lifecycle,
-			...(worker.descriptor.lifecycle === "passivated" ? {} : { workerPid: worker.descriptor.pid! }),
+			// A recovering/processless descriptor is intentionally still routable metadata.
+			// Do not turn a missing identity into a PID read while reporting it.
+			...(worker.descriptor.process ? { workerPid: worker.descriptor.process.pid } : {}),
 		};
 	}
 
@@ -3566,18 +3854,38 @@ export class DaemonSupervisor {
 		command: DaemonCommand,
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<DaemonResponse> {
+		const generation = worker.descriptor.generation;
+		if (!generation || !this.matchesCurrentWorker(worker, generation)) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} was superseded`);
+		}
 		if (this.commandExplicitlyWakesWorker(command)) {
 			await this.wakePassivatedWorker(worker);
+			// An explicit wake may suspend while a replacement takes this worker's
+			// public child selector. Do not let the stale route forward into A or B.
+			if (!this.matchesCurrentWorker(worker, generation)) {
+				throw new Error(`Session worker ${worker.descriptor.workerId} was superseded`);
+			}
 		}
-		if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+		const client = worker.client;
+		if (!client || worker.descriptor.lifecycle !== "ready") {
 			throw new Error(`Session worker is ${worker.descriptor.lifecycle}`);
 		}
-		const response = await worker.client.request(withoutCommandId(command), timeoutMs);
+		const response = await client.request(withoutCommandId(command), timeoutMs);
+		// A request can finish after another assignment has claimed this public
+		// selector. Its result must not be surfaced through that new assignment.
+		if (!this.matchesCurrentWorker(worker, generation) || worker.client !== client) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} was superseded`);
+		}
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		if (command.type === "rename" && response.success && isSessionSummary(response.data)) {
 			await this.refreshWorkerSummaries(worker);
+			// refreshWorkerSummaries fences its writes, but it intentionally returns
+			// quietly when stale. Revalidate before returning A's rename response.
+			if (!this.matchesCurrentWorker(worker, generation) || worker.client !== client) {
+				throw new Error(`Session worker ${worker.descriptor.workerId} was superseded`);
+			}
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		return responseWithId(response, command.id);
@@ -3608,7 +3916,8 @@ export class DaemonSupervisor {
 				ownedWorker.descriptor.archiveOnStop = undefined;
 				ownedWorker.descriptor.lifecycle = "recovering";
 				ownedWorker.descriptor.consecutiveFailures = 0;
-				this.persistWorker(ownedWorker);
+				// Owner attach is an explicit wake. Defer persistence until launch
+				// atomically publishes a canonical generation and process identity.
 				await this.recoverWorker(ownedWorker);
 			}
 		}
@@ -4060,7 +4369,16 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private handleWorkerFrame(worker: ResidentWorker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void {
+	private handleWorkerFrame(
+		worker: ResidentWorker,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+		generation?: string,
+		client?: DaemonWorkerClient,
+	): void {
+		if (generation !== undefined && client !== undefined && !this.acceptsWorkerCallback(worker, generation, client)) {
+			this.log(`Ignoring frame from stale worker callback ${worker.descriptor.workerId}`);
+			return;
+		}
 		if (frame.header.kind !== "outbound") {
 			return;
 		}
@@ -4882,7 +5200,7 @@ export class DaemonSupervisor {
 					if (removeDescriptor) {
 						this.persistWorkerStopTombstone(worker, archiveSession);
 					} else {
-						worker.descriptor.lifecycle = "failed";
+						worker.descriptor.lifecycle = worker.descriptor.process === undefined ? "passivated" : "failed";
 						worker.descriptor.lastError = failure.message;
 						this.persistWorker(worker);
 					}
@@ -4907,6 +5225,9 @@ export class DaemonSupervisor {
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
 	): Promise<void> {
+		if (worker.quarantined) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} is quarantined pending lifecycle repair`);
+		}
 		// Another independently dispatched stop may have completed between this
 		// request being recorded and its turn to run. A dead worker cannot be
 		// stopped twice, but a later archive request is still actionable from the
@@ -4928,7 +5249,7 @@ export class DaemonSupervisor {
 		}
 		// A passivated descriptor is explicitly processless. Its old pid may have
 		// been recycled while the supervisor was down, so never probe or signal it.
-		const processless = worker.descriptor.lifecycle === "passivated" || worker.descriptor.pid === undefined;
+		const processless = worker.descriptor.lifecycle === "passivated" || worker.descriptor.process === undefined;
 		if (worker.ownerCleanupTimer) {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
@@ -4941,7 +5262,10 @@ export class DaemonSupervisor {
 				this.persistWorkerStopTombstone(worker, archiveSession);
 			} else {
 				worker.intentionalStop = true;
-				worker.descriptor.lifecycle = "recovering";
+				// A stopped processless root remains a canonical passive routing
+				// record; recovery hand-off must not manufacture a processless
+				// recovering descriptor.
+				worker.descriptor.lifecycle = worker.descriptor.process === undefined ? "passivated" : "recovering";
 				this.persistWorker(worker);
 			}
 		} catch (error) {
@@ -4984,15 +5308,13 @@ export class DaemonSupervisor {
 			worker.client = undefined;
 		} else if (directChild) {
 			directChild.child.kill("SIGTERM");
-		} else if (!processless && isProcessAlive(worker.descriptor.pid!)) {
-			signalProcessGroupOrProcess(worker.descriptor.pid!, "SIGTERM");
+		} else if (!processless && isProcessAlive(worker.descriptor.process!.pid)) {
+			this.signalTrackedWorker(worker, worker.descriptor.generation ?? "", "SIGTERM");
 		}
 		const isWorkerProcessAlive = () =>
-			processless
-				? false
-				: directChild
-					? directChild.child.exitCode === null && directChild.child.signalCode === null
-					: isProcessAlive(worker.descriptor.pid!);
+			directChild
+				? directChild.child.exitCode === null && directChild.child.signalCode === null
+				: !processless && this.workerProcessIdentity(worker) !== undefined;
 		const gracefulDeadline = Date.now() + (force ? 500 : 2000);
 		while (isWorkerProcessAlive() && Date.now() < gracefulDeadline) {
 			await delay(25);
@@ -5001,7 +5323,7 @@ export class DaemonSupervisor {
 			if (directChild) {
 				directChild.child.kill("SIGKILL");
 			} else {
-				signalProcessGroupOrProcess(worker.descriptor.pid!, "SIGKILL");
+				this.signalTrackedWorker(worker, worker.descriptor.generation ?? "", "SIGKILL");
 			}
 			const forceDeadline = Date.now() + 1000;
 			while (isWorkerProcessAlive() && Date.now() < forceDeadline) {

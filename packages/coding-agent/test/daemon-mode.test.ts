@@ -43,7 +43,25 @@ import {
 	failure,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
+import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
+
+function deferred<T>(): {
+	promise: Promise<T>;
+	resolve(value: T | PromiseLike<T>): void;
+	reject(reason?: unknown): void;
+} {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
 
 describe("daemon mode helpers", () => {
 	it("preserves envelope client identity while registering prompt admission", () => {
@@ -56,6 +74,413 @@ describe("daemon mode helpers", () => {
 
 		parse(client, JSON.stringify(createDaemonCommandEnvelope({ type: "list" }, "request-1", "public-client")));
 		expect(client.id).toBe("public-client");
+	});
+
+	it("keeps B's same-family recovery checkpoint until B's terminal event after A completes and restart", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-operation-token-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-operation-token.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state, { eventGeneration: "11111111-1111-4111-8111-111111111111" });
+			Object.assign(state.runtime, { session: { sessionId: "session" } });
+			const internals = daemon as unknown as {
+				beginWorkerRecoveryOperation(state: ActiveSessionState, operation: "prompt"): unknown;
+				queueWorkerRecoveryTurn(state: ActiveSessionState, token: unknown): void;
+				checkpointWorkerRecoveryEvent(state: ActiveSessionState, operation: "turn_start" | "turn_end"): void;
+			};
+			const tokenA = internals.beginWorkerRecoveryOperation(state, "prompt");
+			internals.queueWorkerRecoveryTurn(state, tokenA);
+			const tokenB = internals.beginWorkerRecoveryOperation(state, "prompt");
+			internals.queueWorkerRecoveryTurn(state, tokenB);
+
+			// The scheduler starts/ends A while B is already admitted. A's terminal
+			// must clear only A's UUID; B remains durable crash evidence.
+			internals.checkpointWorkerRecoveryEvent(state, "turn_start");
+			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
+			const afterA = WorkerRecoveryJournal.readLatest(journalPath);
+			expect(afterA).toHaveLength(1);
+			expect(afterA[0]).toMatchObject({ busy: true, operation: "prompt" });
+
+			// A fresh reader models a worker restart. It still sees B, then B's own
+			// terminal event clears it; no mutable operation-family current map exists.
+			expect(new WorkerRecoveryJournal(journalPath).getLatest()).toEqual(afterA);
+			internals.checkpointWorkerRecoveryEvent(state, "turn_start");
+			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([
+				expect.objectContaining({ busy: false, operation: "prompt" }),
+			]);
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses exact operation tokens for admission cancellation, active steer, rejection, and observation checkpoints", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-operation-token-edges-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-operation-token-edges.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state, { eventGeneration: "11111111-1111-4111-8111-111111111111" });
+			Object.assign(state.runtime, { session: { sessionId: "session" } });
+			const internals = daemon as unknown as {
+				beginWorkerRecoveryOperation(state: ActiveSessionState, operation: "prompt" | "steer_queued"): unknown;
+				queueWorkerRecoveryTurn(state: ActiveSessionState, token: unknown): void;
+				cancelQueuedWorkerRecoveryTurn(state: ActiveSessionState, token: unknown): void;
+				attachWorkerRecoveryToActiveTurn(state: ActiveSessionState, token: unknown): boolean;
+				completeWorkerRecoveryOperation(state: ActiveSessionState, token: unknown): void;
+				checkpointWorkerRecoveryEvent(
+					state: ActiveSessionState,
+					operation: "turn_start" | "turn_end" | "session_action_update" | "rlm_child_update",
+				): void;
+			};
+
+			// An async prompt finally cancels its own pending admission token.
+			const abandonedPrompt = internals.beginWorkerRecoveryOperation(state, "prompt");
+			internals.queueWorkerRecoveryTurn(state, abandonedPrompt);
+			internals.cancelQueuedWorkerRecoveryTurn(state, abandonedPrompt);
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+
+			// A steer while A's turn is active is attached to A, not queued for a
+			// nonexistent next turn. turn_end clears every exact token for that turn.
+			const turnA = internals.beginWorkerRecoveryOperation(state, "prompt");
+			internals.queueWorkerRecoveryTurn(state, turnA);
+			internals.checkpointWorkerRecoveryEvent(state, "turn_start");
+			const activeSteer = internals.beginWorkerRecoveryOperation(state, "steer_queued");
+			expect(internals.attachWorkerRecoveryToActiveTurn(state, activeSteer)).toBe(true);
+			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: false,
+				operation: "steer_queued",
+			});
+
+			// A rejected paired command exact-clears the token it began.
+			const rejected = internals.beginWorkerRecoveryOperation(state, "steer_queued");
+			internals.completeWorkerRecoveryOperation(state, rejected);
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: false,
+				operation: "steer_queued",
+			});
+
+			// Observation events retain durable evidence but cannot strand busy work.
+			internals.checkpointWorkerRecoveryEvent(state, "session_action_update");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: false,
+				operation: "session_action_update",
+			});
+			internals.checkpointWorkerRecoveryEvent(state, "rlm_child_update");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: false,
+				operation: "rlm_child_update",
+			});
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("immediately clears a rejected active steer while its outer turn remains owned", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-rejected-active-steer-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-rejected-active-steer.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state, { eventGeneration: "11111111-1111-4111-8111-111111111111" });
+			const checkpoint = Reflect.get(daemon, "checkpointWorkerRecoveryEvent").bind(daemon) as (
+				state: ActiveSessionState,
+				event: "turn_start" | "turn_end",
+			) => void;
+			const steerResult = deferred<void>();
+			state.runtime = {
+				...state.runtime,
+				session: { sessionId: "session", steer: vi.fn(() => steerResult.promise) },
+			} as never;
+			Reflect.get(daemon, "sessions").set("active", state);
+			const internals = daemon as unknown as {
+				beginWorkerRecoveryOperation(state: ActiveSessionState, operation: "prompt"): unknown;
+				queueWorkerRecoveryTurn(state: ActiveSessionState, token: unknown): void;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+
+			// A owns the outer turn. B first becomes the observable current token,
+			// then fails while attached to A's active frame.
+			const outer = internals.beginWorkerRecoveryOperation(state, "prompt");
+			internals.queueWorkerRecoveryTurn(state, outer);
+			checkpoint(state, "turn_start");
+			const rejectedSteer = internals.handleCommand(makeClient("client", "active"), {
+				type: "steer",
+				activeSessionId: "active",
+				message: "reject",
+			});
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: true,
+				operation: "steer_queued",
+			});
+			steerResult.reject(new Error("steer rejected"));
+			await expect(rejectedSteer).rejects.toThrow("steer rejected");
+
+			// B is exact-cleared at its own rejection, and the still-live A is
+			// republished immediately rather than waiting for any turn terminal.
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			const afterRejection = readFileSync(journalPath, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line)) as Array<{ busy: boolean; operation: string }>;
+			expect(afterRejection).toContainEqual(expect.objectContaining({ busy: false, operation: "steer_queued" }));
+
+			// An unrelated nested terminal cannot resurrect B; A remains owned until
+			// A's own terminal, which is the first point that clears it.
+			checkpoint(state, "turn_start");
+			checkpoint(state, "turn_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			checkpoint(state, "turn_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("retains an accepted non-waiting prompt token through its deferred terminal turn", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-accepted-prompt-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-accepted-prompt.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state, { eventGeneration: "11111111-1111-4111-8111-111111111111" });
+			const terminal = deferred<void>();
+			state.runtime = {
+				...state.runtime,
+				session: {
+					sessionId: "session",
+					isStreaming: false,
+					promptUntilAccepted: vi.fn(
+						async (_message: string, options?: { preflightResult?: (accepted: boolean) => void }) => {
+							options?.preflightResult?.(true);
+							await terminal.promise;
+						},
+					),
+				},
+			} as never;
+			Reflect.get(daemon, "sessions").set("active", state);
+			const handle = Reflect.get(daemon, "handleCommand").bind(daemon) as (
+				client: DaemonSocketClient,
+				command: DaemonCommand,
+			) => Promise<unknown>;
+			await handle(makeClient("client", "active"), {
+				type: "prompt",
+				activeSessionId: "active",
+				message: "queued",
+				streamingBehavior: "followUp",
+			});
+			await vi.waitFor(() =>
+				expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" }),
+			);
+			terminal.resolve();
+			await Promise.resolve();
+			// Acceptance releases only the response/admission plumbing, never the queued token.
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			const checkpoint = Reflect.get(daemon, "checkpointWorkerRecoveryEvent").bind(daemon) as (
+				state: ActiveSessionState,
+				event: "turn_start" | "turn_end",
+			) => void;
+			checkpoint(state, "turn_start");
+			checkpoint(state, "turn_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("pairs nested recovery events and turns in LIFO order", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-lifo-recovery-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-lifo-recovery.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state, { eventGeneration: "11111111-1111-4111-8111-111111111111" });
+			Object.assign(state.runtime, { session: { sessionId: "session" } });
+			const internals = daemon as unknown as {
+				beginWorkerRecoveryOperation(state: ActiveSessionState, operation: "prompt" | "follow_up_queued"): unknown;
+				queueWorkerRecoveryTurn(state: ActiveSessionState, token: unknown): void;
+				checkpointWorkerRecoveryEvent(
+					state: ActiveSessionState,
+					event: "turn_start" | "turn_end" | "message_start" | "message_end",
+				): void;
+			};
+			const a = internals.beginWorkerRecoveryOperation(state, "prompt");
+			const b = internals.beginWorkerRecoveryOperation(state, "follow_up_queued");
+			internals.queueWorkerRecoveryTurn(state, a);
+			internals.queueWorkerRecoveryTurn(state, b);
+			internals.checkpointWorkerRecoveryEvent(state, "turn_start");
+			internals.checkpointWorkerRecoveryEvent(state, "turn_start");
+			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
+			// B is completed at B's edge and A is immediately republished because it
+			// remains active. The outer terminal subsequently clears A, not B.
+			const nestedTurnRecords = readFileSync(journalPath, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line)) as Array<{
+				busy: boolean;
+				operation: string;
+			}>;
+			expect(nestedTurnRecords).toContainEqual(
+				expect.objectContaining({ busy: false, operation: "follow_up_queued" }),
+			);
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: true, operation: "prompt" });
+			internals.checkpointWorkerRecoveryEvent(state, "turn_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({ busy: false, operation: "prompt" });
+			internals.checkpointWorkerRecoveryEvent(state, "message_start");
+			internals.checkpointWorkerRecoveryEvent(state, "message_start");
+			internals.checkpointWorkerRecoveryEvent(state, "message_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: true,
+				operation: "message_start",
+			});
+			internals.checkpointWorkerRecoveryEvent(state, "message_end");
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: false,
+				operation: "message_start",
+			});
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses the worker generation for ready and terminal recovery records", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-worker-generation-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		const previousGeneration = process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_GENERATION;
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_GENERATION = "22222222-2222-4222-8222-222222222222";
+			const daemon = new AgentDaemon("/tmp/prime-agent-worker-generation.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state, { eventGeneration: "11111111-1111-4111-8111-111111111111" });
+			Object.assign(state.runtime, { session: { sessionId: "session" } });
+			const internals = daemon as unknown as {
+				recordWorkerRecoveryState(state: ActiveSessionState, operation: "ready"): void;
+				beginWorkerRecoveryOperation(state: ActiveSessionState, operation: "prompt"): unknown;
+				completeWorkerRecoveryOperation(state: ActiveSessionState, token: unknown): void;
+			};
+			internals.recordWorkerRecoveryState(state, "ready");
+			const prompt = internals.beginWorkerRecoveryOperation(state, "prompt");
+			internals.completeWorkerRecoveryOperation(state, prompt);
+			const latest = WorkerRecoveryJournal.readLatest(journalPath);
+			expect(latest).toHaveLength(1);
+			expect(latest[0]).toMatchObject({
+				busy: false,
+				generation: "22222222-2222-4222-8222-222222222222",
+				operation: "prompt",
+			});
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			if (previousGeneration === undefined) delete process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_GENERATION;
+			else process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER_GENERATION = previousGeneration;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes a follow-up token before an admitted turn can synchronously start", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-follow-up-race-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-follow-up-race.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state, { eventGeneration: "11111111-1111-4111-8111-111111111111" });
+			const checkpoint = Reflect.get(daemon, "checkpointWorkerRecoveryEvent").bind(daemon) as (
+				state: ActiveSessionState,
+				event: "turn_start" | "turn_end",
+			) => void;
+			const held = deferred<boolean>();
+			state.runtime = {
+				...state.runtime,
+				session: {
+					sessionId: "session",
+					followUp: vi.fn(() => {
+						checkpoint(state, "turn_start");
+						checkpoint(state, "turn_end");
+						return held.promise;
+					}),
+				},
+			} as never;
+			Reflect.get(daemon, "sessions").set("active", state);
+			const handle = Reflect.get(daemon, "handleCommand").bind(daemon) as (
+				client: DaemonSocketClient,
+				command: DaemonCommand,
+			) => Promise<unknown>;
+			const pending = handle(makeClient("client", "active"), {
+				type: "follow_up",
+				activeSessionId: "active",
+				message: "race",
+			});
+			// The turn terminal ran before the awaited followUp promise settled.
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: false,
+				operation: "follow_up_queued",
+			});
+			held.resolve(true);
+			await pending;
+			// No token was appended after the turn, so a later unrelated terminal cannot consume it.
+			expect(WorkerRecoveryJournal.readLatest(journalPath)[0]).toMatchObject({
+				busy: false,
+				operation: "follow_up_queued",
+			});
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("normalizes daemon session names before validation and persistence", async () => {
@@ -657,15 +1082,21 @@ describe("daemon mode helpers", () => {
 		});
 		const parentState = makeState("parent");
 		const childState = makeState("child", parentState.activeSessionId);
+		const assignmentId = "11111111-1111-4111-8111-111111111111";
 		Object.assign(childState.runtime.metadata, {
 			kind: "subagent",
 			parentActiveSessionId: parentState.activeSessionId,
 			rlmChildId: "child-1",
+			assignmentId,
 		});
 		let internals: {
 			sessions: Map<string, ActiveSessionState>;
 			closeSession: (state: ActiveSessionState, reason: "completed" | "killed") => Promise<void>;
-			recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<void>;
+			recordRlmSubagentDeletion(
+				parentState: ActiveSessionState,
+				childId: string,
+				assignmentId: string,
+			): Promise<void>;
 			createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
 		};
 		const closeSession = vi.fn(async (state: ActiveSessionState) => {
@@ -681,8 +1112,8 @@ describe("daemon mode helpers", () => {
 		await internals
 			.createSubagentRuntimeHost(parentState)
 			.releaseRlmSubagentRuntime?.(
-				{ session: childState.runtime.session },
-				{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
+				{ session: childState.runtime.session, assignmentId },
+				{ id: "child-1", assignmentId } as CreateRlmSubagentRuntimeOptions,
 				"error",
 			);
 
@@ -692,11 +1123,11 @@ describe("daemon mode helpers", () => {
 		await internals
 			.createSubagentRuntimeHost(parentState)
 			.releaseRlmSubagentRuntime?.(
-				{ session: childState.runtime.session },
-				{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
+				{ session: childState.runtime.session, assignmentId },
+				{ id: "child-1", assignmentId } as CreateRlmSubagentRuntimeOptions,
 				"cancelled",
 			);
-		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1");
+		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1", assignmentId);
 		expect(recordDeletion.mock.invocationCallOrder[0]).toBeLessThan(closeSession.mock.invocationCallOrder[1]!);
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
@@ -710,13 +1141,157 @@ describe("daemon mode helpers", () => {
 			internals
 				.createSubagentRuntimeHost(parentState)
 				.releaseRlmSubagentRuntime?.(
-					{ session: childState.runtime.session },
-					{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
+					{ session: childState.runtime.session, assignmentId },
+					{ id: "child-1", assignmentId } as CreateRlmSubagentRuntimeOptions,
 					"cancelled",
 				),
 		).rejects.toThrow("registry write failed");
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
+	});
+
+	it("fences stale assignment completion and deletion when a child selector is reused", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-assignment-fence.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeState("parent");
+		const assignmentA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+		const assignmentB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+		const childB = makeState("child-b", parent.activeSessionId);
+		Object.assign(childB.runtime.metadata, {
+			kind: "subagent",
+			parentActiveSessionId: parent.activeSessionId,
+			rlmChildId: "reused-child",
+			assignmentId: assignmentB,
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			readLatestRlmSubagentRegistry: ReturnType<typeof vi.fn>;
+			createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
+			closeSession: ReturnType<typeof vi.fn>;
+		};
+		internals.readLatestRlmSubagentRegistry = vi.fn(async () => []);
+		internals.sessions.set(parent.activeSessionId, parent);
+		internals.sessions.set(childB.activeSessionId, childB);
+		internals.closeSession = vi.fn(async () => undefined);
+		const host = internals.createSubagentRuntimeHost(parent);
+
+		// A's completion cannot publish B's registry state, and A's delete cannot
+		// close or remove B even though the mock reused the same child id.
+		expect(host.completeRlmSubagentRuntime?.("reused-child", childB.runtime.session, assignmentA)).toBe(false);
+		await host.deleteRlmSubagentRuntime?.("reused-child", childB.runtime.session, assignmentA);
+		expect(internals.closeSession).not.toHaveBeenCalled();
+		expect(internals.sessions.get(childB.activeSessionId)).toBe(childB);
+	});
+
+	it("rejects a stale lazy-hydration assignment rebind without joining B's reused selector", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-lazy-assignment-join.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeState("parent");
+		const childB = makeState("child-b", parent.activeSessionId);
+		const childA = makeState("child-a", parent.activeSessionId);
+		Object.assign(childB.runtime, {
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: parent.activeSessionId,
+				rlmChildId: "lazy-reused-child",
+				assignmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+			},
+			session: { sessionId: "B", sessionName: "B", sessionFile: "/tmp/B.jsonl" },
+		});
+		Object.assign(childA.runtime, {
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: parent.activeSessionId,
+				rlmChildId: "lazy-reused-child",
+				assignmentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+			},
+			session: { sessionId: "A", sessionName: "A", sessionFile: "/tmp/A.jsonl" },
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			getOrHydrateBoundSessionState(id: string): Promise<ActiveSessionState>;
+			findPassiveRlmSubagent: ReturnType<typeof vi.fn>;
+			hydratePassiveRlmSubagent: ReturnType<typeof vi.fn>;
+		};
+		internals.sessions.set(parent.activeSessionId, parent);
+		internals.sessions.set(childB.activeSessionId, childB);
+		// An obsolete A passive lookup must join the already-bound B session,
+		// rather than reopening/rebinding A by its shared child selector.
+		internals.findPassiveRlmSubagent = vi.fn(async () => undefined);
+		internals.hydratePassiveRlmSubagent = vi.fn(async () => childA);
+		await expect(internals.getOrHydrateBoundSessionState("lazy-reused-child")).resolves.toBe(childB);
+		expect(internals.hydratePassiveRlmSubagent).not.toHaveBeenCalled();
+		expect(internals.sessions.get(childB.activeSessionId)).toBe(childB);
+	});
+
+	it("binds a legacy passive delete to a fresh assignment before persisting its exact tombstone", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-legacy-delete-assignment-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const legacy = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			delete legacy.assignmentId;
+			writeFileSync(registryPath, `${JSON.stringify(legacy)}\n`);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals.createSubagentRuntimeHost(parent).deleteRlmSubagentRuntime(fixture.childId);
+			const rows = readFileSync(registryPath, "utf8")
+				.trim()
+				.split(/\r?\n/)
+				.map((line) => JSON.parse(line) as { childId: string; assignmentId?: string; status: string });
+			const bound = rows.at(-2);
+			const deleted = rows.at(-1);
+			expect(bound).toMatchObject({ childId: fixture.childId, status: "completed" });
+			expect(bound?.assignmentId).toMatch(/^[0-9a-f-]{36}$/i);
+			expect(deleted).toMatchObject({
+				childId: fixture.childId,
+				assignmentId: bound?.assignmentId,
+				status: "deleted",
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps assignment-less registry rows display-only until an assigned row is persisted", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-legacy-assignment-row-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const registryPath = join(tempDir, "rlm-subagents.jsonl");
+			writeFileSync(
+				registryPath,
+				`${JSON.stringify({
+					type: "rlm_subagent",
+					childId: "legacy-child",
+					sessionName: "legacy",
+					sessionDir: tempDir,
+					sessionFile: join(tempDir, "legacy.jsonl"),
+					status: "completed",
+				})}\n`,
+			);
+			const read = (
+				daemon as unknown as {
+					readLatestRlmSubagentRegistryPath(path: string): Promise<Array<{ assignmentId?: string }>>;
+				}
+			).readLatestRlmSubagentRegistryPath.bind(daemon);
+			const entries = await read(registryPath);
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).not.toHaveProperty("assignmentId");
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
@@ -796,7 +1371,9 @@ describe("daemon mode helpers", () => {
 			);
 			if (!childState?.runtime.session.sessionFile) throw new Error("Missing child state");
 			const host = internals.createSubagentRuntimeHost(parentState);
-			expect(host.completeRlmSubagentRuntime?.("child-1", childRuntime.session)).toBe(true);
+			expect(
+				host.completeRlmSubagentRuntime?.("child-1", childRuntime.session, childRuntime.metadata.assignmentId!),
+			).toBe(true);
 			await (
 				daemon as unknown as { closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void> }
 			).closeSession(childState, "shutdown");
@@ -6125,6 +6702,7 @@ describe("daemon mode helpers", () => {
 			expect(parentSession.releaseRlmChildSession).toHaveBeenCalledWith(
 				fixture.childId,
 				childState!.runtime.session,
+				"11111111-1111-4111-8111-111111111111",
 			);
 		} finally {
 			releaseHydration();
@@ -6206,6 +6784,8 @@ describe("daemon mode helpers", () => {
 			expect(parentSession.registerRlmChildSession).toHaveBeenCalledWith(
 				fixture.childId,
 				attachedState.runtime.session,
+				undefined,
+				"11111111-1111-4111-8111-111111111111",
 			);
 
 			await expect(
@@ -6376,7 +6956,12 @@ describe("daemon mode helpers", () => {
 			expect(
 				(parentState.runtime.session as unknown as { registerRlmChildSession: ReturnType<typeof vi.fn> })
 					.registerRlmChildSession,
-			).toHaveBeenCalledWith(fixture.grandchildId, grandchildState.runtime.session);
+			).toHaveBeenCalledWith(
+				fixture.grandchildId,
+				grandchildState.runtime.session,
+				undefined,
+				"22222222-2222-4222-8222-222222222222",
+			);
 		} finally {
 			releaseHydration();
 			rmSync(tempDir, { recursive: true, force: true });
@@ -6530,7 +7115,15 @@ describe("daemon mode helpers", () => {
 			const internals = fixture.daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
 				closingSessions: Map<string, { promise: Promise<void>; reason: "shutdown"; killedEffects?: Promise<void> }>;
-				passivatingSessions: Map<string, Promise<void>>;
+				passivatingSessions: Map<
+					string,
+					{
+						promise: Promise<void>;
+						state: ActiveSessionState;
+						generation: string;
+						operation: { operationId: string; generation: string };
+					}
+				>;
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
 				findPassiveRlmSubagent(id: string): Promise<unknown>;
 				hydratePassiveRlmSubagent(passive: unknown): Promise<ActiveSessionState>;
@@ -6560,7 +7153,12 @@ describe("daemon mode helpers", () => {
 						promise: passivation,
 						reason: "shutdown",
 					});
-					internals.passivatingSessions.set(resolve(fixture.childSessionFile), passivation);
+					internals.passivatingSessions.set(resolve(fixture.childSessionFile), {
+						promise: passivation,
+						state: closingChild,
+						generation: closingChild.eventGeneration,
+						operation: { operationId: "passivation", generation: closingChild.eventGeneration },
+					});
 					markRaceStarted();
 					return internals.waitForBoundSession(closingChild);
 				}
@@ -6790,6 +7388,7 @@ describe("daemon mode helpers", () => {
 				fixture.childId,
 				childState.runtime.session,
 				unsubscribeForwarder,
+				"11111111-1111-4111-8111-111111111111",
 			);
 			expect(unsubscribeForwarder).not.toHaveBeenCalled();
 			emitChildUpdate("recap after failed close");
@@ -6878,7 +7477,11 @@ describe("daemon mode helpers", () => {
 
 			expect(await internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 2)).toBe(1);
 			expect(internals.sessions.has(firstChild.activeSessionId)).toBe(false);
-			expect(parentSession.releaseRlmChildSession).toHaveBeenCalledWith(fixture.childId, firstChild.runtime.session);
+			expect(parentSession.releaseRlmChildSession).toHaveBeenCalledWith(
+				fixture.childId,
+				firstChild.runtime.session,
+				"11111111-1111-4111-8111-111111111111",
+			);
 			expect(fixture.runtimeSessions[1]?.disposeAsync).toHaveBeenCalledOnce();
 
 			const listed = (await internals.handleCommand(makeClient("list-client", parentState.activeSessionId), {
@@ -7829,6 +8432,9 @@ describe("daemon mode helpers", () => {
 			} as never;
 			const existingClose = {
 				promise: failedClose,
+				state,
+				generation: state.eventGeneration,
+				operation: { operationId: "closing", generation: state.eventGeneration },
 				reason: "shutdown" as const,
 				descendants: new Set<ActiveSessionState>(),
 			};
@@ -7890,6 +8496,9 @@ describe("daemon mode helpers", () => {
 			}
 			const existingClose = {
 				promise: Promise.resolve(),
+				state: parent,
+				generation: parent.eventGeneration,
+				operation: { operationId: "closing", generation: parent.eventGeneration },
 				reason: "shutdown" as "shutdown" | "killed",
 				descendants: new Set([child]),
 			};
@@ -8551,11 +9160,9 @@ describe("daemon mode helpers", () => {
 			state.runtime = { ...state.runtime, session: { isStreaming: false, steer, followUp } } as never;
 			const internals = daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
-				recordWorkerRecoveryState: ReturnType<typeof vi.fn>;
 				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			};
 			internals.sessions.set(state.activeSessionId, state);
-			internals.recordWorkerRecoveryState = vi.fn();
 
 			await expect(
 				internals.handleCommand(makeClient("client-1", state.activeSessionId), {
@@ -8576,9 +9183,6 @@ describe("daemon mode helpers", () => {
 				agentMessageId: undefined,
 				resumeIfIdle: true,
 			});
-			if (type === "follow_up") {
-				expect(internals.recordWorkerRecoveryState).toHaveBeenCalledWith(state, "follow_up_queued", true);
-			}
 		},
 	);
 
@@ -9689,6 +10293,7 @@ function makePersistedRlmDaemonFixture(
 		`${JSON.stringify({
 			type: "rlm_subagent",
 			childId: grandchildId,
+			assignmentId: "22222222-2222-4222-8222-222222222222",
 			sessionName: "nested-worker",
 			sessionDir: grandchildSessionDir,
 			sessionFile: grandchildSessionFile,
@@ -9708,6 +10313,7 @@ function makePersistedRlmDaemonFixture(
 		`${JSON.stringify({
 			type: "rlm_subagent",
 			childId,
+			assignmentId: "11111111-1111-4111-8111-111111111111",
 			sessionName: "spawn-worker",
 			sessionDir: childSessionDir,
 			sessionFile: childSessionFile,

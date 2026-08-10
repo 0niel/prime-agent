@@ -15,19 +15,22 @@ export const DAEMON_WORKER_TOKEN_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN
 export const DAEMON_WORKER_ACTIVE_SESSION_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID";
 export const DAEMON_WORKER_SUPERVISOR_SOCKET_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET";
 export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL";
+/** Opaque supervisor-minted worker incarnation for recovery-journal v2. */
+export const DAEMON_WORKER_GENERATION_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_GENERATION";
 export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD";
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 /**
  * `passivated` descriptors retain a session's routing metadata without a worker
  * process. They are deliberately revived only by an explicit session operation.
  */
-export const DAEMON_WORKER_LIFECYCLES = ["starting", "ready", "recovering", "failed", "passivated"] as const;
-export type DaemonWorkerLifecycle = (typeof DAEMON_WORKER_LIFECYCLES)[number];
+export {
+	DAEMON_WORKER_LIFECYCLES,
+	type DaemonWorkerLifecycle,
+	isDaemonWorkerLifecycle,
+	type ProcessIdentity,
+} from "./daemon-lifecycle-identity.js";
 
-/** Durable descriptor states are untrusted input when read from disk. */
-export function isDaemonWorkerLifecycle(value: unknown): value is DaemonWorkerLifecycle {
-	return typeof value === "string" && (DAEMON_WORKER_LIFECYCLES as readonly string[]).includes(value);
-}
+import type { DaemonWorkerLifecycle, ProcessIdentity } from "./daemon-lifecycle-identity.js";
 
 export type DaemonWorkerFrameHeader =
 	| {
@@ -98,12 +101,19 @@ export interface DaemonWorkerDescriptor {
 	workerId: string;
 	/**
 	 * Process identity for resident workers. Both fields are deliberately absent
-	 * for passivated descriptors and may be absent on a recovering descriptor
-	 * normalized from legacy lifecycle data. Legacy fields are accepted only while
-	 * reading a non-passivated v1 descriptor; writers never retain them on a
-	 * passivation.
+	 * only for passivated descriptors in every C01 write. Reader-only legacy or
+	 * malformed lifecycle evidence may be processless in memory, but is never
+	 * rewritten as a non-passivated C01 descriptor. Legacy fields are accepted
+	 * only while reading a non-passivated v1 descriptor; writers never retain
+	 * them on a passivation.
 	 */
+	/** Present only for a resident C01 worker. Legacy pid fields are reader-only. */
+	process?: ProcessIdentity;
+	/** Fresh UUID for every launch/adoption; legacy records may not have one. */
+	generation?: string;
+	/** @deprecated reader-only legacy v1 fields; never emitted by C01 writers. */
 	pid?: number;
+	/** @deprecated reader-only legacy v1 fields; never emitted by C01 writers. */
 	processStartId?: string;
 	socketPath: string;
 	recoveryJournalPath: string;
@@ -128,6 +138,20 @@ export interface DaemonWorkerDescriptor {
 	lastError?: string;
 }
 
+/**
+ * Reader compatibility stays intentionally broad in DaemonWorkerDescriptor.
+ * Every C01 resident/new write instead uses this closed shape: it has a fresh
+ * generation and cannot carry the old PID selector fields.
+ */
+export interface ResidentDaemonWorkerDescriptor
+	extends Omit<DaemonWorkerDescriptor, "generation" | "pid" | "processStartId"> {
+	/** Every published resident/passivated C01 descriptor has an incarnation. */
+	generation: string;
+	/** Legacy flat selectors are accepted only by the reader descriptor above. */
+	pid?: never;
+	processStartId?: never;
+}
+
 export function isDaemonWorkerProcess(environment: NodeJS.ProcessEnv = process.env): boolean {
 	return environment[DAEMON_WORKER_ROLE_ENV] === "1";
 }
@@ -148,9 +172,15 @@ export function waitForDaemonWorkerStartupGate(environment: NodeJS.ProcessEnv = 
 	} finally {
 		closeSync(fd);
 	}
-	if (marker !== DAEMON_WORKER_STARTUP_GATE_COMMIT) {
+	if (!marker.startsWith(DAEMON_WORKER_STARTUP_GATE_COMMIT)) {
 		throw new Error("Daemon session worker startup was cancelled");
 	}
+	// The supervisor observes the child start identity before minting this value.
+	// Publishing it through the gate prevents the worker from journaling or
+	// callback-registration before it has the exact committed incarnation.
+	const generation = marker.slice(DAEMON_WORKER_STARTUP_GATE_COMMIT.length).trim();
+	if (!generation) throw new Error("Daemon session worker startup omitted its generation");
+	environment[DAEMON_WORKER_GENERATION_ENV] = generation;
 }
 
 export function requireDaemonWorkerAuthenticationToken(environment: NodeJS.ProcessEnv = process.env): string {

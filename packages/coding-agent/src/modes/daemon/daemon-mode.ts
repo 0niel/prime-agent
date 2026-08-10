@@ -140,6 +140,7 @@ import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
+import { assertFreshUuid, type OperationIdentity } from "./daemon-lifecycle-identity.js";
 import {
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
@@ -190,6 +191,7 @@ import {
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_GENERATION_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
@@ -207,7 +209,7 @@ import {
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	type SnapshotTranscriptChunkSource,
 } from "./snapshot-transcript-cache.js";
-import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
+import { WorkerRecoveryJournal, type WorkerRecoveryOperation } from "./worker-recovery-journal.js";
 
 export interface DaemonModeOptions {
 	socketPath?: string;
@@ -377,6 +379,8 @@ const RLM_SUBAGENT_REGISTRY_FILE = "rlm-subagents.jsonl";
 interface PersistedRlmSubagentRegistryEntry {
 	type: "rlm_subagent";
 	childId: string;
+	/** Undefined only for legacy display rows; C01 callbacks must never bind one. */
+	assignmentId?: string;
 	sessionName: string;
 	sessionDir: string;
 	sessionFile: string;
@@ -402,6 +406,11 @@ type PassiveRlmSubagent = PassiveRlmRoot & {
 	info: SessionInfo;
 	chain: PersistedRlmSubagentRegistryEntry[];
 };
+
+interface RecoveryOperationToken {
+	operation: WorkerRecoveryOperation;
+	identity: OperationIdentity;
+}
 
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
@@ -454,11 +463,17 @@ export class AgentDaemon {
 	 * coalesces every close by transient activeSessionId, while this one identifies the
 	 * passivation-only close reason by the durable identity needed by hydration/opening.
 	 */
-	private readonly passivatingSessions = new Map<string, Promise<void>>();
+	private readonly passivatingSessions = new Map<
+		string,
+		{ promise: Promise<void>; state: ActiveSessionState; generation: string; operation: OperationIdentity }
+	>();
 	private readonly closingSessions = new Map<
 		string,
 		{
 			promise: Promise<void>;
+			state: ActiveSessionState;
+			generation: string;
+			operation: OperationIdentity;
 			reason: DaemonSessionClosedReason;
 			descendants: Set<ActiveSessionState>;
 			reasonUpgrade?: Promise<void>;
@@ -478,6 +493,10 @@ export class AgentDaemon {
 		{
 			activeSessionId: string;
 			admissionId: string;
+			/** Captured before the prompt flow can await; never reassigned. */
+			operation: OperationIdentity;
+			state?: ActiveSessionState;
+			stateGeneration?: string;
 			controller?: AbortController;
 			status: "waiting" | "owned" | "cancelled";
 		}
@@ -520,6 +539,15 @@ export class AgentDaemon {
 		},
 	);
 	private readonly recoveryJournal?: WorkerRecoveryJournal;
+	// Recovery identities belong to individual admitted operations.  The queues below
+	// are scheduler queues, not a mutable family-current map: each element retains
+	// the immutable token that was durably begun for that particular operation.
+	private readonly recoveryTurnOperations = new WeakMap<
+		ActiveSessionState,
+		{ pending: RecoveryOperationToken[]; active: RecoveryOperationToken[][] }
+	>();
+	private readonly recoveryEventOperations = new WeakMap<ActiveSessionState, Map<string, RecoveryOperationToken[]>>();
+	private readonly workerGeneration: string;
 
 	constructor(
 		private readonly socketPath: string,
@@ -533,6 +561,7 @@ export class AgentDaemon {
 			? AgentCronJobStore.forSessionArtifacts()
 			: new AgentCronJobStore(getCronJobsPath(this.agentDir));
 		this.restoreActiveSessionId = options.worker?.restoreActiveSessionId;
+		this.workerGeneration = process.env[DAEMON_WORKER_GENERATION_ENV] ?? randomUUID();
 		const recoveryJournalPath = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 		if (options.worker && recoveryJournalPath) {
 			this.recoveryJournal = new WorkerRecoveryJournal(recoveryJournalPath);
@@ -885,6 +914,12 @@ export class AgentDaemon {
 		return join(artifactDir, RLM_SUBAGENT_REGISTRY_FILE);
 	}
 
+	private rlmAssignmentKey(entry: Pick<PersistedRlmSubagentRegistryEntry, "childId" | "assignmentId">): string {
+		// Missing assignment is a legacy display identity and is deliberately never
+		// equal to a C01 UUID callback identity.
+		return `${entry.childId}\u0000${entry.assignmentId ?? "legacy"}`;
+	}
+
 	private appendRlmSubagentRegistryEntry(
 		parentState: ActiveSessionState,
 		entry: PersistedRlmSubagentRegistryEntry,
@@ -917,6 +952,7 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		input: {
 			childId: string;
+			assignmentId: string;
 			sessionName: string;
 			sessionDir: string;
 			sessionFile: string;
@@ -934,6 +970,7 @@ export class AgentDaemon {
 		return this.appendRlmSubagentRegistryEntry(parentState, {
 			type: "rlm_subagent",
 			childId: input.childId,
+			assignmentId: input.assignmentId,
 			sessionName: input.sessionName,
 			sessionDir: input.sessionDir,
 			sessionFile: input.sessionFile,
@@ -951,9 +988,13 @@ export class AgentDaemon {
 		});
 	}
 
-	private async recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<void> {
+	private async recordRlmSubagentDeletion(
+		parentState: ActiveSessionState,
+		childId: string,
+		assignmentId: string,
+	): Promise<void> {
 		const latest = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
-			(entry) => entry.childId === childId,
+			(entry) => entry.childId === childId && entry.assignmentId === assignmentId,
 		);
 		if (!latest || latest.status === "deleted") {
 			return;
@@ -1015,18 +1056,35 @@ export class AgentDaemon {
 					typeof entry.sessionFile !== "string" ||
 					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
 					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
-					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
+					(entry.rlmMaxDepth !== undefined &&
+						(!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0)) ||
+					(entry.assignmentId !== undefined &&
+						(typeof entry.assignmentId !== "string" ||
+							!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+								entry.assignmentId,
+							)))
 				) {
 					continue;
 				}
-				latest.set(entry.childId, entry as PersistedRlmSubagentRegistryEntry);
+				latest.set(
+					this.rlmAssignmentKey(entry as PersistedRlmSubagentRegistryEntry),
+					entry as PersistedRlmSubagentRegistryEntry,
+				);
 			} catch (error) {
 				this.log(
 					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
 		}
-		return [...latest.values()];
+		const entries = [...latest.values()];
+		// Once an explicit hydrate has durably rebound an old display-only row,
+		// suppress that legacy duplicate from catalog traversal. Its late callbacks
+		// still cannot match the assigned row because callback matching is exact.
+		return entries.filter(
+			(entry) =>
+				entry.assignmentId !== undefined ||
+				!entries.some((candidate) => candidate.childId === entry.childId && candidate.assignmentId !== undefined),
+		);
 	}
 
 	private rlmSubagentRegistryPathForEntry(entry: PersistedRlmSubagentRegistryEntry, info: SessionInfo): string {
@@ -2209,26 +2267,31 @@ export class AgentDaemon {
 
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
+			assignmentIdentityFenced: true,
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
-			completeRlmSubagentRuntime: (childId, session) => {
+			completeRlmSubagentRuntime: (childId, childSession, assignmentId) => {
+				if (!assignmentId || !childSession) return false;
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
 						candidate.runtime.metadata.kind === "subagent" &&
 						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 						candidate.runtime.metadata.rlmChildId === childId &&
-						candidate.runtime.session === session,
+						candidate.runtime.metadata.assignmentId === assignmentId &&
+						candidate.runtime.session === childSession,
 				);
-				if (!state?.runtime.session.sessionFile) return false;
+				if (!state?.runtime.session.sessionFile || this.sessions.get(parentState.activeSessionId) !== parentState)
+					return false;
 				if (state.runtime.metadata.rehydratedCompleted) return true;
 				const metadata = state.runtime.metadata;
-				const model = session.model;
+				const model = childSession.model;
 				return this.recordRlmSubagentRegistryEntry(parentState, {
 					childId,
-					sessionName: session.sessionName ?? childId,
+					assignmentId,
+					sessionName: childSession.sessionName ?? childId,
 					sessionDir: metadata.sessionDir ?? dirname(state.runtime.session.sessionFile),
 					sessionFile: state.runtime.session.sessionFile,
-					rlmDepth: session.rlmDepth,
-					rlmMaxDepth: session.rlmMaxDepth,
+					rlmDepth: childSession.rlmDepth,
+					rlmMaxDepth: childSession.rlmMaxDepth,
 					rlmParentNodeId: metadata.rlmParentNodeId,
 					prompt: metadata.prompt && metadata.prompt.length <= 4096 ? metadata.prompt : undefined,
 					spawnCode: metadata.spawnCode,
@@ -2238,12 +2301,19 @@ export class AgentDaemon {
 				});
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
+				const assignmentId = runtime.assignmentId ?? options.assignmentId;
+				// A callback without an assignment is a legacy display path and may only
+				// dispose its own unpublished runtime, never mutate daemon state.
+				if (!assignmentId || this.sessions.get(parentState.activeSessionId) !== parentState) {
+					await runtime.session.disposeAsync();
+					return;
+				}
 				// Persist the deletion boundary first, but never let a registry failure
 				// strand the cancelled child as a stale resident session.
 				let deletionError: unknown;
 				if (status === "cancelled") {
 					try {
-						await this.recordRlmSubagentDeletion(parentState, options.id);
+						await this.recordRlmSubagentDeletion(parentState, options.id, assignmentId);
 					} catch (error) {
 						deletionError = error;
 					}
@@ -2253,43 +2323,93 @@ export class AgentDaemon {
 						candidate.runtime.metadata.kind === "subagent" &&
 						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 						candidate.runtime.metadata.rlmChildId === options.id &&
+						candidate.runtime.metadata.assignmentId === assignmentId &&
 						candidate.runtime.session === runtime.session,
 				);
-				if (state) {
+				if (state && this.sessions.get(state.activeSessionId) === state) {
 					await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
 				} else {
 					await runtime.session.disposeAsync();
 				}
 				if (deletionError !== undefined) throw deletionError;
 			},
-			deleteRlmSubagentRuntime: async (childId, session) => {
+			deleteRlmSubagentRuntime: async (childId, childSession, requestedAssignmentId) => {
+				// Public catalog entries intentionally hide assignment IDs. An explicit
+				// delete is therefore the one legacy operation permitted to resolve its
+				// durable row internally. A missing legacy ID is rebound *before* delete;
+				// asynchronous callbacks still require a named assignment and cannot use it.
+				let assignmentId = requestedAssignmentId;
+				// Read the durable boundary before any destructive action.  Errors are
+				// intentionally authoritative: a failed read must not turn an ambiguous
+				// delete into an in-memory close.
+				const persistedEntries = await this.readLatestRlmSubagentRegistry(parentState, true);
+				const currentParent = this.sessions.get(parentState.activeSessionId);
+				if (currentParent && currentParent !== parentState) {
+					await childSession?.disposeAsync();
+					return;
+				}
+				let persisted = assignmentId
+					? persistedEntries.find((entry) => entry.childId === childId && entry.assignmentId === assignmentId)
+					: persistedEntries.find((entry) => entry.childId === childId && entry.status !== "deleted");
+				if (!assignmentId && persisted) {
+					if (!persisted.assignmentId) {
+						assignmentId = randomUUID();
+						if (
+							!this.recordRlmSubagentRegistryEntry(parentState, {
+								childId: persisted.childId,
+								assignmentId,
+								sessionName: persisted.sessionName,
+								sessionDir: persisted.sessionDir,
+								sessionFile: persisted.sessionFile,
+								rlmDepth: persisted.rlmDepth ?? 1,
+								rlmMaxDepth: persisted.rlmMaxDepth ?? parentState.runtime.session.rlmMaxDepth,
+								rlmParentNodeId: persisted.rlmParentNodeId,
+								prompt: persisted.prompt,
+								spawnCode: persisted.spawnCode,
+								model: persisted.model,
+								status: persisted.status,
+								createdAt: persisted.createdAt,
+							})
+						)
+							throw new Error(`Failed to bind legacy RLM subagent ${childId} for deletion`);
+						persisted = { ...persisted, assignmentId };
+					} else assignmentId = persisted.assignmentId;
+				}
+				// Assignment-less resident children are old host data. They remain
+				// deletable only by this explicit (not callback) path; do not invent a
+				// durable row for a fixture/legacy runtime that was never published.
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
 						candidate.runtime.metadata.kind === "subagent" &&
 						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
-						candidate.runtime.metadata.rlmChildId === childId,
+						candidate.runtime.metadata.rlmChildId === childId &&
+						(assignmentId === undefined || candidate.runtime.metadata.assignmentId === assignmentId),
 				);
-				const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
-					(entry) => entry.childId === childId,
-				);
+				if (!assignmentId && !state) {
+					await childSession?.disposeAsync();
+					return;
+				}
 				const childSessionFile = persisted?.sessionFile ?? state?.runtime.session.sessionFile;
-				// Persist the deletion boundary before tearing down the runtime. As with a
-				// resident child, deletion keeps its transcript and artifact tree on disk.
-				await this.recordRlmSubagentDeletion(parentState, childId);
-				const staleSession = state && session && state.runtime.session !== session ? session : undefined;
+				// Awaiting disk I/O must not give an old assignment authority over a replacement.
+				if (
+					(this.sessions.get(parentState.activeSessionId) !== undefined &&
+						this.sessions.get(parentState.activeSessionId) !== parentState) ||
+					(state && this.sessions.get(state.activeSessionId) !== state)
+				) {
+					await childSession?.disposeAsync();
+					return;
+				}
+				if (assignmentId) await this.recordRlmSubagentDeletion(parentState, childId, assignmentId);
+				const staleSession =
+					state && childSession && state.runtime.session !== childSession ? childSession : undefined;
 				try {
-					if (state) {
+					if (state && this.sessions.get(state.activeSessionId) === state)
 						await this.closeSession(state, "killed", false);
-					} else {
-						await session?.disposeAsync();
-					}
+					else await childSession?.disposeAsync();
 				} finally {
 					await staleSession?.disposeAsync();
 				}
-				// A killed close can join a passivation close that already skipped killed cleanup.
-				if (childSessionFile) {
-					this.cancelScheduledJobsForSessionFile(childSessionFile);
-				}
+				if (childSessionFile) this.cancelScheduledJobsForSessionFile(childSessionFile);
 			},
 			disposeRlmSubagentRuntimes: async () => {
 				const cascadeError = await this.closeChildSessions(parentState, "replaced");
@@ -2304,6 +2424,12 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
+		// Assignment is mandatory authority for every daemon-hosted incarnation.
+		// Legacy callers that omit it are adapted by minting here; untrusted values
+		// are never written because readers correctly reject them.
+		const assignmentId = assertFreshUuid(options.assignmentId) ? options.assignmentId : randomUUID();
+		const assignedOptions = assignmentId === options.assignmentId ? options : { ...options, assignmentId };
+		options = assignedOptions;
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
@@ -2369,6 +2495,7 @@ export class AgentDaemon {
 					parentSessionId: options.parentSession.sessionId,
 					parentSessionFile: options.parentSession.sessionFile,
 					rlmChildId: options.id,
+					assignmentId: options.assignmentId,
 					rlmParentNodeId: options.rlmParentNodeId,
 					prompt: options.prompt,
 					spawnCode: options.spawnCode,
@@ -2391,6 +2518,7 @@ export class AgentDaemon {
 				if (runtime.session.sessionFile) {
 					this.recordRlmSubagentRegistryEntry(parentState, {
 						childId: options.id,
+						assignmentId,
 						sessionName: options.sessionName,
 						sessionDir: options.sessionDir,
 						sessionFile: runtime.session.sessionFile,
@@ -2469,12 +2597,22 @@ export class AgentDaemon {
 		const sessionKey = resolve(sessionFile);
 		const parentActiveSessionId = metadata.parentActiveSessionId;
 		const childId = metadata.rlmChildId;
+		const assignmentId = metadata.assignmentId;
+		// Legacy resident children remain readable but cannot let an asynchronous
+		// passivation callback unbind a newer same-selector assignment.
+		if (!assignmentId) return false;
 		const existing = this.passivatingSessions.get(sessionKey);
 		if (existing) {
-			await existing;
+			await existing.promise;
 			return false;
 		}
+		const passivationOperation: OperationIdentity = { operationId: randomUUID(), generation: state.eventGeneration };
 		const snapshot = selectedSnapshot ?? (await this.sessionPassivationSnapshot(state));
+		if (
+			this.sessions.get(state.activeSessionId) !== state ||
+			state.eventGeneration !== passivationOperation.generation
+		)
+			return false;
 		if (!canPassivateSession(snapshot, idleEvictionMinutes, now)) return false;
 
 		// Publish the durable identity before running the close so opens and lazy
@@ -2495,7 +2633,11 @@ export class AgentDaemon {
 			const idleMinutes = Math.floor((now - snapshot.lastActivityAt) / 60_000);
 			// Detach parent tracking before the standard graceful runtime disposal. The
 			// registry/catalog rows remain the sole passive representation after close.
-			const unsubscribeChild = parentState.runtime.session.releaseRlmChildSession(childId, state.runtime.session);
+			const unsubscribeChild = parentState.runtime.session.releaseRlmChildSession(
+				childId,
+				state.runtime.session,
+				assignmentId,
+			);
 			if (!unsubscribeChild) {
 				return;
 			}
@@ -2507,8 +2649,21 @@ export class AgentDaemon {
 				if (
 					this.sessions.get(state.activeSessionId) === state &&
 					this.sessions.get(parentActiveSessionId) === parentState &&
-					parentState.runtime.session.registerRlmChildSession(childId, state.runtime.session, unsubscribeChild)
+					parentState.runtime.session.registerRlmChildSession(
+						childId,
+						state.runtime.session,
+						unsubscribeChild,
+						assignmentId,
+					)
 				) {
+					// The adapter is deliberately optional so old embedded/test hosts observe
+					// the historical register arity. Real AgentSession instances bind the
+					// durable assignment immediately after that compatibility call.
+					parentState.runtime.session.rebindRlmChildSessionAssignment?.(
+						childId,
+						state.runtime.session,
+						assignmentId,
+					);
 					throw error;
 				}
 				unsubscribeChild();
@@ -2519,14 +2674,18 @@ export class AgentDaemon {
 				`Passivated idle child sessionId=${state.runtime.session.sessionId} name=${JSON.stringify(state.runtime.session.sessionName ?? "")} idleMinutes=${idleMinutes}`,
 			);
 		});
-		this.passivatingSessions.set(sessionKey, passivation);
+		const passivationJoin = {
+			promise: passivation,
+			state,
+			generation: passivationOperation.generation,
+			operation: passivationOperation,
+		};
+		this.passivatingSessions.set(sessionKey, passivationJoin);
 		try {
 			await passivation;
 			return this.sessions.get(state.activeSessionId) !== state;
 		} finally {
-			if (this.passivatingSessions.get(sessionKey) === passivation) {
-				this.passivatingSessions.delete(sessionKey);
-			}
+			if (this.passivatingSessions.get(sessionKey) === passivationJoin) this.passivatingSessions.delete(sessionKey);
 		}
 	}
 
@@ -2555,7 +2714,7 @@ export class AgentDaemon {
 	}
 
 	private findPassivationBySessionFile(sessionFile: string): Promise<void> | undefined {
-		return this.passivatingSessions.get(resolve(sessionFile));
+		return this.passivatingSessions.get(resolve(sessionFile))?.promise;
 	}
 
 	private async waitForPassivation(sessionFile: string): Promise<void> {
@@ -2581,7 +2740,8 @@ export class AgentDaemon {
 			if (
 				resident &&
 				resident.runtime.metadata.kind === "subagent" &&
-				resident.runtime.metadata.rlmChildId === passive.entry.childId
+				resident.runtime.metadata.rlmChildId === passive.entry.childId &&
+				resident.runtime.metadata.assignmentId === passive.entry.assignmentId
 			) {
 				return this.waitForBoundSession(resident);
 			}
@@ -2609,8 +2769,12 @@ export class AgentDaemon {
 				hydrated = await this.rehydrateCompletedRlmSubagent(hydratingParent, entry, activeSessionId, clientEnv);
 			} catch (error) {
 				const passivation = this.findPassivationBySessionFile(entry.sessionFile);
-				if (error instanceof BoundSessionUnavailableError && passivation) {
-					await passivation.catch(() => {});
+				if (error instanceof BoundSessionUnavailableError) {
+					// A close can publish after the pre-hydration wait and can finish
+					// before its durable passivation join is observed here. In either
+					// case, re-walk the passive chain rather than returning the closing
+					// incarnation to the caller.
+					if (passivation) await passivation.catch(() => {});
 					return restartAfterParentChange(hydratingParent);
 				}
 				if (isResident(hydratingParent)) throw error;
@@ -2636,6 +2800,31 @@ export class AgentDaemon {
 		if (this.updateRestart !== undefined) {
 			throw new BoundSessionUnavailableError("Daemon is preparing an update restart");
 		}
+		// Assignment-less journal rows are intentionally display-only. Before a
+		// hydrate can create callbacks, append a new immutable assignment row; a late
+		// legacy callback can therefore never acquire authority over this runtime.
+		if (!entry.assignmentId) {
+			const assignmentId = randomUUID();
+			if (
+				!this.recordRlmSubagentRegistryEntry(parentState, {
+					childId: entry.childId,
+					assignmentId,
+					sessionName: entry.sessionName,
+					sessionDir: entry.sessionDir,
+					sessionFile: entry.sessionFile,
+					rlmDepth: entry.rlmDepth ?? 1,
+					rlmMaxDepth: entry.rlmMaxDepth ?? parentState.runtime.session.rlmMaxDepth,
+					rlmParentNodeId: entry.rlmParentNodeId,
+					prompt: entry.prompt,
+					spawnCode: entry.spawnCode,
+					model: entry.model,
+					status: entry.status,
+					createdAt: entry.createdAt,
+				})
+			)
+				throw new Error(`Cannot bind legacy RLM subagent ${entry.childId} without a durable assignment`);
+			entry = { ...entry, assignmentId };
+		}
 		const sessionKey = resolve(entry.sessionFile);
 		const reservation = this.reservingSessionOpens.get(sessionKey);
 		if (reservation) {
@@ -2645,14 +2834,22 @@ export class AgentDaemon {
 		const pending = this.openingSessions.get(sessionKey);
 		if (pending) {
 			const state = await pending;
-			if (state.runtime.metadata.kind !== "subagent" || state.runtime.metadata.rlmChildId !== entry.childId) {
+			if (
+				state.runtime.metadata.kind !== "subagent" ||
+				state.runtime.metadata.rlmChildId !== entry.childId ||
+				state.runtime.metadata.assignmentId !== entry.assignmentId
+			) {
 				if (this.openingSessions.get(sessionKey) === pending) this.openingSessions.delete(sessionKey);
 				return this.rehydrateCompletedRlmSubagent(parentState, entry, restoreActiveSessionId, clientEnv);
 			}
 			return this.waitForBoundSession(state);
 		}
 		const existing = this.findSessionBySessionFile(entry.sessionFile);
-		if (existing?.runtime.metadata.kind === "subagent" && existing.runtime.metadata.rlmChildId === entry.childId) {
+		if (
+			existing?.runtime.metadata.kind === "subagent" &&
+			existing.runtime.metadata.rlmChildId === entry.childId &&
+			existing.runtime.metadata.assignmentId === entry.assignmentId
+		) {
 			return this.waitForBoundSession(existing);
 		}
 		const hydration = (async () => {
@@ -2767,6 +2964,7 @@ export class AgentDaemon {
 							? { parentSessionFile: parentState.runtime.session.sessionFile }
 							: {}),
 						rlmChildId: entry.childId,
+						assignmentId: entry.assignmentId,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
 						rehydratedCompleted: true,
 						...(entry.prompt ? { prompt: entry.prompt } : {}),
@@ -2788,7 +2986,23 @@ export class AgentDaemon {
 			);
 			// The session transcript is authoritative for mutable metadata such as a
 			// later user-assigned name; the registry value is only the spawn snapshot.
-			if (!parentState.runtime.session.registerRlmChildSession(entry.childId, runtime.session)) {
+			const registered = parentState.runtime.session.registerRlmChildSession(
+				entry.childId,
+				runtime.session,
+				undefined,
+				entry.assignmentId,
+			);
+			// The explicit assignment is the authority boundary for lazy hydration.
+			// Keep the historical rebinding adapter only for an old session host that
+			// does not accept the fourth argument.
+			const assignmentBound = entry.assignmentId
+				? parentState.runtime.session.rebindRlmChildSessionAssignment?.(
+						entry.childId,
+						runtime.session,
+						entry.assignmentId,
+					)
+				: undefined;
+			if (!registered || assignmentBound === false) {
 				await this.closeSession(state, "replaced");
 				throw new RuntimeOpenCancelledError();
 			}
@@ -2796,7 +3010,11 @@ export class AgentDaemon {
 				this.sessions.get(parentState.activeSessionId) !== parentState ||
 				this.closingSessions.has(parentState.activeSessionId)
 			) {
-				const unsubscribeChild = parentState.runtime.session.releaseRlmChildSession(entry.childId, runtime.session);
+				const unsubscribeChild = parentState.runtime.session.releaseRlmChildSession(
+					entry.childId,
+					runtime.session,
+					entry.assignmentId,
+				);
 				try {
 					await this.closeSession(state, "replaced");
 				} finally {
@@ -3101,6 +3319,7 @@ export class AgentDaemon {
 				this.promptAdmissions.set(key, {
 					activeSessionId: parsed.activeSessionId,
 					admissionId: parsed.admissionId,
+					operation: { operationId: randomUUID(), generation: this.workerGeneration },
 					controller: new AbortController(),
 					status: "waiting",
 				});
@@ -3770,6 +3989,9 @@ export class AgentDaemon {
 						this.promptAdmissions.delete(admissionKey);
 					}
 				};
+				// Admission identity is allocated by the synchronous line parser.  For
+				// legacy/no-id prompts we allocate it before this command reaches its
+				// first await below, then retain it until the matching turn_end.
 				const commitAdmission = () => {
 					if (admission?.status === "waiting") admission.status = "owned";
 				};
@@ -3777,10 +3999,17 @@ export class AgentDaemon {
 				try {
 					if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
 					state = this.getBoundSessionState(command.activeSessionId);
+					if (admission) {
+						admission.state = state;
+						admission.stateGeneration = state.eventGeneration;
+					}
 				} catch (error) {
 					clearAdmission();
 					throw error;
 				}
+				const identity = admission?.operation ?? { operationId: randomUUID(), generation: this.workerGeneration };
+				const recoveryToken = this.beginWorkerRecoveryOperation(state, "prompt", identity);
+				this.queueWorkerRecoveryTurn(state, recoveryToken);
 				const options: PromptOptions = {
 					content: command.content,
 					images: command.images,
@@ -3802,17 +4031,26 @@ export class AgentDaemon {
 						await this.promptWithAgentMessagePreparingGuard(state, command.message, {
 							...options,
 							preflightResult: (didSucceed) => {
-								if (didSucceed) this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+								if (didSucceed) {
+									// `prompt` was durably begun at admission.  Do not replace
+									// its identity at acceptance: a delayed A acceptance must not
+									// overwrite a later B begin in the one-record crash journal.
+								}
 							},
 						});
 						return success(command.id, command.type);
 					} finally {
+						this.cancelQueuedWorkerRecoveryTurn(state, recoveryToken);
 						clearAdmission();
 					}
 				}
 
 				let responseSent = false;
 				let preflightRejected = false;
+				// `promptUntilAccepted` resolves once the session has admitted work, not
+				// once the queued turn has terminally ended.  Keep its exact token
+				// queued after acceptance so a crash remains recoverable until turn_end.
+				let accepted = false;
 				const sendSuccessResponse = () => {
 					if (responseSent) return;
 					responseSent = true;
@@ -3827,7 +4065,10 @@ export class AgentDaemon {
 						customMessage: command.customMessage,
 						preflightResult: (didSucceed) => {
 							if (didSucceed) {
-								this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+								// `prompt` was durably begun at admission.  Do not replace
+								// its identity at acceptance: a delayed A acceptance must not
+								// overwrite a later B begin in the one-record crash journal.
+								accepted = true;
 								sendSuccessResponse();
 							} else {
 								preflightRejected = true;
@@ -3842,6 +4083,9 @@ export class AgentDaemon {
 							const error = new Error("Prompt was not accepted by the session.");
 							this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
 						} else {
+							// Guard legacy prompt implementations that resolve accepted without
+							// invoking preflightResult.
+							accepted = true;
 							sendSuccessResponse();
 						}
 					})
@@ -3852,56 +4096,81 @@ export class AgentDaemon {
 							this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
 						}
 					})
-					.finally(clearAdmission);
+					.finally(() => {
+						// Only a rejected/cancelled preflight has no terminal turn.  An
+						// accepted non-waiting prompt must retain this queued token until
+						// its own turn_start/turn_end pair consumes it.
+						if (!accepted) this.cancelQueuedWorkerRecoveryTurn(state, recoveryToken);
+						clearAdmission();
+					});
 				return undefined;
 			}
 
 			case "steer": {
 				const state = this.getBoundSessionState(command.activeSessionId);
-				if (command.expandPromptTemplates === false) {
-					await state.runtime.session.restoreSteeringMessage(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						content: command.content,
-						customMessage: command.customMessage,
-						prefixMessages: command.prefixMessages,
-					});
-				} else {
-					await state.runtime.session.steer(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						resumeIfIdle: true,
-					});
+				const recoveryToken = this.beginWorkerRecoveryOperation(state, "steer_queued");
+				// A steer injected during a running turn has no future turn_start; bind
+				// it to that exact turn so its turn_end clears it. Idle steer awaits one.
+				if (!this.attachWorkerRecoveryToActiveTurn(state, recoveryToken)) {
+					this.queueWorkerRecoveryTurn(state, recoveryToken);
 				}
-				this.recordWorkerRecoveryState(state, "steer_queued", true);
-				return success(command.id, "steer");
+				try {
+					if (command.expandPromptTemplates === false) {
+						await state.runtime.session.restoreSteeringMessage(command.message, command.images, {
+							queueKey: command.queueKey,
+							agentMessageId: command.agentMessageId,
+							content: command.content,
+							customMessage: command.customMessage,
+							prefixMessages: command.prefixMessages,
+						});
+					} else {
+						await state.runtime.session.steer(command.message, command.images, {
+							queueKey: command.queueKey,
+							agentMessageId: command.agentMessageId,
+							resumeIfIdle: true,
+						});
+					}
+					return success(command.id, "steer");
+				} catch (error) {
+					this.cancelQueuedWorkerRecoveryTurn(state, recoveryToken);
+					throw error;
+				}
 			}
 
 			case "follow_up": {
 				const state = this.getBoundSessionState(command.activeSessionId);
-				let queued = true;
-				let admitted = true;
-				if (command.expandPromptTemplates === false) {
-					queued = await state.runtime.session.restoreFollowUpMessage(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						content: command.content,
-						customMessage: command.customMessage,
-						prefixMessages: command.prefixMessages,
-					});
-					admitted = queued;
-				} else {
-					queued = await state.runtime.session.followUp(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						resumeIfIdle: true,
-					});
-					admitted = queued;
+				// Do not clear this at queue admission.  A queued follow-up has not
+				// terminally run; turn_end will consume this exact FIFO scheduler token.
+				const recoveryToken = this.beginWorkerRecoveryOperation(state, "follow_up_queued");
+				// Publish before calling the session: followUp may synchronously resume
+				// an idle action before its returned promise continuation runs.
+				this.queueWorkerRecoveryTurn(state, recoveryToken);
+				try {
+					let queued = true;
+					let admitted = true;
+					if (command.expandPromptTemplates === false) {
+						queued = await state.runtime.session.restoreFollowUpMessage(command.message, command.images, {
+							queueKey: command.queueKey,
+							agentMessageId: command.agentMessageId,
+							content: command.content,
+							customMessage: command.customMessage,
+							prefixMessages: command.prefixMessages,
+						});
+						admitted = queued;
+					} else {
+						queued = await state.runtime.session.followUp(command.message, command.images, {
+							queueKey: command.queueKey,
+							agentMessageId: command.agentMessageId,
+							resumeIfIdle: true,
+						});
+						admitted = queued;
+					}
+					if (!admitted) this.cancelQueuedWorkerRecoveryTurn(state, recoveryToken);
+					return success(command.id, "follow_up", { queued });
+				} catch (error) {
+					this.cancelQueuedWorkerRecoveryTurn(state, recoveryToken);
+					throw error;
 				}
-				if (admitted) {
-					this.recordWorkerRecoveryState(state, "follow_up_queued", true);
-				}
-				return success(command.id, "follow_up", { queued });
 			}
 
 			case "restore_next_turn": {
@@ -3912,9 +4181,13 @@ export class AgentDaemon {
 
 			case "restore_actions": {
 				const state = this.getSessionState(command.activeSessionId);
-				const restored = await state.runtime.session.restoreSessionActions(command.snapshot);
-				if (restored > 0) this.recordWorkerRecoveryState(state, "actions_restored", true);
-				return success(command.id, "restore_actions", { restored });
+				const recoveryToken = this.beginWorkerRecoveryOperation(state, "actions_restored");
+				try {
+					const restored = await state.runtime.session.restoreSessionActions(command.snapshot);
+					return success(command.id, "restore_actions", { restored });
+				} finally {
+					this.completeWorkerRecoveryOperation(state, recoveryToken);
+				}
 			}
 
 			case "append_custom_message": {
@@ -5912,7 +6185,12 @@ export class AgentDaemon {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
 		}
 		const existingClose = this.closingSessions.get(state.activeSessionId);
-		if (existingClose) {
+		if (
+			existingClose &&
+			existingClose.state === state &&
+			existingClose.generation === state.eventGeneration &&
+			(this.sessions.get(state.activeSessionId) === state || this.sessions.get(state.activeSessionId) === undefined)
+		) {
 			const requestedReason = this.isStrongerCloseReason(reason, existingClose.reason)
 				? reason
 				: existingClose.reason;
@@ -5925,6 +6203,12 @@ export class AgentDaemon {
 				closeFailed = true;
 			}
 			const reasonUpgrade = (existingClose.reasonUpgrade ?? Promise.resolve()).then(() => {
+				if (
+					(this.sessions.get(state.activeSessionId) !== state &&
+						this.sessions.get(state.activeSessionId) !== undefined) ||
+					state.eventGeneration !== existingClose.generation
+				)
+					return;
 				if (!this.isStrongerCloseReason(requestedReason, existingClose.reason)) return;
 				try {
 					this.applyReasonUpgrade(state, existingClose.descendants, existingClose.reason, requestedReason);
@@ -5943,10 +6227,11 @@ export class AgentDaemon {
 			return;
 		}
 		const descendants = new Set<ActiveSessionState>();
+		const operation: OperationIdentity = { operationId: randomUUID(), generation: state.eventGeneration };
 		const closePromise = Promise.resolve().then(() =>
-			this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants),
+			this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants, operation),
 		);
-		const close = { promise: closePromise, reason, descendants };
+		const close = { promise: closePromise, state, generation: operation.generation, operation, reason, descendants };
 		this.closingSessions.set(state.activeSessionId, close);
 		try {
 			await closePromise;
@@ -6019,10 +6304,14 @@ export class AgentDaemon {
 		waitForAbort: boolean,
 		cascadeChildren: boolean,
 		descendants: Set<ActiveSessionState>,
+		operation: OperationIdentity,
 	): Promise<void> {
-		if (!this.sessions.has(state.activeSessionId)) {
-			return;
-		}
+		const current = () =>
+			this.sessions.get(state.activeSessionId) === state && state.eventGeneration === operation.generation;
+		if (!current()) return;
+		// Begin before the first await; completion receives this exact immutable identity.
+		const recoveryIdentity = this.recordWorkerRecoveryState(state, `closed:${reason}`, true, undefined, operation);
+		if (!current()) return;
 		if (reason === "killed") {
 			this.cancelScheduledJobsForSession(state);
 		} else if (reason !== "shutdown" && reason !== "update") {
@@ -6034,6 +6323,7 @@ export class AgentDaemon {
 		const cascadeError = cascadeChildren
 			? await this.closeChildSessions(state, reason, waitForAbort, descendants)
 			: undefined;
+		if (!current()) return;
 		// Empty draft (no messages, config, or jobs): discard rather than persist an
 		// empty session file. Mirrors the detach-time discard so a config-bearing
 		// draft closed via kill/completed is never wiped.
@@ -6043,6 +6333,7 @@ export class AgentDaemon {
 		// Clean shutdown leaves the session un-archived so it stays in the resume list.
 		if (!keepsResumeEntry && !isEmptyDraftSession) {
 			try {
+				if (!current()) return;
 				this.archiveSession(state);
 			} catch (error) {
 				persistError = error;
@@ -6063,14 +6354,18 @@ export class AgentDaemon {
 		} else if (reason === "shutdown" || reason === "replaced") {
 			await state.runtime.session.abort().catch(() => undefined);
 		}
-		this.recordWorkerRecoveryState(state, `closed:${reason}`, false);
+		if (!current()) return;
+		this.recordWorkerRecoveryState(state, `closed:${reason}`, false, recoveryIdentity, operation);
+		if (!current()) return;
 		state.unsubscribe?.();
+		if (!current()) return;
 		let disposeError: unknown;
 		try {
 			await state.runtime.dispose();
 		} catch (error) {
 			disposeError = error;
 		}
+		if (!current()) return;
 		for (const client of state.clients) {
 			abortClientSnapshotStreaming(client, state.activeSessionId);
 		}
@@ -6080,6 +6375,7 @@ export class AgentDaemon {
 			removeDaemonClientSessionCapabilities(client, state.activeSessionId);
 		}
 		state.clients.clear();
+		if (!current()) return;
 		this.sessions.delete(state.activeSessionId);
 		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
@@ -6133,7 +6429,7 @@ export class AgentDaemon {
 				void this.closeSession(state, "killed");
 			}
 			if (RECOVERY_CHECKPOINT_EVENTS.has(eventType)) {
-				this.recordWorkerRecoveryState(state, eventType);
+				this.checkpointWorkerRecoveryEvent(state, eventType as WorkerRecoveryOperation);
 			}
 		}
 		this.stampRlmChildActiveSessionId(message);
@@ -6265,24 +6561,162 @@ export class AgentDaemon {
 		}
 	}
 
-	private recordWorkerRecoveryState(state: ActiveSessionState, operation: string, busyOverride?: boolean): void {
-		if (!this.recoveryJournal) {
-			return;
-		}
+	private beginWorkerRecoveryOperation(
+		state: ActiveSessionState,
+		operation: WorkerRecoveryOperation,
+		identity: OperationIdentity = { operationId: randomUUID(), generation: this.workerGeneration },
+	): RecoveryOperationToken {
+		const token: RecoveryOperationToken = { operation, identity };
+		this.writeWorkerRecoveryOperation(state, token, true);
+		return token;
+	}
+
+	private completeWorkerRecoveryOperation(state: ActiveSessionState, token: RecoveryOperationToken): void {
+		// The journal is intentionally given the token captured at admission.  It
+		// never looks up a later same-family identity, so A cannot clear B.
+		this.writeWorkerRecoveryOperation(state, token, false);
+	}
+
+	private writeWorkerRecoveryOperation(state: ActiveSessionState, token: RecoveryOperationToken, busy: boolean): void {
+		if (!this.recoveryJournal) return;
 		const session = state.runtime.session;
-		const busy =
-			busyOverride ?? (isActiveSessionBusy(state) || session.isRetrying || session.hasAcceptedPromptInFlight);
 		try {
 			this.recoveryJournal.record({
 				activeSessionId: state.activeSessionId,
 				sessionId: session.sessionId,
 				...(session.sessionFile ? { sessionFile: session.sessionFile } : {}),
 				busy,
-				operation,
+				operation: token.operation,
+				operationId: token.identity.operationId,
+				generation: token.identity.generation,
 			});
 		} catch (error) {
 			this.log(`could not checkpoint worker operation state: ${String(error)}`);
 		}
+	}
+
+	private recoveryTurnsFor(state: ActiveSessionState): {
+		pending: RecoveryOperationToken[];
+		active: RecoveryOperationToken[][];
+	} {
+		let turns = this.recoveryTurnOperations.get(state);
+		if (!turns) {
+			turns = { pending: [], active: [] };
+			this.recoveryTurnOperations.set(state, turns);
+		}
+		return turns;
+	}
+
+	private queueWorkerRecoveryTurn(state: ActiveSessionState, token: RecoveryOperationToken): void {
+		const turns = this.recoveryTurnsFor(state);
+		if (!turns.pending.includes(token) && !turns.active.some((turn) => turn.includes(token))) {
+			turns.pending.push(token);
+		}
+	}
+
+	private attachWorkerRecoveryToActiveTurn(state: ActiveSessionState, token: RecoveryOperationToken): boolean {
+		const turn = this.recoveryTurnsFor(state).active.at(-1);
+		if (!turn) return false;
+		turn.push(token);
+		return true;
+	}
+
+	private cancelQueuedWorkerRecoveryTurn(state: ActiveSessionState, token: RecoveryOperationToken): void {
+		const turns = this.recoveryTurnsFor(state);
+		let removed = false;
+		const pendingIndex = turns.pending.indexOf(token);
+		if (pendingIndex >= 0) {
+			turns.pending.splice(pendingIndex, 1);
+			removed = true;
+		}
+		// A steer admitted during an existing turn belongs to that active frame,
+		// rather than pending a future turn. Its rejection therefore must remove
+		// this exact token here, at the command boundary, not at an unrelated
+		// turn_end. Preserve every other frame/token (including nested turns).
+		for (const turn of turns.active) {
+			const activeIndex = turn.indexOf(token);
+			if (activeIndex >= 0) {
+				turn.splice(activeIndex, 1);
+				removed = true;
+			}
+		}
+		if (!removed) return;
+		this.completeWorkerRecoveryOperation(state, token);
+
+		// Completing the most recently journaled token would otherwise leave the
+		// one-record journal clear even though an enclosing active turn remains
+		// live. Republish that frame's actual current token, never a synthesized
+		// replacement or a pending future turn.
+		for (let frameIndex = turns.active.length - 1; frameIndex >= 0; frameIndex--) {
+			const current = turns.active[frameIndex].at(-1);
+			if (current) {
+				this.writeWorkerRecoveryOperation(state, current, true);
+				break;
+			}
+		}
+	}
+
+	private checkpointWorkerRecoveryEvent(state: ActiveSessionState, operation: WorkerRecoveryOperation): void {
+		const match = /^(.*)_(start|end)$/.exec(operation);
+		if (!match) {
+			// These are observations inside a turn/tool, not independently live work.
+			// Preserve the fsync evidence without stranding a permanent busy record.
+			const token = this.beginWorkerRecoveryOperation(state, operation);
+			this.completeWorkerRecoveryOperation(state, token);
+			return;
+		}
+		const [, family, edge] = match;
+		if (family === "turn") {
+			const turns = this.recoveryTurnsFor(state);
+			if (edge === "start") {
+				const token = turns.pending.shift() ?? this.beginWorkerRecoveryOperation(state, operation);
+				turns.active.push([token]);
+			} else {
+				const tokens = turns.active.pop();
+				for (const token of tokens ?? []) this.completeWorkerRecoveryOperation(state, token);
+				// A nested B terminal must not erase still-active A crash evidence.
+				// Complete B first (with B's immutable token), then republish the
+				// parent frame's existing token(s), never a synthesized identity.
+				for (const token of turns.active.at(-1) ?? []) this.writeWorkerRecoveryOperation(state, token, true);
+			}
+			return;
+		}
+		let queues = this.recoveryEventOperations.get(state);
+		if (!queues) {
+			queues = new Map();
+			this.recoveryEventOperations.set(state, queues);
+		}
+		const queue = queues.get(family) ?? [];
+		queues.set(family, queue);
+		if (edge === "start") queue.push(this.beginWorkerRecoveryOperation(state, operation));
+		else {
+			const token = queue.pop();
+			if (token) this.completeWorkerRecoveryOperation(state, token);
+			// Preserve the exact outer event while its nested event has ended.
+			const parent = queue.at(-1);
+			if (parent) this.writeWorkerRecoveryOperation(state, parent, true);
+		}
+	}
+
+	/** Compatibility wrapper for isolated state observations and close callers. */
+	private recordWorkerRecoveryState(
+		state: ActiveSessionState,
+		operation: WorkerRecoveryOperation,
+		busyOverride?: boolean,
+		exactIdentity?: { operation: WorkerRecoveryOperation; operationId: string },
+		operationIdentity?: OperationIdentity,
+	): { operation: WorkerRecoveryOperation; operationId: string } | undefined {
+		// The journal key is a worker attempt, never the session event/replay
+		// generation.  Use this daemon worker incarnation for ready, ordinary
+		// events, and terminal callbacks alike.
+		const identity: OperationIdentity = {
+			operationId: operationIdentity?.operationId ?? exactIdentity?.operationId ?? randomUUID(),
+			generation: this.workerGeneration,
+		};
+		const token: RecoveryOperationToken = { operation: exactIdentity?.operation ?? operation, identity };
+		if (busyOverride === false) this.completeWorkerRecoveryOperation(state, token);
+		else this.beginWorkerRecoveryOperation(state, token.operation, token.identity);
+		return { operation: token.operation, operationId: token.identity.operationId };
 	}
 
 	private catchUpBackpressuredClient(client: DaemonSocketClient): Promise<void> {

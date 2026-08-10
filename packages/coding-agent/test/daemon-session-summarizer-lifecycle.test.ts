@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { AGENT_TASK_STATES, type AgentTaskState } from "../src/core/session-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { DaemonSessionSummarizer } from "../src/modes/daemon/daemon-session-summarizer.js";
 
@@ -39,9 +40,9 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		vi.useRealTimers();
 	});
 
-	test("runs the model call after the settle debounce and records the verdict", async () => {
+	test.each(AGENT_TASK_STATES)("persists the %s idle verdict after the settle debounce", async (taskState) => {
 		vi.useFakeTimers();
-		const generate = vi.fn().mockResolvedValue({ summary: "Added the health endpoint", taskState: "completed" });
+		const generate = vi.fn().mockResolvedValue({ summary: `Fixture ${taskState} verdict`, taskState });
 		const onStatusChanged = vi.fn();
 		const summarizer = new DaemonSessionSummarizer(() => [], onStatusChanged, generate);
 		const state = makeState({ working: false });
@@ -53,7 +54,11 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 
 		await vi.advanceTimersByTimeAsync(600);
 		expect(generate).toHaveBeenCalledOnce();
-		expect(state.summaryState).toMatchObject({ summary: "Added the health endpoint", taskState: "completed" });
+		const expected = { summary: `Fixture ${taskState} verdict`, taskState, basedOnMessageCount: 2 };
+		expect(state.summaryState).toEqual(expected);
+		// The summarizer passes the closed codec through unchanged; SessionManager owns
+		// durable JSON encoding and the SDK compatibility test verifies the JSON row.
+		expect((state as unknown as { appendedStatuses: unknown[] }).appendedStatuses).toEqual([expected]);
 		expect(onStatusChanged).toHaveBeenCalled();
 	});
 
@@ -166,9 +171,13 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		expect((state as unknown as { appendedStatuses: unknown[] }).appendedStatuses).toHaveLength(1);
 	});
 
-	test("seeds a subagent's persisted recap into memory", () => {
+	test.each(AGENT_TASK_STATES)("seeds a subagent's persisted %s recap into memory", (taskState) => {
 		const summarizer = new DaemonSessionSummarizer(() => [], undefined, vi.fn());
-		const persisted = { summary: "Reviewing the diff", taskState: "needs_input", basedOnMessageCount: 3 };
+		const persisted: { summary: string; taskState: AgentTaskState; basedOnMessageCount: number } = {
+			summary: `Persisted ${taskState} fixture`,
+			taskState,
+			basedOnMessageCount: 3,
+		};
 		const state = makeState({ kind: "subagent", persisted });
 
 		summarizer.seed(state);

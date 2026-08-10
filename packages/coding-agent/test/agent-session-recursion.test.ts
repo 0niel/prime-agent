@@ -110,6 +110,7 @@ interface CapturedCommReply {
 
 interface InspectableRlmRun {
 	id: string;
+	assignmentId: string;
 	sessionDir: string;
 	abort: () => void;
 	status: string;
@@ -117,6 +118,7 @@ interface InspectableRlmRun {
 	error?: string;
 	detachedDeletion?: Awaited<ReturnType<AgentSession["listRlmSubagents"]>>["subagents"][number];
 	session?: AgentSession;
+	unsubscribe?: () => void;
 }
 
 interface InspectableRlmSession {
@@ -130,7 +132,12 @@ interface InspectableRlmSession {
 	>;
 	_rlmChildCleanupFailures: Map<string, Awaited<ReturnType<AgentSession["listRlmSubagents"]>>["subagents"][number]>;
 	_rlmChildSessions: Map<string, AgentSession>;
+	_rlmChildSessionAssignments: Map<string, string>;
+	_deletedRlmChildIds: Set<string>;
 	_rlmChildUnsubscribes: Map<string, () => void>;
+	_rlmChildUnsubscribeAssignments: Map<string, string>;
+	_removeRlmSubagentTracking(childId: string, run?: InspectableRlmRun, assignmentId?: string): void;
+	_deleteRlmSubagentSession(childId: string, assignmentId?: string, session?: AgentSession): Promise<void>;
 	_createKernelHostHandlers(): HostRequestHandlers;
 	_reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void>;
 }
@@ -594,6 +601,50 @@ describe("AgentSession rlm recursion", () => {
 		expect(disposeChild).toHaveBeenCalledOnce();
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 		expect(childStatuses).toEqual(["cancelled"]);
+	});
+
+	it("keeps every held A callback from mutating a replacement B assignment", () => {
+		const childId = "held-assignment-child";
+		const assignmentA = "held-assignment-A";
+		const assignmentB = "held-assignment-B";
+		const root = createSession();
+		const childA = createSession({ rlmSessionDir: join(tempDir, "held-A") });
+		const childB = createSession({ rlmSessionDir: join(tempDir, "held-B") });
+		const unsubscribeA = vi.fn();
+		const unsubscribeB = vi.fn();
+		const internals = root as unknown as InspectableRlmSession;
+
+		// A is admitted, then B takes the same public selector while all A callbacks
+		// are deliberately held. This models creation, terminal, usage/update, and
+		// unsubscribe continuations without allowing a stale callback to own B.
+		expect(root.registerRlmChildSession(childId, childA, unsubscribeA, assignmentA)).toBe(true);
+		internals._rlmChildSessions.set(childId, childB);
+		internals._rlmChildSessionAssignments.set(childId, assignmentB);
+		internals._rlmChildUnsubscribes.set(childId, unsubscribeB);
+		internals._rlmChildUnsubscribeAssignments.set(childId, assignmentB);
+
+		// Held creation/terminal retention, release/delete, unsubscribe, and lazy
+		// hydration must all reject A, including when hydration has the same session
+		// object that B currently owns.
+		expect(root.registerRlmChildSession(childId, childA, unsubscribeA, assignmentA)).toBe(false);
+		expect(root.releaseRlmChildSession(childId, childA, assignmentA)).toBe(false);
+		expect(root.rebindRlmChildSessionAssignment(childId, childB, assignmentA)).toBe(false);
+		internals._removeRlmSubagentTracking(childId, undefined, assignmentA);
+		expect(internals._rlmChildSessions.get(childId)).toBe(childB);
+		expect(internals._rlmChildSessionAssignments.get(childId)).toBe(assignmentB);
+		expect(internals._rlmChildUnsubscribes.get(childId)).toBe(unsubscribeB);
+		expect(unsubscribeA).not.toHaveBeenCalled();
+		expect(unsubscribeB).not.toHaveBeenCalled();
+
+		// A tombstone is scoped to A. It cannot hide B's map/listing incarnation,
+		// and B's terminal/delete cleanup cannot be swallowed by that old tombstone.
+		internals._deletedRlmChildIds.add(`${childId}\0${assignmentA}`);
+		expect(root.releaseRlmChildSession(childId, childB, assignmentB)).toBe(unsubscribeB);
+		expect(unsubscribeB).not.toHaveBeenCalled();
+		expect(root.registerRlmChildSession(childId, childB, unsubscribeB, assignmentB)).toBe(true);
+		internals._removeRlmSubagentTracking(childId, undefined, assignmentB);
+		expect(internals._rlmChildSessions.has(childId)).toBe(false);
+		expect(internals._deletedRlmChildIds.has(`${childId}\0${assignmentA}`)).toBe(true);
 	});
 
 	it("retries and releases failed retained child cleanup on the next compaction", async () => {
@@ -2137,9 +2188,9 @@ describe("AgentSession rlm recursion", () => {
 	});
 
 	it("lets a stale kernel depth cap defer to the live host gate", () => {
-		const python =
-			process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python");
-		const runtime = join(process.cwd(), "..", "..", "prime-agent-runtime", "src");
+		const defaultPython = join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python");
+		const python = process.env.PRIME_AGENT_KERNEL_PYTHON ?? (existsSync(defaultPython) ? defaultPython : "python3");
+		const runtime = join(__dirname, "..", "..", "..", "prime-agent-runtime", "src");
 		const probe = spawnSync(
 			python,
 			["-c", "import asyncio, rlm; rlm.Comm = None; asyncio.run(rlm.run('raised live cap'))"],
@@ -2480,6 +2531,154 @@ describe("AgentSession rlm recursion", () => {
 		expect(disposeChild).not.toHaveBeenCalled();
 		expect((root as unknown as InspectableRlmSession)._activeRlmChildRuns.size).toBe(0);
 		expect(root.getRlmChildSession(spawned.rlm_child_id)).toBeUndefined();
+	});
+
+	it("keeps replacement B's hosted lifecycle maps untouched when stale A settles", async () => {
+		let releaseHostedCreate!: () => void;
+		const hostedCreateGate = new Promise<void>((resolve) => {
+			releaseHostedCreate = resolve;
+		});
+		let markHostedCreateStarted!: () => void;
+		const hostedCreateStarted = new Promise<void>((resolve) => {
+			markHostedCreateStarted = resolve;
+		});
+		let releaseATerminal!: () => void;
+		const aTerminalGate = new Promise<void>((resolve) => {
+			releaseATerminal = resolve;
+		});
+		let markAPromptStarted!: () => void;
+		const aPromptStarted = new Promise<void>((resolve) => {
+			markAPromptStarted = resolve;
+		});
+		let markAReleased!: () => void;
+		const aReleased = new Promise<void>((resolve) => {
+			markAReleased = resolve;
+		});
+		const childA = createSession({
+			rlmSessionDir: join(tempDir, "stale-a"),
+			streamFn: () => {
+				markAPromptStarted();
+				const stream = createAssistantMessageEventStream();
+				void aTerminalGate.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("A terminal", usage(41, 17)) });
+				});
+				return stream;
+			},
+		});
+		const childB = createSession({ rlmSessionDir: join(tempDir, "replacement-b") });
+		const releaseRuntime = vi.fn(async (runtime: { session: AgentSession }) => {
+			expect(runtime.session).toBe(childA);
+			markAReleased();
+			await runtime.session.disposeAsync();
+		});
+		const deleteRuntime = vi.fn(async (_id: string, runtime: AgentSession | undefined) => {
+			expect(runtime).toBe(childA);
+			await runtime?.disposeAsync();
+		});
+		const root = createSession({
+			depth: 0,
+			maxDepth: 2,
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					markHostedCreateStarted();
+					await hostedCreateGate;
+					return { session: childA };
+				},
+				assignmentIdentityFenced: true,
+				releaseRlmSubagentRuntime: releaseRuntime,
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		const usageAttribution = vi.spyOn(root.sessionManager, "appendChildUsageAttribution");
+		const updates: unknown[] = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") updates.push(event);
+		});
+
+		const admittedA = await root.runRlmChild("A must become stale", { name: "shared-worker" });
+		await hostedCreateStarted;
+		const internals = root as unknown as InspectableRlmSession;
+		const bUnsubscribe = vi.fn();
+		const bRun: InspectableRlmRun = {
+			id: admittedA.rlm_child_id,
+			assignmentId: "assignment-B",
+			sessionDir: join(tempDir, "replacement-b"),
+			status: "done",
+			settled: true,
+			abort: vi.fn(),
+			session: childB,
+		};
+		const aUnsubscribe = vi.fn();
+		const staleARun: InspectableRlmRun = {
+			id: admittedA.rlm_child_id,
+			assignmentId: "assignment-A",
+			sessionDir: join(tempDir, "stale-a"),
+			status: "done",
+			settled: true,
+			abort: vi.fn(),
+			session: childA,
+		};
+		staleARun.unsubscribe = aUnsubscribe;
+		const bTombstone = `${admittedA.rlm_child_id}\u0000assignment-B`;
+		internals._activeRlmChildRuns.set(admittedA.rlm_child_id, bRun);
+		internals._rlmChildSessions.set(admittedA.rlm_child_id, childB);
+		internals._rlmChildSessionAssignments.set(admittedA.rlm_child_id, "assignment-B");
+		internals._rlmChildUnsubscribes.set(admittedA.rlm_child_id, bUnsubscribe);
+		internals._rlmChildUnsubscribeAssignments.set(admittedA.rlm_child_id, "assignment-B");
+		internals._deletedRlmChildIds.add(bTombstone);
+		updates.length = 0;
+		const injectedTerminal = vi.fn(async () => undefined);
+		(root as unknown as { _promptInjectedMessage: typeof injectedTerminal })._promptInjectedMessage =
+			injectedTerminal;
+
+		releaseHostedCreate();
+		await aPromptStarted;
+		releaseATerminal();
+		await aReleased;
+
+		// A's hosted create, terminal delivery, release, event update, and usage
+		// attribution have all settled after B reuses its public selector.
+		expect(releaseRuntime).toHaveBeenCalledOnce();
+		expect(injectedTerminal).not.toHaveBeenCalled();
+		expect(usageAttribution).not.toHaveBeenCalled();
+		expect(updates).toEqual([]);
+		expect(internals._activeRlmChildRuns.get(admittedA.rlm_child_id)).toBe(bRun);
+		expect(internals._rlmChildSessions.get(admittedA.rlm_child_id)).toBe(childB);
+		expect(internals._rlmChildSessionAssignments.get(admittedA.rlm_child_id)).toBe("assignment-B");
+		expect(internals._rlmChildUnsubscribes.get(admittedA.rlm_child_id)).toBe(bUnsubscribe);
+		expect(internals._rlmChildUnsubscribeAssignments.get(admittedA.rlm_child_id)).toBe("assignment-B");
+		expect(internals._deletedRlmChildIds.has(bTombstone)).toBe(true);
+
+		// Stale A release, delete-cleanup, registration, and unsubscribe paths have
+		// no authority over B's assignment-keyed maps or B's tombstone.
+		expect(root.releaseRlmChildSession(admittedA.rlm_child_id, childA, "assignment-A")).toBe(false);
+		expect(root.registerRlmChildSession(admittedA.rlm_child_id, childA, vi.fn(), "assignment-A")).toBe(false);
+		await internals._deleteRlmSubagentSession(admittedA.rlm_child_id, "assignment-A", childA);
+		expect(deleteRuntime).toHaveBeenCalledWith(admittedA.rlm_child_id, childA, "assignment-A");
+		internals._removeRlmSubagentTracking(admittedA.rlm_child_id, staleARun, "assignment-A");
+		expect(aUnsubscribe).toHaveBeenCalledOnce();
+		expect(bUnsubscribe).not.toHaveBeenCalled();
+		expect(internals._activeRlmChildRuns.get(admittedA.rlm_child_id)).toBe(bRun);
+		expect(internals._rlmChildSessions.get(admittedA.rlm_child_id)).toBe(childB);
+		expect(internals._rlmChildUnsubscribes.get(admittedA.rlm_child_id)).toBe(bUnsubscribe);
+		expect(internals._deletedRlmChildIds.has(bTombstone)).toBe(true);
+	});
+
+	it("rejects stale lazy-hydration rebind A when B owns the reused child ID", () => {
+		const root = createSession();
+		const childA = createSession({ rlmSessionDir: join(tempDir, "lazy-a") });
+		const childB = createSession({ rlmSessionDir: join(tempDir, "lazy-b") });
+		const internals = root as unknown as InspectableRlmSession;
+		const unsubscribeB = vi.fn();
+
+		expect(root.registerRlmChildSession("lazy-reused-child", childB, unsubscribeB, "assignment-B")).toBe(true);
+		// A hydration continuation is still holding its stale session object. It
+		// must not join B merely because the public child selector matches.
+		expect(root.rebindRlmChildSessionAssignment("lazy-reused-child", childA, "assignment-A")).toBe(false);
+		expect(internals._rlmChildSessions.get("lazy-reused-child")).toBe(childB);
+		expect(internals._rlmChildSessionAssignments.get("lazy-reused-child")).toBe("assignment-B");
+		expect(internals._rlmChildUnsubscribes.get("lazy-reused-child")).toBe(unsubscribeB);
+		expect(internals._rlmChildUnsubscribeAssignments.get("lazy-reused-child")).toBe("assignment-B");
 	});
 
 	it("does not let completion retention resurrect a child being deleted", async () => {

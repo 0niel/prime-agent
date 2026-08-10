@@ -198,13 +198,23 @@ export function createRlmDeleteSubagentHostHandler(handler: RlmDeleteSubagentHan
 	};
 }
 
+export const RLM_CHILD_TERMINAL_STATUSES = ["done", "error", "cancelled"] as const;
+export type RlmChildTerminalStatus = (typeof RLM_CHILD_TERMINAL_STATUSES)[number];
+export function isRlmChildTerminalStatus(value: unknown): value is RlmChildTerminalStatus {
+	return typeof value === "string" && (RLM_CHILD_TERMINAL_STATUSES as readonly string[]).includes(value);
+}
+
 export interface RlmSubagentRuntime {
 	session: AgentSession;
+	/** Immutable attempt identity; never expose this in the public child catalog. */
+	assignmentId?: string;
 }
 
 export interface CreateRlmSubagentRuntimeOptions {
 	parentSession: AgentSession;
 	id: string;
+	/** Minted by the parent before this child is published. */
+	assignmentId?: string;
 	prompt: string;
 	sessionName: string;
 	sessionDir: string;
@@ -227,9 +237,11 @@ export interface CreateRlmSubagentRuntimeOptions {
 }
 
 export interface SubagentRuntimeHost {
+	/** Opt-in daemon adapter: legacy embedded hosts retain their historical callback arity. */
+	readonly assignmentIdentityFenced?: true;
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
 	/** Persist host-owned completion before the child becomes passivation-eligible. */
-	completeRlmSubagentRuntime?(childId: string, session: AgentSession): boolean;
+	completeRlmSubagentRuntime?(childId: string, session: AgentSession, assignmentId?: string): boolean;
 	/** Release a host-owned child after its detached initial task settles. */
 	releaseRlmSubagentRuntime?: (
 		runtime: RlmSubagentRuntime,
@@ -237,6 +249,6 @@ export interface SubagentRuntimeHost {
 		status: "done" | "error" | "cancelled",
 	) => Promise<void>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
-	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
+	deleteRlmSubagentRuntime(childId: string, session?: AgentSession, assignmentId?: string): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
 }

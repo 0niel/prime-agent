@@ -41,6 +41,7 @@ interface WorkerFixture {
 	archiveFinalization?: Promise<void>;
 	stopFinalized?: boolean;
 	stopFailure?: Error;
+	quarantined?: true;
 }
 
 interface PassivatedWorkerFixture extends WorkerFixture {
@@ -55,6 +56,7 @@ interface PassivatedWorkerFixture extends WorkerFixture {
 interface SupervisorInternals {
 	workers: Map<string, WorkerFixture>;
 	loadWorkerDescriptors(): Promise<void>;
+	persistWorker(worker: WorkerFixture): void;
 	wakePassivatedWorker(worker: WorkerFixture): Promise<void>;
 	forwardToWorker(worker: WorkerFixture, command: object): Promise<unknown>;
 	stopWorker(
@@ -68,6 +70,7 @@ interface SupervisorInternals {
 	stopWorkerOnce: ReturnType<typeof vi.fn>;
 	recoverWorker: ReturnType<typeof vi.fn>;
 	passivatedSummaryForDescriptor(descriptor: DaemonWorkerDescriptor): Promise<unknown>;
+	assertRecoveryAllowed(): Promise<void>;
 	catalog: { archive(sessionFile: string, sessionId: string): Promise<void> };
 }
 
@@ -106,6 +109,7 @@ function descriptor(
 		version: 1,
 		workerId,
 		pid: 999_999_999,
+		generation: "11111111-1111-4111-8111-111111111111",
 		socketPath: join(fixture.root, `${workerId}.sock`),
 		recoveryJournalPath: join(fixture.descriptorDir, `${workerId}.recovery.jsonl`),
 		supervisorSocketPath: fixture.socketPath,
@@ -379,6 +383,63 @@ describe("daemon supervisor restart passivation", () => {
 		expect(worker.descriptor.lifecycle).toBe("ready");
 	});
 
+	it("passivates an explicit wake spawn failure without persisting recovery intent", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const {
+			pid: _pid,
+			processStartId: _processStartId,
+			...passive
+		} = descriptor(fixture, "wake-spawn-failure", session);
+		const worker: WorkerFixture = {
+			descriptor: { ...passive, lifecycle: "passivated" },
+			descriptorPath: join(fixture.descriptorDir, "wake-spawn-failure.json"),
+			summaries: new Map(),
+		};
+		writeFileSync(worker.descriptorPath, `${JSON.stringify(worker.descriptor, null, 2)}\n`);
+		supervisor.workers.set(worker.descriptor.workerId, worker);
+		supervisor.assertRecoveryAllowed = vi.fn(async () => undefined);
+		workerSpawn.mockImplementation(() => {
+			throw new Error("deterministic spawn failure");
+		});
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-02T03:04:05.000Z"));
+		try {
+			// Register the rejection handler before advancing timers: wake intentionally
+			// reports its failed operation, but must not leak an unhandled rejection.
+			const wakeResult = supervisor.wakePassivatedWorker(worker).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			await vi.runAllTimersAsync();
+			expect(await wakeResult).toBeInstanceOf(Error);
+
+			const diskBytes = readFileSync(worker.descriptorPath, "utf8");
+			const persisted = JSON.parse(diskBytes);
+			expect(persisted).toMatchObject({
+				lifecycle: "passivated",
+				lastError: "deterministic spawn failure",
+			});
+			expect(persisted).not.toHaveProperty("process");
+			expect(persisted).not.toHaveProperty("pid");
+			expect(persisted).not.toHaveProperty("processStartId");
+			expect(diskBytes).not.toContain('"lifecycle": "recovering"');
+			expect(diskBytes).not.toContain('"lifecycle": "failed"');
+			// The writer output is exactly the canonical in-memory descriptor, rather
+			// than an older processless recovery/failed serialization.
+			expect(diskBytes).toBe(`${JSON.stringify(worker.descriptor, null, 2)}\n`);
+		} finally {
+			vi.useRealTimers();
+			workerSpawn.mockImplementation(() => {
+				throw new Error("unexpected worker spawn");
+			});
+		}
+	});
+
 	it("rejects an incompatible telemetry attach before waking a passivated root", async () => {
 		const fixture = fixtureRoot();
 		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
@@ -430,6 +491,7 @@ describe("daemon supervisor restart passivation", () => {
 			descriptorPath: join(fixture.descriptorDir, "read.json"),
 			summaries: new Map(),
 		};
+		supervisor.workers.set(worker.descriptor.workerId, worker);
 		supervisor.recoverWorker = vi.fn(async () => {
 			worker.descriptor.lifecycle = "ready";
 			worker.client = { request: vi.fn() };
@@ -472,6 +534,7 @@ describe("daemon supervisor restart passivation", () => {
 			descriptorPath: join(fixture.descriptorDir, "wake-command.json"),
 			summaries: new Map(),
 		};
+		supervisor.workers.set(worker.descriptor.workerId, worker);
 		supervisor.recoverWorker = vi.fn(async () => {
 			worker.descriptor.lifecycle = "ready";
 			worker.client = { request: vi.fn() };
@@ -741,7 +804,7 @@ describe("daemon supervisor restart passivation", () => {
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
 		const worker = {
-			descriptor: entry,
+			descriptor: { ...entry, generation: "11111111-1111-4111-8111-111111111111" },
 			descriptorPath: join(fixture.descriptorDir, "owner-no-env.json"),
 			summaries: new Map(),
 			snapshotCache: new Map(),
@@ -1001,7 +1064,7 @@ describe("daemon supervisor restart passivation", () => {
 
 		await supervisor.stopWorker(worker, false);
 		expect(supervisor.workers.has("update-stop")).toBe(false);
-		expect(JSON.parse(readFileSync(worker.descriptorPath, "utf8"))).toMatchObject({ lifecycle: "recovering" });
+		expect(JSON.parse(readFileSync(worker.descriptorPath, "utf8"))).toMatchObject({ lifecycle: "passivated" });
 	});
 
 	it("late archive deletion removes a retained recovering descriptor before restart", async () => {
@@ -1035,7 +1098,7 @@ describe("daemon supervisor restart passivation", () => {
 		supervisor.catalog.archive = vi.fn(async () => undefined);
 
 		await supervisor.stopWorker(worker, false);
-		expect(JSON.parse(readFileSync(worker.descriptorPath, "utf8"))).toMatchObject({ lifecycle: "recovering" });
+		expect(JSON.parse(readFileSync(worker.descriptorPath, "utf8"))).toMatchObject({ lifecycle: "passivated" });
 		await supervisor.stopWorker(worker, true, false, true);
 
 		expect(supervisor.catalog.archive).toHaveBeenCalledTimes(1);
@@ -1174,37 +1237,70 @@ describe("daemon supervisor restart passivation", () => {
 		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
 	});
 
-	it("keeps normalized v1 lifecycle roots visible and passive across successive reloads", async () => {
+	it("writes one canonical passive migration for a safely classifiable stale nested legacy identity", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const entry = descriptor(fixture, "nested-legacy", session);
+		delete entry.pid;
+		entry.process = { pid: 999_999_999, processStartId: "stale-start" };
+		delete entry.generation;
+		writeFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), JSON.stringify(entry));
+
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const persist = vi.spyOn(supervisor, "persistWorker");
+		await supervisor.loadWorkerDescriptors();
+
+		const loaded = supervisor.workers.get(entry.workerId);
+		expect(loaded?.descriptor.generation).toMatch(/^[0-9a-f-]+$/);
+		expect(loaded?.descriptor.lifecycle).toBe("passivated");
+		const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), "utf8"));
+		expect(persisted).toMatchObject({ generation: loaded?.descriptor.generation, lifecycle: "passivated" });
+		expect(persisted).not.toHaveProperty("pid");
+		expect(persisted).not.toHaveProperty("processStartId");
+		expect(persist).toHaveBeenCalledOnce();
+	});
+
+	it("keeps malformed lifecycle descriptors visible as raw quarantined evidence across successive reloads", async () => {
 		const fixture = fixtureRoot();
 		const missing = persistSession(fixture.sessionDir, fixture.root, "completed");
 		const unknown = persistSession(fixture.sessionDir, fixture.root, "completed");
 		const missingDescriptor = descriptor(fixture, "missing-lifecycle", missing);
 		const unknownDescriptor = { ...descriptor(fixture, "unknown-lifecycle", unknown), lifecycle: "future_state" };
 		delete (missingDescriptor as Partial<DaemonWorkerDescriptor>).lifecycle;
-		writeFileSync(join(fixture.descriptorDir, "missing-lifecycle.json"), JSON.stringify(missingDescriptor));
-		writeFileSync(join(fixture.descriptorDir, "unknown-lifecycle.json"), JSON.stringify(unknownDescriptor));
+		delete (missingDescriptor as Partial<DaemonWorkerDescriptor>).generation;
+		delete (unknownDescriptor as Partial<DaemonWorkerDescriptor>).generation;
+		const raw = new Map([
+			["missing-lifecycle", JSON.stringify(missingDescriptor)],
+			["unknown-lifecycle", JSON.stringify(unknownDescriptor)],
+		]);
+		for (const [workerId, contents] of raw) {
+			writeFileSync(join(fixture.descriptorDir, `${workerId}.json`), contents);
+		}
 
-		// The first reload normalizes untrusted lifecycle values. The next one must
-		// accept those durable, processless `recovering` descriptors rather than
-		// dropping their roots before it can classify them as passive.
+		// Unknown lifecycle input remains available to diagnostics, but its disk
+		// bytes are not C01 state. It must never be normalized into a writable,
+		// processless recovering row on either reload.
 		const first = new DaemonSupervisor(fixture.socketPath, {
 			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
 		first.recoverWorker = vi.fn();
+		const firstWrite = vi.spyOn(first, "persistWorker");
 		workerSpawn.mockClear();
 		const kill = vi.spyOn(process, "kill");
 		try {
 			await first.loadWorkerDescriptors();
 			expect(first.workers).toHaveLength(2);
-			for (const workerId of ["missing-lifecycle", "unknown-lifecycle"]) {
+			for (const workerId of raw.keys()) {
 				const worker = first.workers.get(workerId);
-				expect(worker?.descriptor.lifecycle).toBe("recovering");
+				expect(worker).toMatchObject({ quarantined: true, descriptor: { lifecycle: "recovering" } });
+				expect(worker?.descriptor.process).toBeUndefined();
 				expect(worker?.descriptor.pid).toBeUndefined();
-				expect(worker?.descriptor.processStartId).toBeUndefined();
-				const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
-				expect(persisted.lifecycle).toBe("recovering");
-				expect(persisted.pid).toBeUndefined();
+				await expect(first.wakePassivatedWorker(worker!)).rejects.toThrow("quarantined");
+				expect(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8")).toBe(raw.get(workerId));
 			}
 
 			const second = new DaemonSupervisor(fixture.socketPath, {
@@ -1213,19 +1309,16 @@ describe("daemon supervisor restart passivation", () => {
 			}) as unknown as SupervisorInternals;
 			second.recoverWorker = vi.fn();
 			await second.loadWorkerDescriptors();
-
-			// Completed roots become metadata-only on the second reload, retaining
-			// their summaries for explicit wake without an automatic wake or signal.
 			expect(second.workers).toHaveLength(2);
-			for (const workerId of ["missing-lifecycle", "unknown-lifecycle"]) {
+			for (const workerId of raw.keys()) {
 				const worker = second.workers.get(workerId);
-				expect(worker?.descriptor.lifecycle).toBe("passivated");
-				expect(worker?.descriptor.pid).toBeUndefined();
-				expect(worker?.descriptor.processStartId).toBeUndefined();
+				expect(worker).toMatchObject({ quarantined: true, descriptor: { lifecycle: "recovering" } });
 				expect(worker?.client).toBeUndefined();
-				expect(worker?.summaries.has(worker?.descriptor.rootActiveSessionId ?? "")).toBe(true);
+				expect(worker?.summaries).toHaveLength(0);
+				expect(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8")).toBe(raw.get(workerId));
 			}
 			expect(first.recoverWorker).not.toHaveBeenCalled();
+			expect(firstWrite).not.toHaveBeenCalled();
 			expect(second.recoverWorker).not.toHaveBeenCalled();
 			expect(workerSpawn).not.toHaveBeenCalled();
 			expect(kill).not.toHaveBeenCalled();
@@ -1310,7 +1403,95 @@ describe("daemon supervisor restart passivation", () => {
 		}
 	});
 
-	it("recovers rather than passivating malformed or stale durable task verdicts", async () => {
+	it.each(["flat", "nested"] as const)(
+		"quarantines unknown-start legacy %s identity with recoverable work without rewriting raw evidence",
+		async (shape) => {
+			const fixture = fixtureRoot();
+			const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+			const entry = descriptor(fixture, `unknown-start-busy-${shape}`, session);
+			delete entry.generation;
+			if (shape === "nested") {
+				delete entry.pid;
+				entry.process = { pid: 999_999_999, processStartId: "unobservable-start" };
+			}
+			// The impossible PID makes either legacy identity unobservable; the busy
+			// journal independently rejects passive classification. This exact
+			// combination must retain raw evidence rather than write processless
+			// `recovering` C01 state that could later be restarted.
+			writeFileSync(
+				entry.recoveryJournalPath,
+				`${JSON.stringify({
+					version: 1,
+					activeSessionId: entry.rootActiveSessionId,
+					sessionId: session.id,
+					sessionFile: session.sessionFile,
+					busy: true,
+					operation: "legacy-work",
+					recordedAt: new Date(0).toISOString(),
+				})}\n`,
+			);
+			const descriptorPath = join(fixture.descriptorDir, `${entry.workerId}.json`);
+			const raw = JSON.stringify(entry);
+			writeFileSync(descriptorPath, raw);
+			const supervisor = new DaemonSupervisor(fixture.socketPath, {
+				defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+				descriptorDir: fixture.descriptorDir,
+			}) as unknown as SupervisorInternals;
+			supervisor.recoverWorker = vi.fn();
+			const persist = vi.spyOn(supervisor, "persistWorker");
+			const kill = vi.spyOn(process, "kill");
+			try {
+				await supervisor.loadWorkerDescriptors();
+				const worker = supervisor.workers.get(entry.workerId);
+				expect(worker).toMatchObject({ quarantined: true, descriptor: { lifecycle: "recovering" } });
+				expect(worker?.descriptor.process).toBeUndefined();
+				expect(worker?.descriptor.pid).toBeUndefined();
+				expect(worker?.summaries).toHaveLength(0);
+				expect(readFileSync(descriptorPath, "utf8")).toBe(raw);
+				expect(persist).not.toHaveBeenCalled();
+				expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+				await expect(supervisor.wakePassivatedWorker(worker!)).rejects.toThrow("quarantined");
+				expect(kill).not.toHaveBeenCalled();
+			} finally {
+				kill.mockRestore();
+			}
+		},
+	);
+
+	it("writes only canonical C01 descriptor shapes", () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const { pid: _pid, processStartId: _startId, ...passive } = descriptor(fixture, "writer-shape", session);
+		const worker: WorkerFixture = {
+			descriptor: { ...passive, lifecycle: "passivated" },
+			descriptorPath: join(fixture.descriptorDir, "writer-shape.json"),
+			summaries: new Map(),
+		};
+
+		supervisor.persistWorker(worker);
+		const persisted = JSON.parse(readFileSync(worker.descriptorPath, "utf8"));
+		expect(persisted).toMatchObject({ generation: "11111111-1111-4111-8111-111111111111", lifecycle: "passivated" });
+		expect(persisted).not.toHaveProperty("pid");
+		expect(persisted).not.toHaveProperty("processStartId");
+		expect(persisted).not.toHaveProperty("process");
+
+		worker.descriptor.generation = "legacy-generation";
+		expect(() => supervisor.persistWorker(worker)).toThrow("canonical generation");
+		worker.descriptor.generation = "11111111-1111-4111-8111-111111111111";
+		for (const lifecycle of ["starting", "recovering", "failed"] as const) {
+			worker.descriptor.lifecycle = lifecycle;
+			expect(() => supervisor.persistWorker(worker)).toThrow("without a process identity");
+		}
+		worker.descriptor.lifecycle = "passivated";
+		worker.descriptor.process = { pid: process.pid, processStartId: "not-authoritative" };
+		expect(() => supervisor.persistWorker(worker)).toThrow("passivated worker");
+	});
+
+	it("quarantines malformed or stale durable task verdicts without rewriting legacy selectors", async () => {
 		const fixture = fixtureRoot();
 		const malformed = persistSession(fixture.sessionDir, fixture.root, "completed");
 		const stale = persistSession(fixture.sessionDir, fixture.root, "completed");
@@ -1326,13 +1507,8 @@ describe("daemon supervisor restart passivation", () => {
 		] as const) {
 			writeFileSync(
 				session.sessionFile,
-				`${JSON.stringify({
-					type: "agent_status",
-					id: `${workerId}-status`,
-					parentId: "root",
-					timestamp: new Date().toISOString(),
-					status,
-				})}\n`,
+				`${JSON.stringify({ type: "agent_status", id: `${workerId}-status`, parentId: "root", timestamp: new Date().toISOString(), status })}
+`,
 				{ flag: "a" },
 			);
 			writeFileSync(
@@ -1342,13 +1518,8 @@ describe("daemon supervisor restart passivation", () => {
 		}
 		writeFileSync(
 			invalidLifecycle.sessionFile,
-			`${JSON.stringify({
-				type: "session_state",
-				id: "invalid-lifecycle",
-				parentId: "root",
-				timestamp: new Date().toISOString(),
-				state: { status: "untrusted_lifecycle" },
-			})}\n`,
+			`${JSON.stringify({ type: "session_state", id: "invalid-lifecycle", parentId: "root", timestamp: new Date().toISOString(), state: { status: "untrusted_lifecycle" } })}
+`,
 			{ flag: "a" },
 		);
 		writeFileSync(
@@ -1358,10 +1529,10 @@ describe("daemon supervisor restart passivation", () => {
 		writeFileSync(truncatedLifecycle.sessionFile, '{"type":"session_state"', { flag: "a" });
 		writeFileSync(
 			oversizedVerdict.sessionFile,
-			`\n{"type":"agent_status","padding":"${"x".repeat(2 * 1024 * 1024)}"}\n`,
-			{
-				flag: "a",
-			},
+			`
+{"type":"agent_status","padding":"${"x".repeat(2 * 1024 * 1024)}"}
+`,
+			{ flag: "a" },
 		);
 		for (const [workerId, session] of [
 			["truncated-lifecycle", truncatedLifecycle],
@@ -1373,29 +1544,28 @@ describe("daemon supervisor restart passivation", () => {
 				JSON.stringify(descriptor(fixture, workerId, session)),
 			);
 		}
+		const raw = new Map(
+			[
+				"malformed",
+				"stale",
+				"invalid-lifecycle",
+				"truncated-lifecycle",
+				"oversized-verdict",
+				"corrupt-array-artifact",
+			].map((workerId) => [workerId, readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8")]),
+		);
 		const supervisor = new DaemonSupervisor(fixture.socketPath, {
 			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
+		const persist = vi.spyOn(supervisor, "persistWorker");
 		await supervisor.loadWorkerDescriptors();
-		expect(supervisor.workers.get("malformed")?.descriptor.lifecycle).toBe("recovering");
-		expect(supervisor.workers.get("stale")?.descriptor.lifecycle).toBe("recovering");
-		expect(supervisor.workers.get("invalid-lifecycle")?.descriptor.lifecycle).toBe("recovering");
-		expect(supervisor.workers.get("truncated-lifecycle")?.descriptor.lifecycle).toBe("recovering");
-		expect(supervisor.workers.get("oversized-verdict")?.descriptor.lifecycle).toBe("recovering");
-		// A top-level array is corrupt artifact state, so fail closed rather than
-		// passivating a root whose scheduled work cannot be reconstructed.
-		expect(supervisor.workers.get("corrupt-array-artifact")?.descriptor.lifecycle).toBe("recovering");
-		for (const workerId of [
-			"malformed",
-			"stale",
-			"invalid-lifecycle",
-			"truncated-lifecycle",
-			"oversized-verdict",
-			"corrupt-array-artifact",
-		]) {
-			const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
-			expect(persisted.pid).toBe(999_999_999);
+		for (const [workerId, contents] of raw) {
+			const worker = supervisor.workers.get(workerId);
+			expect(worker).toMatchObject({ quarantined: true, descriptor: { lifecycle: "recovering" } });
+			expect(worker?.descriptor.process).toBeUndefined();
+			expect(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8")).toBe(contents);
 		}
+		expect(persist).not.toHaveBeenCalled();
 	});
 });

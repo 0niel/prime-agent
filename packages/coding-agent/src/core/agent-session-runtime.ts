@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { AgentSession } from "./agent-session.js";
@@ -56,6 +57,10 @@ export interface AgentSessionRuntimeMetadata {
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	rlmChildId?: string;
+	/** Daemon worker incarnation; absent for legacy and inline top-level runtimes. */
+	generation?: string;
+	/** Required for C01-created subagent runtimes; internal only. */
+	assignmentId?: string;
 	rlmParentNodeId?: string;
 	/** Runtime restored from an already-persisted completed registry entry. */
 	rehydratedCompleted?: boolean;
@@ -90,6 +95,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private beforeSessionInvalidate?: () => void;
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
+	/** Assignment currently owning each compatibility child-id map entry. */
+	private subagentRuntimeAssignments = new Map<string, string>();
 	private disposePromise?: Promise<void>;
 
 	constructor(
@@ -298,6 +305,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private async disposeSubagentRuntimes(): Promise<void> {
 		const runtimes = [...this.subagentRuntimes.values()];
 		this.subagentRuntimes.clear();
+		this.subagentRuntimeAssignments.clear();
 		let disposeError: unknown;
 		for (const runtime of runtimes) {
 			try {
@@ -340,6 +348,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				rlmDepth: options.rlmDepth,
 			});
 		}
+		const assignmentId = options.assignmentId ?? randomUUID();
 		const runtime = await this.scopedBuild(() =>
 			createAgentSessionRuntime(this.createRuntime, {
 				cwd: sessionManager.getCwd(),
@@ -369,6 +378,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					parentSessionId: options.parentSession.sessionId,
 					parentSessionFile: options.parentSession.sessionFile,
 					rlmChildId: options.id,
+					assignmentId: assignmentId,
 					rlmParentNodeId: options.rlmParentNodeId,
 					prompt: options.prompt,
 					spawnCode: options.spawnCode,
@@ -377,9 +387,13 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			}),
 		);
 		this.subagentRuntimes.set(options.id, runtime);
+		this.subagentRuntimeAssignments.set(options.id, assignmentId);
 		try {
 			await runtime.session.bindExtensions({});
-			if (options.parentSession.getRlmChildRunStatus(options.id) === "cancelled") {
+			if (
+				this.subagentRuntimeAssignments.get(options.id) !== assignmentId ||
+				options.parentSession.getRlmChildRunStatus(options.id) === "cancelled"
+			) {
 				throw new Error("RLM subagent startup was cancelled");
 			}
 			if (runtime.session.sessionName !== options.sessionName) {
@@ -387,27 +401,35 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			}
 			options.onSessionPublished?.(runtime.session);
 		} catch (error) {
-			this.subagentRuntimes.delete(options.id);
+			if (
+				this.subagentRuntimes.get(options.id) === runtime &&
+				this.subagentRuntimeAssignments.get(options.id) === assignmentId
+			) {
+				this.subagentRuntimes.delete(options.id);
+				this.subagentRuntimeAssignments.delete(options.id);
+			}
 			await runtime.dispose();
 			throw error;
 		}
 		return runtime;
 	}
 
-	async deleteRlmSubagentRuntime(childId: string, session: AgentSession): Promise<void> {
+	async deleteRlmSubagentRuntime(childId: string, childSession?: AgentSession, assignmentId?: string): Promise<void> {
 		const runtime = this.subagentRuntimes.get(childId);
-		if (!runtime) {
-			await session.disposeAsync();
+		const currentAssignment = this.subagentRuntimeAssignments.get(childId);
+		// Inline runtimes have no durable daemon registry. Preserve direct delete
+		// compatibility, but a named C01 assignment fences stale callbacks.
+		if (!runtime || (assignmentId !== undefined && currentAssignment !== assignmentId)) {
+			await childSession?.disposeAsync();
 			return;
 		}
 		this.subagentRuntimes.delete(childId);
-		const shouldDisposeStaleSession = runtime.session !== session;
+		this.subagentRuntimeAssignments.delete(childId);
+		const shouldDisposeStaleSession = !!childSession && runtime.session !== childSession;
 		try {
 			await runtime.dispose();
 		} finally {
-			if (shouldDisposeStaleSession) {
-				await session.disposeAsync();
-			}
+			if (shouldDisposeStaleSession) await childSession?.disposeAsync();
 		}
 	}
 
