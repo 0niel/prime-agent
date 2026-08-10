@@ -168,6 +168,7 @@ import {
 	normalizeGoalState,
 	validateGoalBudget,
 	validateGoalObjective,
+	validateGoalPauseReason,
 } from "./goals.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
@@ -2835,6 +2836,13 @@ export class AgentSession {
 			}
 			case "goal.complete":
 				return goalHostResponse(this._completeGoalFromHost(), true);
+			case "goal.pause":
+				if (typeof payload.reason !== "string") {
+					throw new Error("goal.pause reason must be a string");
+				}
+				return goalHostResponse(this._pauseGoalFromHost(payload.reason), false);
+			case "goal.resume":
+				return goalHostResponse(this._resumeGoalFromHost(), false);
 			default:
 				throw new Error(`unknown goal request type "${type}"`);
 		}
@@ -3140,6 +3148,29 @@ export class AgentSession {
 				// idle, or a terminal record (complete / error): nothing pending, start fresh.
 				return this._startGoal(objective, tokenBudget);
 		}
+	}
+
+	private _pauseGoalFromHost(reasonText: string): GoalState {
+		if (this._goalState.status !== "active" || !this._goalState.objective) {
+			throw new Error("cannot pause goal because this thread has no active goal");
+		}
+		const reason = validateGoalPauseReason(reasonText);
+		this._pauseGoal(reason);
+		return this._goalState;
+	}
+
+	private _resumeGoalFromHost(): GoalState {
+		if (this._goalState.status !== "paused" || !this._goalState.objective) {
+			throw new Error("cannot resume goal because this thread has no paused goal");
+		}
+		this._setGoalState({
+			...this._goalState,
+			active: true,
+			status: "active",
+			lastReason: undefined,
+			lastError: undefined,
+		});
+		return this._goalState;
 	}
 
 	private _completeGoalFromHost(): GoalState {
@@ -8716,7 +8747,7 @@ export class AgentSession {
 			}),
 		};
 		if (this._includeGoals) {
-			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
+			for (const type of ["goal.get", "goal.create", "goal.complete", "goal.pause", "goal.resume"]) {
 				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
 			}
 		}

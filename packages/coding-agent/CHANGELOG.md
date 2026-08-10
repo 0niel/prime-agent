@@ -14,6 +14,7 @@
 - Fixed long-running supervisors permanently rejecting commands after temporary registry pruning ([#1148](https://github.com/PrimeIntellect-ai/prime-agent/issues/1148)).
 - Fixed Windows daemon startup and worker authentication blocking on slow child startup and synchronous process identity checks ([#1077](https://github.com/PrimeIntellect-ai/prime-agent/issues/1077)).
 - Fixed Windows kernel bootstrap using the Unix virtual-environment interpreter path and Unix-only uv installer ([#660](https://github.com/PrimeIntellect-ai/prime-agent/issues/660)).
+- Added model-driven goal pause and resume transitions so externally blocked goals stop auto-continuing ([#986](https://github.com/PrimeIntellect-ai/prime-agent/issues/986)).
 - Added a configurable copy action to login dialogs so raw sign-in URLs can be copied without selecting wrapped text ([#643](https://github.com/PrimeIntellect-ai/prime-agent/issues/643)).
 - Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.

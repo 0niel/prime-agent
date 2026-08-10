@@ -41,12 +41,27 @@ async def create(objective: str, token_budget: int | None = None) -> dict[str, A
     return await host_request("goal.create", payload)
 
 
+async def pause(reason: str) -> dict[str, Any]:
+    """Pause an active goal that is fully blocked on external input.
+
+    The reason must identify the user input, approval, credential, or external
+    resource required before autonomous work can continue.
+    """
+    if not isinstance(reason, str):
+        raise TypeError(f"reason must be str, got {type(reason).__name__}")
+    return await host_request("goal.pause", {"reason": reason})
+
+
+async def resume() -> dict[str, Any]:
+    """Resume a paused goal after new input resolves its blocker."""
+    return await host_request("goal.resume")
+
+
 async def complete() -> dict[str, Any]:
     """Mark the existing thread goal achieved.
 
     Use only when the objective has actually been achieved and no required
     work remains — not because the budget is nearly exhausted or because you
-    are stopping work. Pause, resume, and budget-limit transitions are
-    controlled by the user and the host.
+    are stopping work.
     """
     return await host_request("goal.complete")

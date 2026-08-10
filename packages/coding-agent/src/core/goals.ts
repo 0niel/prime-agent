@@ -6,6 +6,7 @@ export const GOAL_CONTEXT_CUSTOM_TYPE = "goal_context";
 export const GOAL_CONTEXT_PREVIEW_LABEL = "Goal context";
 export const GOAL_SKILL_NAME = "goal";
 export const MAX_THREAD_GOAL_OBJECTIVE_CHARS = 4000;
+export const MAX_THREAD_GOAL_PAUSE_REASON_CHARS = 2000;
 
 export type GoalStatus = "idle" | "active" | "paused" | "budget_limited" | "complete" | "error";
 export type GoalContextKind = "continuation" | "budget_limit" | "objective_updated";
@@ -35,6 +36,7 @@ export type SerializedGoal = {
 	time_used_seconds: number;
 	created_at?: number;
 	updated_at?: number;
+	last_reason?: string;
 };
 
 /** Reply payload for goal.* host requests from the IPython kernel. */
@@ -81,6 +83,17 @@ export function validateGoalObjective(value: string): string {
 		throw new Error(`Goal objective must be at most ${MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters.`);
 	}
 	return objective;
+}
+
+export function validateGoalPauseReason(value: string): string {
+	const reason = value.trim();
+	if (!reason) {
+		throw new Error("Goal pause reason must not be empty.");
+	}
+	if ([...reason].length > MAX_THREAD_GOAL_PAUSE_REASON_CHARS) {
+		throw new Error(`Goal pause reason must be at most ${MAX_THREAD_GOAL_PAUSE_REASON_CHARS} characters.`);
+	}
+	return reason;
 }
 
 export function validateGoalBudget(value: number | undefined): number | undefined {
@@ -141,6 +154,7 @@ export function goalHostResponse(goal: GoalState, includeCompletionReport: boole
 		time_used_seconds: goal.timeUsedSeconds,
 		created_at: goal.createdAt,
 		updated_at: goal.updatedAt,
+		last_reason: goal.lastReason,
 	};
 
 	return {
@@ -225,6 +239,8 @@ Goal state:
 The goal persists across turns. Ending one turn does not reduce or redefine the objective. If the goal is not complete yet, make concrete progress toward the full objective.
 
 Before marking the goal complete, audit the current state against every requirement in the objective. Do not rely on intent, partial progress, memory of earlier work, or a plausible final answer as proof of completion. If the objective is achieved, run \`await goal.complete()\` in ipython so usage accounting is preserved.
+
+If every remaining action is blocked only on new user input, approval, credentials, or another unavailable external resource, run \`await goal.pause(reason)\` after clearly reporting the blocker. A paused goal will stop automatic continuation until new input arrives and \`await goal.resume()\` is called. Do not pause while concrete autonomous work remains.
 
 Do not call \`goal.complete()\` unless the goal is complete. Do not mark a goal complete merely because the budget is nearly exhausted or because you are stopping work.`;
 }
