@@ -1,6 +1,6 @@
 import * as acp from "@agentclientprotocol/sdk";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import { PRIME_AGENT_META_NAMESPACE } from "../../src/modes/acp/acp-meta.js";
 import { runAcpModeWithConnection } from "../../src/modes/acp/index.js";
@@ -149,6 +149,39 @@ describe("ACP mode end to end", () => {
 		});
 		harness.cleanup();
 	}, 30_000);
+
+	it("reports a live in-process child that spawned after ACP attached", async () => {
+		const harness = await createHarness({ rlmDepth: 0, rlmMaxDepth: 1 });
+		let releaseChild!: () => void;
+		const childReleased = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		harness.setResponses([
+			async () => {
+				await childReleased;
+				return fauxAssistantMessage("child done");
+			},
+		]);
+		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		const { client, updates } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: harness.tempDir, mcpServers: [] });
+		// The child is admitted after ACP attaches, so an attach-time snapshot was
+		// empty. Its run stays live while the independent parent prompt completes.
+		await harness.session.runRlmChild("continue in the background");
+		harness.appendResponses([fauxAssistantMessage("parent done")]);
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "finish the parent turn" }],
+		});
+		const quiescence = updates.find((update) => update.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
+		expect(quiescence?.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence.outstandingSubagents).toBe(1);
+
+		releaseChild();
+		await vi.waitFor(() => expect(harness.session.getRlmChildSnapshots()[0]?.status).toBe("done"));
+		harness.cleanup();
+	}, 30_000);
+
 	it("fails session creation when the initial roster snapshot fails", async () => {
 		const connection = fakeAcpConnection({
 			initialSnapshot: async () => {
