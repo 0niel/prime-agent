@@ -577,6 +577,65 @@ describe("buildSystemPrompt", () => {
 		expect(customPrompt).not.toContain("For prose that you write yourself, use ASD-STE100");
 	});
 
+	test("uses built-in assembly when provenance is absent", () => {
+		const prompt = buildSystemPrompt({ selectedTools: ["ipython"], contextFiles: [], skills: [], cwd: "/repo" });
+
+		expect(prompt).toContain("You are a general purpose agent that uses code to solve tasks.");
+	});
+
+	test("preserves a caller-present empty custom prompt without default assembly", () => {
+		const prompt = buildSystemPrompt({
+			systemPromptSource: { provenance: "custom", content: "" },
+			selectedTools: [],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+		});
+
+		expect(prompt.startsWith("\nCurrent date: ")).toBe(true);
+		expect(prompt).toContain("\nCurrent working directory: /repo");
+		expect(prompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
+	});
+
+	test("preserves distinctive custom prompt bytes exactly", () => {
+		const content = "custom\r\nbytes\t✓";
+		const prompt = buildSystemPrompt({
+			systemPromptSource: { provenance: "custom", content },
+			selectedTools: [],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+		});
+
+		expect(prompt.startsWith(content)).toBe(true);
+	});
+
+	test("does not inject built-in content for a P02-lookalike custom prompt", () => {
+		const content = "P02 system prompt lookalike: You are a general purpose agent that uses code to solve tasks.";
+		const prompt = buildSystemPrompt({
+			systemPromptSource: { provenance: "custom", content },
+			selectedTools: [],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+		});
+
+		expect(prompt.match(/You are a general purpose agent that uses code to solve tasks\./g)).toHaveLength(1);
+	});
+
+	test("fails closed for unknown provenance", () => {
+		const prompt = buildSystemPrompt({
+			systemPromptSource: { provenance: "unknown" },
+			selectedTools: ["ipython"],
+			appendSystemPrompt: "caller content",
+			contextFiles: [{ path: "AGENTS.md", content: "caller context" }],
+			skills: [skill("caller-skill")],
+			cwd: "/repo",
+		});
+
+		expect(prompt).toBe("");
+	});
+
 	test("custom prompt override bypasses the rlm harness body", () => {
 		const harnessState: HarnessState = {
 			schema: 1,

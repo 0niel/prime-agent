@@ -6,6 +6,7 @@ import { AuthStorage } from "../src/core/auth-storage.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
+import type { SystemPromptSource } from "../src/core/system-prompt.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
@@ -594,6 +595,33 @@ Explicit override.`,
 			await loader.reload();
 
 			expect(loader.getSystemPrompt()).toBe("Custom system prompt");
+		});
+
+		it("tracks absent and caller-present empty system prompts with typed provenance", async () => {
+			const absent = new DefaultResourceLoader({ cwd, agentDir });
+			await absent.reload();
+			expect(absent.getSystemPromptSource()).toEqual({ source: { provenance: "built_in" }, diagnostics: [] });
+
+			const presentEmpty = new DefaultResourceLoader({ cwd, agentDir, systemPrompt: "" });
+			await presentEmpty.reload();
+			expect(presentEmpty.getSystemPromptSource()).toEqual({
+				source: { provenance: "custom", content: "" },
+				diagnostics: [],
+			});
+		});
+
+		it("fails closed with a bounded diagnostic for malformed prompt provenance", async () => {
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				systemPromptSourceOverride: () => ({ provenance: "custom" } as unknown as SystemPromptSource),
+			});
+			await loader.reload();
+
+			expect(loader.getSystemPromptSource()).toEqual({
+				source: { provenance: "unknown" },
+				diagnostics: [{ type: "error", message: "System prompt provenance unavailable" }],
+			});
 		});
 	});
 
