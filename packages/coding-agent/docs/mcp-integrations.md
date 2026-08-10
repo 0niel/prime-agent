@@ -185,6 +185,13 @@ treated as authoritative and fetched through the same SSRF-safe policy; it is ne
 persisted in credentials. This supports catalog and user-declared servers that publish
 protected-resource metadata only through the MCP authorization challenge.
 
+The safe network policy performs RFC 7050 `ipv4only.arpa` discovery and decodes every
+RFC 6052 prefix layout before classifying an embedded IPv4 destination. Programmatic
+providers can set `McpOAuthConfig.nat64Prefixes` when the network's translator prefix
+cannot be discovered. To preserve ordinary IPv6 compatibility, an unmatched global
+IPv6 address remains subject to the global-locator policy rather than being guessed as
+NAT64; operators using a non-discoverable translator should configure its prefixes.
+
 ## The `McpIntegration` API
 
 Imported from `rlm` (`from rlm import McpIntegration`).

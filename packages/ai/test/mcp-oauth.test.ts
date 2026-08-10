@@ -482,6 +482,24 @@ describe.sequential("MCP OAuth provider", () => {
 		expect(() => parseMcpOAuthChallenge("Bearer realm=x\r\nInjected: yes")).toThrow("Invalid");
 	});
 
+	it.each([
+		'Bearer scope="read"',
+		'Bearer error="invalid_token"',
+		'Basic realm="decoy"',
+		'Bearer resource_metadata="not a url"',
+	])("fails closed for supplied challenge without valid resource metadata: %s", async (authorizationChallenge) => {
+		global.fetch = vi.fn(async () => jsonResponse(META)) as typeof fetch;
+		const provider = createMcpOAuthProvider({
+			server: "bad-supplied-challenge",
+			url: "https://srv.test/mcp",
+			authorizationChallenge,
+		});
+		await expect(provider.login({ onAuth: vi.fn(), onPrompt: async () => "" })).rejects.toThrow(
+			/Supplied MCP OAuth authorization challenge/,
+		);
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
 	it("uses a surfaced challenge metadata URL and challenged scope", async () => {
 		let authUrl = "";
 		const requested: string[] = [];

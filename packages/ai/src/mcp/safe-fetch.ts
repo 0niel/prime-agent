@@ -11,6 +11,10 @@ export interface OAuthFetchPolicy {
 	maxRedirects?: number;
 	maxBodyBytes?: number;
 	timeoutMs?: number;
+	/** Optional RFC 6052 NAT64 prefixes (length /32, /40, /48, /56, /64, or /96). */
+	nat64Prefixes?: string[];
+	/** @internal Shares one RFC 7050 discovery result across related endpoint policies. */
+	nat64CacheKey?: object;
 }
 
 interface ResolvedTarget {
@@ -89,6 +93,121 @@ function inCidr(bytes: number[], network: number[], prefixBits: number): boolean
 	if (remainder === 0) return true;
 	const mask = (0xff << (8 - remainder)) & 0xff;
 	return (bytes[wholeBytes] & mask) === (network[wholeBytes] & mask);
+}
+
+const RFC6052_PREFIX_LENGTHS = new Set([32, 40, 48, 56, 64, 96]);
+const IPV4ONLY_DISCOVERY_ADDRESSES = new Set(["192.0.0.170", "192.0.0.171"]);
+interface Nat64Prefix {
+	bytes: number[];
+	length: number;
+}
+const NAT64_DISCOVERY_CACHE_MS = 30_000;
+interface Nat64CacheEntry {
+	expiresAt: number;
+	promise: Promise<Nat64Prefix[]>;
+}
+const nat64PrefixCache = new WeakMap<object, Nat64CacheEntry>();
+
+function parseNat64Prefix(cidr: string): Nat64Prefix {
+	const slash = cidr.lastIndexOf("/");
+	const length = Number(cidr.slice(slash + 1));
+	const bytes = ipv6Bytes(cidr.slice(0, slash));
+	if (slash <= 0 || !bytes || !RFC6052_PREFIX_LENGTHS.has(length)) {
+		throw new Error("OAuth NAT64 prefix must be valid IPv6 with RFC 6052 length /32, /40, /48, /56, /64, or /96");
+	}
+	const network = bytes.map((byte, index) => (index < length / 8 ? byte : 0));
+	if (!bytes.every((byte, index) => byte === network[index])) {
+		throw new Error("OAuth NAT64 prefix contains non-zero host bits");
+	}
+	if (length === 96 && bytes[8] !== 0) {
+		throw new Error("OAuth NAT64 /96 prefix must keep the RFC 6052 u octet zero");
+	}
+	return { bytes: network, length };
+}
+
+function decodeRfc6052(address: number[], prefix: Nat64Prefix): number[] | undefined {
+	if (!inCidr(address, prefix.bytes, prefix.length)) return undefined;
+	const n = prefix.length / 8;
+	if (prefix.length === 96) return address.slice(12, 16);
+	const beforeU = 8 - n;
+	if (address[8] !== 0) return undefined;
+	const embedded = [...address.slice(n, n + beforeU), ...address.slice(9, 9 + (4 - beforeU))];
+	return embedded.length === 4 ? embedded : undefined;
+}
+
+function deriveRfc7050Prefix(address: string): Nat64Prefix | undefined {
+	const bytes = ipv6Bytes(address);
+	if (!bytes) return undefined;
+	for (const length of RFC6052_PREFIX_LENGTHS) {
+		const prefix: Nat64Prefix = {
+			bytes: bytes.map((byte, index) => (index < length / 8 ? byte : 0)),
+			length,
+		};
+		if (length === 96 && prefix.bytes[8] !== 0) continue;
+		const embedded = decodeRfc6052(bytes, prefix);
+		if (embedded && IPV4ONLY_DISCOVERY_ADDRESSES.has(embedded.join("."))) return prefix;
+	}
+	return undefined;
+}
+
+async function resolveNat64Prefixes(policy: OAuthFetchPolicy): Promise<Nat64Prefix[]> {
+	const cacheKey = policy.nat64CacheKey ?? policy;
+	const existing = nat64PrefixCache.get(cacheKey);
+	if (existing && Date.now() < existing.expiresAt) return existing.promise;
+	const promise = (async () => {
+		if ((policy.nat64Prefixes?.length ?? 0) > 16) throw new Error("OAuth NAT64 prefix limit exceeded (16)");
+		const configured = policy.nat64Prefixes?.map(parseNat64Prefix);
+		if (configured) return [parseNat64Prefix("64:ff9b::/96"), ...configured];
+		try {
+			const { lookup } = await import("node:dns/promises");
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				const answers = await Promise.race([
+					lookup("ipv4only.arpa", { all: true, verbatim: true }),
+					new Promise<never>((_, reject) => {
+						timer = setTimeout(
+							() => reject(new Error("RFC 7050 discovery timed out")),
+							policy.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+						);
+					}),
+				]);
+				const discovered = answers
+					.slice(0, 64)
+					.filter(({ family }) => family === 6)
+					.map(({ address }) => deriveRfc7050Prefix(address))
+					.filter((prefix): prefix is Nat64Prefix => prefix !== undefined);
+				const unique = new Map(discovered.map((prefix) => [`${prefix.bytes.join(":")}/${prefix.length}`, prefix]));
+				return [parseNat64Prefix("64:ff9b::/96"), ...unique.values()];
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+		} catch {
+			return [parseNat64Prefix("64:ff9b::/96")];
+		}
+	})();
+	nat64PrefixCache.set(cacheKey, {
+		expiresAt: policy.nat64Prefixes === undefined ? Date.now() + NAT64_DISCOVERY_CACHE_MS : Number.POSITIVE_INFINITY,
+		promise,
+	});
+	return promise;
+}
+
+async function addressKindWithPolicy(
+	address: string,
+	family: number,
+	policy: OAuthFetchPolicy,
+): Promise<"public" | "loopback" | "blocked"> {
+	if (family !== 6) return addressKind(address, family);
+	const bytes = ipv6Bytes(address);
+	if (!bytes) return "blocked";
+	for (const prefix of await resolveNat64Prefixes(policy)) {
+		if (!inCidr(bytes, prefix.bytes, prefix.length)) continue;
+		const embedded = decodeRfc6052(bytes, prefix);
+		if (!embedded || ipv4Kind(embedded.join(".")) !== "public") return "blocked";
+	}
+	// A public embedded IPv4 never upgrades an otherwise non-global IPv6
+	// locator; discovered/configured prefixes are monotonic deny-only.
+	return ipv6Kind(address);
 }
 
 function ipv6Kind(address: string): "public" | "loopback" | "blocked" {
@@ -203,7 +322,9 @@ async function resolveTarget(rawUrl: string | URL, policy: OAuthFetchPolicy): Pr
 		}
 	}
 	if (addresses.length === 0) throw new Error(`OAuth hostname resolved to no addresses: ${hostname}`);
-	const kinds = addresses.map(({ address, family }) => addressKind(address, family));
+	const kinds = await Promise.all(
+		addresses.map(({ address, family }) => addressKindWithPolicy(address, family, policy)),
+	);
 	if (isHttpException) {
 		if (kinds.some((kind) => kind !== "loopback")) {
 			throw new Error("The configured HTTP MCP resource must resolve only to loopback addresses");

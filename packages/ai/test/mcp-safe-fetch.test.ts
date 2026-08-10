@@ -69,6 +69,107 @@ describe("MCP OAuth safe fetch", () => {
 		expect(global.fetch).toHaveBeenCalledOnce();
 	});
 
+	it.each([
+		{ prefix: "2a00::/32", publicAddress: "2a00:0:808:808::", privateAddress: "2a00:0:a00:1::" },
+		{ prefix: "2a00:1200::/40", publicAddress: "2a00:1200:8:808:8::", privateAddress: "2a00:1200:a:0:1::" },
+		{
+			prefix: "2a00:1234:5600::/48",
+			publicAddress: "2a00:1234:5600:808:8:800::",
+			privateAddress: "2a00:1234:5600:a00:0:100::",
+		},
+		{
+			prefix: "2a00:1234:5678::/56",
+			publicAddress: "2a00:1234:5678:8:8:808::",
+			privateAddress: "2a00:1234:5678:a:0:1::",
+		},
+		{
+			prefix: "2a00:1234:5678:9abc::/64",
+			publicAddress: "2a00:1234:5678:9abc:8:808:800:0",
+			privateAddress: "2a00:1234:5678:9abc:a:0:100:0",
+		},
+		{ prefix: "2a00:1098:2c::/96", publicAddress: "2a00:1098:2c::808:808", privateAddress: "2a00:1098:2c::a00:1" },
+	])("decodes configured RFC 6052 $prefix destinations", async ({ prefix, publicAddress, privateAddress }) => {
+		global.fetch = vi.fn(async () => jsonResponse({ ok: true })) as typeof fetch;
+		const policy = { nat64Prefixes: [prefix] };
+		await expect(safeFetchJson(`https://[${publicAddress}]/metadata`, undefined, policy)).resolves.toEqual({
+			ok: true,
+		});
+		await expect(safeFetchJson(`https://[${privateAddress}]/metadata`, undefined, policy)).rejects.toThrow(
+			/non-public/,
+		);
+	});
+
+	it("blocks private embeddings with non-zero suffix and invalid u octets", async () => {
+		global.fetch = vi.fn(async () => jsonResponse({})) as typeof fetch;
+		const policy = { nat64Prefixes: ["2a00::/32"] };
+		await expect(safeFetchJson("https://[2a00:0:a00:1:0:0:0:1]/metadata", undefined, policy)).rejects.toThrow(
+			/non-public/,
+		);
+		await expect(safeFetchJson("https://[2a00:0:808:808:100::]/metadata", undefined, policy)).rejects.toThrow(
+			/non-public/,
+		);
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
+	it.each(["2a00:1098:2c::7f00:1", "2a00:1098:2c::a00:1"])(
+		"rejects private IPv4 embedded under an RFC 7050-discovered prefix: %s",
+		async (address) => {
+			dnsLookup.mockResolvedValueOnce([
+				{ address: "2a00:1098:2c::c000:aa", family: 6 as const },
+				{ address: "2a00:1098:2c::c000:ab", family: 6 as const },
+			]);
+			global.fetch = vi.fn(async () => jsonResponse({})) as typeof fetch;
+			await expect(safeFetchJson(`https://[${address}]/metadata`, undefined, {})).rejects.toThrow(/non-public/);
+			expect(global.fetch).not.toHaveBeenCalled();
+		},
+	);
+
+	it("allows and caches public RFC 7050-discovered NAT64 destinations", async () => {
+		dnsLookup.mockResolvedValueOnce([
+			{ address: "2a00:1098:2c::c000:aa", family: 6 as const },
+			{ address: "2a00:1098:2c::c000:ab", family: 6 as const },
+		]);
+		global.fetch = vi.fn(async () => jsonResponse({ ok: true })) as typeof fetch;
+		const policy = {};
+		await expect(safeFetchJson("https://[2a00:1098:2c::808:808]/metadata", undefined, policy)).resolves.toEqual({
+			ok: true,
+		});
+		await expect(safeFetchJson("https://[2a00:1098:2c::101:101]/metadata", undefined, policy)).resolves.toEqual({
+			ok: true,
+		});
+		expect(dnsLookup).toHaveBeenCalledOnce();
+	});
+
+	it("refreshes cached RFC 7050 discovery so network-prefix changes fail closed", async () => {
+		vi.useFakeTimers();
+		dnsLookup
+			.mockResolvedValueOnce([{ address: "2a00:1098:2c::c000:aa", family: 6 as const }])
+			.mockResolvedValueOnce([{ address: "2a01:1098:2c::c000:aa", family: 6 as const }]);
+		global.fetch = vi.fn(async () => jsonResponse({ ok: true })) as typeof fetch;
+		const policy = {};
+		await expect(safeFetchJson("https://[2a00:1098:2c::808:808]/metadata", undefined, policy)).resolves.toEqual({
+			ok: true,
+		});
+		await vi.advanceTimersByTimeAsync(30_001);
+		await expect(safeFetchJson("https://[2a01:1098:2c::a00:1]/metadata", undefined, policy)).rejects.toThrow(
+			/non-public/,
+		);
+		expect(dnsLookup).toHaveBeenCalledTimes(2);
+		expect(global.fetch).toHaveBeenCalledOnce();
+	});
+
+	it.each([
+		["2a00::1/32", /non-zero host bits/],
+		["2a00::/72", /RFC 6052 length/],
+		["2a00:1098:2c:0:100::/96", /u octet zero/],
+	] as const)("rejects malformed configured NAT64 prefix %s", async (prefix, message) => {
+		global.fetch = vi.fn(async () => jsonResponse({})) as typeof fetch;
+		await expect(
+			safeFetchJson("https://[2a00:1098:2c::808:808]/metadata", undefined, { nat64Prefixes: [prefix] }),
+		).rejects.toThrow(message);
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
 	it("rejects a hostname when any DNS answer is private", async () => {
 		dnsLookup.mockResolvedValueOnce([
 			{ address: "93.184.216.34", family: 4 as 4 | 6 },

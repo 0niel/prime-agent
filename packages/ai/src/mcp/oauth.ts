@@ -65,6 +65,8 @@ export interface McpOAuthConfig {
 	 * integrations that have the 401 response can pass it through this field.
 	 */
 	authorizationChallenge?: string;
+	/** Optional operator-provided RFC 6052 NAT64 prefixes for this network context. */
+	nat64Prefixes?: string[];
 }
 
 /** Extra fields we persist alongside the standard credential triple. */
@@ -289,8 +291,19 @@ async function discover(
 	const attempts: string[] = [];
 	const errors: string[] = [];
 	let sawAdvertisedIssuers = false;
-	let challenge = authorizationChallenge ? parseMcpOAuthChallenge(authorizationChallenge) : undefined;
-	if (!challenge) {
+	let challenge: McpOAuthChallenge | undefined;
+	if (authorizationChallenge !== undefined) {
+		try {
+			challenge = parseMcpOAuthChallenge(authorizationChallenge);
+			if (challenge?.resourceMetadataUrl) new URL(challenge.resourceMetadataUrl);
+		} catch (cause) {
+			throw new Error("Supplied MCP OAuth authorization challenge was invalid", { cause });
+		}
+		if (!challenge?.resourceMetadataUrl) {
+			throw new Error("Supplied MCP OAuth authorization challenge omitted Bearer resource_metadata");
+		}
+	}
+	if (authorizationChallenge === undefined) {
 		try {
 			const probe = await probeMcpOAuthChallenge(resourceIdentifier, resourcePolicy);
 			if (probe.challenged) {
@@ -565,8 +578,10 @@ function toCredentials(
 /** Build a provider for one MCP server. Register it with registerOAuthProvider(). */
 export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInterface {
 	const label = config.label ?? config.server;
-	const resourcePolicy = createOAuthFetchPolicy(config.url);
-	const oauthPolicy: OAuthFetchPolicy = {};
+	const nat64Prefixes = config.nat64Prefixes ? [...config.nat64Prefixes] : undefined;
+	const nat64CacheKey = {};
+	const resourcePolicy: OAuthFetchPolicy = { ...createOAuthFetchPolicy(config.url), nat64Prefixes, nat64CacheKey };
+	const oauthPolicy: OAuthFetchPolicy = { nat64Prefixes, nat64CacheKey };
 
 	async function login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 		const discovery = await discover(config.url, resourcePolicy, oauthPolicy, config.authorizationChallenge);
