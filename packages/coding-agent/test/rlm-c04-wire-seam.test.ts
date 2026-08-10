@@ -3,13 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-	assertChildResultReference,
-	createRlmChildResultReferenceTerminalMessage,
-	formatRlmChildResultReference,
-	MAX_RLM_CHILD_RESULT_REFERENCE_BYTES,
+	createRlmSafeTerminalResultTerminalMessage,
+	MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES,
 	materializedTerminalMessageId,
 	openRlmDurableOperationStore,
-	type RlmChildResultReferenceV1,
 	readRlmDurableOperationRegistry,
 } from "../src/core/rlm-durable-operations.js";
 
@@ -19,44 +16,13 @@ const assignmentId = uuid(2);
 const operationId = uuid(3);
 const deliveryId = uuid(4);
 const childSessionId = uuid(5);
-const resultId = uuid(6);
-const handleId = uuid(7);
 const roots: string[] = [];
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function reference(overrides: Partial<RlmChildResultReferenceV1> = {}): RlmChildResultReferenceV1 {
-	return {
-		version: 1,
-		resultId,
-		status: "completed",
-		summary: "completed safely",
-		preview: "safe preview",
-		model: {
-			initialResolvedSelector: "test/initial",
-			terminalResolvedSelector: "test/final",
-			fallbackHistory: ["test/initial"],
-		},
-		artifacts: [
-			{
-				version: 1,
-				handleId,
-				resultId,
-				kind: "terminal_output",
-				contentType: "text/plain",
-				byteLength: 512 * 1024 * 1024,
-				sha256: "a".repeat(64),
-				retentionState: "retained",
-			},
-		],
-		retentionState: "retained",
-		...overrides,
-	};
-}
-
 function fixture() {
-	const root = mkdtempSync(join(tmpdir(), "rlm-c04-wire-"));
+	const root = mkdtempSync(join(tmpdir(), "rlm-safe-terminal-"));
 	roots.push(root);
 	const parentArtifacts = join(root, "parent-artifacts");
 	const childArtifacts = join(root, "child-artifacts");
@@ -93,7 +59,7 @@ function fixture() {
 			childArtifactRoot: root,
 		}),
 	).toBe(true);
-	const outbox = (message: ReturnType<typeof createRlmChildResultReferenceTerminalMessage>) => ({
+	const outbox = (message: ReturnType<typeof createRlmSafeTerminalResultTerminalMessage>) => ({
 		parentSessionId: parentId,
 		parentSessionFile: parentFile,
 		parentSessionRoot: root,
@@ -110,23 +76,45 @@ function fixture() {
 		terminal: "done" as const,
 		message,
 	});
-	return { root, parentArtifacts, childArtifacts, parentFile, childFile, store, outbox };
+	return { root, parentArtifacts, childArtifacts, childFile, store, outbox };
 }
 
-describe("C03 C04 bounded child-result wire seam", () => {
-	it("accepts an exact C04 projection and deterministically derives the only content", () => {
-		const result = reference();
-		assertChildResultReference(result);
-		const message = createRlmChildResultReferenceTerminalMessage(result, 1);
-		expect(message.content).toBe(formatRlmChildResultReference(result));
-		expect(Buffer.byteLength(message.content)).toBeLessThanOrEqual(MAX_RLM_CHILD_RESULT_REFERENCE_BYTES);
+describe("C03 generic safe-terminal envelope", () => {
+	it("uses only the exact generic keys and retains the opaque projection verbatim", () => {
+		const projection = '{"unrelated":true,"nested":{"anything":"caller-owned"}}';
+		const message = createRlmSafeTerminalResultTerminalMessage("human presentation", projection, 1);
+		expect(message).toEqual({
+			role: "custom",
+			customType: "rlm_safe_terminal_result",
+			content: "human presentation",
+			display: true,
+			details: { kind: "safe_terminal_result_v1", projection },
+			timestamp: 1,
+		});
+		expect(Object.keys(message.details).sort()).toEqual(["kind", "projection"]);
 	});
 
-	it("rejects arbitrary/mismatched content while leaving legacy 24KiB messages unchanged", () => {
-		const result = reference();
-		const message = createRlmChildResultReferenceTerminalMessage(result, 1);
+	it("permits caller-owned mismatched presentation without interpreting projection", () => {
 		const f = fixture();
-		expect(() => f.store.appendOutbox(f.outbox({ ...message, content: "arbitrary" }))).toThrow(/deterministic/);
+		const message = createRlmSafeTerminalResultTerminalMessage("status unavailable", '{"status":"completed"}', 1);
+		expect(() => f.store.appendOutbox(f.outbox(message))).not.toThrow();
+	});
+
+	it("rejects unknown envelope keys and the full near-cap overflow while legacy remains 24KiB", () => {
+		const f = fixture();
+		const valid = createRlmSafeTerminalResultTerminalMessage("presentation", "{}", 1);
+		expect(() =>
+			f.store.appendOutbox(f.outbox({ ...valid, details: { ...valid.details, extra: true } } as never)),
+		).toThrow(/details/);
+		const base = createRlmSafeTerminalResultTerminalMessage("presentation", "", 1);
+		const overhead = Buffer.byteLength(JSON.stringify(base));
+		expect(() =>
+			createRlmSafeTerminalResultTerminalMessage(
+				"presentation",
+				"x".repeat(MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES - overhead + 32),
+				1,
+			),
+		).toThrow(/too large/);
 		const legacy = {
 			role: "custom" as const,
 			customType: "rlm_child_terminal_notice" as const,
@@ -138,23 +126,24 @@ describe("C03 C04 bounded child-result wire seam", () => {
 		expect(() => f.store.appendOutbox(f.outbox(legacy as never))).toThrow(/too large/);
 	});
 
-	it("round-trips reference-only delivery through outbox, terminal, inbox, restart and materialization", () => {
+	it("stores the exact message once with deterministic digest, import, restart, and materialization", () => {
 		const f = fixture();
-		const message = createRlmChildResultReferenceTerminalMessage(reference(), 1);
+		const message = createRlmSafeTerminalResultTerminalMessage("arbitrary presentation", '{"safe":"opaque"}', 1);
 		expect(f.store.appendOutbox(f.outbox(message))).toBe("new");
-		// Store identity compares the canonical message digest, so the exact
-		// projection is idempotent without a second hand-off body.
-		expect(f.store.appendOutbox(f.outbox(createRlmChildResultReferenceTerminalMessage(reference(), 1)))).toBe(
-			"already_recorded",
-		);
+		expect(
+			f.store.appendOutbox(
+				f.outbox(createRlmSafeTerminalResultTerminalMessage("arbitrary presentation", '{"safe":"opaque"}', 1)),
+			),
+		).toBe("already_recorded");
 		expect(
 			f.store.recordTerminal({ parentSessionId: parentId, assignmentId, operationId, deliveryId, terminal: "done" }),
 		).toBe(true);
 		expect(f.store.importOutbox(f.outbox(message))).toBe("new");
-		const inbox = f.store.pendingInbox();
-		expect(inbox).toHaveLength(1);
-		expect(inbox[0]!.message).toEqual(message);
-		expect(readFileSync(join(f.childArtifacts, "rlm-terminal-outbox.jsonl"), "utf8")).not.toContain("owner");
+		expect(f.store.pendingInbox()).toHaveLength(1);
+		expect(f.store.pendingInbox()[0]!.message).toEqual(message);
+		expect(readFileSync(join(f.childArtifacts, "rlm-terminal-outbox.jsonl"), "utf8")).toContain(
+			JSON.stringify(message.details.projection),
+		);
 		expect(
 			f.store.markMaterializedDelivery({
 				parentSessionId: parentId,
@@ -185,42 +174,9 @@ describe("C03 C04 bounded child-result wire seam", () => {
 		).toBe(1);
 	});
 
-	it("fails closed for unknown/nested owner/path/body, bad UUID/digest, duplicate handles, mismatch and malformed JSONL", () => {
-		const bads: unknown[] = [
-			{ ...reference(), owner: {} },
-			{ ...reference(), artifacts: [{ ...reference().artifacts[0]!, owner: { parentSessionId: parentId } }] },
-			{ ...reference(), artifacts: [{ ...reference().artifacts[0]!, path: "/private/secret" }] },
-			{ ...reference(), artifacts: [{ ...reference().artifacts[0]!, body: "secret" }] },
-			{ ...reference(), resultId: "not-a-v4" },
-			{ ...reference(), artifacts: [{ ...reference().artifacts[0]!, sha256: "A".repeat(64) }] },
-			{ ...reference(), artifacts: [reference().artifacts[0]!, reference().artifacts[0]!] },
-			{ ...reference(), artifacts: [{ ...reference().artifacts[0]!, resultId: uuid(8) }] },
-			{ ...reference(), status: "completed", error: { code: "invalid_result", message: "no" } },
-			{ ...reference(), status: "failed", error: undefined },
-		];
-		for (const candidate of bads) expect(() => assertChildResultReference(candidate)).toThrow();
+	it("retains malformed JSONL recovery without introducing a provider or queue path", () => {
 		const f = fixture();
 		appendFileSync(join(f.parentArtifacts, "rlm-terminal-inbox.jsonl"), "{bad}\n");
 		expect(readRlmDurableOperationRegistry(f.parentArtifacts).hasUncertainRecords).toBe(true);
-	});
-
-	it("enforces Unicode scalar and UTF-8 byte bounds and the 64KiB projection cap", () => {
-		expect(() => assertChildResultReference(reference({ summary: "😀".repeat(4097) }))).toThrow();
-		expect(() => assertChildResultReference(reference({ preview: "😀".repeat(2049) }))).toThrow();
-		expect(() => assertChildResultReference(reference({ summary: "𐀀".repeat(4097) }))).toThrow();
-		const huge = reference({
-			artifacts: Array.from({ length: 16 }, (_, index) => ({
-				...reference().artifacts[0]!,
-				handleId: uuid(index + 20),
-			})),
-		});
-		huge.summary = "𐀀".repeat(4096);
-		huge.preview = "𐀀".repeat(2048);
-		huge.model = {
-			initialResolvedSelector: "𐀀".repeat(512),
-			terminalResolvedSelector: "𐀀".repeat(512),
-			fallbackHistory: Array.from({ length: 16 }, () => "𐀀".repeat(512)),
-		};
-		expect(() => assertChildResultReference(huge)).toThrow(/too large/);
 	});
 });

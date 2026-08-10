@@ -22,76 +22,6 @@ import { dirname, isAbsolute, relative } from "node:path";
 export type RlmChildTerminalStatus = "done" | "error" | "cancelled";
 export const RLM_DURABLE_VERSION = 1 as const;
 
-/**
- * The deliberately small, C03-owned view of C04's terminal result reference.
- * It has no C01/C03 owner tuple: those IDs remain only in the surrounding
- * durable record and are never copied into a parent transcript message.
- */
-/** C04's C05-facing opaque-reference spelling for this C03 wire view. */
-export type C04OpaqueArtifactReference = RlmChildResultArtifactReference;
-
-export interface RlmChildResultArtifactReference {
-	version: 1;
-	handleId: string;
-	resultId: string;
-	kind: "terminal_output" | "diagnostic" | "trajectory" | "attachment";
-	contentType: "text/plain" | "application/json" | "application/octet-stream";
-	byteLength: number;
-	sha256: string;
-	retentionState: "retained" | "expired" | "deleted" | "unavailable" | "uncertain";
-}
-
-export interface RlmChildResultModelReference {
-	requestedSelector?: string;
-	initialResolvedSelector: string;
-	terminalResolvedSelector: string;
-	fallbackHistory?: readonly string[];
-}
-
-export type RlmChildResultErrorCode =
-	| "invalid_result"
-	| "result_too_large"
-	| "artifact_too_large"
-	| "artifact_quota_exceeded"
-	| "artifact_unavailable"
-	| "artifact_integrity_failed"
-	| "artifact_expired"
-	| "terminal_storage_failed"
-	| "cancelled"
-	| "timed_out"
-	| "stalled"
-	| "unknown_after_crash";
-
-export interface RlmChildResultErrorReference {
-	/** A closed C04 code, never a provider error or a thrown error name. */
-	code: RlmChildResultErrorCode;
-	/** A pre-sanitized, bounded safe explanation. */
-	message: string;
-}
-
-/**
- * C04's v1 bounded terminal projection as carried by C03. C03 validates,
- * persists, imports, and materializes this value, but does not construct it.
- * In particular it is not an artifact-read capability and contains neither
- * owner identities nor payload/path/body data.
- */
-export interface RlmChildResultReferenceV1 {
-	version: 1;
-	resultId: string;
-	status: "completed" | "failed" | "cancelled" | "timed_out" | "stalled" | "unknown_after_crash";
-	summary: string;
-	/** C04 requires a deliberately prepared safe preview for every terminal result. */
-	preview: string;
-	error?: RlmChildResultErrorReference;
-	model?: RlmChildResultModelReference;
-	artifacts: readonly RlmChildResultArtifactReference[];
-	retentionState: "retained" | "expired" | "deleted" | "unavailable" | "uncertain";
-}
-
-/** C04's stable bounded public projection spelling. */
-export type C04ChildResultReference = RlmChildResultReferenceV1;
-export type C04PublicChildResult = RlmChildResultReferenceV1;
-
 export type RlmTerminalMessage =
 	| {
 			role: "custom";
@@ -118,10 +48,10 @@ export type RlmTerminalMessage =
 	  }
 	| {
 			role: "custom";
-			customType: "rlm_child_result_reference";
+			customType: "rlm_safe_terminal_result";
 			content: string;
 			display: true;
-			details: { kind: "child_result_v1"; result: RlmChildResultReferenceV1 };
+			details: { kind: "safe_terminal_result_v1"; projection: string };
 			timestamp: number;
 	  };
 
@@ -386,64 +316,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const TERMINALS = new Set<RlmChildTerminalStatus>(["done", "error", "cancelled"]);
 const MAX_MESSAGE_CHARS = 16_384;
 const MAX_MESSAGE_BYTES = 24 * 1024;
-/** C04 v1 wire bounds. These are fixed C03 acceptance bounds, not knobs. */
-export const RLM_CHILD_RESULT_REFERENCE_VERSION = 1 as const;
-export const MAX_RLM_CHILD_RESULT_REFERENCE_BYTES = 64 * 1024;
-export const MAX_RLM_CHILD_RESULT_SUMMARY_CHARS = 4_096;
-export const MAX_RLM_CHILD_RESULT_SUMMARY_BYTES = 16 * 1024;
-export const MAX_RLM_CHILD_RESULT_PREVIEW_CHARS = 2_048;
-export const MAX_RLM_CHILD_RESULT_PREVIEW_BYTES = 8 * 1024;
-export const MAX_RLM_CHILD_RESULT_ERROR_CODE_CHARS = 96;
-export const MAX_RLM_CHILD_RESULT_ERROR_MESSAGE_CHARS = 1_024;
-export const MAX_RLM_CHILD_RESULT_ERROR_MESSAGE_BYTES = 4 * 1024;
-export const MAX_RLM_CHILD_RESULT_ARTIFACTS = 16;
-const MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_CHARS = 512;
-const MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_BYTES = 2 * 1024;
-const MAX_RLM_CHILD_RESULT_MODEL_FALLBACKS = 16;
-export const MAX_RLM_CHILD_RESULT_ARTIFACT_BYTES = 512 * 1024 * 1024;
-const MAX_RLM_CHILD_RESULT_ERROR_CODE_BYTES = 384;
-const SHA256 = /^[0-9a-f]{64}$/;
-const RLM_CHILD_RESULT_STATUSES = new Set<RlmChildResultReferenceV1["status"]>([
-	"completed",
-	"failed",
-	"cancelled",
-	"timed_out",
-	"stalled",
-	"unknown_after_crash",
-]);
-const RLM_CHILD_RESULT_RETENTION_STATES = new Set<RlmChildResultReferenceV1["retentionState"]>([
-	"retained",
-	"expired",
-	"deleted",
-	"unavailable",
-	"uncertain",
-]);
-const RLM_CHILD_RESULT_ARTIFACT_KINDS = new Set<RlmChildResultArtifactReference["kind"]>([
-	"terminal_output",
-	"diagnostic",
-	"trajectory",
-	"attachment",
-]);
-const RLM_CHILD_RESULT_CONTENT_TYPES = new Set<RlmChildResultArtifactReference["contentType"]>([
-	"text/plain",
-	"application/json",
-	"application/octet-stream",
-]);
-const RLM_CHILD_RESULT_ERROR_CODES = new Set<RlmChildResultErrorCode>([
-	"invalid_result",
-	"result_too_large",
-	"artifact_too_large",
-	"artifact_quota_exceeded",
-	"artifact_unavailable",
-	"artifact_integrity_failed",
-	"artifact_expired",
-	"terminal_storage_failed",
-	"cancelled",
-	"timed_out",
-	"stalled",
-	"unknown_after_crash",
-]);
-const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+/** Fixed C03 bounds for the generic public safe-terminal envelope. */
+export const MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES = 64 * 1024;
+export const MAX_RLM_SAFE_TERMINAL_CONTENT_CHARS = 16_384;
+
 const LEDGER = "rlm-operation-ledger.jsonl";
 const INBOX = "rlm-terminal-inbox.jsonl";
 const CONSUMED = "rlm-terminal-consumed.jsonl";
@@ -1443,243 +1319,60 @@ function assertTerminalMessage(value: unknown): asserts value is RlmTerminalMess
 			)
 				throw new Error("Completed notice details are not approved");
 		} else throw new Error("Unknown terminal notice kind");
-	} else if (value.customType === "rlm_child_result_reference") {
+	} else if (value.customType === "rlm_safe_terminal_result") {
 		if (
 			!isObject(value.details) ||
-			!exactKeys(value.details, ["kind", "result"]) ||
-			value.details.kind !== "child_result_v1"
+			!exactKeys(value.details, ["kind", "projection"]) ||
+			value.details.kind !== "safe_terminal_result_v1" ||
+			!isUtf8String(value.details.projection)
 		)
-			throw new Error("Child-result reference details are not approved");
-		assertChildResultReference(value.details.result);
-		if (value.content !== formatRlmChildResultReference(value.details.result))
-			throw new Error("Child-result reference content must be its deterministic projection");
-		// The C04 projection itself has the 64-KiB cap.  Do not apply C03's
-		// legacy 24-KiB envelope cap here: that would silently narrow C04.
+			throw new Error("Safe-terminal result details are not approved");
+		if (!isBoundedText(value.content, MAX_RLM_SAFE_TERMINAL_CONTENT_CHARS))
+			throw new Error("Safe-terminal human content is invalid or too large");
+		// The string is deliberately opaque; only the full envelope byte cap is checked.
+		if (Buffer.byteLength(stableJson(value), "utf8") > MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES)
+			throw new Error("Safe-terminal terminal message is too large");
 	} else throw new Error("Terminal message custom type is not approved");
-	if (value.customType !== "rlm_child_result_reference") {
+	if (value.customType !== "rlm_safe_terminal_result") {
 		if (!isBoundedText(value.content, MAX_MESSAGE_CHARS) || Buffer.byteLength(stableJson(value)) > MAX_MESSAGE_BYTES)
 			throw new Error("Terminal message is too large");
 	}
 }
 
 /**
- * Stable C03 transcript/outbox representation of C04's public projection.
- * It deliberately contains only the projection and has no owner/path/body
- * interpolation or provider/queue side effect.
+ * Creates the generic safe-terminal envelope from already-sanitized caller
+ * inputs. It deliberately makes no interpretation of `projection`.
  */
-export function formatRlmChildResultReference(result: RlmChildResultReferenceV1): string {
-	assertChildResultReference(result);
-	return stableJson(result);
-}
-
-/** Creates the only accepted C04 terminal-message form. */
-export function createRlmChildResultReferenceTerminalMessage(
-	result: RlmChildResultReferenceV1,
+export function createRlmSafeTerminalResultTerminalMessage(
+	content: string,
+	projection: string,
 	timestamp: number,
-): Extract<RlmTerminalMessage, { customType: "rlm_child_result_reference" }> {
+): Extract<RlmTerminalMessage, { customType: "rlm_safe_terminal_result" }> {
 	if (!Number.isFinite(timestamp)) throw new Error("Terminal timestamp must be finite");
-	const content = formatRlmChildResultReference(result);
-	return {
-		role: "custom",
-		customType: "rlm_child_result_reference",
+	const message = {
+		role: "custom" as const,
+		customType: "rlm_safe_terminal_result" as const,
 		content,
-		display: true,
-		details: { kind: "child_result_v1", result },
+		display: true as const,
+		details: { kind: "safe_terminal_result_v1" as const, projection },
 		timestamp,
 	};
+	assertTerminalMessage(message);
+	return message;
 }
 
-/**
- * Exact, recursive C04 wire validator.  This validates the public C03
- * projection, rather than C04's owner-bearing on-disk ChildResult.  Thus a
- * successful value cannot smuggle a capability, a path, a body, or C01/C03
- * correlation fields through an unknown nested property.
- */
-export function assertChildResultReference(value: unknown): asserts value is RlmChildResultReferenceV1 {
-	if (!isObject(value)) throw new Error("Child-result reference has unknown or missing fields");
-	const hasError = value.error !== undefined;
-	const hasModel = value.model !== undefined;
-	if (
-		!exactKeys(value, [
-			"version",
-			"resultId",
-			"status",
-			"summary",
-			"preview",
-			"artifacts",
-			"retentionState",
-			...(hasError ? ["error"] : []),
-			...(hasModel ? ["model"] : []),
-		])
-	)
-		throw new Error("Child-result reference has unknown or missing fields");
-	if (value.version !== RLM_CHILD_RESULT_REFERENCE_VERSION)
-		throw new Error("Child-result reference version is unsupported");
-	assertUuidV4(value.resultId, "resultId");
-	if (
-		typeof value.status !== "string" ||
-		!RLM_CHILD_RESULT_STATUSES.has(value.status as RlmChildResultReferenceV1["status"])
-	)
-		throw new Error("Child-result status is not approved");
-	assertResultText(value.summary, "summary", MAX_RLM_CHILD_RESULT_SUMMARY_CHARS, MAX_RLM_CHILD_RESULT_SUMMARY_BYTES);
-	assertResultText(value.preview, "preview", MAX_RLM_CHILD_RESULT_PREVIEW_CHARS, MAX_RLM_CHILD_RESULT_PREVIEW_BYTES);
-	if (
-		typeof value.retentionState !== "string" ||
-		!RLM_CHILD_RESULT_RETENTION_STATES.has(value.retentionState as RlmChildResultReferenceV1["retentionState"])
-	)
-		throw new Error("Child-result retention state is not approved");
-	if (hasModel) assertChildResultModel(value.model);
-	if (!Array.isArray(value.artifacts) || value.artifacts.length > MAX_RLM_CHILD_RESULT_ARTIFACTS)
-		throw new Error("Child-result artifacts are too numerous or invalid");
-	const handles = new Set<string>();
-	for (const artifact of value.artifacts) {
-		assertChildResultArtifact(artifact, value.resultId);
-		if (handles.has(artifact.handleId)) throw new Error("Child-result artifact handles must be unique");
-		handles.add(artifact.handleId);
+/** Verifies that the JavaScript string contains Unicode scalar values only. */
+function isUtf8String(value: unknown): value is string {
+	if (typeof value !== "string") return false;
+	for (let index = 0; index < value.length; index++) {
+		const unit = value.charCodeAt(index);
+		if (unit >= 0xd800 && unit <= 0xdbff) {
+			if (index + 1 >= value.length) return false;
+			const next = value.charCodeAt(++index);
+			if (next < 0xdc00 || next > 0xdfff) return false;
+		} else if (unit >= 0xdc00 && unit <= 0xdfff) return false;
 	}
-	if (value.status === "completed") {
-		if (value.error !== undefined) throw new Error("Completed child result cannot carry an error");
-	} else {
-		assertChildResultError(value.error);
-	}
-	if (Buffer.byteLength(stableJson(value), "utf8") > MAX_RLM_CHILD_RESULT_REFERENCE_BYTES)
-		throw new Error("Child-result reference is too large");
-}
-
-/** Boolean form for reducers which must fail closed without throwing. */
-export function isRlmChildResultReference(value: unknown): value is RlmChildResultReferenceV1 {
-	try {
-		assertChildResultReference(value);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function assertChildResultArtifact(value: unknown, resultId: string): asserts value is RlmChildResultArtifactReference {
-	if (
-		!isObject(value) ||
-		!exactKeys(value, [
-			"version",
-			"handleId",
-			"resultId",
-			"kind",
-			"contentType",
-			"byteLength",
-			"sha256",
-			"retentionState",
-		])
-	)
-		throw new Error("Child-result artifact has unknown or missing fields");
-	if (value.version !== RLM_CHILD_RESULT_REFERENCE_VERSION)
-		throw new Error("Child-result artifact version is unsupported");
-	assertUuidV4(value.handleId, "handleId");
-	if (value.resultId !== resultId) throw new Error("Child-result artifact resultId does not match");
-	if (
-		typeof value.kind !== "string" ||
-		!RLM_CHILD_RESULT_ARTIFACT_KINDS.has(value.kind as RlmChildResultArtifactReference["kind"])
-	)
-		throw new Error("Child-result artifact kind is not approved");
-	if (
-		typeof value.contentType !== "string" ||
-		!RLM_CHILD_RESULT_CONTENT_TYPES.has(value.contentType as RlmChildResultArtifactReference["contentType"])
-	)
-		throw new Error("Child-result artifact content type is not approved");
-	if (
-		typeof value.byteLength !== "number" ||
-		!Number.isSafeInteger(value.byteLength) ||
-		value.byteLength < 0 ||
-		value.byteLength > MAX_RLM_CHILD_RESULT_ARTIFACT_BYTES
-	)
-		throw new Error("Child-result artifact byte length is invalid");
-	if (typeof value.sha256 !== "string" || !SHA256.test(value.sha256))
-		throw new Error("Child-result artifact sha256 is invalid");
-	if (
-		typeof value.retentionState !== "string" ||
-		!RLM_CHILD_RESULT_RETENTION_STATES.has(value.retentionState as RlmChildResultReferenceV1["retentionState"])
-	)
-		throw new Error("Child-result artifact retention state is not approved");
-}
-
-function assertChildResultModel(value: unknown): asserts value is RlmChildResultModelReference {
-	if (!isObject(value)) throw new Error("Child-result model is invalid");
-	const hasRequested = value.requestedSelector !== undefined;
-	const hasHistory = value.fallbackHistory !== undefined;
-	if (
-		!exactKeys(value, [
-			"initialResolvedSelector",
-			"terminalResolvedSelector",
-			...(hasRequested ? ["requestedSelector"] : []),
-			...(hasHistory ? ["fallbackHistory"] : []),
-		])
-	)
-		throw new Error("Child-result model has unknown or missing fields");
-	if (hasRequested)
-		assertResultText(
-			value.requestedSelector,
-			"requestedSelector",
-			MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_CHARS,
-			MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_BYTES,
-		);
-	assertResultText(
-		value.initialResolvedSelector,
-		"initialResolvedSelector",
-		MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_CHARS,
-		MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_BYTES,
-	);
-	assertResultText(
-		value.terminalResolvedSelector,
-		"terminalResolvedSelector",
-		MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_CHARS,
-		MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_BYTES,
-	);
-	if (hasHistory) {
-		if (!Array.isArray(value.fallbackHistory) || value.fallbackHistory.length > MAX_RLM_CHILD_RESULT_MODEL_FALLBACKS)
-			throw new Error("Child-result model fallback history is invalid");
-		for (const selector of value.fallbackHistory)
-			assertResultText(
-				selector,
-				"fallback selector",
-				MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_CHARS,
-				MAX_RLM_CHILD_RESULT_MODEL_SELECTOR_BYTES,
-			);
-	}
-}
-
-function assertChildResultError(value: unknown): asserts value is RlmChildResultErrorReference {
-	if (
-		!isObject(value) ||
-		!exactKeys(value, ["code", "message"]) ||
-		typeof value.code !== "string" ||
-		!RLM_CHILD_RESULT_ERROR_CODES.has(value.code as RlmChildResultErrorCode)
-	)
-		throw new Error("Child-result error is not a closed safe error");
-	assertResultText(
-		value.code,
-		"error code",
-		MAX_RLM_CHILD_RESULT_ERROR_CODE_CHARS,
-		MAX_RLM_CHILD_RESULT_ERROR_CODE_BYTES,
-	);
-	assertResultText(
-		value.message,
-		"error message",
-		MAX_RLM_CHILD_RESULT_ERROR_MESSAGE_CHARS,
-		MAX_RLM_CHILD_RESULT_ERROR_MESSAGE_BYTES,
-	);
-}
-
-function assertUuidV4(value: unknown, name: string): asserts value is string {
-	if (typeof value !== "string" || !UUID_V4.test(value)) throw new Error(`${name} must be a canonical UUIDv4`);
-}
-
-function assertResultText(value: unknown, name: string, charLimit: number, byteLimit: number): asserts value is string {
-	if (
-		typeof value !== "string" ||
-		!value.trim() ||
-		Array.from(value).length > charLimit ||
-		Buffer.byteLength(value, "utf8") > byteLimit
-	)
-		throw new Error(`${name} is invalid or too large`);
+	return true;
 }
 
 function digestMessage(message: RlmTerminalMessage): string {

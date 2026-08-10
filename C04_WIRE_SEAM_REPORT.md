@@ -1,17 +1,13 @@
-# C04 wire seam report — C03 integration
-
-**Order / dependency.** This narrowly completes the C03-to-C04 terminal wire seam on top of C03 `d9b58451e012774f5d4e5b708668cd3e413994f1`. It is intentionally earlier than, and does not substitute for, the C04 artifact store/resolver described in `terra-c04-contract.md`; C03 remains the sole ledger/outbox/inbox/consumed transport authority. There are no provider, stream, queue, daemon protocol, or limiter changes.
+# C03 generic safe-terminal envelope report
 
 ## Contract delivered
 
-- Added the closed `RlmTerminalMessage` `rlm_child_result_reference` variant, with `details.kind: "child_result_v1"` and a `RlmChildResultReferenceV1` projection only.
-- `assertChildResultReference` is recursive and fail-closed: exact keys at every object level, canonical UUIDv4 result/handle IDs, lower-case 64-hex SHA-256, safe artifact byte integers through 512 MiB, at most 16 unique handles bound to the outer `resultId`, closed status/kind/content-type/error/retention sets, required summary/preview, and scalar-value plus UTF-8 byte limits.
-- The projection is capped at 64 KiB. Legacy terminal messages retain their pre-existing 16,384-character / 24-KiB envelope cap. The result-reference branch validates its projection cap instead and never loosens legacy acceptance.
-- `formatRlmChildResultReference` and `createRlmChildResultReferenceTerminalMessage` make `content` exactly the canonical projection. Validation rejects arbitrary or mismatching content. A completed result rejects `error`; every non-completed result requires a closed `{ code, message }` safe error.
-- No owner/correlation ID, filesystem path, payload/body, or unknown nested field can enter this C03 public projection.
+C03 now owns one durable terminal-envelope variant only: `rlm_safe_terminal_result` with the exact `details` shape `{ kind: "safe_terminal_result_v1", projection: string }`. The `projection` is an opaque caller-produced safe JSON string. C03 checks its JavaScript string type and UTF-8 byte size only as part of the full stable terminal-message 64 KiB cap. It never parses, validates, sanitizes, or reserializes the projection's JSON.
+
+`content` is separately supplied bounded human presentation (16,384 characters). It is intentionally not compared with or derived from `projection`. The exported `createRlmSafeTerminalResultTerminalMessage(content, projection, timestamp)` constructor accepts these already-sanitized caller inputs and creates the exact envelope.
+
+The generic envelope is accepted by the existing durable ledger/outbox/inbox/consumed transport. Stable-message digest identity and restart recovery therefore retain the exact message once. Legacy terminal variants retain their established 16,384-character and 24 KiB envelope bounds.
 
 ## Focused proof
 
-`rlm-c04-wire-seam.test.ts` adds five deterministic tests for exact acceptance/formatting, legacy-cap isolation, outbox/terminal/inbox/restart/materialization and digest idempotence, malicious nested fields/malformed recovery, and character/byte/64-KiB boundaries. It uses only temporary local artifacts.
-
-The source is a C03 adapter seam, not C04 artifact creation or authorization. The full C04 implementation must use the contract-owned `rlm-child-results.ts` authority and then hand only this validated projection to C03.
+The focused seam test proves exact keys, verbatim opaque projection retention, arbitrary mismatched human presentation, full-envelope near-cap rejection, legacy-cap isolation, deterministic digest/idempotence, outbox/inbox round-trip, restart/materialization, and malformed JSONL recovery. It uses only temporary local artifacts; no provider or queue is involved.
