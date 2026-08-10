@@ -1,8 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+
+const tsxPath = fileURLToPath(new URL("../../../node_modules/tsx/dist/cli.mjs", import.meta.url));
+const benchmarkPath = fileURLToPath(new URL("./streaming-json-parse-cpu-bench.ts", import.meta.url));
+const packagePath = fileURLToPath(new URL("../", import.meta.url));
 
 const temporaryDirectories: string[] = [];
 
@@ -18,8 +23,8 @@ describe("streaming JSON CPU benchmark CLI", () => {
 		execFileSync(
 			process.execPath,
 			[
-				resolve(process.cwd(), "../../node_modules/tsx/dist/cli.mjs"),
-				"test/streaming-json-parse-cpu-bench.ts",
+				tsxPath,
+				benchmarkPath,
 				"--name",
 				"N01-streaming-structured-output-parse-cpu",
 				"--json",
@@ -31,7 +36,7 @@ describe("streaming JSON CPU benchmark CLI", () => {
 				"--repetitions",
 				"3",
 			],
-			{ cwd: process.cwd(), stdio: "pipe" },
+			{ cwd: packagePath, stdio: "pipe" },
 		);
 		const result = JSON.parse(readFileSync(output, "utf8")) as {
 			name: string;
