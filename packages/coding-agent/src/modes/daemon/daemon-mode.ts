@@ -535,22 +535,33 @@ function removeSupervisorLaunchLockGenerationUnlocked(
 }
 
 function refreshSupervisorLaunchLock(lockDirectory: string, token: string): boolean {
-	return withSupervisorLaunchLockGuard(lockDirectory, () => {
-		if (readSupervisorLaunchLock(lockDirectory)?.generation !== token) {
+	return withSupervisorLaunchLockGuard(lockDirectory, () => refreshSupervisorLaunchLockUnlocked(lockDirectory, token));
+}
+
+function refreshSupervisorLaunchLockUnlocked(lockDirectory: string, token: string): boolean {
+	if (readSupervisorLaunchLock(lockDirectory)?.generation !== token) {
+		return false;
+	}
+	const leasePath = join(lockDirectory, supervisorLaunchLockOwnerFileName(token));
+	try {
+		const now = Date.now() / 1000;
+		utimesSync(leasePath, now, now);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 			return false;
 		}
-		const leasePath = join(lockDirectory, supervisorLaunchLockOwnerFileName(token));
-		try {
-			const now = Date.now() / 1000;
-			utimesSync(leasePath, now, now);
-			return true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				return false;
-			}
-			throw error;
-		}
-	});
+		throw error;
+	}
+}
+
+function isSupervisorLaunchLockFresh(lockDirectory: string, generation: string): boolean {
+	const snapshot = readSupervisorLaunchLock(lockDirectory);
+	return (
+		snapshot?.generation === generation &&
+		Date.now() - snapshot.updatedAtMs >= 0 &&
+		Date.now() - snapshot.updatedAtMs < SUPERVISOR_LAUNCH_LOCK_STALE_MS
+	);
 }
 
 function isProcessIdAlive(pid: number): boolean {
@@ -1094,15 +1105,26 @@ export class AgentDaemon {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
-			if (!assertCurrentLockGeneration()) {
+			const child = withSupervisorLaunchLockGuard(lockDirectory, () => {
+				if (
+					!lockGeneration ||
+					readSupervisorLaunchLock(lockDirectory)?.generation !== lockGeneration ||
+					!refreshSupervisorLaunchLockUnlocked(lockDirectory, lockGeneration) ||
+					!isSupervisorLaunchLockFresh(lockDirectory, lockGeneration)
+				) {
+					lockGenerationLost = true;
+					return undefined;
+				}
+				return spawn(launch.command, launch.args, {
+					cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
+					detached: true,
+					env: environment,
+					stdio: "ignore",
+				});
+			});
+			if (!child) {
 				return;
 			}
-			const child = spawn(launch.command, launch.args, {
-				cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
-				detached: true,
-				env: environment,
-				stdio: "ignore",
-			});
 			child.unref();
 			const deadline = Date.now() + 10_000;
 			while (!this.shuttingDown && Date.now() < deadline) {

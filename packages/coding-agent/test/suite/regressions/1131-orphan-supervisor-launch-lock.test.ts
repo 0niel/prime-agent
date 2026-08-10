@@ -4,7 +4,31 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const launchTestState = vi.hoisted(() => ({ launchSpecCalls: 0 }));
+const launchTestState = vi.hoisted(() => ({
+	launchSpecCalls: 0,
+	spawnCalls: 0,
+	interceptSpawn: false,
+	onSpawn: undefined as (() => void) | undefined,
+}));
+
+interface ChildProcessModule {
+	spawn(...args: unknown[]): unknown;
+}
+
+vi.mock("node:child_process", async (importOriginal) => {
+	const actual = await importOriginal<ChildProcessModule>();
+	return {
+		...actual,
+		spawn(...args: unknown[]) {
+			if (!launchTestState.interceptSpawn) {
+				return actual.spawn(...args);
+			}
+			launchTestState.spawnCalls++;
+			launchTestState.onSpawn?.();
+			return { unref() {} };
+		},
+	};
+});
 
 interface SubprocessLaunchModule {
 	createCliSubprocessLaunchSpec(args: readonly string[]): unknown;
@@ -32,6 +56,7 @@ interface LaunchHarness {
 	shuttingDown: boolean;
 	canConnectToSupervisor: ReturnType<typeof vi.fn>;
 	log: ReturnType<typeof vi.fn>;
+	options: { defaultSessionConfig: { cwd: string } };
 	launchReplacementSupervisor(supervisorSocketPath: string): Promise<void>;
 }
 
@@ -41,6 +66,9 @@ afterEach(() => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
 	launchTestState.launchSpecCalls = 0;
+	launchTestState.spawnCalls = 0;
+	launchTestState.interceptSpawn = false;
+	launchTestState.onSpawn = undefined;
 	for (const directory of tempDirs.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
 	}
@@ -57,6 +85,7 @@ function createHarness(canConnect: () => Promise<boolean> = async () => true): L
 		shuttingDown: false,
 		canConnectToSupervisor: vi.fn(canConnect),
 		log: vi.fn(),
+		options: { defaultSessionConfig: { cwd: process.cwd() } },
 	}) as LaunchHarness;
 }
 
@@ -192,6 +221,31 @@ describe("#1131 orphan supervisor launch lock recovery", () => {
 		firstProbe.resolve(true);
 		await firstLaunch;
 		expect(existsSync(lockDirectory)).toBe(false);
+	});
+
+	it("holds the generation guard through the final fence and spawn action", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-regression-1131-atomic-spawn-"));
+		tempDirs.push(root);
+		const supervisorSocketPath = join(root, "daemon.sock");
+		let firstProbeCount = 0;
+		const first = createHarness(async () => {
+			firstProbeCount++;
+			return firstProbeCount > 1;
+		});
+		const contender = createHarness();
+		let contenderLaunch: Promise<void> | undefined;
+		launchTestState.interceptSpawn = true;
+		launchTestState.onSpawn = () => {
+			contenderLaunch = contender.launchReplacementSupervisor(supervisorSocketPath);
+		};
+
+		await first.launchReplacementSupervisor(supervisorSocketPath);
+		await contenderLaunch;
+
+		expect(launchTestState.spawnCalls).toBe(1);
+		expect(contender.canConnectToSupervisor).not.toHaveBeenCalled();
+		expect(contender.log).toHaveBeenCalledWith(expect.stringContaining("failed to launch replacement supervisor"));
+		expect(existsSync(launchLockPath(supervisorSocketPath))).toBe(false);
 	});
 
 	it("a stalled old launcher cannot delete its successor lock when it resumes", async () => {
