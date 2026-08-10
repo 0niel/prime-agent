@@ -108,8 +108,10 @@ async function createRealDaemonFixture(root: string, scripted: BarrierScriptedPr
 			agentMessageController: runtimeOptions.sessionOptions?.agentMessageController,
 			agentObserveController: runtimeOptions.sessionOptions?.agentObserveController,
 			rlmHeartbeatController: runtimeOptions.sessionOptions?.rlmHeartbeatController,
-			rlmDepth: runtimeOptions.sessionOptions?.rlmDepth,
-			rlmMaxDepth: runtimeOptions.sessionOptions?.rlmMaxDepth,
+			// Test process environment may itself be a maximum-depth RLM child; a
+			// daemon-created top-level parent is nevertheless depth zero.
+			rlmDepth: runtimeOptions.sessionOptions?.rlmDepth ?? 0,
+			rlmMaxDepth: runtimeOptions.sessionOptions?.rlmMaxDepth ?? 1,
 			rlmSessionDir: runtimeOptions.sessionOptions?.rlmSessionDir,
 			rlmParentNodeId: runtimeOptions.sessionOptions?.rlmParentNodeId,
 			rlmParentAgent: runtimeOptions.sessionOptions?.rlmParentAgent,
@@ -309,5 +311,171 @@ describe("C03 real daemon production recovery", () => {
 		expect(promptAndWait).toHaveBeenCalledTimes(1);
 		expect([...realRegistry(artifacts).deliveries.values()]).toHaveLength(1);
 		await cInternals.closeSession(parentC, "shutdown");
+	}, 20_000);
+
+	it("uses the public daemon delete path to retain a live intent until its real cancelled terminal is deleted and discarded", async () => {
+		const root = await mkdtemp(join(tmpdir(), "prime-agent-c03-real-delete-"));
+		const requestId = "request-9002";
+		const scripted = createBarrierScriptedProvider({
+			api: "c03-real-delete-scripted",
+			provider: "c03-real-delete-scripted",
+			barrier: { expected: [requestId], timeoutMs: 10_000 },
+			models: [{ id: "c03-real-delete-model", responseModel: "c03-real-delete-model" }],
+			scripts: {
+				[requestId]: [
+					{
+						requestId,
+						blocks: [{ type: "text", chunks: ["must never reach parent"] }],
+						usage: usage(11, 7),
+						responseModel: "c03-real-delete-model",
+						waitForRelease: true,
+					},
+				],
+			},
+		});
+		cleanups.push(() => scripted.unregister());
+		cleanups.push(() => rm(root, { recursive: true, force: true }));
+		const fixture = await createRealDaemonFixture(root, scripted);
+		const internals = fixture.daemon as unknown as DaemonInternals;
+		const parentState = await internals.createRuntime({ type: "create" });
+		const parent = parentState.runtime.session;
+		const handle = await parent.runRlmChild(`C03 actual cancel ${requestId}`, {
+			name: "c03-live-delete-worker",
+			model: "c03-real-delete-scripted/c03-real-delete-model",
+		});
+		await scripted.open;
+		const artifacts = parent.sessionManager.getSessionArtifactDir();
+		if (!artifacts) throw new Error("Missing persisted real parent artifact");
+		const admitted = realRegistry(artifacts);
+		const operation = [...admitted.operations.values()].find(
+			(candidate) => candidate.childId === handle.rlm_child_id,
+		);
+		if (!operation) throw new Error("Missing admitted real C03 deletion operation");
+
+		// This is the public session API, which delegates to the real daemon host.
+		await parent.deleteRlmSubagent(handle.rlm_child_id);
+		expect(terminalEntries(parent, operation.deliveryId)).toHaveLength(0);
+		await vi.waitFor(() => {
+			const after = realRegistry(artifacts);
+			expect(after.operations.get(operation.key)).toMatchObject({ lifecycle: "deleted", deleteIntent: true });
+			expect(
+				[...after.deliveries.values()].find((delivery) => delivery.deliveryId === operation.deliveryId),
+			).toMatchObject({
+				consumed: "discarded",
+			});
+		});
+		expect(terminalEntries(parent, operation.deliveryId)).toHaveLength(0);
+		expect(parent.messages.filter((message) => message.role === "custom")).toHaveLength(0);
+		expect(scripted.observations()).toEqual([
+			expect.objectContaining({ requestId, terminal: "aborted", signalAborted: true }),
+		]);
+		await vi.waitFor(async () => expect((await parent.listRlmSubagents()).subagents).toHaveLength(0));
+		await internals.closeSession(parentState, "shutdown");
+	}, 20_000);
+
+	it("keeps deleted A durable facts separate when B reuses the same public selector", async () => {
+		const root = await mkdtemp(join(tmpdir(), "prime-agent-c03-real-reuse-"));
+		const aRequest = "request-9002";
+		const bRequest = "request-9003";
+		const scripted = createBarrierScriptedProvider({
+			api: "c03-real-reuse-scripted",
+			provider: "c03-real-reuse-scripted",
+			barrier: { expected: [aRequest, bRequest], timeoutMs: 10_000 },
+			models: [{ id: "c03-real-reuse-model", responseModel: "c03-real-reuse-model" }],
+			scripts: {
+				[aRequest]: [
+					{
+						requestId: aRequest,
+						blocks: [{ type: "text", chunks: ["A must be discarded"] }],
+						usage: usage(11, 7),
+						responseModel: "c03-real-reuse-model",
+						waitForRelease: true,
+					},
+				],
+				[bRequest]: [
+					{
+						requestId: bRequest,
+						blocks: [{ type: "text", chunks: ["B completed"] }],
+						usage: usage(13, 9),
+						responseModel: "c03-real-reuse-model",
+						waitForRelease: true,
+					},
+				],
+			},
+		});
+		cleanups.push(() => scripted.unregister());
+		cleanups.push(() => rm(root, { recursive: true, force: true }));
+		const fixture = await createRealDaemonFixture(root, scripted);
+		const internals = fixture.daemon as unknown as DaemonInternals;
+		const parentState = await internals.createRuntime({ type: "create" });
+		const parent = parentState.runtime.session;
+		const name = "c03-reused-public-selector";
+		const a = await parent.runRlmChild(`C03 stale A ${aRequest}`, {
+			name,
+			model: "c03-real-reuse-scripted/c03-real-reuse-model",
+		});
+		// A's provider entry is sufficient to make cancellation real, but B must not be
+		// admitted until the public delete has hidden the exact A incarnation.
+		await vi.waitFor(() => expect(scripted.observations()).toHaveLength(1));
+		const artifacts = parent.sessionManager.getSessionArtifactDir();
+		const parentFile = parent.sessionFile;
+		if (!artifacts || !parentFile) throw new Error("Missing persisted real parent paths");
+		const aOperation = [...realRegistry(artifacts).operations.values()].find(
+			(candidate) => candidate.childId === a.rlm_child_id,
+		);
+		if (!aOperation) throw new Error("Missing real A operation");
+		await parent.deleteRlmSubagent(name);
+		await vi.waitFor(async () => expect((await parent.listRlmSubagents()).subagents).toHaveLength(0));
+		const b = await parent.runRlmChild(`C03 replacement B ${bRequest}`, {
+			name,
+			model: "c03-real-reuse-scripted/c03-real-reuse-model",
+		});
+		expect(b.rlm_child_id).not.toBe(a.rlm_child_id);
+		await scripted.open;
+		scripted.release([bRequest]);
+		await vi.waitFor(() => {
+			const registry = realRegistry(artifacts);
+			const candidate = [...registry.operations.values()].find((operation) => operation.childId === b.rlm_child_id);
+			expect(candidate).toMatchObject({ lifecycle: "terminal_recorded" });
+			expect(candidate && terminalEntries(parent, candidate.deliveryId)).toHaveLength(1);
+		});
+		const beforeACompletes = realRegistry(artifacts);
+		const bOperation = [...beforeACompletes.operations.values()].find(
+			(candidate) => candidate.childId === b.rlm_child_id,
+		);
+		if (!bOperation) throw new Error("Missing B operation");
+		const bDelivery = [...beforeACompletes.deliveries.values()].find(
+			(candidate) => candidate.deliveryId === bOperation.deliveryId,
+		);
+		const bState = await internals.getOrHydrateBoundSessionState(b.rlm_child_id);
+		const bFile = bState.runtime.session.sessionFile;
+		if (!bFile) throw new Error("Missing B session file");
+		const bSessionBefore = await readFile(bFile, "utf8");
+		const parentTranscriptBefore = await readFile(parentFile, "utf8");
+
+		// A's exact durable deletion is independent of B's reused public selector.
+		await vi.waitFor(() => {
+			const registry = realRegistry(artifacts);
+			expect(registry.operations.get(aOperation.key)).toMatchObject({ lifecycle: "deleted", deleteIntent: true });
+			expect(
+				[...registry.deliveries.values()].find((delivery) => delivery.deliveryId === aOperation.deliveryId),
+			).toMatchObject({
+				consumed: "discarded",
+			});
+		});
+		const afterACompletes = realRegistry(artifacts);
+		expect(afterACompletes.operations.get(bOperation.key)).toEqual(beforeACompletes.operations.get(bOperation.key));
+		expect(
+			[...afterACompletes.deliveries.values()].find((delivery) => delivery.deliveryId === bOperation.deliveryId),
+		).toEqual(bDelivery);
+		expect(await readFile(bFile, "utf8")).toBe(bSessionBefore);
+		expect(await readFile(parentFile, "utf8")).toBe(parentTranscriptBefore);
+		expect(terminalEntries(parent, aOperation.deliveryId)).toHaveLength(0);
+		expect(terminalEntries(parent, bOperation.deliveryId)).toHaveLength(1);
+		expect(afterACompletes.operations.get(aOperation.key)).not.toMatchObject({ lifecycle: "delete_intent" });
+		expect(await parent.listRlmSubagents()).toMatchObject({
+			subagents: [expect.objectContaining({ rlm_child_id: b.rlm_child_id, session_name: name })],
+		});
+		await internals.closeSession(parentState, "shutdown");
 	}, 20_000);
 });

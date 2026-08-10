@@ -9908,7 +9908,11 @@ export class AgentSession {
 		}
 		const localConflict =
 			[...this._activeRlmChildRuns.values()].some(
-				(run) => run.session?.sessionName === name || (!run.session && run.sessionName === name),
+				// A detached deletion keeps only its immutable tuple; it no longer owns
+				// this public selector while its terminal hand-off finishes.
+				(run) =>
+					!(run.detachedDeletion && this._subagentRuntimeHost?.assignmentIdentityFenced) &&
+					(run.session?.sessionName === name || (!run.session && run.sessionName === name)),
 			) ||
 			[...this._rlmChildSessions.values()].some((session) => session.sessionName === name) ||
 			[...this._rlmChildCleanupFailures.values()].some((entry) => entry.session_name === name);

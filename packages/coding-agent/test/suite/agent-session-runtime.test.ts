@@ -24,6 +24,10 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "../../src/index.js";
+import { initTheme } from "../../src/modes/interactive/theme/theme.js";
+
+// The runtime characterization exercises an error renderer; initialize its test-only theme dependency.
+initTheme("dark");
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent

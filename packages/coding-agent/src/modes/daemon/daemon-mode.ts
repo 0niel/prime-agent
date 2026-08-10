@@ -2673,12 +2673,14 @@ export class AgentDaemon {
 				// Lifecycle facts are exact operation keyed. A stale A cannot release B.
 				if (operationId && options.deliveryId && current(options, runtime)) {
 					const parentArtifactDir = parent.sessionManager.getSessionArtifactDir?.();
-					if (parentArtifactDir) {
-						const store = durableStore();
-						if (status === "cancelled")
-							store.recordRelease({ parentSessionId: parent.sessionId, assignmentId, operationId }, "deleted");
-						else
-							store.recordRelease({ parentSessionId: parent.sessionId, assignmentId, operationId }, "released");
+					if (parentArtifactDir && status !== "cancelled") {
+						// A cancellation's durable terminal owner alone may turn a live intent
+						// into deleted.  Releasing it here races the actual child terminal and
+						// can incorrectly make terminal-before-deleted unobservable.
+						durableStore().recordRelease(
+							{ parentSessionId: parent.sessionId, assignmentId, operationId },
+							"released",
+						);
 					}
 				}
 				// Persist the deletion boundary first, but never let a registry failure
@@ -2857,6 +2859,16 @@ export class AgentDaemon {
 					}
 				}
 				if (assignmentId) await this.recordRlmSubagentDeletion(parentState, childId, assignmentId, operationId);
+				// A live C03 deletion has already durably hidden the public row and retained
+				// its exact delete intent. Keep only the active cancelled run alive long
+				// enough for its abort to write the owner-local terminal hand-off. Passive
+				// and passivating instances have no such owner and must close normally.
+				if (assignmentId && operationId && parent.getRlmChildRunStatus(childId) === "cancelled") {
+					const pendingDelete = durableStore()
+						.rebuild()
+						.operations.get(JSON.stringify([parent.sessionId, assignmentId, operationId]));
+					if (pendingDelete?.deleteIntent && pendingDelete.lifecycle !== "deleted") return;
+				}
 				// C01 append awaited above; reject a late A before it can close B.
 				if (
 					parentState.eventGeneration !== parentGeneration ||
