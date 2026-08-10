@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -252,6 +252,96 @@ describe("C04 bounded child results", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+	it("uses authenticated recoverable disposition leases and fails closed for live or unreadable owners", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-disposition-lease-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
+		const input = {
+			owner: owner(file),
+			childArtifactRoot: artifacts,
+			parentRecoveryAuthority: authority(file),
+			candidate: {
+				status: "completed" as const,
+				summary: "done",
+				preview: "safe",
+				artifacts: [
+					{
+						kind: "terminal_output" as const,
+						contentType: "text/plain" as const,
+						data: (async function* () {
+							yield new TextEncoder().encode("private");
+						})(),
+					},
+				],
+			},
+		};
+		try {
+			const result = await createOrGetTerminalChildResult(input);
+			const operationIndex = join(artifacts, "rlm-child-results", "operation-index");
+			const lock = join(operationIndex, `.disposition.${result.resultId}.lock`);
+			const installLease = () => {
+				const payload = {
+					version: 1,
+					owner: input.owner,
+					resultId: result.resultId,
+					nonce: ids[4],
+					pid: process.pid,
+					processStartId: "old-owner",
+				};
+				const mac = createHmac("sha256", readFileSync(input.parentRecoveryAuthority.recoveryKeyPath))
+					.update(canonical(payload))
+					.digest("hex");
+				mkdirSync(lock, { mode: 0o700 });
+				writeFileSync(join(lock, "lease.json"), canonical({ ...payload, mac }), { mode: 0o600 });
+			};
+			for (const state of ["live", "unreadable"] as const) {
+				installLease();
+				const restore = setC04ProcessIdentitySeamForTest({
+					captureCurrent: () => ({ pid: process.pid, processStartId: "current" }),
+					observe: () => state,
+				});
+				expect(
+					recordChildResultDisposition(
+						input.owner,
+						{ resultId: result.resultId, disposition: "deleted" },
+						artifacts,
+					),
+				).toBe(false);
+				restore();
+				expect(existsSync(lock)).toBe(true);
+				rmSync(lock, { recursive: true, force: true }); // Test cleanup, never production recovery.
+			}
+			for (const state of ["dead", "mismatch"] as const) {
+				installLease();
+				const restore = setC04ProcessIdentitySeamForTest({
+					captureCurrent: () => ({ pid: process.pid, processStartId: "current" }),
+					observe: () => state,
+				});
+				expect(
+					recordChildResultDisposition(
+						input.owner,
+						{ resultId: result.resultId, disposition: "deleted" },
+						artifacts,
+					),
+				).toBe(true);
+				restore();
+				expect(existsSync(lock)).toBe(false);
+				expect(
+					JSON.parse(
+						readFileSync(join(artifacts, "rlm-child-results", "results", `${result.resultId}.json`), "utf8"),
+					).generation,
+				).toBe(1);
+				break; // State is terminal after the first successful transition.
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts authority UUIDv7 identities while preserving random v4 result/handle IDs", async () => {
 		const root = mkdtempSync(join(tmpdir(), "c04-v7-"));
 		const childV7 = "019a8f42-1234-7000-8000-123456789abc";

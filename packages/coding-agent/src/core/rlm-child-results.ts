@@ -9,7 +9,6 @@ import {
 	constants,
 	fstatSync,
 	fsyncSync,
-	ftruncateSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
@@ -18,6 +17,7 @@ import {
 	readSync,
 	realpathSync,
 	renameSync,
+	rmdirSync,
 	statSync,
 	unlinkSync,
 	writeSync,
@@ -452,7 +452,7 @@ export function recordChildResultDisposition(
 	try {
 		const verified = validateOwner(owner);
 		const root = prepareBoundRoot(verified, childArtifactRoot, false);
-		return withDispositionLock(root, input.resultId, () => {
+		return withDispositionLock(root, verified, input.resultId, () => {
 			// Re-read *under* the inter-process lock. This is a generation-CAS
 			// equivalent: no contender can base its transition on an older record.
 			const result = readStored(root, input.resultId);
@@ -486,34 +486,157 @@ export function recordChildResultDisposition(
 	}
 }
 
-/** A filesystem lock serializes retention writers across daemon processes.
- * It is intentionally result-scoped (rather than a client-wide limiter), and
- * every writer rereads the generation after acquiring it. */
-function withDispositionLock<T>(root: string, resultId: string, action: () => T): T {
+/** An authenticated result-scoped lock directory serializes retention writers.
+ * A bare O_EXCL file is unrecoverable after a crash.  The lease binds exact
+ * owner/result, random nonce, PID and PID-start identity under the parent HMAC.
+ * Live or unreadable leases fail closed. Only dead/reused identities are moved
+ * atomically to quarantine; contenders then race mkdir for the vacant name. */
+interface DispositionLeasePayload {
+	version: 1;
+	owner: C04ChildResultOwner;
+	resultId: string;
+	nonce: string;
+	pid: number;
+	processStartId: string;
+}
+interface DispositionLease extends DispositionLeasePayload {
+	mac: string;
+}
+function withDispositionLock<T>(root: string, owner: C04ChildResultOwner, resultId: string, action: () => T): T {
 	if (!isUuid(resultId)) throw new Error("invalid result ID");
-	const path = safePath(root, "operation-index", `.disposition.${resultId}.lock`);
-	let fd: number | undefined;
-	for (let attempt = 0; attempt < 400; attempt++) {
+	const recoveryKey = readDispositionRecoveryKey(root, owner);
+	const lock = safePath(root, "operation-index", `.disposition.${resultId}.lock`);
+	const identity = processIdentitySeam.captureCurrent();
+	if (!identity || !Number.isSafeInteger(identity.pid) || identity.pid < 1 || !identity.processStartId)
+		throw new Error("C04 exact process identity is unavailable");
+	const payload: DispositionLeasePayload = {
+		version: 1,
+		owner,
+		resultId,
+		nonce: randomUuid(),
+		pid: identity.pid,
+		processStartId: identity.processStartId,
+	};
+	const lease: DispositionLease = { ...payload, mac: dispositionLeaseMac(recoveryKey, payload) };
+	const token = canonicalJson(lease);
+	let acquired = false;
+	for (let attempt = 0; attempt < 32 && !acquired; attempt++) {
 		try {
-			fd = openSyncNoFollow(path, "wx", 0o600);
-			writeAll(fd, Buffer.from(`${process.pid}\n`));
-			fsyncSync(fd);
-			break;
+			mkdirSync(lock, { mode: 0o700 });
+			const leasePath = join(lock, "lease.json");
+			let fd: number | undefined;
+			try {
+				fd = openSyncNoFollow(leasePath, "wx", 0o600);
+				writeAll(fd, Buffer.from(token));
+				fsyncSync(fd);
+			} finally {
+				if (fd !== undefined) closeSync(fd);
+			}
+			fsyncDirectory(lock);
+			fsyncDirectory(dirname(lock));
+			acquired = true;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			// Synchronous public APIs cannot await; Atomics.wait yields the worker
-			// without spinning and allows a competing process to release promptly.
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+			let previous: DispositionLease;
+			try {
+				previous = readDispositionLease(lock, recoveryKey);
+				if (!sameOwner(previous.owner, owner) || previous.resultId !== resultId) throw new Error("foreign");
+			} catch (readError) {
+				// The stale directory may have been renamed by another contender
+				// after our mkdir lost. Race mkdir again; all other unreadable
+				// lease states fail closed.
+				if ((readError as NodeJS.ErrnoException).code === "ENOENT") continue;
+				throw new Error("C04 disposition lock is uncertain");
+			}
+			const state = processIdentitySeam.observe(previous);
+			if (state === "live" || state === "unreadable") throw new Error("C04 disposition lock is uncertain");
+			// Atomic rename is the stale-owner CAS. Keep quarantine as evidence;
+			// never unlink, steal, or clean a foreign/live lease.
+			const quarantine = safePath(
+				root,
+				"operation-index",
+				`.disposition.${resultId}.dead.${previous.nonce}.${randomUuid()}.lock`,
+			);
+			try {
+				renameSync(lock, quarantine);
+				fsyncDirectory(dirname(lock));
+			} catch (renameError) {
+				if ((renameError as NodeJS.ErrnoException).code !== "ENOENT") throw renameError;
+			}
 		}
 	}
-	if (fd === undefined) throw new Error("C04 disposition lock unavailable");
+	if (!acquired) throw new Error("C04 disposition lock unavailable");
 	try {
 		return action();
 	} finally {
-		closeSync(fd);
-		safeUnlink(path);
-		fsyncDirectory(dirname(path));
+		// Cleanup is bound to this exact nonce/token, never a replacement lease.
+		try {
+			const leasePath = join(lock, "lease.json");
+			if (readFileSync(leasePath, "utf8") === token) {
+				unlinkSync(leasePath);
+				rmdirSync(lock);
+				fsyncDirectory(dirname(lock));
+			}
+		} catch {
+			/* failed cleanup remains an authenticated recoverable lease */
+		}
 	}
+}
+function dispositionLeaseMac(key: Buffer, payload: DispositionLeasePayload): string {
+	return createHmac("sha256", key).update(canonicalJson(payload)).digest("hex");
+}
+function readDispositionLease(lock: string, key: Buffer): DispositionLease {
+	const leasePath = join(lock, "lease.json");
+	const stat = lstatSync(leasePath);
+	if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8192) throw new Error("invalid disposition lease");
+	const value: unknown = JSON.parse(readFileSync(leasePath, "utf8"));
+	if (
+		!isObject(value) ||
+		!exactKeys(value, ["version", "owner", "resultId", "nonce", "pid", "processStartId", "mac"]) ||
+		value.version !== 1 ||
+		!isUuid(value.resultId) ||
+		!isUuid(value.nonce) ||
+		!Number.isSafeInteger(value.pid) ||
+		value.pid < 1 ||
+		typeof value.processStartId !== "string" ||
+		!value.processStartId ||
+		typeof value.mac !== "string" ||
+		!SHA256.test(value.mac)
+	)
+		throw new Error("invalid disposition lease");
+	const payload: DispositionLeasePayload = {
+		version: 1,
+		owner: validateOwner(value.owner as C04ChildResultOwner),
+		resultId: value.resultId,
+		nonce: value.nonce,
+		pid: value.pid,
+		processStartId: value.processStartId,
+	};
+	const expected = Buffer.from(dispositionLeaseMac(key, payload), "hex");
+	const actual = Buffer.from(value.mac, "hex");
+	if (expected.length !== actual.length || !timingSafeEqual(expected, actual))
+		throw new Error("invalid disposition lease");
+	return { ...payload, mac: value.mac };
+}
+function readDispositionRecoveryKey(root: string, owner: C04ChildResultOwner): Buffer {
+	const childRoot = dirname(root);
+	let state = dirname(dirname(childRoot));
+	for (;;) {
+		const parentArtifactRoot = join(state, "session-artifacts", owner.parentSessionId);
+		try {
+			return readParentRecoveryKey(owner, childRoot, {
+				parentSessionFile: join(state, "sessions", `${owner.parentSessionId}.jsonl`),
+				parentArtifactRoot,
+				recoveryKeyPath: join(parentArtifactRoot, ".c04-recovery-key"),
+			});
+		} catch {
+			/* candidate parent must pass exact binding */
+		}
+		const next = dirname(state);
+		if (next === state) break;
+		state = next;
+	}
+	throw new Error("C04 disposition recovery authority is unavailable");
 }
 
 export function canonicalChildResultBytes(value: C04ChildResultReference): Uint8Array {
@@ -850,6 +973,7 @@ function reserveOperationAndQuota(
 		throw immutableConflict(root, owner.operationId);
 	}
 	let currentToken = token;
+	let currentQuotaToken = token;
 	return {
 		resultId: journal.resultId,
 		recordHandle: (handleId: string) => {
@@ -861,21 +985,22 @@ function reserveOperationAndQuota(
 			// Reservation ownership is still protected by the O_EXCL name. Update it
 			// durably before publishing the random blob name, so crash recovery owns
 			// the same-attempt orphan even if no result record was written.
-			const update = openSyncNoFollow(reservation, "r+");
-			try {
-				ftruncateSync(update, 0);
-				writeAll(update, Buffer.from(next));
-				fsyncSync(update);
-			} finally {
-				closeSync(update);
-			}
+			// A crash observes either the old complete HMAC journal or the new
+			// complete HMAC journal, never an in-place truncated intermediate.
+			if (readFileSync(reservation, "utf8") !== currentToken) throw new Error("C04 reservation ownership changed");
+			if (readFileSync(quotaReservation, "utf8") !== currentQuotaToken)
+				throw new Error("C04 quota reservation ownership changed");
+			atomicJson(reservation, journal);
+			// A cut between these two replacements leaves two independently valid
+			// journals for the same nonce/result; recovery accepts either version.
+			atomicJson(quotaReservation, journal);
 			currentToken = next;
+			currentQuotaToken = next;
 		},
 		release: () => {
 			operationReservations.delete(key);
 			unlinkReservationIfOwned(reservation, currentToken);
-			// quota is only an admission mutex, so its original authenticated body is sufficient.
-			unlinkReservationIfOwned(quotaReservation, token);
+			unlinkReservationIfOwned(quotaReservation, currentQuotaToken);
 			fsyncDirectory(dirname(reservation));
 		},
 	};
@@ -942,7 +1067,13 @@ function reconcileAbandonedReservation(
 		appendAudit(root, "uncertain", "restart_tombstoned", journal.resultId);
 	}
 	unlinkReservationIfOwned(path, token);
-	unlinkReservationIfOwned(safePath(root, "operation-index", `.quota.${owner.childSessionId}.reserve`), token);
+	// A cut between journal replacements can leave quota at the prior complete
+	// version. Delete it only after independently authenticating the same attempt.
+	unlinkQuotaReservationForAttempt(
+		safePath(root, "operation-index", `.quota.${owner.childSessionId}.reserve`),
+		recoveryKey,
+		journal,
+	);
 	fsyncDirectory(dirname(path));
 }
 function reservationMac(key: Buffer, payload: ReservationJournalPayload): string {
@@ -1009,6 +1140,16 @@ function readHandleIndexIfMatching(
 		return value.resultId === resultId && sameOwner(value.owner, owner);
 	} catch {
 		return false;
+	}
+}
+function unlinkQuotaReservationForAttempt(path: string, key: Buffer, attempt: ReservationJournal): void {
+	try {
+		const token = readFileSync(path, "utf8");
+		const quota = parseAuthenticatedReservation(token, key);
+		if (sameOwner(quota.owner, attempt.owner) && quota.nonce === attempt.nonce && quota.resultId === attempt.resultId)
+			unlinkReservationIfOwned(path, token);
+	} catch {
+		// Never remove an unreadable, foreign, or unauthenticated quota lease.
 	}
 }
 function unlinkReservationIfOwned(path: string, token: string): void {
@@ -1238,7 +1379,7 @@ function expireIfElapsed(root: string, result: StoredChildResult, now: Date): St
 	return setExpired(root, result);
 }
 function setExpired(root: string, result: StoredChildResult): StoredChildResult {
-	return withDispositionLock(root, result.resultId, () => {
+	return withDispositionLock(root, result.owner, result.resultId, () => {
 		const current = readStored(root, result.resultId);
 		if (current.retentionState !== "retained") return current;
 		const expired = {
