@@ -17,14 +17,13 @@ import {
 	validateRssSampleCadence,
 } from "./rss-campaign-cadence.js";
 import { type ProcessRecord, type ProcessStat, parseProcessStat, processRecordFromStatus } from "./rss-proc.js";
+import { RSS_SCAN_RETRY_DELAY_MS, RSS_SCAN_RETRY_WINDOW_MS, retryUnavailableSnapshot } from "./rss-snapshot-retry.js";
 
 const FANOUTS = [1, 4, 16, 64] as const;
 const WORKER = new URL("./rss-campaign-worker.ts", import.meta.url);
 const DEFAULT_TIMEOUT_MS = 60_000;
 const REAP_GRACE_MS = 250;
 const REAP_VERIFY_MS = 1_000;
-const SCAN_ATTEMPTS = 3;
-const SCAN_RETRY_DELAY_MS = 2;
 const SCHEMA_VERSION = 2;
 
 type SupportedPlatform = "linux";
@@ -267,12 +266,16 @@ async function groupSnapshotWithRetries(
 	pgid: number,
 	shouldInjectFailure: (attempt: number) => boolean = () => false,
 ): Promise<GroupSnapshot> {
-	for (let attempt = 0; attempt < SCAN_ATTEMPTS; attempt += 1) {
-		const snapshot = await groupSnapshot(pgid, shouldInjectFailure(attempt));
-		if (snapshot.kind !== "unavailable") return snapshot;
-		if (attempt + 1 < SCAN_ATTEMPTS) await pause(SCAN_RETRY_DELAY_MS);
-	}
-	return { kind: "unavailable" };
+	// Fork/exec children can briefly have a stat record but no VmRSS. Retry
+	// complete scans through this short convergence window, never individual
+	// records: a successful return is always one coherent full-group view.
+	return retryUnavailableSnapshot(
+		(attempt) => groupSnapshot(pgid, shouldInjectFailure(attempt)),
+		(snapshot) => snapshot.kind === "unavailable",
+		{ now: monotonicMs, pause },
+		RSS_SCAN_RETRY_WINDOW_MS,
+		RSS_SCAN_RETRY_DELAY_MS,
+	);
 }
 
 async function collectorAvailable(): Promise<boolean> {
@@ -425,7 +428,7 @@ async function runCell(
 				currentOwnership,
 				announced.filter((record): record is ProcessRecord => record?.pgid === currentOwnership.pgid),
 			);
-			const snapshot = await groupSnapshot(currentOwnership.pgid);
+			const snapshot = await groupSnapshotWithRetries(currentOwnership.pgid);
 			const records = snapshotRecords(snapshot);
 			if (!records) {
 				collectorFailed = true;
