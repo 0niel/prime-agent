@@ -61,7 +61,11 @@ export type DaemonWorkerCommand =
 	  }
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
 	| { id?: string; type: "worker_sync_agent_peers"; peers: AgentSessionMessageAgentSummary[] }
-	| { id?: string; type: "worker_archive_and_shutdown" }
+	/**
+	 * The supervisor binds archival to the worker incarnation it observed. The
+	 * worker rejects a stale owner instead of letting it archive a replacement.
+	 */
+	| { id?: string; type: "worker_archive_and_shutdown"; workerPid: number; workerProcessStartId: string }
 	| {
 			id?: string;
 			type: "worker_passivate_idle_children";

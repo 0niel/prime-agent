@@ -442,6 +442,76 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(client.socket.end).not.toHaveBeenCalled();
 	});
 
+	it("rejects a stale archive RPC before it closes worker sessions", async () => {
+		const closeSession = vi.fn(async () => undefined);
+		const write = vi.fn();
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			sessions: new Map([["active-1", { activeSessionId: "active-1" }]]),
+			closeSession,
+			write,
+			shutdown: vi.fn(async () => undefined),
+		}) as unknown as {
+			handleWorkerCommand(
+				client: DaemonSocketClient,
+				command: { id?: string; type: "worker_archive_and_shutdown"; workerPid: number; workerProcessStartId: string },
+			): Promise<void>;
+		};
+		const client = { socket: { destroyed: false } } as unknown as DaemonSocketClient;
+
+		await daemon.handleWorkerCommand(client, {
+			id: "stale-archive",
+			type: "worker_archive_and_shutdown",
+			workerPid: process.pid,
+			workerProcessStartId: "recycled-process",
+		});
+
+		expect(closeSession).not.toHaveBeenCalled();
+		expect(write).toHaveBeenCalledWith(
+			client,
+			expect.objectContaining({
+				id: "stale-archive",
+				command: "worker_archive_and_shutdown",
+				success: false,
+				error: "worker_process_identity_stale",
+			}),
+		);
+	});
+
+	it("archives only when the archive RPC names the current worker process", async () => {
+		const closeSession = vi.fn(async () => undefined);
+		const write = vi.fn();
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			sessions: new Map([["active-1", { activeSessionId: "active-1" }]]),
+			closeSession,
+			write,
+			shutdown: vi.fn(async () => undefined),
+		}) as unknown as {
+			handleWorkerCommand(
+				client: DaemonSocketClient,
+				command: { id?: string; type: "worker_archive_and_shutdown"; workerPid: number; workerProcessStartId: string },
+			): Promise<void>;
+		};
+		const client = { socket: { destroyed: false } } as unknown as DaemonSocketClient;
+		const { getProcessStartId } = await import("../src/core/session-lease.js");
+		const workerProcessStartId = getProcessStartId(process.pid);
+		if (!workerProcessStartId) {
+			throw new Error("Test process did not expose its process identity");
+		}
+
+		await daemon.handleWorkerCommand(client, {
+			id: "current-archive",
+			type: "worker_archive_and_shutdown",
+			workerPid: process.pid,
+			workerProcessStartId,
+		});
+
+		expect(closeSession).toHaveBeenCalledWith({ activeSessionId: "active-1" }, "killed");
+		expect(write).toHaveBeenCalledWith(
+			client,
+			expect.objectContaining({ id: "current-archive", command: "worker_archive_and_shutdown", success: true }),
+		);
+	});
+
 	it("revokes an old supervisor before ending its socket when a replacement authenticates", async () => {
 		let markOldAssertionReached = () => {};
 		const oldAssertionReached = new Promise<void>((resolve) => {

@@ -107,7 +107,12 @@ import {
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	getProcessStartId,
+	type SessionLease,
+} from "../../core/session-lease.js";
 import {
 	readSessionInfo,
 	resolveSessionRlmDepth,
@@ -3373,6 +3378,15 @@ export class AgentDaemon {
 					this.writeWorkerSuccess(client, command);
 					return;
 				case "worker_archive_and_shutdown": {
+					// A durable supervisor can be replaced while an old worker-client
+					// socket is still draining. Never let that stale owner archive a
+					// replacement process that inherited the same worker socket path.
+					if (
+						command.workerPid !== process.pid ||
+						getProcessStartId(process.pid) !== command.workerProcessStartId
+					) {
+						throw new Error("worker_process_identity_stale");
+					}
 					for (const state of [...this.sessions.values()]) {
 						await this.closeSession(state, "killed");
 					}

@@ -4810,9 +4810,19 @@ export class DaemonSupervisor {
 		worker.snapshotGenerations?.clear();
 		if (entryClient) {
 			if (archiveSession) {
-				await entryClient
-					.requestWorker({ type: "worker_archive_and_shutdown" }, force ? 1000 : 5000)
-					.catch(() => undefined);
+				// Archive is destructive too. Re-authorize this supervisor and bind
+				// the RPC to the exact worker process immediately before dispatch;
+				// the worker repeats the identity check before it archives sessions.
+				await this.assertCurrentOwnership();
+				this.assertWorkerTupleCurrent(worker, entryDescriptor, entryStopRevision, entryStopRequestedAt);
+				if (entryStartId !== undefined && this.processIdentity(entryPid, entryStartId) === "current") {
+					await entryClient
+						.requestWorker(
+							{ type: "worker_archive_and_shutdown", workerPid: entryPid, workerProcessStartId: entryStartId },
+							force ? 1000 : 5000,
+						)
+						.catch(() => undefined);
+				}
 			} else {
 				await entryClient.request({ type: "shutdown" }, force ? 1000 : 5000).catch(() => undefined);
 			}
