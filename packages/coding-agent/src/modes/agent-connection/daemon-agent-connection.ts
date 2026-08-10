@@ -62,6 +62,7 @@ import type {
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
 	AgentConnectionResourceSnapshot,
+	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSavedSessionInfo,
 	AgentConnectionSavedSessionScope,
 	AgentConnectionScopedModel,
@@ -1467,6 +1468,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			if (message.event.type !== "refine_complete" && message.event.type !== "refine_failed") {
 				this.observeStreamingMessage(message.event);
 			}
+			if (message.event.type === "rlm_child_update") {
+				this.observeRlmChildUpdate(message.event.child);
+			}
 			this.latestSnapshotIsFresh = false;
 			await this.emit({ type: "session_event", event: message.event });
 			return;
@@ -1891,6 +1895,19 @@ export class DaemonAgentConnection implements AgentConnection {
 		} else if (purpose === "resync") {
 			await this.emit({ type: "session_resynced", snapshot: this.latestSnapshot });
 		}
+	}
+
+	private observeRlmChildUpdate(child: AgentConnectionRlmChildAgentSnapshot): void {
+		if (!this.latestSnapshot) return;
+		const children = this.latestSnapshot.children ?? [];
+		const index = children.findIndex((candidate) => candidate.id === child.id);
+		const updatedChildren = [...children];
+		if (index === -1) {
+			updatedChildren.push(child);
+		} else {
+			updatedChildren[index] = child;
+		}
+		this.latestSnapshot = { ...this.latestSnapshot, children: updatedChildren };
 	}
 
 	private observeStreamingMessage(event: AgentSessionEvent): void {
