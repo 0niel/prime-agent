@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { renameSync, writeFileSync } from "node:fs";
 import { cpus, release, type } from "node:os";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	createStreamingJsonParseState,
 	getLegacyStreamingJsonInputExaminedForTesting,
@@ -9,14 +11,22 @@ import {
 	resetStreamingJsonParseInstrumentationForTesting,
 } from "../src/utils/json-parse.js";
 
-const BENCHMARK_NAME = "N01-streaming-structured-output-parse-cpu";
+export const BENCHMARK_NAME = "N01-streaming-structured-output-parse-cpu";
+export const MAX_CORPUS_BYTES = 16 * 1024 * 1024;
+export const MAX_REPETITIONS = 21;
 type Mode = "legacy" | "incremental";
-type Options = {
+export type BenchmarkOptions = {
 	name: string;
 	output: string;
 	escapedBytes: number;
 	unicodeBytes: number;
 	repetitions: number;
+};
+
+type CorpusPlan = {
+	entries: number;
+	structuralMinimum: number;
+	estimatedBytes: number;
 };
 
 function requiredOption(args: string[], name: string): string {
@@ -25,43 +35,98 @@ function requiredOption(args: string[], name: string): string {
 	return args[index + 1];
 }
 
-function positiveIntegerOption(args: string[], name: string, defaultValue: number): number {
+function positiveBoundedIntegerOption(args: string[], name: string, defaultValue: number, maximum: number): number {
 	const index = args.indexOf(name);
 	if (index === -1) return defaultValue;
 	const parsed = Number(args[index + 1]);
-	if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
+	if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > maximum)
+		throw new Error(`${name} must be a positive safe integer no greater than ${maximum}`);
 	return parsed;
 }
 
-function parseOptions(args: string[]): Options {
+/** Parses and bounds every allocation-driving option before corpus estimation or allocation. */
+export function parseBenchmarkOptions(args: string[]): BenchmarkOptions {
 	const name = requiredOption(args, "--name");
 	if (name !== BENCHMARK_NAME) throw new Error(`--name must be ${BENCHMARK_NAME}`);
 	return {
 		name,
 		output: requiredOption(args, "--json"),
-		escapedBytes: positiveIntegerOption(args, "--escaped-bytes", 1024 * 1024),
-		unicodeBytes: positiveIntegerOption(args, "--unicode-bytes", 256 * 1024),
-		repetitions: positiveIntegerOption(args, "--repetitions", 7),
+		escapedBytes: positiveBoundedIntegerOption(args, "--escaped-bytes", 1024 * 1024, MAX_CORPUS_BYTES),
+		unicodeBytes: positiveBoundedIntegerOption(args, "--unicode-bytes", 256 * 1024, MAX_CORPUS_BYTES),
+		repetitions: positiveBoundedIntegerOption(args, "--repetitions", 7, MAX_REPETITIONS),
 	};
+}
+
+function nonnegativeSafeInteger(value: number, name: string): void {
+	if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be a nonnegative safe integer`);
+}
+
+function safeNumber(value: bigint, name: string): number {
+	if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER))
+		throw new Error(`${name} exceeds Number.MAX_SAFE_INTEGER`);
+	return Number(value);
 }
 
 function corpusDocument(outer: Array<{ index: number; text: string }>, padding: string): string {
 	return JSON.stringify({ outer, padding });
 }
 
-/** Returns the UTF-8 byte count for a corpus with `count` nested entries and no padding. */
-function estimateNestedCorpusBytes(count: number, text: string, emptyBytes: number): number {
+/**
+ * Returns the UTF-8 byte count for a corpus with `count` nested entries and no padding.
+ * BigInt keeps every multiplication and addition exact before the checked Number conversion.
+ */
+export function estimateNestedCorpusBytes(count: number, text: string, emptyBytes: number): number {
+	nonnegativeSafeInteger(count, "entry count");
+	nonnegativeSafeInteger(emptyBytes, "empty corpus bytes");
 	if (count === 0) return emptyBytes;
 	const firstEntryBytes = Buffer.byteLength(JSON.stringify({ index: 0, text }));
-	let indexedDigits = 0;
-	let start = 0;
-	for (let digits = 1; start < count; digits++) {
-		const end = Math.min(count, 10 ** digits);
+	nonnegativeSafeInteger(firstEntryBytes, "first entry bytes");
+
+	const countBig = BigInt(count);
+	let indexedDigits = 0n;
+	let start = 0n;
+	let threshold = 10n;
+	for (let digits = 1n; start < countBig; digits++) {
+		const end = countBig < threshold ? countBig : threshold;
 		indexedDigits += (end - start) * digits;
 		start = end;
+		threshold *= 10n;
 	}
-	// One comma separates every pair; entry zero already accounts for its one digit.
-	return emptyBytes + count * (firstEntryBytes - 1) + indexedDigits + count - 1;
+	return safeNumber(
+		BigInt(emptyBytes) + countBig * BigInt(firstEntryBytes - 1) + indexedDigits + countBig - 1n,
+		"estimated corpus bytes",
+	);
+}
+
+function corpusText(unicode: boolean): string {
+	return unicode ? "😀\u2028 nested é " : '\\"escaped\\n nested ';
+}
+
+/** Estimates the largest nested corpus that fits a target without constructing its document. */
+export function estimateCorpusPlan(bytes: number, unicode: boolean): CorpusPlan {
+	nonnegativeSafeInteger(bytes, "requested corpus bytes");
+	if (bytes > MAX_CORPUS_BYTES) throw new Error(`requested corpus bytes must be no greater than ${MAX_CORPUS_BYTES}`);
+	const text = corpusText(unicode);
+	const emptyBytes = Buffer.byteLength(corpusDocument([], ""));
+	const structuralMinimum = estimateNestedCorpusBytes(1, text, emptyBytes);
+	if (bytes < structuralMinimum)
+		throw new Error(`requested ${bytes} bytes is below structural minimum ${structuralMinimum}`);
+
+	const firstEntryBytes = structuralMinimum - emptyBytes;
+	const maximumEntries = Math.floor((bytes - emptyBytes) / firstEntryBytes);
+	nonnegativeSafeInteger(maximumEntries, "maximum entries");
+	let lower = 1;
+	let upper = maximumEntries;
+	while (lower < upper) {
+		const middle = Math.ceil((lower + upper) / 2);
+		if (estimateNestedCorpusBytes(middle, text, emptyBytes) <= bytes) lower = middle;
+		else upper = middle - 1;
+	}
+	return {
+		entries: lower,
+		structuralMinimum,
+		estimatedBytes: estimateNestedCorpusBytes(lower, text, emptyBytes),
+	};
 }
 
 /**
@@ -70,24 +135,10 @@ function estimateNestedCorpusBytes(count: number, text: string, emptyBytes: numb
  * rather than constructing increasingly large candidate documents.
  */
 function corpus(bytes: number, unicode: boolean): string {
-	const text = unicode ? "😀\u2028 nested é " : '\\"escaped\\n nested ';
-	const emptyBytes = Buffer.byteLength(corpusDocument([], ""));
-	const structuralBytes = estimateNestedCorpusBytes(1, text, emptyBytes);
-	if (bytes < structuralBytes)
-		throw new Error(`requested ${bytes} bytes is below structural minimum ${structuralBytes}`);
-
-	const firstEntryBytes = structuralBytes - emptyBytes;
-	const maximumEntries = Math.floor((bytes - emptyBytes) / firstEntryBytes);
-	let lower = 1;
-	let upper = maximumEntries;
-	while (lower < upper) {
-		const middle = Math.ceil((lower + upper) / 2);
-		if (estimateNestedCorpusBytes(middle, text, emptyBytes) <= bytes) lower = middle;
-		else upper = middle - 1;
-	}
-
-	const outer = Array.from({ length: lower }, (_, index) => ({ index, text }));
-	const paddingBytes = bytes - estimateNestedCorpusBytes(lower, text, emptyBytes);
+	const text = corpusText(unicode);
+	const plan = estimateCorpusPlan(bytes, unicode);
+	const outer = Array.from({ length: plan.entries }, (_, index) => ({ index, text }));
+	const paddingBytes = bytes - plan.estimatedBytes;
 	const document = corpusDocument(outer, "x".repeat(paddingBytes));
 	if (Buffer.byteLength(document) !== bytes) throw new Error("corpus did not meet requested UTF-8 byte length");
 	return document;
@@ -143,7 +194,7 @@ function writeJsonAtomically(output: string, value: unknown): void {
 	renameSync(temporary, output);
 }
 
-function run(options: Options): void {
+function run(options: BenchmarkOptions): void {
 	const results = [
 		{
 			name: `escaped-nested-${options.escapedBytes}-64`,
@@ -204,4 +255,8 @@ function run(options: Options): void {
 	});
 }
 
-run(parseOptions(process.argv.slice(2)));
+function isDirectExecution(): boolean {
+	return process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+}
+
+if (isDirectExecution()) run(parseBenchmarkOptions(process.argv.slice(2)));
