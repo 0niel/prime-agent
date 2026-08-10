@@ -419,7 +419,7 @@ describe("AgentSessionRuntime characterization", () => {
 		};
 
 		assertCustomPrompt();
-		await childRuntime.newSession();
+		await childRuntime.session.reload();
 		assertCustomPrompt();
 		await runtime.deleteRlmSubagentRuntime("provenance-child", childRuntime.session);
 	});
