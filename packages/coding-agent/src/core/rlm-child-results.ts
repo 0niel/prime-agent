@@ -21,7 +21,7 @@ import {
 	unlinkSync,
 	writeSync,
 } from "node:fs";
-import { basename, dirname, join, parse, relative, resolve } from "node:path";
+import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import {
 	createRlmSafeTerminalResultTerminalMessage,
 	MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES,
@@ -990,9 +990,15 @@ function readParentRecoveryKey(
 	const parentRoot = canonicalDirectoryNoSymlinks(authority.parentArtifactRoot);
 	const expectedParentRoot = join(dirname(dirname(parentFile)), "session-artifacts", owner.parentSessionId);
 	if (parentRoot !== expectedParentRoot) throw new Error("C04 parent recovery artifact binding is invalid");
-	// Child and parent must remain within the same SessionManager state authority.
+	// A nested RLM child keeps its session and artifact root below the parent
+	// artifact directory. Both roots must be bound to the same parent state,
+	// rather than merely being siblings (which is true only for top-level
+	// SessionManager sessions).
 	const childRoot = canonicalDirectoryNoSymlinks(childArtifactRoot);
-	if (dirname(parentRoot) !== dirname(childRoot)) throw new Error("C04 parent recovery authority is foreign");
+	const childStateRoot = dirname(dirname(canonicalExistingRegularFile(owner.childSessionFile)!));
+	const topLevelSibling = dirname(parentRoot) === dirname(childRoot);
+	const nestedChild = parentRoot === childStateRoot && childRoot.startsWith(`${parentRoot}${sep}`);
+	if (!topLevelSibling && !nestedChild) throw new Error("C04 parent recovery authority is foreign");
 	let keyPath = resolve(authority.recoveryKeyPath);
 	try {
 		if (basename(keyPath) !== ".c04-recovery-key" || realpathSync(dirname(keyPath)) !== parentRoot)
@@ -1035,7 +1041,11 @@ function validateChildBinding(owner: C04ChildResultOwner, childArtifactRoot: str
 	// This is the one layout SessionManager publishes. IDs and paths are all
 	// checked together so a sibling session's root cannot be substituted.
 	const sessionDir = dirname(file);
-	if (basename(sessionDir) !== "sessions" || basename(file) !== `${sessionId}.jsonl`)
+	// RLM children use a private per-child session directory below their
+	// parent's artifact root, while top-level sessions use `sessions/`. Both
+	// are SessionManager layouts: in either case its artifact root is the
+	// sibling `session-artifacts/<sessionId>` of that exact session directory.
+	if (basename(file) !== `${sessionId}.jsonl`)
 		throw new Error("C04 child session file is not the exact SessionManager child binding");
 	const expected = join(dirname(sessionDir), "session-artifacts", sessionId);
 	if (root !== expected) throw new Error("C04 child artifact root is not the exact SessionManager child binding");
@@ -1380,7 +1390,7 @@ function assertArtifactRef(value: unknown, resultId: string): asserts value is C
 		typeof value.sha256 !== "string" ||
 		!SHA256.test(value.sha256) ||
 		!isUuid(value.creatorAssignmentId) ||
-		!isUuid(value.ownerSessionId) ||
+		!isCanonicalUuid(value.ownerSessionId) ||
 		!retentionStates.has(value.retentionState)
 	)
 		throw new Error("invalid C04 artifact reference");

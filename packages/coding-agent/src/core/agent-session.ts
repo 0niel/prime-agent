@@ -10259,7 +10259,16 @@ export class AgentSession {
 												{
 													kind: "terminal_output" as const,
 													contentType: "text/plain" as const,
-													data: terminalOutputSink ?? new C04ProducerSink(),
+													data: (() => {
+														// A producer opened by a text delta remains live until the child has
+														// actually finished.  Empty and tool-only completions have no such
+														// producer, so their fallback must already be closed: otherwise C04
+														// correctly waits forever for bytes that can never arrive.
+														if (terminalOutputSink) return terminalOutputSink;
+														const emptyTerminalOutput = new C04ProducerSink();
+														emptyTerminalOutput.close();
+														return emptyTerminalOutput;
+													})(),
 												},
 											],
 										}
