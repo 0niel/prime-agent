@@ -2,6 +2,8 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { type ThemeColor, theme } from "../theme/theme.js";
 
 const ARG_TOKEN_PATTERN = /@"[^"\n]*"|@[^\s\x1b]+|--[A-Za-z0-9][A-Za-z0-9-]*/g;
+/** Also matches a bare `--` end-of-options separator; only used in recognized slash-command text. */
+const ARG_TOKEN_PATTERN_WITH_SEPARATOR = /@"[^"\n]*"|@[^\s\x1b]+|--[A-Za-z0-9][A-Za-z0-9-]*|--(?=\s|$)/g;
 const FG_SGR_PATTERN = /\x1b\[(?:0|39|3[0-7]|9[0-7]|38;[0-9;]+)m/g;
 /** Escape sequences the editor splices into displayed text (cursor highlight, IME marker). */
 const CURSOR_ESCAPE_PATTERN = /\x1b\[[0-9;]*m|\x1b_[^\x07]*\x07/g;
@@ -29,10 +31,11 @@ function hasTokenBoundary(text: string, index: number): boolean {
 	return index === 0 || /\s/.test(text.charAt(index - 1));
 }
 
-/** Finds @path references and --flags in plain (unrendered) text. */
-function findArgTokens(text: string, fromIndex = 0): ArgTokenSpan[] {
+/** Finds @path references and --flags in plain (unrendered) text; includeBareSeparator also matches a bare `--`. */
+function findArgTokens(text: string, fromIndex = 0, includeBareSeparator = false): ArgTokenSpan[] {
 	const spans: ArgTokenSpan[] = [];
-	for (const match of text.matchAll(ARG_TOKEN_PATTERN)) {
+	const pattern = includeBareSeparator ? ARG_TOKEN_PATTERN_WITH_SEPARATOR : ARG_TOKEN_PATTERN;
+	for (const match of text.matchAll(pattern)) {
 		if (match.index < fromIndex || !hasTokenBoundary(text, match.index)) continue;
 		spans.push({ start: match.index, end: match.index + match[0].length, color: tokenColor(match[0]) });
 	}
@@ -57,10 +60,11 @@ function maskGrapheme(grapheme: string): string {
 export function styleArgumentTokens(
 	text: string,
 	styleOther: (segment: string) => string = (segment) => segment,
+	includeBareSeparator = false,
 ): string {
 	let result = "";
 	let offset = 0;
-	for (const token of findArgTokens(text)) {
+	for (const token of findArgTokens(text, 0, includeBareSeparator)) {
 		result += styleOther(text.slice(offset, token.start)) + theme.fg(token.color, text.slice(token.start, token.end));
 		offset = token.end;
 	}
@@ -86,7 +90,7 @@ export class PromptTokenMask {
 		if (commandEnd > 0) {
 			tokens.push({ start: 0, end: commandEnd, color: "accent" });
 		}
-		tokens.push(...findArgTokens(source, commandEnd));
+		tokens.push(...findArgTokens(source, commandEnd, commandEnd > 0));
 
 		let text = "";
 		let cursor = 0;
@@ -148,8 +152,8 @@ export class PromptTokenMask {
 export class ArgTokenHighlighter {
 	private spans: ArgTokenSpan[][] = [];
 
-	reset(lines: readonly string[]): void {
-		this.spans = lines.map((line) => findArgTokens(line));
+	reset(lines: readonly string[], includeBareSeparator = false): void {
+		this.spans = lines.map((line) => findArgTokens(line, 0, includeBareSeparator));
 	}
 
 	/**

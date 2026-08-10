@@ -95,6 +95,28 @@ describe("UserMessageComponent", () => {
 		expect(rendered).toContain(theme.fg("success", "@src/foo.ts"));
 	});
 
+	test("highlights a bare -- separator only in recognized slash commands", () => {
+		initTheme("dark");
+		const recognized = (name: string) => name === "new";
+		const command = new UserMessageComponent("/new --name bla -- hello", undefined, recognized).render(60).join("\n");
+		const plain = new UserMessageComponent("this -- however -- is fine", undefined, recognized).render(60).join("\n");
+
+		expect(command).toContain(theme.fg("mdLink", "--"));
+		expect(plain).not.toContain(theme.fg("mdLink", "--"));
+	});
+
+	test("does not highlight --- or glued -- as a separator", () => {
+		initTheme("dark");
+		const recognized = (name: string) => name === "new";
+		const triple = new UserMessageComponent("/new a --- b", undefined, recognized).render(60).join("\n");
+		const glued = new UserMessageComponent("/new x-- y", undefined, recognized).render(60).join("\n");
+		const plain = new UserMessageComponent("a --- b").render(60).join("\n");
+
+		expect(triple).not.toContain(theme.fg("mdLink", "--"));
+		expect(glued).not.toContain(theme.fg("mdLink", "--"));
+		expect(plain).not.toContain(theme.fg("mdLink", "--"));
+	});
+
 	test("highlights @path references in plain user messages", () => {
 		initTheme("dark");
 		const rendered = new UserMessageComponent("check @src/foo.ts please").render(60).join("\n");

@@ -313,7 +313,7 @@ export function styleQueuedMessagePreview(
 	const styleDim = (segment: string) => theme.fg("dim", segment);
 	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return styleArgumentTokens(preview, styleDim);
 	const prefix = preview.slice(0, preview.length - message.length);
-	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest) => styleArgumentTokens(rest, styleDim))}`;
+	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest) => styleArgumentTokens(rest, styleDim, true))}`;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {

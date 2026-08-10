@@ -267,6 +267,28 @@ describe("CustomEditor", () => {
 		expect(line).toContain(theme.fg("success", "@src/foo.ts"));
 	});
 
+	it("highlights a bare -- separator only for argument commands", () => {
+		initTheme("dark");
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			isArgumentCommand: (name) => name === "new",
+		});
+		editor.setText("/new --name bla -- hello");
+
+		const commandLine = editor.render(60)[1]!;
+
+		expect(commandLine).toContain(theme.fg("mdLink", "--"));
+
+		editor.setText("this -- however -- is fine");
+		const plain = editor.render(60).join("\n");
+
+		expect(plain).not.toContain(theme.fg("mdLink", "--"));
+
+		editor.setText("/unknown -- hello");
+		const unknownCommand = editor.render(60).join("\n");
+
+		expect(unknownCommand).not.toContain(theme.fg("mdLink", "--"));
+	});
+
 	it("highlights wrapped @path fragments across editor lines", () => {
 		initTheme("dark");
 		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());

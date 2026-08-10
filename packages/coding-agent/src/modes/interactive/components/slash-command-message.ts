@@ -14,7 +14,7 @@ export function isLeadingSlashCommand(text: string, isRecognized: (name: string)
 
 export function styleSlashCommandText(
 	text: string,
-	styleRest: (rest: string) => string = (rest) => styleArgumentTokens(rest),
+	styleRest: (rest: string) => string = (rest) => styleArgumentTokens(rest, undefined, true),
 ): string {
 	const parsed = parseSlashCommand(text);
 	const commandEnd = parsed ? parsed.name.length + 1 : text.length;

@@ -142,7 +142,9 @@ export class CustomEditor extends Editor {
 	}
 
 	override render(width: number): string[] {
-		this.argTokenHighlighter.reset(this.getLines());
+		const commandMatch = /^(\s*)\/(\S+)/.exec(this.getLines()[0] ?? "");
+		const isArgumentCommandLine = commandMatch !== null && this.isArgumentCommand(commandMatch[2]!);
+		this.argTokenHighlighter.reset(this.getLines(), isArgumentCommandLine);
 		let lines = super.render(width);
 		if (this.placeholder && this.getText().length === 0 && lines.length >= 2) {
 			lines = [lines[0]!, this.renderPlaceholderLine(width), ...lines.slice(2)];
