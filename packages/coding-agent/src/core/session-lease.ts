@@ -110,10 +110,21 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
-type ProcessQuery = (command: string, args: string[]) => string;
+interface ProcessQueryOptions {
+	timeout: number;
+	maxBuffer: number;
+}
 
-function runProcessQuery(command: string, args: string[]): string {
+type ProcessQuery = (command: string, args: string[], options: ProcessQueryOptions) => string;
+
+const PROCESS_QUERY_OPTIONS: ProcessQueryOptions = {
+	timeout: 250,
+	maxBuffer: 64 * 1024,
+};
+
+export function runProcessQuery(command: string, args: string[], options = PROCESS_QUERY_OPTIONS): string {
 	return execFileSync(command, args, {
+		...options,
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "ignore"],
 	});
@@ -124,13 +135,17 @@ export function getWindowsProcessStartId(pid: number, query: ProcessQuery = runP
 		return undefined;
 	}
 	try {
-		const startTicks = query("powershell.exe", [
-			"-NoLogo",
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			`([System.Diagnostics.Process]::GetProcessById(${pid})).StartTime.ToUniversalTime().Ticks`,
-		]).trim();
+		const startTicks = query(
+			"powershell.exe",
+			[
+				"-NoLogo",
+				"-NoProfile",
+				"-NonInteractive",
+				"-Command",
+				`([System.Diagnostics.Process]::GetProcessById(${pid})).StartTime.ToUniversalTime().Ticks`,
+			],
+			PROCESS_QUERY_OPTIONS,
+		).trim();
 		return /^\d+$/.test(startTicks) ? `win:${startTicks}` : undefined;
 	} catch {
 		return undefined;
@@ -156,7 +171,7 @@ export function getProcessStartId(pid: number): string | undefined {
 		// Fall through to the portable process listing used on macOS and BSD.
 	}
 	try {
-		const startTime = runProcessQuery("ps", ["-p", String(pid), "-o", "lstart="]).trim();
+		const startTime = runProcessQuery("ps", ["-p", String(pid), "-o", "lstart="], PROCESS_QUERY_OPTIONS).trim();
 		return startTime ? `ps:${startTime}` : undefined;
 	} catch {
 		return undefined;
