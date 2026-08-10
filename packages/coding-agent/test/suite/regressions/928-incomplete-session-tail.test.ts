@@ -10,9 +10,9 @@ import {
 	renameSync,
 	rmSync,
 	statSync,
-	unlinkSync,
 	utimesSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,11 +21,11 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	acquireSessionFileLockForTest,
+	acquireSessionLockTransitionForTest,
+	getSessionLockIdentityProbeCountForTest,
 	loadEntriesFromFile,
 	SessionManager,
-	setSessionLockIdentitylessClaimHookForTest,
-	setSessionLockReclaimHookForTest,
-	tryReclaimDeadSessionFileLockForTest,
+	setSessionLockOwnerWriteForTest,
 } from "../../../src/core/session-manager.js";
 import { createHarness, type Harness } from "../harness.js";
 
@@ -53,8 +53,7 @@ describe("regression #928: incomplete session tails", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
-		setSessionLockIdentitylessClaimHookForTest(undefined);
-		setSessionLockReclaimHookForTest(undefined);
+		setSessionLockOwnerWriteForTest(undefined);
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -298,6 +297,48 @@ describe("regression #928: incomplete session tails", () => {
 		},
 	);
 
+	it.each(["transition", "release"] as const)(
+		"recovers promptly when a writer crashes at the %s lock boundary",
+		async (phase) => {
+			if (process.platform === "win32") return;
+			const { harness, path } = await createSession();
+			const ready = join(harness.tempDir, `${phase}-crash-ready`);
+			const child = spawn(
+				process.execPath,
+				[
+					"--import",
+					"tsx",
+					fixturePath,
+					path,
+					`${phase} crash owner`,
+					join(harness.tempDir, `${phase}-crash-started`),
+					join(harness.tempDir, `${phase}-crash-done`),
+					ready,
+					join(harness.tempDir, `${phase}-crash-go`),
+				],
+				{
+					cwd: join(dirname(fixturePath), "../../.."),
+					stdio: "pipe",
+					env: { ...process.env, SESSION_LOCK_CRASH_PHASE: phase },
+				},
+			);
+			await waitForFile(ready);
+			const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+			child.kill("SIGKILL");
+			await exited;
+
+			const startedAt = Date.now();
+			const manager = SessionManager.open(path);
+			manager.appendSessionInfo(`after ${phase} crash`);
+			expect(Date.now() - startedAt).toBeLessThan(2_000);
+			const names = loadEntriesFromFile(path)
+				.filter((entry) => entry.type === "session_info")
+				.map((entry) => entry.name);
+			expect(names).toContain(`after ${phase} crash`);
+			if (phase === "release") expect(names).toContain("release crash owner");
+		},
+	);
+
 	it.runIf(process.platform !== "win32")("reclaims an owner whose PID start identity mismatches", async () => {
 		const { harness, path } = await createSession();
 		appendFileSync(path, '{"type":"message","id":"torn"');
@@ -358,77 +399,101 @@ describe("regression #928: incomplete session tails", () => {
 		release();
 	});
 
-	it("reclaims an identity-less lock only after the stale fallback", async () => {
+	it("fails promptly for an empty or malformed session lock", async () => {
 		const { path } = await createSession();
-		const targetPath = realpathSync(path);
-		const lockDir = `${targetPath}.lock`;
+		const lockDir = `${realpathSync(path)}.lock`;
 		mkdirSync(lockDir);
-		expect(tryReclaimDeadSessionFileLockForTest(targetPath)).toBe(false);
-		const staleTime = new Date(Date.now() - 10 * 60_000);
-		utimesSync(lockDir, staleTime, staleTime);
+		const startedAt = Date.now();
 
-		expect(tryReclaimDeadSessionFileLockForTest(targetPath)).toBe(true);
-		expect(existsSync(lockDir)).toBe(false);
+		expect(() => SessionManager.open(path)).toThrow(/Session lock is malformed/);
+		expect(Date.now() - startedAt).toBeLessThan(2_000);
 	});
 
-	it("does not quarantine a replacement during identity-less stale claiming", async () => {
+	it("fails promptly for a live owner whose process identity is unavailable", async () => {
 		const { path } = await createSession();
-		const targetPath = realpathSync(path);
-		const lockDir = `${targetPath}.lock`;
+		const lockDir = `${realpathSync(path)}.lock`;
 		mkdirSync(lockDir);
-		const staleTime = new Date(Date.now() - 10 * 60_000);
-		utimesSync(lockDir, staleTime, staleTime);
-		const replacementMarker = join(lockDir, "replacement-owner");
-		setSessionLockIdentitylessClaimHookForTest(() => {
-			rmSync(lockDir, { recursive: true, force: true });
-			mkdirSync(lockDir);
-			writeFileSync(replacementMarker, "live replacement");
-		});
-
-		expect(tryReclaimDeadSessionFileLockForTest(targetPath)).toBe(false);
-		expect(readFileSync(replacementMarker, "utf8")).toBe("live replacement");
-		expect(existsSync(lockDir)).toBe(true);
-	});
-
-	it("does not reclaim a lock whose recorded owner is still live", async () => {
-		const { path } = await createSession();
-		const targetPath = realpathSync(path);
-		const lockDir = `${targetPath}.lock`;
-		mkdirSync(lockDir);
-		const generation = "live-generation";
-		const ownerPath = join(lockDir, `owner-${generation}.json`);
-		writeFileSync(ownerPath, JSON.stringify({ generation, pid: process.pid, createdAt: Date.now() }));
-
-		expect(tryReclaimDeadSessionFileLockForTest(targetPath)).toBe(false);
-		expect(existsSync(ownerPath)).toBe(true);
-	});
-
-	it("does not reclaim a replacement generation after observing a dead owner", async () => {
-		const { path } = await createSession();
-		const targetPath = realpathSync(path);
-		const lockDir = `${targetPath}.lock`;
-		mkdirSync(lockDir);
-		const oldGeneration = "old-generation";
-		const oldOwnerPath = join(lockDir, `owner-${oldGeneration}.json`);
+		const generation = "unknown-identity";
 		writeFileSync(
-			oldOwnerPath,
-			JSON.stringify({ generation: oldGeneration, pid: 2_147_483_647, createdAt: Date.now() }),
+			join(lockDir, `owner-${generation}.json`),
+			JSON.stringify({ generation, pid: process.pid, createdAt: Date.now() }),
 		);
-		const newGeneration = "replacement-generation";
-		const newOwnerPath = join(lockDir, `owner-${newGeneration}.json`);
-		setSessionLockReclaimHookForTest(({ ownerPath, generation }) => {
-			expect(generation).toBe(oldGeneration);
-			unlinkSync(ownerPath);
-			writeFileSync(
-				newOwnerPath,
-				JSON.stringify({ generation: newGeneration, pid: process.pid, createdAt: Date.now() }),
-			);
-		});
+		const startedAt = Date.now();
 
-		expect(tryReclaimDeadSessionFileLockForTest(targetPath)).toBe(false);
-		expect(existsSync(newOwnerPath)).toBe(true);
-		expect(existsSync(lockDir)).toBe(true);
+		expect(() => SessionManager.open(path)).toThrow(/locked by PID/);
+		expect(Date.now() - startedAt).toBeLessThan(2_000);
 	});
+
+	it("writes complete owner metadata across short synchronous writes", async () => {
+		const { path } = await createSession();
+		const targetPath = realpathSync(path);
+		const shortWriter = ((fd: number, buffer: Buffer, offset: number, length: number) =>
+			writeSync(fd, buffer, offset, Math.min(length, 3))) as typeof writeSync;
+		setSessionLockOwnerWriteForTest(shortWriter);
+
+		const release = acquireSessionFileLockForTest(targetPath);
+		const lockDir = `${targetPath}.lock`;
+		const ownerName = readdirSync(lockDir).find((name) => name.startsWith("owner-"));
+		expect(() => JSON.parse(readFileSync(join(lockDir, ownerName!), "utf8"))).not.toThrow();
+		release();
+	});
+
+	it("recovers its own main lock after a bounded transition-release failure", async () => {
+		const { path } = await createSession();
+		const targetPath = realpathSync(path);
+		const releaseMain = acquireSessionFileLockForTest(targetPath);
+		const releaseTransition = acquireSessionLockTransitionForTest(targetPath);
+		const startedAt = Date.now();
+
+		expect(releaseMain).toThrow(/transition is held by PID/);
+		expect(Date.now() - startedAt).toBeLessThan(1_500);
+		releaseTransition();
+		const recoveredRelease = acquireSessionFileLockForTest(targetPath);
+		recoveredRelease();
+	});
+
+	it("fails promptly for malformed transition metadata", async () => {
+		const { path } = await createSession();
+		writeFileSync(`${realpathSync(path)}.transition-lock`, "");
+		const startedAt = Date.now();
+
+		expect(() => SessionManager.open(path)).toThrow(/transition is malformed/);
+		expect(Date.now() - startedAt).toBeLessThan(1_000);
+	});
+
+	it.runIf(process.platform !== "win32")(
+		"classifies a contended owner identity only once per acquisition episode",
+		async () => {
+			const { harness, path } = await createSession();
+			appendFileSync(path, '{"type":"message","id":"torn"');
+			const ready = join(harness.tempDir, "identity-probe-ready");
+			const child = spawn(
+				process.execPath,
+				[
+					"--import",
+					"tsx",
+					fixturePath,
+					path,
+					"identity probe owner",
+					join(harness.tempDir, "identity-probe-started"),
+					join(harness.tempDir, "identity-probe-done"),
+					ready,
+					join(harness.tempDir, "identity-probe-go"),
+				],
+				{ cwd: join(dirname(fixturePath), "../../.."), stdio: "pipe" },
+			);
+			await waitForFile(ready);
+			const before = getSessionLockIdentityProbeCountForTest();
+			const startedAt = Date.now();
+
+			expect(() => SessionManager.open(path)).toThrow(/locked by PID/);
+			expect(Date.now() - startedAt).toBeLessThan(1_500);
+			expect(getSessionLockIdentityProbeCountForTest() - before).toBeLessThanOrEqual(1);
+			const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+			child.kill("SIGKILL");
+			await exited;
+		},
+	);
 
 	it("fails closed instead of allocating or truncating an oversized unterminated record", async () => {
 		const { path } = await createSession();

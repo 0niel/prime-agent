@@ -133,7 +133,10 @@ describe("SessionManager.flushNow", () => {
 		mgr.flushNow();
 
 		const tempFd = fsMocks.fchownSync.mock.calls[0]?.[0];
-		const tempPath = fsMocks.renameSync.mock.calls[0]?.[0];
+		const fileRenameIndex = fsMocks.renameSync.mock.calls.findIndex(
+			(call) => basename(String(call[1])) === basename(file) && String(call[0]).endsWith(".tmp"),
+		);
+		const tempPath = fsMocks.renameSync.mock.calls[fileRenameIndex]?.[0];
 		expect(tempFd).toEqual(expect.any(Number));
 		expect(tempPath).toEqual(expect.any(String));
 		expect(fsMocks.fchownSync).toHaveBeenCalledWith(tempFd, before.uid, before.gid);
@@ -143,7 +146,7 @@ describe("SessionManager.flushNow", () => {
 			fsMocks.fchmodSync.mock.invocationCallOrder[0]!,
 		);
 		expect(fsMocks.fchmodSync.mock.invocationCallOrder[0]!).toBeLessThan(
-			fsMocks.renameSync.mock.invocationCallOrder[0]!,
+			fsMocks.renameSync.mock.invocationCallOrder[fileRenameIndex]!,
 		);
 		const after = statSync(file);
 		expect({ mode: after.mode & 0o777, uid: after.uid, gid: after.gid }).toEqual({
@@ -170,7 +173,7 @@ describe("SessionManager.flushNow", () => {
 		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
 
 		expect(() => mgr.flushNow()).toThrow(permissionError);
-		expect(fsMocks.renameSync).not.toHaveBeenCalled();
+		expect(fsMocks.renameSync.mock.calls.some((call) => call[1] === file)).toBe(false);
 		expect(readFileSync(file)).toEqual(before);
 		expect(readdirSync(dirname(file)).filter((name) => name.startsWith(tempPrefix) && name.endsWith(".tmp"))).toEqual(
 			[],
