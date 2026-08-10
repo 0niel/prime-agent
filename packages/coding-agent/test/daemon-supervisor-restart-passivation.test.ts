@@ -30,7 +30,14 @@ interface SupervisorInternals {
 	loadWorkerDescriptors(): Promise<void>;
 	wakePassivatedWorker(worker: WorkerFixture): Promise<void>;
 	forwardToWorker(worker: WorkerFixture, command: object): Promise<unknown>;
-	stopWorker(worker: WorkerFixture, removeDescriptor: boolean, force?: boolean, archiveSession?: boolean): Promise<void>;
+	stopWorker(
+		worker: WorkerFixture,
+		removeDescriptor: boolean,
+		force?: boolean,
+		archiveSession?: boolean,
+		recoveryCleanup?: boolean,
+		directChild?: unknown,
+	): Promise<void>;
 	stopWorkerOnce: ReturnType<typeof vi.fn>;
 	recoverWorker: ReturnType<typeof vi.fn>;
 	catalog: { archive(sessionFile: string, sessionId: string): Promise<void> };
@@ -605,6 +612,77 @@ describe("daemon supervisor restart passivation", () => {
 		]);
 	});
 
+
+	it("honors a concurrent force/archive/remove stop while an update stop is still graceful", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const worker = {
+			descriptor: { ...descriptor(fixture, "force", session), lifecycle: "ready" as const },
+			descriptorPath: join(fixture.descriptorDir, "force.json"), summaries: new Map(),
+			snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(),
+			intentionalStop: false, stopRevision: 0,
+		};
+		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
+		supervisor.workers.set("force", worker);
+		supervisor.catalog.archive = vi.fn(async () => undefined);
+		let signalTerm: () => void = () => undefined;
+		const termSignaled = new Promise<void>((resolve) => { signalTerm = resolve; });
+		const signals: string[] = [];
+		const child = {
+			exitCode: null as number | null,
+			signalCode: null as NodeJS.Signals | null,
+			kill(signal: NodeJS.Signals) {
+				signals.push(signal);
+				if (signal === "SIGTERM") signalTerm();
+				if (signal === "SIGKILL") this.signalCode = signal;
+				return true;
+			},
+		};
+		const directChild = { child, closed: Promise.resolve() };
+		const graceful = supervisor.stopWorker(worker, false, false, false, false, directChild);
+		await termSignaled;
+		const destructive = supervisor.stopWorker(worker, true, true, true, false, directChild);
+		await Promise.all([graceful, destructive]);
+
+		expect(signals).toContain("SIGKILL");
+		expect(supervisor.catalog.archive).toHaveBeenCalledTimes(1);
+		expect(supervisor.workers.has("force")).toBe(false);
+		expect(() => readFileSync(worker.descriptorPath)).toThrow();
+	});
+
+	it("does not let a recovery-cleanup direct child suppress a concurrent deleting archive", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const worker = {
+			descriptor: { ...descriptor(fixture, "recovery-collision", session), lifecycle: "ready" as const },
+			descriptorPath: join(fixture.descriptorDir, "recovery-collision.json"), summaries: new Map(),
+			snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(),
+			intentionalStop: false, stopRevision: 0,
+		};
+		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
+		supervisor.workers.set("recovery-collision", worker);
+		supervisor.catalog.archive = vi.fn(async () => undefined);
+		let releaseChild: () => void = () => undefined;
+		const childClosed = new Promise<void>((resolve) => { releaseChild = resolve; });
+		const child = { exitCode: 0, signalCode: null, kill: vi.fn(() => true) };
+		const recoveryCleanup = supervisor.stopWorker(worker, false, true, false, true, { child, closed: childClosed });
+		await Promise.resolve();
+		const deletingArchive = supervisor.stopWorker(worker, true, false, true);
+		releaseChild();
+		await Promise.all([recoveryCleanup, deletingArchive]);
+
+		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+		expect(supervisor.workers.has("recovery-collision")).toBe(false);
+		expect(() => readFileSync(worker.descriptorPath)).toThrow();
+	});
 
 	it("removes a stopped update resident while retaining its descriptor for replacement recovery", async () => {
 		const fixture = fixtureRoot();

@@ -4780,7 +4780,9 @@ export class DaemonSupervisor {
 		// Do not coalesce stop calls. Their remove/force/archive/recovery/direct-child
 		// arguments are intentional and a later caller must not silently inherit the
 		// first caller's policy. The set is only a fence for a stale passive wake.
-		if (worker.stopFinalized) throw new Error(`Session worker ${worker.descriptor.workerId} was stopped`);
+		if (worker.stopFinalized && !(removeDescriptor && archiveSession && !worker.archiveFinalization)) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} was stopped`);
+		}
 		// Defer entry one microtask so every stop dispatched in the same turn records
 		// its immutable request before any one can begin final deletion.
 		const stop = Promise.resolve().then(() =>
@@ -4792,21 +4794,25 @@ export class DaemonSupervisor {
 			await stop;
 		} catch (error) {
 			const failure = error instanceof Error ? error : new Error(String(error));
-			// A prior successful concurrent deletion may already have removed this
-			// object. Restore the failed-stop fence so a fresh lookup cannot wake it.
-			this.workers.set(worker.descriptor.workerId, worker);
-			worker.stopFailure = failure;
-			worker.intentionalStop = true;
-			try {
-				if (removeDescriptor) {
-					this.persistWorkerStopTombstone(worker, archiveSession);
-				} else {
-					worker.descriptor.lifecycle = "failed";
-					worker.descriptor.lastError = failure.message;
-					this.persistWorker(worker);
+			// A concurrent finalizer may have already stopped and removed this worker.
+			// Do not let a later loser resurrect its registry entry or descriptor merely
+			// to record its own cleanup failure.
+			if (!worker.stopFinalized) {
+				// Restore the failed-stop fence so a fresh lookup cannot wake it.
+				this.workers.set(worker.descriptor.workerId, worker);
+				worker.stopFailure = failure;
+				worker.intentionalStop = true;
+				try {
+					if (removeDescriptor) {
+						this.persistWorkerStopTombstone(worker, archiveSession);
+					} else {
+						worker.descriptor.lifecycle = "failed";
+						worker.descriptor.lastError = failure.message;
+						this.persistWorker(worker);
+					}
+				} catch (persistError) {
+					this.reportCleanupFailure(`worker stop failure fence ${worker.descriptor.workerId}`, persistError);
 				}
-			} catch (persistError) {
-				this.reportCleanupFailure(`worker stop failure fence ${worker.descriptor.workerId}`, persistError);
 			}
 			throw error;
 		} finally {
@@ -4825,6 +4831,17 @@ export class DaemonSupervisor {
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
 	): Promise<void> {
+		// Another independently dispatched stop may have completed between this
+		// request being recorded and its turn to run. A dead worker cannot be
+		// stopped twice, but a later archive request is still actionable from the
+		// retained descriptor context and must not be silently lost.
+		if (worker.stopFinalized) {
+			if (removeDescriptor && archiveSession && !worker.archiveFinalization) {
+				worker.archiveFinalization = this.finalizeArchivedWorkerStop(worker);
+				await worker.archiveFinalization;
+			}
+			return;
+		}
 		// A passivated descriptor is explicitly processless. Its old pid may have
 		// been recycled while the supervisor was down, so never probe or signal it.
 		const processless = worker.descriptor.lifecycle === "passivated" || worker.descriptor.pid === undefined;
