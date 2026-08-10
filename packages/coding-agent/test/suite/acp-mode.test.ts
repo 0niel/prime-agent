@@ -34,6 +34,7 @@ function fakeAcpConnection(
 		initialSnapshot?: () => Promise<any>;
 		finalSnapshot?: () => Promise<any>;
 		onInitialSnapshot?: (subscribed: boolean) => void;
+		onPromptAndWait?: () => void;
 		onUnsubscribe?: () => void;
 	} = {},
 ): any {
@@ -61,7 +62,10 @@ function fakeAcpConnection(
 			if (options.finalSnapshot) return options.finalSnapshot();
 			return snapshot;
 		},
-		promptAndWait: async () => {},
+		promptAndWait: async () => {
+			options.onPromptAndWait?.();
+		},
+		dispose: async () => {},
 		waitForHeadlessCompletion: async () => ({
 			enabled: false,
 			continuationsUsed: 0,
@@ -71,6 +75,9 @@ function fakeAcpConnection(
 		}),
 		emitChild(child: any) {
 			listener?.({ type: "session_event", event: { type: "rlm_child_update", child } });
+		},
+		emitHeartbeat() {
+			listener?.({ type: "heartbeats_changed" });
 		},
 	};
 }
@@ -142,8 +149,19 @@ describe("ACP mode end to end", () => {
 			sessionId: session.sessionId,
 			prompt: [{ type: "text", text: "finish" }],
 		});
-		const quiescence = updates.find((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
-		expect(quiescence?.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence).toEqual({
+		const correlated = updates
+			.map((update) => update.update?._meta?.[PRIME_AGENT_META_NAMESPACE])
+			.filter((meta) => meta?.promptTurnId === 1);
+		expect(correlated.map((meta) => meta.eventSequence)).toEqual(
+			[...correlated.map((meta) => meta.eventSequence)].sort((a, b) => a - b),
+		);
+		expect(new Set(correlated.map((meta) => meta.eventSequence)).size).toBe(correlated.length);
+		expect(correlated.filter((meta) => meta.phase === "responseBoundary")).toEqual([
+			expect.objectContaining({ outcome: "result" }),
+		]);
+		const terminalIndex = correlated.findIndex((meta) => meta.phase === "terminalQuiescence");
+		expect(terminalIndex).toBeGreaterThan(correlated.findIndex((meta) => meta.phase === "responseBoundary"));
+		expect(correlated[terminalIndex].quiescence).toEqual({
 			outstandingSubagents: 0,
 			remainingAutonomousContinuations: 0,
 		});
@@ -272,8 +290,15 @@ describe("ACP mode end to end", () => {
 				prompt: [{ type: "text", text: "finish" }],
 			}),
 		).rejects.toThrow();
-		const quiescence = updates.find((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
-		expect(quiescence).toBeUndefined();
+		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(metadata).toContainEqual(
+			expect.objectContaining({
+				promptTurnId: 1,
+				phase: "responseBoundary",
+				outcome: "error",
+			}),
+		);
+		expect(metadata.find((meta) => meta.phase === "terminalQuiescence")).toBeUndefined();
 		close();
 	});
 
@@ -292,6 +317,81 @@ describe("ACP mode end to end", () => {
 		});
 		const quiescence = updates.find((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
 		expect(quiescence.update._meta[PRIME_AGENT_META_NAMESPACE].quiescence.outstandingSubagents).toBe(1);
+		close();
+	});
+
+	it("keeps global sequences and causal turn ids across sequential prompts", async () => {
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "first" }],
+		});
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "second" }],
+		});
+		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		const sequences = metadata.map((meta) => meta.eventSequence);
+		expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+		expect(metadata.filter((meta) => meta.phase === "responseBoundary").map((meta) => meta.promptTurnId)).toEqual([
+			1, 2,
+		]);
+		expect(metadata.filter((meta) => meta.phase === "terminalQuiescence").map((meta) => meta.promptTurnId)).toEqual([
+			1, 2,
+		]);
+		close();
+	});
+
+	it("keeps a late child update on its originating prompt", async () => {
+		const child = { id: "child-1", label: "child", status: "running", sessionDir: "/tmp/child" };
+		let connection: any;
+		connection = fakeAcpConnection({
+			onPromptAndWait: () => connection.emitChild(child),
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "first" }],
+		});
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "second" }],
+		});
+		connection.emitChild({ ...child, status: "done" });
+		await vi.waitFor(() =>
+			expect(
+				updates.some(
+					(u) =>
+						u.update?.sessionUpdate === "session_info_update" &&
+						u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.subagents,
+				),
+			).toBe(true),
+		);
+		const childUpdates = updates
+			.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE])
+			.filter((meta) => meta?.subagents);
+		expect(childUpdates.map((meta) => meta.promptTurnId)).toEqual([1, 1]);
+		expect(childUpdates.map((meta) => meta.phase)).toEqual(["event", "event"]);
+		close();
+	});
+
+	it("correlates connection-scoped heartbeats to turn zero", async () => {
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		connection.emitHeartbeat();
+		await vi.waitFor(() => expect(updates).toHaveLength(1));
+		expect(updates[0].update._meta[PRIME_AGENT_META_NAMESPACE]).toMatchObject({
+			promptTurnId: 0,
+			phase: "event",
+			eventSequence: 1,
+		});
 		close();
 	});
 });

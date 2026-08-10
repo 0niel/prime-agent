@@ -10,10 +10,14 @@ import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
 import { InProcessAgentConnection } from "../agent-connection/in-process-agent-connection.js";
-import type { AgentConnection, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
+import type {
+	AgentConnection,
+	AgentConnectionRlmChildAgentSnapshot,
+	AgentConnectionSessionEvent,
+} from "../agent-connection/types.js";
 import { latestAutonomousGateAttempt } from "../headless-completion.js";
 import { type AcpEventMappingState, acpUpdatesForSessionEvent } from "./acp-events.js";
-import { type PrimeAgentAutonomousMeta, primeAgentMeta } from "./acp-meta.js";
+import { PRIME_AGENT_META_NAMESPACE, type PrimeAgentAutonomousMeta, primeAgentMeta } from "./acp-meta.js";
 import { type AcpStopReason, acpStopReason } from "./acp-stop-reason.js";
 
 /**
@@ -100,6 +104,94 @@ interface AcpSessionEntry {
 	id: string;
 	abort: AbortController | undefined;
 	unsubscribe: (() => void) | undefined;
+	producer: AcpUpdateProducer;
+}
+
+/**
+ * The sole producer of ACP session updates for one ACP session.
+ *
+ * ACP notifications are asynchronous, so assigning an id at each call site is
+ * insufficient: detached calls can be observed out of order. This producer
+ * serializes publication and stamps the *delivered* order. Its phase/outcome
+ * fields are application metadata, deliberately independent of ACP stop
+ * reasons such as `end_turn`.
+ */
+class AcpUpdateProducer {
+	private eventSequence = 0;
+	private nextPromptTurnId = 0;
+	private activePromptTurnId = 0;
+	private tail: Promise<void> = Promise.resolve();
+	private readonly childOriginTurnIds = new Map<string, number>();
+
+	constructor(
+		private readonly sessionId: string,
+		private readonly client: { notify(method: unknown, params: unknown): Promise<unknown> },
+	) {}
+
+	beginPrompt(): number {
+		this.activePromptTurnId = ++this.nextPromptTurnId;
+		return this.activePromptTurnId;
+	}
+
+	finishPrompt(turnId: number): void {
+		if (this.activePromptTurnId === turnId) this.activePromptTurnId = 0;
+	}
+
+	turnForEvent(event: AgentConnectionSessionEvent): number {
+		if (event.type === "rlm_child_update") {
+			const known = this.childOriginTurnIds.get(event.child.id);
+			if (known !== undefined) return known;
+			// A child is first observed while its parent prompt is producing it.
+			// Remember that origin so a later child update cannot be relabelled by
+			// a subsequent prompt.
+			if (this.activePromptTurnId !== 0) this.childOriginTurnIds.set(event.child.id, this.activePromptTurnId);
+			return this.activePromptTurnId;
+		}
+		return this.activePromptTurnId;
+	}
+
+	publish(
+		update: Record<string, unknown>,
+		turnId: number,
+		phase: "event" | "responseBoundary" | "terminalQuiescence",
+		outcome?: "result" | "error",
+	): Promise<void> {
+		const eventSequence = ++this.eventSequence;
+		const priorMeta = (update._meta && typeof update._meta === "object" ? update._meta : {}) as Record<
+			string,
+			unknown
+		>;
+		const priorPrimeMeta =
+			priorMeta[PRIME_AGENT_META_NAMESPACE] && typeof priorMeta[PRIME_AGENT_META_NAMESPACE] === "object"
+				? (priorMeta[PRIME_AGENT_META_NAMESPACE] as Record<string, unknown>)
+				: {};
+		const correlatedUpdate = {
+			...update,
+			_meta: {
+				...priorMeta,
+				[PRIME_AGENT_META_NAMESPACE]: {
+					...priorPrimeMeta,
+					promptTurnId: turnId,
+					eventSequence,
+					phase,
+					...(outcome ? { outcome } : {}),
+				},
+			},
+		};
+		// Keep the chain alive after a disconnect, while preserving the order of
+		// every later notification and allowing callers to await its drain.
+		this.tail = this.tail.then(() =>
+			this.client
+				.notify(acp.methods.client.session.update, { sessionId: this.sessionId, update: correlatedUpdate })
+				.then(() => undefined)
+				.catch(() => undefined),
+		);
+		return this.tail;
+	}
+
+	drain(): Promise<void> {
+		return this.tail;
+	}
 }
 
 /**
@@ -321,7 +413,8 @@ export async function runAcpModeWithConnection(
 				// Install the listener before fetching the snapshot. Child updates can arrive
 				// while the snapshot request is in flight; the connection remains the
 				// authoritative source used when quiescence is emitted below.
-				const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined };
+				const producer = new AcpUpdateProducer(sessionId, ctx.client);
+				const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined, producer };
 				// Subscribe for the session lifetime, not per prompt turn: prime-agent
 				// subagents are fire-and-forget and keep reporting after the spawning turn
 				// ends, so a turn-scoped subscription would drop their updates. One
@@ -329,20 +422,20 @@ export async function runAcpModeWithConnection(
 				// the run that produced it.
 				const mappingState: AcpEventMappingState = {};
 				const unsubscribe = connection.subscribe((event) => {
-					const notify = (update: Record<string, unknown>) =>
-						void ctx.client
-							.notify(acp.methods.client.session.update, { sessionId, update })
-							.catch(() => undefined);
-					// Heartbeats and cron schedules are connection-level rather than
-					// session events, but they drive the long-running work an ACP client
-					// most needs to observe.
+					// Heartbeats are connection-scoped, including if one races a prompt.
+					// They therefore intentionally use origin turn 0.
 					if (event.type === "heartbeats_changed") {
-						notify({ sessionUpdate: "session_info_update", _meta: primeAgentMeta({ heartbeatsChanged: true }) });
+						void producer.publish(
+							{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({ heartbeatsChanged: true }) },
+							0,
+							"event",
+						);
 						return;
 					}
 					if (event.type !== "session_event") return;
+					const turnId = producer.turnForEvent(event.event);
 					for (const update of acpUpdatesForSessionEvent(event.event, mappingState)) {
-						notify(update);
+						void producer.publish(update, turnId, "event");
 					}
 				});
 				try {
@@ -371,60 +464,76 @@ export async function runAcpModeWithConnection(
 			const params = ctx.params as { sessionId: string; prompt: readonly unknown[] };
 			const entry = session?.id === params.sessionId ? session : undefined;
 			if (!entry) throw new Error(`Unknown ACP session: ${params.sessionId}`);
+			if (entry.abort) throw new Error("A prompt turn is already running for this ACP session");
 
-			// ACP allows one turn at a time per session. Refuse a concurrent prompt
-			// rather than overwriting the running turn's controller, which would make
-			// the live turn uncancellable and let the loser's cleanup clear it.
-			if (entry.abort) {
-				throw new Error("A prompt turn is already running for this ACP session");
-			}
 			const abort = new AbortController();
 			entry.abort = abort;
-
+			// Allocate the causal turn before the first await, not when an update is
+			// delivered. This prevents late producer events becoming the next turn.
+			const promptTurnId = entry.producer.beginPrompt();
+			let responseBoundaryEmitted = false;
 			try {
 				const { text, images } = promptContent(params.prompt);
-				// Only this turn's messages may decide its outcome, and compaction can
-				// rebuild the transcript mid-turn, so record the pre-turn messages
-				// themselves rather than how many there were.
 				const priorMessages = turnBoundary(await connection.getMessages());
 				await connection.promptAndWait(text, images.length > 0 ? { images } : undefined);
-				// Autonomous gates continue inside this same prompt turn: the turn is
-				// only over once the gate loop settles.
-				const status = await connection.waitForHeadlessCompletion();
-				// Snapshot after headless completion: detached subagents can publish a
-				// terminal update after the parent model turn has gone idle.
-				const autonomous = autonomousMeta(status);
-				// Read the authoritative live roster at emission time. A session-local
-				// shadow map can miss detached children or updates during the turn.
-				const liveSnapshot = await connection.getInitialSnapshot();
-				const meta = primeAgentMeta({
-					...(autonomous ? { autonomous } : {}),
-					quiescence: quiescenceMeta(status, liveSnapshot.children),
-				});
-				await ctx.client
-					.notify(acp.methods.client.session.update, {
-						sessionId: params.sessionId,
-						update: { sessionUpdate: "session_info_update", _meta: meta },
-					})
-					.catch(() => undefined);
-
-				// A turn that failed (provider error, auth, no usable model) must not be
-				// reported as a clean end_turn. Print mode surfaces
-				// `stopReason: "error"` with its errorMessage; ACP previously dropped
-				// that and answered end_turn with no updates at all, which reads to a
-				// client as a successful but empty turn.
 				const failure = await turnFailure(connection, priorMessages);
 				if (failure && !abort.signal.aborted) {
+					await entry.producer.publish(
+						{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
+						promptTurnId,
+						"responseBoundary",
+						"error",
+					);
+					responseBoundaryEmitted = true;
+					await entry.producer.drain();
 					throw new Error(`prime-agent turn failed: ${failure}`);
 				}
+
+				// Establish the state that makes a result boundary truthful before
+				// publishing it. The boundary still precedes terminal quiescence.
+				const status = await connection.waitForHeadlessCompletion();
+				const autonomous = autonomousMeta(status);
+				const liveSnapshot = await connection.getInitialSnapshot();
+				// `result` is application causality, never an ACP transport reason.
+				await entry.producer.publish(
+					{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
+					promptTurnId,
+					"responseBoundary",
+					"result",
+				);
+				responseBoundaryEmitted = true;
+				await entry.producer.publish(
+					{
+						sessionUpdate: "session_info_update",
+						_meta: primeAgentMeta({
+							...(autonomous ? { autonomous } : {}),
+							quiescence: quiescenceMeta(status, liveSnapshot.children),
+						}),
+					},
+					promptTurnId,
+					"terminalQuiescence",
+				);
+				await entry.producer.drain();
 				return { stopReason: acpStopReason({ cancelled: abort.signal.aborted, autonomous: status }) };
 			} catch (error) {
-				// Cancellation is a normal ACP prompt outcome, not a JSON-RPC error.
-				if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
+				if (abort.signal.aborted) {
+					await entry.producer.drain();
+					return { stopReason: "cancelled" satisfies AcpStopReason };
+				}
+				// Failed prompt/snapshot admission gets one correlated error boundary;
+				// it never gets an invented terminal-quiescence update.
+				if (!responseBoundaryEmitted) {
+					await entry.producer.publish(
+						{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
+						promptTurnId,
+						"responseBoundary",
+						"error",
+					);
+				}
+				await entry.producer.drain();
 				throw error;
 			} finally {
-				// Only clear our own controller: a later turn must not be cleared by
-				// an earlier one unwinding.
+				entry.producer.finishPrompt(promptTurnId);
 				if (entry.abort === abort) entry.abort = undefined;
 			}
 		})
