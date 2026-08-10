@@ -437,10 +437,15 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		descriptor.version === 1 &&
 		descriptor.supervisorSocketPath === socketPath &&
 		typeof descriptor.workerId === "string" &&
-		// Early v1 descriptors predate lifecycle. Accept those only when their
-		// process identity is valid, so the loader can recover them safely below.
-		// A missing/corrupt identity remains fail-closed and is ignored.
-		(knownLifecycle ? descriptor.lifecycle === "passivated" || validLegacyProcess : validLegacyProcess) &&
+		// A passivated descriptor is intentionally processless. `recovering` is
+		// also processless after normalizing a legacy missing/unknown lifecycle:
+		// retaining it lets the next supervisor recover the root without treating
+		// a stale PID as safe to adopt or signal. Other lifecycle states still need
+		// a valid process identity, and unknown legacy states do too until their
+		// first normalization pass, so malformed input remains fail-closed.
+		(knownLifecycle
+			? descriptor.lifecycle === "passivated" || descriptor.lifecycle === "recovering" || validLegacyProcess
+			: validLegacyProcess) &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&

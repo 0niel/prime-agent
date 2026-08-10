@@ -98,8 +98,10 @@ export interface DaemonWorkerDescriptor {
 	workerId: string;
 	/**
 	 * Process identity for resident workers. Both fields are deliberately absent
-	 * for passivated descriptors. Legacy fields are accepted only while reading
-	 * a non-passivated v1 descriptor; writers never retain them on a passivation.
+	 * for passivated descriptors and may be absent on a recovering descriptor
+	 * normalized from legacy lifecycle data. Legacy fields are accepted only while
+	 * reading a non-passivated v1 descriptor; writers never retain them on a
+	 * passivation.
 	 */
 	pid?: number;
 	processStartId?: string;

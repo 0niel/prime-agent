@@ -1173,7 +1173,7 @@ describe("daemon supervisor restart passivation", () => {
 		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
 	});
 
-	it("recovers v1 descriptors with missing or unknown lifecycle instead of hiding their roots", async () => {
+	it("keeps normalized v1 lifecycle roots visible and passive across successive reloads", async () => {
 		const fixture = fixtureRoot();
 		const missing = persistSession(fixture.sessionDir, fixture.root, "completed");
 		const unknown = persistSession(fixture.sessionDir, fixture.root, "completed");
@@ -1183,23 +1183,53 @@ describe("daemon supervisor restart passivation", () => {
 		writeFileSync(join(fixture.descriptorDir, "missing-lifecycle.json"), JSON.stringify(missingDescriptor));
 		writeFileSync(join(fixture.descriptorDir, "unknown-lifecycle.json"), JSON.stringify(unknownDescriptor));
 
-		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+		// The first reload normalizes untrusted lifecycle values. The next one must
+		// accept those durable, processless `recovering` descriptors rather than
+		// dropping their roots before it can classify them as passive.
+		const first = new DaemonSupervisor(fixture.socketPath, {
 			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
-		await supervisor.loadWorkerDescriptors();
+		first.recoverWorker = vi.fn();
+		workerSpawn.mockClear();
+		const kill = vi.spyOn(process, "kill");
+		try {
+			await first.loadWorkerDescriptors();
+			expect(first.workers).toHaveLength(2);
+			for (const workerId of ["missing-lifecycle", "unknown-lifecycle"]) {
+				const worker = first.workers.get(workerId);
+				expect(worker?.descriptor.lifecycle).toBe("recovering");
+				expect(worker?.descriptor.pid).toBeUndefined();
+				expect(worker?.descriptor.processStartId).toBeUndefined();
+				const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
+				expect(persisted.lifecycle).toBe("recovering");
+				expect(persisted.pid).toBeUndefined();
+			}
 
-		// Both roots remain reachable by the restart path, but their malformed
-		// lifecycle cannot authorize adoption, passivation, or process signalling.
-		expect(supervisor.workers).toHaveLength(2);
-		for (const workerId of ["missing-lifecycle", "unknown-lifecycle"]) {
-			const worker = supervisor.workers.get(workerId);
-			expect(worker?.descriptor.lifecycle).toBe("recovering");
-			expect(worker?.descriptor.pid).toBeUndefined();
-			expect(worker?.descriptor.processStartId).toBeUndefined();
-			const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
-			expect(persisted.lifecycle).toBe("recovering");
-			expect(persisted.pid).toBeUndefined();
+			const second = new DaemonSupervisor(fixture.socketPath, {
+				defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+				descriptorDir: fixture.descriptorDir,
+			}) as unknown as SupervisorInternals;
+			second.recoverWorker = vi.fn();
+			await second.loadWorkerDescriptors();
+
+			// Completed roots become metadata-only on the second reload, retaining
+			// their summaries for explicit wake without an automatic wake or signal.
+			expect(second.workers).toHaveLength(2);
+			for (const workerId of ["missing-lifecycle", "unknown-lifecycle"]) {
+				const worker = second.workers.get(workerId);
+				expect(worker?.descriptor.lifecycle).toBe("passivated");
+				expect(worker?.descriptor.pid).toBeUndefined();
+				expect(worker?.descriptor.processStartId).toBeUndefined();
+				expect(worker?.client).toBeUndefined();
+				expect(worker?.summaries.has(worker?.descriptor.rootActiveSessionId ?? "")).toBe(true);
+			}
+			expect(first.recoverWorker).not.toHaveBeenCalled();
+			expect(second.recoverWorker).not.toHaveBeenCalled();
+			expect(workerSpawn).not.toHaveBeenCalled();
+			expect(kill).not.toHaveBeenCalled();
+		} finally {
+			kill.mockRestore();
 		}
 	});
 
