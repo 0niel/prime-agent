@@ -50,6 +50,17 @@ export interface RlmFindModelsResult {
 }
 
 export type RlmRunHandler = (request: RlmRunRequest) => Promise<Record<string, unknown>>;
+/** Deliberately minimal policy projection; selectors, tools and policy data stay host-private. */
+export interface RlmRole {
+	id: string;
+	model_profile: string;
+	decision_scopes: string[];
+	implementation_scopes: string[];
+}
+export interface RlmListRolesResult {
+	roles: RlmRole[];
+}
+export type RlmListRolesHandler = () => RlmListRolesResult | Promise<RlmListRolesResult>;
 export type RlmListSubagentsHandler = () => RlmListSubagentsResult | Promise<RlmListSubagentsResult>;
 export type RlmDeleteSubagentHandler = (target: string) => Promise<RlmDeleteSubagentResult>;
 export type RlmFindModelsHandler = (query: string, limit: number) => RlmFindModelsResult | Promise<RlmFindModelsResult>;
@@ -179,6 +190,14 @@ export function createRlmFindModelsHostHandler(handler: RlmFindModelsHandler): H
 	};
 }
 
+/** Expose the bounded safe projection of a role policy to its kernel. */
+export function createRlmListRolesHostHandler(handler: RlmListRolesHandler): HostRequestHandler {
+	return async () => {
+		const { roles } = await handler();
+		return { roles };
+	};
+}
+
 /** Expose the current parent session's RLM child registry to its kernel. */
 export function createRlmListSubagentsHostHandler(handler: RlmListSubagentsHandler): HostRequestHandler {
 	return async () => {
@@ -215,6 +234,8 @@ export interface CreateRlmSubagentRuntimeOptions {
 	id: string;
 	/** Minted by the parent before this child is published. */
 	assignmentId?: string;
+	/** Host-private immutable policy assignment, if admission used policy mode. */
+	swarmRoleAssignment?: import("./swarm-role-policy.js").SwarmRoleAssignment;
 	prompt: string;
 	sessionName: string;
 	sessionDir: string;

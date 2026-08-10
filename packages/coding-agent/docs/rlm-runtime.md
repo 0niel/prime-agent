@@ -275,3 +275,8 @@ Provider credentials are resolved by the TypeScript host. The bounded model cata
 ## Focused Validation
 
 From the repository root, the implementation is covered by focused kernel, recursion, context-tree, daemon RLM, and runtime tests. When changing child creation or accounting, include `agent-session-recursion.test.ts`; when changing comm transport, include the kernel comm tests; when changing daemon retention, include the daemon RLM lifecycle tests.
+
+
+## Optional swarm role policy
+
+The server-only `PRIME_AGENT_ENABLE_SWARM_ROLE_POLICY=1` rollout flag enables a host-authorized role admission policy when a valid configured policy exists. In that mode use `await rlm.list_roles()` and `await rlm.run(prompt, role=..., decision_scopes=..., implementation_scopes=..., shared_context=...)`; `model` is rejected. With the flag unset or `0`, policy arguments and `list_roles` are rejected and the existing model API is unchanged. Roles narrow host-provided tools and are **not** a filesystem, process, or network sandbox. Shared context is explicitly supplied, untrusted, bounded, and non-transitive.

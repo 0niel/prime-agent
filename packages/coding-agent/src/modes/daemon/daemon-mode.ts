@@ -101,6 +101,7 @@ import {
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
+import type { SwarmRoleAssignment } from "../../core/swarm-role-policy.js";
 import {
 	canPassivateSession,
 	type IdleEvictionMinutes,
@@ -392,6 +393,8 @@ interface PersistedRlmSubagentRegistryEntry {
 	prompt?: string;
 	spawnCode?: string;
 	model?: { provider: string; modelId: string };
+	/** Private safe policy snapshot; no instructions, capsule bodies, settings, or credentials. */
+	swarmRoleAssignment?: SwarmRoleAssignment;
 	status: "running" | "completed" | "deleted";
 	createdAt: number;
 	updatedAt: string;
@@ -997,6 +1000,7 @@ export class AgentDaemon {
 			prompt?: string;
 			spawnCode?: string;
 			model?: { provider: string; modelId: string };
+			swarmRoleAssignment?: SwarmRoleAssignment;
 			status: PersistedRlmSubagentRegistryEntry["status"];
 			createdAt?: number;
 		},
@@ -1017,6 +1021,7 @@ export class AgentDaemon {
 			...(input.prompt ? { prompt: input.prompt } : {}),
 			...(input.spawnCode ? { spawnCode: input.spawnCode } : {}),
 			...(input.model ? { model: input.model } : {}),
+			...(input.swarmRoleAssignment ? { swarmRoleAssignment: input.swarmRoleAssignment } : {}),
 			status: input.status,
 			createdAt: input.createdAt ?? Date.now(),
 			updatedAt: new Date().toISOString(),
@@ -2356,6 +2361,7 @@ export class AgentDaemon {
 					prompt: metadata.prompt && metadata.prompt.length <= 4096 ? metadata.prompt : undefined,
 					spawnCode: metadata.spawnCode,
 					...(model ? { model: { provider: model.provider, modelId: model.id } } : {}),
+					...(childSession.swarmRoleAssignment ? { swarmRoleAssignment: childSession.swarmRoleAssignment } : {}),
 					status: "completed",
 					createdAt: metadata.createdAt,
 				});
@@ -2430,6 +2436,7 @@ export class AgentDaemon {
 								prompt: persisted.prompt,
 								spawnCode: persisted.spawnCode,
 								model: persisted.model,
+								swarmRoleAssignment: persisted.swarmRoleAssignment,
 								status: persisted.status,
 								createdAt: persisted.createdAt,
 							})
@@ -2550,6 +2557,7 @@ export class AgentDaemon {
 					rlmSessionDir: options.sessionDir,
 					rlmParentNodeId: options.rlmParentNodeId,
 					rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+					swarmRoleAssignment: options.swarmRoleAssignment,
 				},
 				runtimeMetadata: {
 					kind: "subagent",
@@ -2594,6 +2602,7 @@ export class AgentDaemon {
 							provider: options.model.provider,
 							modelId: options.model.id,
 						},
+						...(options.swarmRoleAssignment ? { swarmRoleAssignment: options.swarmRoleAssignment } : {}),
 						status: "running",
 						createdAt: runtime.metadata.createdAt,
 					});
@@ -3017,6 +3026,7 @@ export class AgentDaemon {
 								: 1),
 						rlmMaxDepth: entry.rlmMaxDepth,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
+						swarmRoleAssignment: entry.swarmRoleAssignment,
 					},
 					runtimeMetadata: {
 						kind: "subagent",

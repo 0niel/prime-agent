@@ -115,7 +115,7 @@ function exactSelector(value: unknown): string {
 	if (typeof value !== "string") fail("model profile model must be a string");
 	const selector = value.trim();
 	const slash = selector.indexOf("/");
-	if (!selector || slash <= 0 || slash === selector.length - 1 || /\s/.test(selector))
+	if (!selector || slash <= 0 || slash !== selector.lastIndexOf("/") || slash === selector.length - 1 || /\s/.test(selector))
 		fail("model profile model must be an exact provider/model selector");
 	return selector;
 }
@@ -147,10 +147,7 @@ function parseProfile(value: unknown, alias: string): SwarmModelProfile {
 		profile.thinkingLevel = value.thinkingLevel as ThinkingLevel;
 	}
 	if (value.serviceTier !== undefined) {
-		if (
-			value.serviceTier !== null &&
-			(typeof value.serviceTier !== "string" || !SERVICE_TIERS.has(value.serviceTier as Exclude<ServiceTier, null>))
-		)
+		if (typeof value.serviceTier !== "string" || !SERVICE_TIERS.has(value.serviceTier as Exclude<ServiceTier, null>))
 			fail(`modelProfiles.${alias}.serviceTier is invalid`);
 		profile.serviceTier = value.serviceTier as ServiceTier;
 	}
