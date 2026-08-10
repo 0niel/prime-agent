@@ -1,11 +1,25 @@
+import { isUtf8 } from "node:buffer";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "fs";
+import {
+	appendFileSync,
+	closeSync,
+	existsSync,
+	mkdirSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	realpathSync,
+	statSync,
+	writeSync,
+} from "fs";
 import { readdir, readFile, stat } from "fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
+import { replaceFileAtomicallySync, writeFileAtomicallySync } from "../utils/atomic-file.js";
 import { readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
@@ -66,6 +80,13 @@ export interface NewSessionOptions {
 }
 
 export type SessionPersistListener = (sessionFile: string) => void;
+
+export interface SessionFileRecovery {
+	action: "append-newline" | "truncate";
+	originalSize: number;
+	repairedSize: number;
+	discardedBytes: number;
+}
 
 export interface SessionEntryBase {
 	type: string;
@@ -287,6 +308,7 @@ export type ReadonlySessionManager = Pick<
 	| "getSessionDir"
 	| "getSessionId"
 	| "getSessionFile"
+	| "getFileRecovery"
 	| "getLeafId"
 	| "getLeafEntry"
 	| "getEntry"
@@ -1183,6 +1205,88 @@ async function listSessionsFromDir(
 	return sessions;
 }
 
+interface UnterminatedSessionTail {
+	action: SessionFileRecovery["action"];
+	originalSize: number;
+	repairedSize: number;
+}
+
+function readExactly(fd: number, buffer: Buffer, position: number): void {
+	let offset = 0;
+	while (offset < buffer.length) {
+		const bytesRead = readSync(fd, buffer, offset, buffer.length - offset, position + offset);
+		if (bytesRead === 0) {
+			throw new Error("Session file changed while inspecting its JSONL tail");
+		}
+		offset += bytesRead;
+	}
+}
+
+function inspectUnterminatedSessionTail(path: string): UnterminatedSessionTail | undefined {
+	const originalSize = statSync(path).size;
+	if (originalSize === 0) return undefined;
+
+	const fd = openSync(path, "r");
+	try {
+		const lastByte = Buffer.allocUnsafe(1);
+		readExactly(fd, lastByte, originalSize - 1);
+		if (lastByte[0] === 0x0a) return undefined;
+
+		let tailStart = 0;
+		let cursor = originalSize;
+		const scanBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, originalSize));
+		while (cursor > 0) {
+			const length = Math.min(scanBuffer.length, cursor);
+			const position = cursor - length;
+			const chunk = scanBuffer.subarray(0, length);
+			readExactly(fd, chunk, position);
+			const newline = chunk.lastIndexOf(0x0a);
+			if (newline !== -1) {
+				tailStart = position + newline + 1;
+				break;
+			}
+			cursor = position;
+		}
+
+		const tail = Buffer.allocUnsafe(originalSize - tailStart);
+		readExactly(fd, tail, tailStart);
+		let isCompleteRecord = false;
+		if (isUtf8(tail)) {
+			try {
+				JSON.parse(tail.toString("utf8"));
+				isCompleteRecord = true;
+			} catch {
+				// An invalid unterminated record is a torn append.
+			}
+		}
+
+		return isCompleteRecord
+			? { action: "append-newline", originalSize, repairedSize: originalSize + 1 }
+			: { action: "truncate", originalSize, repairedSize: tailStart };
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function copyFilePrefix(sourcePath: string, targetFd: number, length: number): void {
+	const sourceFd = openSync(sourcePath, "r");
+	try {
+		const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, length)));
+		let position = 0;
+		while (position < length) {
+			const chunk = buffer.subarray(0, Math.min(buffer.length, length - position));
+			readExactly(sourceFd, chunk, position);
+			let written = 0;
+			while (written < chunk.length) {
+				written += writeSync(targetFd, chunk, written, chunk.length - written);
+			}
+			position += chunk.length;
+		}
+	} finally {
+		closeSync(sourceFd);
+	}
+}
+
 /**
  * Manages conversation sessions as append-only trees stored in JSONL files.
  *
@@ -1207,6 +1311,8 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
+	private needsTailRepair = false;
+	private fileRecovery: SessionFileRecovery | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1236,11 +1342,14 @@ export class SessionManager {
 	 */
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
 		this.sessionFile = resolve(sessionFile);
+		this.fileRecovery = undefined;
+		this.needsTailRepair = false;
 		if (existsSync(this.sessionFile)) {
 			const firstHeader = readSessionHeader(this.sessionFile);
 			if (firstHeader?.type === "session" && typeof firstHeader.id === "string") {
 				assertValidSessionId(firstHeader.id);
 			}
+			this.needsTailRepair = inspectUnterminatedSessionTail(this.sessionFile) !== undefined;
 			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
@@ -1329,6 +1438,8 @@ export class SessionManager {
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		this.flushed = false;
+		this.needsTailRepair = false;
+		this.fileRecovery = undefined;
 
 		if (this.persist) {
 			this.sessionFile = sessionFile;
@@ -1361,7 +1472,33 @@ export class SessionManager {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
 		writePrivateFileAtomic(this.sessionFile, content);
+		this.needsTailRepair = false;
 		this._notifyPersistListeners();
+	}
+
+	private _repairUnterminatedTail(): void {
+		if (!this.needsTailRepair || !this.sessionFile || !existsSync(this.sessionFile)) return;
+		const recovery = inspectUnterminatedSessionTail(this.sessionFile);
+		if (!recovery) {
+			this.needsTailRepair = false;
+			return;
+		}
+
+		replaceFileAtomicallySync(this.sessionFile, (fd, currentPath) => {
+			if (statSync(currentPath).size !== recovery.originalSize) {
+				throw new Error("Session file changed while repairing its JSONL tail");
+			}
+			const bytesToCopy = recovery.action === "truncate" ? recovery.repairedSize : recovery.originalSize;
+			copyFilePrefix(currentPath, fd, bytesToCopy);
+			if (recovery.action === "append-newline") {
+				writeSync(fd, "\n");
+			}
+		});
+		this.needsTailRepair = false;
+		this.fileRecovery = {
+			...recovery,
+			discardedBytes: recovery.originalSize - Math.min(recovery.originalSize, recovery.repairedSize),
+		};
 	}
 
 	private _notifyPersistListeners(): void {
@@ -1402,6 +1539,10 @@ export class SessionManager {
 
 	getSessionFile(): string | undefined {
 		return this.sessionFile;
+	}
+
+	getFileRecovery(): SessionFileRecovery | undefined {
+		return this.fileRecovery ? { ...this.fileRecovery } : undefined;
 	}
 
 	materializeSessionFile(sessionDir?: string): string {
@@ -1467,7 +1608,14 @@ export class SessionManager {
 			this._rewriteFile();
 			this.flushed = true;
 		} else {
-			appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this._repairUnterminatedTail();
+			try {
+				appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}
+`);
+			} catch (error) {
+				this.needsTailRepair = true;
+				throw error;
+			}
 			this._notifyPersistListeners();
 		}
 	}
