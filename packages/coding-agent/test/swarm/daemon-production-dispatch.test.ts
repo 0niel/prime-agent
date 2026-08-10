@@ -12,7 +12,9 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	readlinkSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
@@ -100,13 +102,45 @@ async function removeTempRoot(root: string): Promise<void> {
 	}
 	throw new Error("B00B_TEMP_CLEANUP_FAILED");
 }
-function cwdPidsUnder(roots: readonly string[]): number[] {
+function cwdUnderRoots(cwd: string, roots: readonly string[]): boolean {
+	const normalizedCwd = cwd.replace(/\s+\(deleted\)$/, "");
+	return roots.some((root) => normalizedCwd === root || normalizedCwd.startsWith(`${root}/`));
+}
+
+/** Linux has a portable cwd handle for every visible process; do not require lsof in the pinned image. */
+function cwdPidsUnderProc(roots: readonly string[], procRoot = "/proc"): number[] {
+	let entries: string[];
+	try {
+		entries = readdirSync(procRoot);
+	} catch (error) {
+		throw new Error(`B00B_PROC_ROOT_UNREADABLE ${procRoot}: ${(error as Error).message}`);
+	}
+
+	const matching = new Set<number>();
+	for (const entry of entries) {
+		if (!/^\d+$/.test(entry)) continue;
+		const pid = Number.parseInt(entry, 10);
+		try {
+			if (cwdUnderRoots(readlinkSync(join(procRoot, entry, "cwd")), roots)) matching.add(pid);
+		} catch (error) {
+			// Processes can exit, or their cwd can be inaccessible, between readdir and readlink.
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code === "ENOENT" || code === "EACCES" || code === "EPERM") continue;
+			throw new Error(`B00B_PROC_CWD_UNREADABLE ${join(procRoot, entry, "cwd")}: ${(error as Error).message}`);
+		}
+	}
+	return [...matching];
+}
+
+function cwdPidsUnderDarwin(roots: readonly string[]): number[] {
 	let output: string;
 	try {
 		output = execFileSync("lsof", ["-n", "-Fpn", "-a", "-d", "cwd"], { encoding: "utf8" });
 	} catch (error) {
-		const status = (error as { status?: unknown }).status;
-		if (status === 1) return [];
+		const errno = error as NodeJS.ErrnoException & { status?: unknown };
+		if (errno.status === 1) return [];
+		if (errno.code === "ENOENT")
+			throw new Error("B00B_LSOF_UNAVAILABLE_ON_DARWIN: install lsof to enforce the cwd residue assertion");
 		throw error;
 	}
 	let pid: number | undefined;
@@ -114,10 +148,15 @@ function cwdPidsUnder(roots: readonly string[]): number[] {
 	for (const line of output.split("\n")) {
 		if (line.startsWith("p")) pid = Number.parseInt(line.slice(1), 10);
 		if (!line.startsWith("n") || pid === undefined) continue;
-		const cwd = line.slice(1).replace(/\s+\(deleted\)$/, "");
-		if (roots.some((root) => cwd === root || cwd.startsWith(`${root}/`))) matching.add(pid);
+		if (cwdUnderRoots(line.slice(1), roots)) matching.add(pid);
 	}
 	return [...matching];
+}
+
+function cwdPidsUnder(roots: readonly string[]): number[] {
+	if (process.platform === "linux") return cwdPidsUnderProc(roots);
+	if (process.platform === "darwin") return cwdPidsUnderDarwin(roots);
+	throw new Error(`B00B_CWD_RESIDUE_CHECK_UNSUPPORTED_PLATFORM: ${process.platform}`);
 }
 
 function assertNoRunResidue(roots: readonly string[]): void {
@@ -471,6 +510,30 @@ async function attachThenPause(
 }
 
 describe("B00B real daemon production dispatch", () => {
+	test("enumerates Linux-style proc cwd links without lsof", () => {
+		const procRoot = mkdtempSync(join(tmpdir(), "b00b-proc-"));
+		try {
+			const matchingRoot = join(procRoot, "matching-root");
+			const otherRoot = join(procRoot, "other-root");
+			mkdirSync(matchingRoot);
+			mkdirSync(otherRoot);
+			mkdirSync(join(procRoot, "101"));
+			mkdirSync(join(procRoot, "202"));
+			// A process may exit after /proc is listed, leaving no cwd link.
+			mkdirSync(join(procRoot, "303"));
+			mkdirSync(join(procRoot, "404"));
+			writeFileSync(join(procRoot, "not-a-pid"), "ignored");
+			// proc cwd entries are symlinks; Linux appends this suffix for a deleted cwd.
+			symlinkSync(matchingRoot, join(procRoot, "101", "cwd"));
+			symlinkSync(otherRoot, join(procRoot, "202", "cwd"));
+			symlinkSync(`${matchingRoot} (deleted)`, join(procRoot, "404", "cwd"));
+			expect(cwdPidsUnderProc([matchingRoot], procRoot)).toEqual([101, 404]);
+			expect(() => cwdPidsUnderProc([], join(procRoot, "missing"))).toThrow("B00B_PROC_ROOT_UNREADABLE");
+		} finally {
+			rmSync(procRoot, { recursive: true, force: true });
+		}
+	});
+
 	test.each([1, 2, 3])(
 		"isolates paused attachment, cancellation, and upstream 429 across real supervisor workers (run %i)",
 		async () => {
