@@ -117,7 +117,11 @@ import {
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
-import type { SwarmRoleAssignment } from "../../core/swarm-role-policy.js";
+import {
+	SWARM_ROLE_MAX_CONTEXT_BYTES,
+	SWARM_ROLE_MAX_ITEMS,
+	type SwarmRoleAssignment,
+} from "../../core/swarm-role-policy.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -398,6 +402,176 @@ interface PersistedRlmSubagentRegistryEntry {
 	status: "running" | "completed" | "deleted";
 	createdAt: number;
 	updatedAt: string;
+}
+
+const PERSISTED_SWARM_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const PERSISTED_SWARM_RESERVED_IDENTIFIERS = new Set(["default", "inherit", "none"]);
+const PERSISTED_SWARM_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const PERSISTED_SWARM_SERVICE_TIERS = new Set(["auto", "default", "flex", "scale", "priority"]);
+const PERSISTED_SWARM_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const PERSISTED_SWARM_DIGEST = /^[0-9a-f]{64}$/;
+
+function isPersistedSwarmRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The journal is untrusted input, including values written by older daemon versions. */
+function persistedSwarmString(value: unknown, label: string): string {
+	if (typeof value !== "string" || value !== value.normalize("NFC"))
+		throw new Error(`invalid persisted swarm assignment ${label}`);
+	return value;
+}
+function persistedSwarmIdentifier(value: unknown, label: string, reserved = false): string {
+	const result = persistedSwarmString(value, label);
+	if (!result || result.length > 64 || !PERSISTED_SWARM_IDENTIFIER.test(result))
+		throw new Error(`invalid persisted swarm assignment ${label}`);
+	if (reserved && PERSISTED_SWARM_RESERVED_IDENTIFIERS.has(result.toLowerCase()))
+		throw new Error(`invalid persisted swarm assignment ${label}`);
+	return result;
+}
+function persistedSwarmIdentifierArray(value: unknown, label: string, reserved = false): string[] {
+	if (!Array.isArray(value)) throw new Error(`invalid persisted swarm assignment ${label}`);
+	const result = value.map((item, index) => persistedSwarmIdentifier(item, `${label}[${index}]`, reserved));
+	if (new Set(result).size !== result.length) throw new Error(`invalid persisted swarm assignment ${label}`);
+	return result;
+}
+function persistedSwarmToolArray(value: unknown): string[] {
+	if (!Array.isArray(value)) throw new Error("invalid persisted swarm assignment allowedToolNames");
+	const result = value.map((item, index) => {
+		const tool = persistedSwarmString(item, `allowedToolNames[${index}]`);
+		if (!tool || tool !== tool.trim()) throw new Error("invalid persisted swarm assignment allowedToolNames");
+		return tool;
+	});
+	if (new Set(result).size !== result.length) throw new Error("invalid persisted swarm assignment allowedToolNames");
+	return result;
+}
+function freezePersistedSwarmAssignment(value: SwarmRoleAssignment): Readonly<SwarmRoleAssignment> {
+	const sharedContext: SwarmRoleAssignment["sharedContext"] = {
+		maxItems: value.sharedContext.maxItems,
+		maxBytes: value.sharedContext.maxBytes,
+		...(value.sharedContext.allowedKinds
+			? { allowedKinds: Object.freeze([...value.sharedContext.allowedKinds]) as unknown as string[] }
+			: {}),
+	};
+	return Object.freeze({
+		assignmentId: value.assignmentId,
+		policyDigest: value.policyDigest,
+		roleId: value.roleId,
+		modelProfile: value.modelProfile,
+		model: value.model,
+		...(value.thinkingLevel === undefined ? {} : { thinkingLevel: value.thinkingLevel }),
+		...(value.serviceTier === undefined ? {} : { serviceTier: value.serviceTier }),
+		decisionScopes: Object.freeze([...value.decisionScopes]) as unknown as string[],
+		implementationScopes: Object.freeze([...value.implementationScopes]) as unknown as string[],
+		allowedToolNames: Object.freeze([...value.allowedToolNames]) as unknown as string[],
+		delegableRoleIds: Object.freeze([...value.delegableRoleIds]) as unknown as string[],
+		sharedContext: Object.freeze(sharedContext) as SwarmRoleAssignment["sharedContext"],
+	});
+}
+
+/**
+ * Decode the private role snapshot embedded in a JSONL registry row. This is
+ * deliberately separate from policy parsing: a registry must never become a
+ * second policy language or silently normalize a capability on restore.
+ */
+function decodePersistedSwarmRoleAssignment(
+	value: unknown,
+	registryAssignmentId: string | undefined,
+): Readonly<SwarmRoleAssignment> {
+	if (!isPersistedSwarmRecord(value) || !registryAssignmentId) throw new Error("invalid persisted swarm assignment");
+	const allowed = new Set([
+		"assignmentId",
+		"policyDigest",
+		"roleId",
+		"modelProfile",
+		"model",
+		"thinkingLevel",
+		"serviceTier",
+		"decisionScopes",
+		"implementationScopes",
+		"allowedToolNames",
+		"delegableRoleIds",
+		"sharedContext",
+	]);
+	const required = [
+		"assignmentId",
+		"policyDigest",
+		"roleId",
+		"modelProfile",
+		"model",
+		"decisionScopes",
+		"implementationScopes",
+		"allowedToolNames",
+		"delegableRoleIds",
+		"sharedContext",
+	];
+	if (Object.keys(value).some((key) => !allowed.has(key)) || required.some((key) => !(key in value)))
+		throw new Error("invalid persisted swarm assignment schema");
+	const assignmentId = persistedSwarmString(value.assignmentId, "assignmentId");
+	if (!PERSISTED_SWARM_UUID.test(assignmentId) || assignmentId !== registryAssignmentId)
+		throw new Error("persisted swarm assignment ID does not match registry row");
+	const policyDigest = persistedSwarmString(value.policyDigest, "policyDigest");
+	if (!PERSISTED_SWARM_DIGEST.test(policyDigest)) throw new Error("invalid persisted swarm assignment policyDigest");
+	const roleId = persistedSwarmIdentifier(value.roleId, "roleId", true);
+	const modelProfile = persistedSwarmIdentifier(value.modelProfile, "modelProfile", true);
+	const model = persistedSwarmString(value.model, "model");
+	const slash = model.indexOf("/");
+	if (!model || slash <= 0 || slash !== model.lastIndexOf("/") || slash === model.length - 1 || /\s/.test(model))
+		throw new Error("invalid persisted swarm assignment model");
+	let thinkingLevel: SwarmRoleAssignment["thinkingLevel"];
+	if (value.thinkingLevel !== undefined) {
+		const candidate = persistedSwarmString(value.thinkingLevel, "thinkingLevel");
+		if (!PERSISTED_SWARM_THINKING_LEVELS.has(candidate))
+			throw new Error("invalid persisted swarm assignment thinkingLevel");
+		thinkingLevel = candidate as NonNullable<typeof thinkingLevel>;
+	}
+	let serviceTier: SwarmRoleAssignment["serviceTier"];
+	if (value.serviceTier !== undefined) {
+		const candidate = persistedSwarmString(value.serviceTier, "serviceTier");
+		if (!PERSISTED_SWARM_SERVICE_TIERS.has(candidate))
+			throw new Error("invalid persisted swarm assignment serviceTier");
+		serviceTier = candidate as NonNullable<typeof serviceTier>;
+	}
+	if (!isPersistedSwarmRecord(value.sharedContext))
+		throw new Error("invalid persisted swarm assignment sharedContext");
+	const context = value.sharedContext;
+	if (Object.keys(context).some((key) => key !== "maxItems" && key !== "maxBytes" && key !== "allowedKinds"))
+		throw new Error("invalid persisted swarm assignment sharedContext");
+	const maxItems = context.maxItems;
+	const maxBytes = context.maxBytes;
+	if (
+		typeof maxItems !== "number" ||
+		!Number.isSafeInteger(maxItems) ||
+		maxItems < 0 ||
+		maxItems > SWARM_ROLE_MAX_ITEMS ||
+		typeof maxBytes !== "number" ||
+		!Number.isSafeInteger(maxBytes) ||
+		maxBytes < 0 ||
+		maxBytes > SWARM_ROLE_MAX_CONTEXT_BYTES
+	)
+		throw new Error("invalid persisted swarm assignment sharedContext");
+	const allowedKinds =
+		context.allowedKinds === undefined
+			? undefined
+			: persistedSwarmIdentifierArray(context.allowedKinds, "sharedContext.allowedKinds");
+	return freezePersistedSwarmAssignment({
+		assignmentId,
+		policyDigest,
+		roleId,
+		modelProfile,
+		model,
+		...(thinkingLevel === undefined ? {} : { thinkingLevel }),
+		...(serviceTier === undefined ? {} : { serviceTier }),
+		decisionScopes: persistedSwarmIdentifierArray(value.decisionScopes, "decisionScopes"),
+		implementationScopes: persistedSwarmIdentifierArray(value.implementationScopes, "implementationScopes"),
+		allowedToolNames: persistedSwarmToolArray(value.allowedToolNames),
+		delegableRoleIds: persistedSwarmIdentifierArray(value.delegableRoleIds, "delegableRoleIds", true),
+		sharedContext: {
+			maxItems,
+			maxBytes,
+			...(allowedKinds === undefined ? {} : { allowedKinds }),
+		},
+	});
 }
 
 type PassiveRlmRoot =
@@ -1086,8 +1260,19 @@ export class AgentDaemon {
 			if (!trimmed) {
 				continue;
 			}
+			let rawEntry: Partial<PersistedRlmSubagentRegistryEntry> | undefined;
 			try {
-				const entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
+				rawEntry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
+				const entry =
+					rawEntry.swarmRoleAssignment === undefined
+						? rawEntry
+						: {
+								...rawEntry,
+								swarmRoleAssignment: decodePersistedSwarmRoleAssignment(
+									rawEntry.swarmRoleAssignment,
+									rawEntry.assignmentId,
+								),
+							};
 				if (
 					entry.type !== "rlm_subagent" ||
 					typeof entry.childId !== "string" ||
@@ -1111,6 +1296,17 @@ export class AgentDaemon {
 					entry as PersistedRlmSubagentRegistryEntry,
 				);
 			} catch (error) {
+				// A malformed update must not fall through to an older snapshot of the
+				// same durable assignment. It is quarantined until a later complete row
+				// deliberately republishes that assignment.
+				if (typeof rawEntry?.childId === "string") {
+					latest.delete(
+						this.rlmAssignmentKey({
+							childId: rawEntry.childId,
+							assignmentId: rawEntry.assignmentId,
+						}),
+					);
+				}
 				this.log(
 					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
 				);

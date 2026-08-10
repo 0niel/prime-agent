@@ -1498,6 +1498,91 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("rehydrates an exact immutable persisted swarm assignment and reapplies its narrowed tools", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-persisted-swarm-assignment-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const row = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			row.swarmRoleAssignment = persistedSwarmAssignment(String(row.assignmentId));
+			writeFileSync(registryPath, `${JSON.stringify(row)}\n`);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createAgentMessageController(
+					getCurrentState: () => ActiveSessionState | undefined,
+				): AgentSessionMessageController;
+				readLatestRlmSubagentRegistryPath(path: string): Promise<Array<{ swarmRoleAssignment?: unknown }>>;
+			};
+			const decoded = await internals.readLatestRlmSubagentRegistryPath(registryPath);
+			const assignment = decoded[0]?.swarmRoleAssignment as {
+				allowedToolNames: string[];
+				sharedContext: { allowedKinds?: string[] };
+			};
+			expect(Object.isFrozen(assignment)).toBe(true);
+			expect(Object.isFrozen(assignment.allowedToolNames)).toBe(true);
+			expect(Object.isFrozen(assignment.sharedContext)).toBe(true);
+			expect(Object.isFrozen(assignment.sharedContext.allowedKinds)).toBe(true);
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await internals
+				.createAgentMessageController(() => parent)
+				.sendAgentMessage({
+					target: "renamed-worker",
+					message: "wake exact policy child",
+				});
+			expect(fixture.createRuntime).toHaveBeenCalledTimes(2);
+			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions).toMatchObject({
+				thinkingLevel: "low",
+				serviceTier: "flex",
+				initialActiveToolNames: ["agent_message"],
+				allowedToolNames: ["agent_message"],
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("quarantines malformed or assignment-mismatched swarm registry rows without waking them", async () => {
+		for (const corrupt of [
+			(assignment: Record<string, unknown>) => ({ ...assignment, unexpected: true }),
+			(assignment: Record<string, unknown>) => ({
+				...assignment,
+				assignmentId: "22222222-2222-4222-8222-222222222222",
+			}),
+			(assignment: Record<string, unknown>) => ({ ...assignment, roleId: "re\u0301viewer" }),
+		]) {
+			const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-invalid-persisted-swarm-"));
+			try {
+				const fixture = makePersistedRlmDaemonFixture(tempDir);
+				const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+				const row = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+				const validRow = { ...row, swarmRoleAssignment: persistedSwarmAssignment(String(row.assignmentId)) };
+				row.swarmRoleAssignment = corrupt(persistedSwarmAssignment(String(row.assignmentId)));
+				// A corrupt newer update must quarantine the older valid incarnation too.
+				writeFileSync(registryPath, `${JSON.stringify(validRow)}\n${JSON.stringify(row)}\n`);
+				const internals = fixture.daemon as unknown as {
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+					createAgentMessageController(
+						getCurrentState: () => ActiveSessionState | undefined,
+					): AgentSessionMessageController;
+					readLatestRlmSubagentRegistryPath(path: string): Promise<unknown[]>;
+				};
+				expect(await internals.readLatestRlmSubagentRegistryPath(registryPath)).toEqual([]);
+				const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+				await expect(
+					internals
+						.createAgentMessageController(() => parent)
+						.sendAgentMessage({
+							target: "renamed-worker",
+							message: "must not wake corrupt policy child",
+						}),
+				).rejects.toThrow();
+				expect(fixture.createRuntime).toHaveBeenCalledOnce();
+			} finally {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("selects only B's latest durable reuse for legacy delete and passive catalog traversal", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-reused-durable-registry-"));
 		try {
@@ -10563,6 +10648,23 @@ function makeCronJob(input: {
 		updatedAt: "2026-01-01T12:00:00.000Z",
 		nextRunAt: "2026-01-01T12:05:00.000Z",
 		runCount: 0,
+	};
+}
+
+function persistedSwarmAssignment(assignmentId: string): Record<string, unknown> {
+	return {
+		assignmentId,
+		policyDigest: "a".repeat(64),
+		roleId: "reviewer",
+		modelProfile: "scripted",
+		model: "test/scripted",
+		thinkingLevel: "low",
+		serviceTier: "flex",
+		decisionScopes: ["review"],
+		implementationScopes: ["patch"],
+		allowedToolNames: ["agent_message"],
+		delegableRoleIds: ["worker"],
+		sharedContext: { maxItems: 1, maxBytes: 256, allowedKinds: ["summary"] },
 	};
 }
 
