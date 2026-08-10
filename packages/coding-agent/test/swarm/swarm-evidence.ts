@@ -300,7 +300,17 @@ function safeEvidenceString(value: string, key?: string): boolean {
 		(key === "benchmarkVersion" && value === "b00a") ||
 		((key === "fingerprint" || key === "deterministicBundleId" || key === "artifactBundleId" || key === "sha256") &&
 			/^[0-9a-f]{64}$/.test(value)) ||
-		(key === "path" && (EVIDENCE_FILES as readonly string[]).includes(value))
+		(key === "path" && (EVIDENCE_FILES as readonly string[]).includes(value)) ||
+		(key === "provider" && value === "b00b-scripted") ||
+		(key === "model" &&
+			[
+				"fixture-a",
+				"fixture-b",
+				"fixture-zero",
+				"fixture-a-resolved",
+				"fixture-b-resolved",
+				"fixture-zero-resolved",
+			].includes(value))
 	);
 }
 /** No arbitrary fixture content, including object keys, enters normal artifacts. */
@@ -1062,11 +1072,29 @@ function verifyProcessSamples(samples: unknown): void {
 }
 
 /** Strict verifier: expected set only, no links/extras, canonical bytes, hashes, and semantic joins. */
-export async function verifySwarmEvidence(directory: string, capability: SwarmEvidenceCapability): Promise<void> {
-	const registration = registeredBundles.get(capability);
-	assert(registration, "issued swarm evidence capability is required");
+/**
+ * Verifies an evidence directory against either the writer's in-process
+ * capability or an externally held artifact-bundle commitment.  The latter is
+ * intentionally only the expected bundle id: callers which need durable
+ * trust (B00B) authenticate that id outside this artifact directory before
+ * invoking this canonical/semantic verifier in a fresh process.
+ */
+export async function verifySwarmEvidence(
+	directory: string,
+	trustedArtifactBundle: SwarmEvidenceCapability | string,
+): Promise<void> {
+	const registration =
+		typeof trustedArtifactBundle === "string" ? undefined : registeredBundles.get(trustedArtifactBundle);
+	if (typeof trustedArtifactBundle !== "string") assert(registration, "issued swarm evidence capability is required");
+	assert(
+		typeof trustedArtifactBundle === "string" || registration !== undefined,
+		"issued swarm evidence capability is required",
+	);
+	const expectedArtifactBundleId =
+		typeof trustedArtifactBundle === "string" ? trustedArtifactBundle : registration!.artifactBundleId;
+	assert(/^[0-9a-f]{64}$/.test(expectedArtifactBundleId), "invalid trusted artifact bundle identity");
 	const root = await realpath(directory);
-	assert(root === registration.directory, "swarm evidence capability directory mismatch");
+	if (registration) assert(root === registration.directory, "swarm evidence capability directory mismatch");
 	const names = (await readdir(root)).sort();
 	assert(
 		canonicalJson(names) === canonicalJson([...ALL_EVIDENCE_FILES].sort()),
@@ -1131,10 +1159,7 @@ export async function verifySwarmEvidence(directory: string, capability: SwarmEv
 		"summary.json": await readFile(join(root, "summary.json"), "utf8"),
 	});
 	assert(manifest.deterministicBundleId === deterministic, "deterministic bundle identity mismatch");
-	assert(
-		manifest.artifactBundleId === registration.artifactBundleId,
-		"issued swarm evidence capability bundle mismatch",
-	);
+	assert(manifest.artifactBundleId === expectedArtifactBundleId, "trusted artifact bundle mismatch");
 }
 export function createFixedFanoutScenario(fanout: (typeof SUPPORTED_SWARM_FANOUTS)[number]): SwarmBenchmarkConfig {
 	return {
