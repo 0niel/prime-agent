@@ -421,6 +421,22 @@ describe("AgentSession rlm recursion", () => {
 		expect(child.rlmDepth).toBe(3);
 	});
 
+	it("keeps RLM descendants in memory when the root session is non-persisted", async () => {
+		const root = createSession({ sessionManager: SessionManager.inMemory(tempDir), maxDepth: 2 });
+		const childHandle = await root.runRlmChild("ephemeral child");
+		const child = root.getRlmChildSession(childHandle.rlm_child_id);
+		if (!child) throw new Error("Missing admitted child session");
+		const grandchildHandle = await child.runRlmChild("ephemeral grandchild");
+		const grandchild = child.getRlmChildSession(grandchildHandle.rlm_child_id);
+		if (!grandchild) throw new Error("Missing admitted grandchild session");
+
+		expect(child.sessionManager.isPersisted()).toBe(false);
+		expect(child.sessionFile).toBeUndefined();
+		expect(grandchild.sessionManager.isPersisted()).toBe(false);
+		expect(grandchild.sessionFile).toBeUndefined();
+		expect(readdirSync(childHandle.session_dir).some((name) => name.endsWith(".jsonl"))).toBe(false);
+		expect(readdirSync(grandchildHandle.session_dir).some((name) => name.endsWith(".jsonl"))).toBe(false);
+	});
 
 	it("lets the orchestrator choose a unique subagent session name", async () => {
 		const root = createSession();

@@ -83,7 +83,7 @@ Sessions are saved automatically as flat JSONL files under `~/.prime/agent/sessi
 ```bash
 prime-agent -c                  # Continue most recent session
 prime-agent -r [path|id]        # Browse sessions or resume one directly
-prime-agent --no-session        # Do not persist this session transcript or artifacts
+prime-agent --no-session        # Do not persist root or RLM descendant session transcripts/artifacts
 prime-agent --fork <path|id>    # Fork a session into a new session file
 ```
 
@@ -219,7 +219,7 @@ Use `prime-agent model list [search]` to list available models.
 | `-r`, `--resume [path\|id]` | Browse and select a session, or resume a specific session file or partial UUID |
 | `--fork <path\|id>` | Fork a session file or partial UUID into a new session |
 | `--session-dir <dir>` | Custom session storage directory |
-| `--no-session` | Do not persist the session transcript or session-artifact directory; not a sandbox or fully stateless mode |
+| `--no-session` | Do not persist root or RLM descendant session transcripts/artifact trees; temporary RLM working files may still exist; not a sandbox |
 
 Use `prime-agent session export <file> [output]` to export a session to HTML.
 

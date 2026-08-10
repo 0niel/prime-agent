@@ -8966,7 +8966,9 @@ export class AgentSession {
 	}
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
-		const childSessionManager = SessionManager.create(this._cwd, options.sessionDir);
+		const childSessionManager = options.parentSession.sessionManager.isPersisted()
+			? SessionManager.create(this._cwd, options.sessionDir)
+			: SessionManager.inMemory(this._cwd, options.sessionDir);
 		if (options.parentSession.sessionFile) {
 			childSessionManager.newSession({
 				parentSession: options.parentSession.sessionFile,
