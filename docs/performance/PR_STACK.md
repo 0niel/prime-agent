@@ -35,7 +35,7 @@ core:    B00A ──> C00 ──> B00B ──> C01 ──> C02 ──> C03 ─�
 | Parent | Item | Pull request | Status | Base → head | Head commit |
 | --- | --- | --- | --- | --- | --- |
 | C01 | SW01 | [#1157](https://github.com/PrimeIntellect-ai/prime-agent/pull/1157) | Published; open | `perf/c01-identity-fencing` → `perf/sw01-role-policy` | `2c61c246b2ba7b30d7e60b45bf511af45ef19ba6` |
-| B00B | N01 | [#1169](https://github.com/PrimeIntellect-ai/prime-agent/pull/1169) | **Draft; validation/review pending** | `perf/b00b-production-gate` → `perf/n01-incremental-structured-output` | `e8b407f0d92cf0382a3f7df7b6299a1095701278` |
+| B00B | N01 | [#1169](https://github.com/PrimeIntellect-ai/prime-agent/pull/1169) | **Draft; remote final attempt rerunning after retained preflight failure** | `perf/b00b-production-gate` → `perf/n01-incremental-structured-output` | `5835416078b7440cbf479c007e43b63d4ae55416` |
 | B00B | MEM01 | [#1170](https://github.com/PrimeIntellect-ai/prime-agent/pull/1170) | **Draft; validation/review pending** | `perf/b00b-production-gate` → `perf/mem01-storage-adapter` | `b529552f10c8000fa8cf9bab0b51626d844cd78f` |
 | MEM01 | MEM02 | — | **Local / security-blocked; not review-ready** | `perf/mem01-storage-adapter` → `perf/mem02-sqlite-backend` | local head `6e24fedcc8b451763fca7a6b390b9af6384d649d` |
 
