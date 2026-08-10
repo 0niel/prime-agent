@@ -4549,7 +4549,11 @@ export class DaemonSupervisor {
 	}
 
 	private async prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> {
-		const residents = [...this.workers.values()];
+		// Passivated records deliberately have no process or client. They are durable
+		// routing metadata, not residents in this transaction: preparing, draining, or
+		// stopping one would either fail on its absent client or spuriously wake it.
+		// Keep it in the registry so the replacement supervisor can retain its summary.
+		const residents = [...this.workers.values()].filter((worker) => worker.descriptor.lifecycle !== "passivated");
 		const unavailable = residents.find(
 			(worker) => worker.descriptor.lifecycle !== "ready" || worker.client === undefined,
 		);

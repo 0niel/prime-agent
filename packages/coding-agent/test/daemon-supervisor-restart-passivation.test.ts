@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../src/core/session-manager.js";
+import { DAEMON_UPDATE_RESTART_FORMAT_VERSION } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 
@@ -158,6 +159,83 @@ describe("daemon supervisor restart passivation", () => {
 		}
 		expect(supervisor.workers.get("scheduled")?.descriptor.lifecycle).toBe("recovering");
 		expect(supervisor.workers.get("unjudged")?.descriptor.lifecycle).toBe("recovering");
+	});
+
+	it("prepares only ready residents and retains processless roots for the replacement supervisor", async () => {
+		const fixture = fixtureRoot();
+		const passiveSession = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const passiveDescriptor = { ...descriptor(fixture, "passive", passiveSession), lifecycle: "passivated" as const };
+		delete passiveDescriptor.pid;
+		delete passiveDescriptor.processStartId;
+		writeFileSync(join(fixture.descriptorDir, "passive.json"), JSON.stringify(passiveDescriptor));
+
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals & {
+			prepareUpdateRestartFenced(deadline: number): Promise<{ sessions: Array<{ activeSessionId: string }> }>;
+			validateAndPersistUpdateManifest: ReturnType<typeof vi.fn>;
+			stopWorker: ReturnType<typeof vi.fn>;
+		};
+		supervisor.recoverWorker = vi.fn();
+		await supervisor.loadWorkerDescriptors();
+		const passive = supervisor.workers.get("passive");
+		if (!passive) throw new Error("passive fixture was not loaded");
+		const passiveSummary = passive.summaries.get(passiveDescriptor.rootActiveSessionId);
+		const readySession = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const readyClient = {
+			requestWorker: vi.fn(async ({ type }: { type: string }) =>
+				type === "worker_prepare_update"
+					? {
+							success: true,
+							data: {
+								formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+								createdAt: "now",
+								sessions: [{ activeSessionId: "active-ready", sessionFile: readySession.sessionFile }],
+							},
+						}
+					: { success: true },
+			),
+		};
+		const ready = {
+			descriptor: { ...descriptor(fixture, "ready", readySession), rootActiveSessionId: "active-ready" },
+			descriptorPath: join(fixture.descriptorDir, "ready.json"),
+			client: readyClient,
+			summaries: new Map(),
+		};
+		supervisor.workers.set("ready", ready);
+		supervisor.validateAndPersistUpdateManifest = vi.fn();
+		supervisor.stopWorker = vi.fn(async () => undefined);
+
+		await expect(supervisor.prepareUpdateRestartFenced(Date.now() + 10_000)).resolves.toMatchObject({
+			sessions: [{ activeSessionId: "active-ready" }],
+		});
+		expect(readyClient.requestWorker).toHaveBeenCalledTimes(2);
+		expect(readyClient.requestWorker).toHaveBeenNthCalledWith(
+			1,
+			{ type: "worker_prepare_update" },
+			expect.any(Number),
+		);
+		expect(supervisor.stopWorker).toHaveBeenCalledTimes(1);
+		expect(supervisor.stopWorker).toHaveBeenCalledWith(ready, false);
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+		expect(passive.descriptor).toMatchObject({ lifecycle: "passivated" });
+		expect(passive.descriptor).not.toHaveProperty("pid");
+		expect(passive.client).toBeUndefined();
+		expect(passive.summaries.get(passiveDescriptor.rootActiveSessionId)).toEqual(passiveSummary);
+
+		const replacement = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		replacement.recoverWorker = vi.fn();
+		await replacement.loadWorkerDescriptors();
+		const reloadedPassive = replacement.workers.get("passive");
+		expect(reloadedPassive?.descriptor.lifecycle).toBe("passivated");
+		expect(reloadedPassive?.descriptor).not.toHaveProperty("pid");
+		expect(reloadedPassive?.client).toBeUndefined();
+		expect(reloadedPassive?.summaries.get(passiveDescriptor.rootActiveSessionId)).toEqual(passiveSummary);
+		expect(replacement.recoverWorker).not.toHaveBeenCalled();
 	});
 
 	it("single-flights an explicit wake and does not revive passivated records by itself", async () => {
