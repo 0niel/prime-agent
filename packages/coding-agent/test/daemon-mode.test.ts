@@ -11017,6 +11017,124 @@ function makeClient(id: string, activeSessionId: string, supportsExtensionUi = f
 }
 
 describe("C03 durable daemon publication", () => {
+	it("fails closed without parent registry authority while read-only family metadata remains safe", async () => {
+		const createRuntime = vi.fn();
+		const daemon = new AgentDaemon("/tmp/prime-agent-c03-no-registry.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime,
+		});
+		const parent = makeState("c03-parent");
+		const parentSession = {
+			sessionId: "c03-parent-session",
+			sessionName: "read-only-parent",
+			sessionManager: { getCwd: () => "/tmp" },
+			rlmDepth: 0,
+			rlmMaxDepth: 4,
+		} as ActiveSessionState["runtime"]["session"];
+		parent.runtime = {
+			...parent.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: parentSession,
+		} as ActiveSessionState["runtime"];
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			appendRlmSubagentRegistryEntry(parent: ActiveSessionState, entry: Record<string, unknown>): boolean;
+			recordRlmSubagentRegistryEntry(parent: ActiveSessionState, input: Record<string, unknown>): boolean;
+			recordRlmSubagentDeletion(
+				parent: ActiveSessionState,
+				childId: string,
+				assignmentId: string,
+				operationId: string,
+			): Promise<void>;
+			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+			createRlmSubagentRuntime(
+				parent: ActiveSessionState,
+				options: CreateRlmSubagentRuntimeOptions,
+			): Promise<ActiveSessionState["runtime"]>;
+		};
+		internals.sessions.set(parent.activeSessionId, parent);
+		const options: CreateRlmSubagentRuntimeOptions = {
+			parentSession,
+			id: "no-registry-child",
+			assignmentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+			operationId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000010",
+			deliveryId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000020",
+			prompt: "must not reach child factory",
+			sessionName: "no-registry-child",
+			sessionDir: "/tmp/no-registry-child",
+			model: {} as Model<Api>,
+			thinkingLevel: "off",
+			serviceTier: null,
+			scopedModels: [],
+			activeToolNames: [],
+			customTools: [],
+			includeGoals: false,
+			includeCompactSkill: false,
+			rlmDepth: 1,
+			rlmMaxDepth: 4,
+			rlmParentNodeId: "no-registry-child",
+		};
+		const registryRow = {
+			type: "rlm_subagent",
+			childId: options.id,
+			assignmentId: options.assignmentId,
+			operationId: options.operationId,
+			deliveryId: options.deliveryId,
+			sessionName: options.sessionName,
+			sessionDir: options.sessionDir,
+			sessionFile: "/tmp/no-registry-child/session.jsonl",
+			parentSessionId: parentSession.sessionId,
+			rlmDepth: 1,
+			rlmMaxDepth: 4,
+			status: "running",
+			createdAt: 1,
+			updatedAt: new Date(0).toISOString(),
+		};
+
+		const host = internals.createSubagentRuntimeHost(parent);
+		expect(() => host.admitRlmSubagentOperation?.(options)).toThrow("parent registry artifact");
+		await expect(internals.createRlmSubagentRuntime(parent, options)).rejects.toThrow("parent registry artifact");
+		expect(createRuntime).not.toHaveBeenCalled();
+		expect(internals.appendRlmSubagentRegistryEntry(parent, registryRow)).toBe(false);
+		expect(internals.recordRlmSubagentRegistryEntry(parent, registryRow)).toBe(false);
+		await expect(
+			internals.recordRlmSubagentDeletion(parent, options.id, options.assignmentId!, options.operationId!),
+		).rejects.toThrow("parent registry artifact");
+		const child = { disposeAsync: vi.fn(async () => {}) } as unknown as ActiveSessionState["runtime"]["session"];
+		await expect(
+			host.deleteRlmSubagentRuntime(options.id, child, options.assignmentId, options.operationId),
+		).rejects.toThrow("parent registry artifact");
+		expect(child.disposeAsync).not.toHaveBeenCalled();
+		await expect(
+			host.deliverRlmSubagentTerminal?.(
+				{
+					session: child,
+					assignmentId: options.assignmentId,
+					operationId: options.operationId,
+					deliveryId: options.deliveryId,
+				},
+				options,
+				"done",
+				{
+					role: "custom",
+					customType: "rlm_child_terminal_notice",
+					content: "must remain unacknowledged",
+					display: true,
+					details: { kind: "completed_without_reply", childId: options.id, sessionName: options.sessionName },
+					timestamp: 1,
+				},
+			),
+		).rejects.toThrow("parent registry artifact");
+
+		// Metadata-only legacy/mocked sessions remain readable by family discovery.
+		const roster = daemon as unknown as {
+			createAgentFamilyRoster(state: ActiveSessionState): Promise<{ current: { id: string } }>;
+		};
+		await expect(roster.createAgentFamilyRoster(parent)).resolves.toMatchObject({
+			current: { id: parentSession.sessionId },
+		});
+	});
+
 	it("fsyncs admission before factory work, materializes before registry/publication, and leaves a failed child pending", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-c03-durable-publication-"));
 		try {

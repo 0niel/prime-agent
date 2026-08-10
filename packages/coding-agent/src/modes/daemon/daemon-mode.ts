@@ -424,6 +424,9 @@ interface RecoveryOperationToken {
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
+/** A C03 lifecycle boundary cannot proceed without its parent-owned registry. */
+class RlmRegistryAuthorityError extends Error {}
+
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = options.socketPath ?? defaultDaemonSocketPath();
 	const daemon = new AgentDaemon(socketPath, options);
@@ -972,6 +975,14 @@ export class AgentDaemon {
 		return [...currentByChildId.values()].filter((entry) => entry.status !== "deleted");
 	}
 
+	private requireRlmSubagentRegistryPath(parentState: ActiveSessionState): string {
+		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
+		if (!path) {
+			throw new RlmRegistryAuthorityError("Durable RLM requires a parent registry artifact");
+		}
+		return path;
+	}
+
 	private appendRlmSubagentRegistryEntry(
 		parentState: ActiveSessionState,
 		entry: PersistedRlmSubagentRegistryEntry,
@@ -979,7 +990,8 @@ export class AgentDaemon {
 		assertRlmRegistryWriteIdentity(entry);
 		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
 		if (!path) {
-			return true;
+			this.log("failed to persist RLM subagent registry entry: parent registry artifact is unavailable");
+			return false;
 		}
 		try {
 			mkdirSync(dirname(path), { recursive: true });
@@ -1052,6 +1064,10 @@ export class AgentDaemon {
 		assignmentId: string,
 		operationId?: string,
 	): Promise<void> {
+		// A C03 deletion is an authoritative lifecycle acknowledgement and must
+		// not degrade into an in-memory success. Assignment-only legacy cleanup
+		// retains its compatibility behavior when no registry exists.
+		if (operationId) this.requireRlmSubagentRegistryPath(parentState);
 		const latest = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
 			(entry) =>
 				entry.childId === childId &&
@@ -2495,8 +2511,13 @@ export class AgentDaemon {
 		return {
 			assignmentIdentityFenced: true,
 			admitRlmSubagentOperation: (options) => {
-				if (!current(options) || !parentFile || !parentArtifactDir)
-					throw new Error("Stale or unpersisted durable RLM admission");
+				if (!current(options)) throw new RlmRegistryAuthorityError("Stale durable RLM admission");
+				// Admission is the first C03 mutation. Require the companion registry
+				// before ledger/factory work, so an unpublishable operation never reaches a
+				// provider or public child state.
+				this.requireRlmSubagentRegistryPath(parentState);
+				if (!parentFile || !parentArtifactDir)
+					throw new RlmRegistryAuthorityError("Unpersisted durable RLM admission");
 				durableStore().admit({
 					parentSessionId: parent.sessionId,
 					parentSessionFile: parentFile,
@@ -2520,7 +2541,8 @@ export class AgentDaemon {
 					!options.operationId ||
 					!options.deliveryId
 				)
-					return;
+					throw new RlmRegistryAuthorityError("Durable RLM terminal requires a parent registry artifact");
+				this.requireRlmSubagentRegistryPath(parentState);
 				const store = durableStore();
 				const durableOperation = () =>
 					store
@@ -2629,6 +2651,9 @@ export class AgentDaemon {
 				if (!state?.runtime.session.sessionFile || this.sessions.get(parentState.activeSessionId) !== parentState)
 					return false;
 				if (state.runtime.metadata.rehydratedCompleted) return true;
+				// A registry-less assignment-only embedded runtime is display-compatible,
+				// not a C03 completion boundary. Do not claim that an append occurred.
+				if (operationId === undefined && !this.rlmSubagentRegistryPath(parentState.runtime.session)) return true;
 				const metadata = state.runtime.metadata;
 				const model = childSession.model;
 				return this.recordRlmSubagentRegistryEntry(parentState, {
@@ -2711,6 +2736,9 @@ export class AgentDaemon {
 				if (deletionError !== undefined) throw deletionError;
 			},
 			deleteRlmSubagentRuntime: async (childId, childSession, requestedAssignmentId, requestedOperationId) => {
+				// An operation-bearing request is C03 authority. Never convert a missing
+				// registry into an in-memory close or a successful deletion acknowledgement.
+				if (requestedOperationId) this.requireRlmSubagentRegistryPath(parentState);
 				// Public catalog entries intentionally hide assignment IDs. An explicit
 				// delete is therefore the one legacy operation permitted to resolve its
 				// durable row internally. A missing legacy ID is rebound *before* delete;
@@ -2758,6 +2786,9 @@ export class AgentDaemon {
 				// A retained C03 child passes its operation; an explicit selector delete
 				// resolves the newest durable C03 incarnation, while legacy stays undefined.
 				const operationId = requestedOperationId ?? persisted?.operationId;
+				// A selector may resolve a C03 row only after proving it can persist the
+				// corresponding tombstone. Do this before durable intent or runtime close.
+				if (operationId) this.requireRlmSubagentRegistryPath(parentState);
 				// Callback cleanup carries an operation; it is never a selector or
 				// assignment-only capability.  A legacy explicit delete has no operation
 				// and intentionally retains its historical catalog behavior.
@@ -2914,6 +2945,9 @@ export class AgentDaemon {
 		const assignedOptions = assignmentId === options.assignmentId ? options : { ...options, assignmentId };
 		options = assignedOptions;
 		const parent = parentState.runtime.session;
+		// Direct daemon callers share the host admission invariant: a C03 child
+		// cannot construct a runtime before the parent registry is writable.
+		if (options.operationId) this.requireRlmSubagentRegistryPath(parentState);
 		const parentArtifactDir = options.operationId ? parent.sessionManager.getSessionArtifactDir?.() : undefined;
 		const durableStore = () => {
 			if (!parentArtifactDir) throw new Error("Durable RLM requires a persisted parent artifact");
@@ -3027,7 +3061,9 @@ export class AgentDaemon {
 						)
 							throw new Error("Failed durable RLM child materialization");
 					}
+					const hasRegistryAuthority = this.rlmSubagentRegistryPath(parent) !== undefined;
 					if (
+						(options.operationId || hasRegistryAuthority) &&
 						!this.recordRlmSubagentRegistryEntry(parentState, {
 							childId: options.id,
 							assignmentId,
@@ -3049,7 +3085,7 @@ export class AgentDaemon {
 							createdAt: runtime.metadata.createdAt,
 						})
 					) {
-						// C01 publication is a second durable boundary.  The C03 materialized
+						// C01 publication is a second durable boundary. The C03 materialized
 						// fact remains recoverably pending, but this unpublished runtime must
 						// never become addressable or start prompt work.
 						throw new Error("Failed to persist running RLM subagent registry entry");
