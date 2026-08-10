@@ -341,6 +341,44 @@ describe("IpythonKernelProvisioner", () => {
 	});
 
 	it.runIf(process.platform !== "win32")(
+		"allows cooperative bash cleanup before escalating the process group",
+		{ timeout: 180_000 },
+		async () => {
+			const provisioner = new IpythonKernelProvisioner(tempDir, {});
+			const bashPidFile = join(tempDir, "cooperative-bash.pid");
+			const interruptFile = join(tempDir, "interrupt-cleanup.txt");
+			const terminateFile = join(tempDir, "unexpected-term.txt");
+			const controller = new AbortController();
+			try {
+				const manager = await provisioner.ensure();
+				const execution = manager.execute(
+					`%%bash
+trap 'echo started > ${interruptFile}; sleep 0.07; echo complete >> ${interruptFile}; exit 0' INT
+trap 'echo term > ${terminateFile}; exit 1' TERM
+echo $$ > ${bashPidFile}
+while :; do sleep 1; done`,
+					{ signal: controller.signal },
+				);
+				await vi.waitFor(() => expect(existsSync(bashPidFile)).toBe(true), { timeout: 10_000 });
+				controller.abort();
+				await expect(execution).resolves.toMatchObject({ status: "aborted" });
+				expect(readFileSync(interruptFile, "utf8")).toContain("complete");
+				expect(existsSync(terminateFile)).toBe(false);
+			} finally {
+				if (existsSync(bashPidFile)) {
+					const bashPid = Number(readFileSync(bashPidFile, "utf8").trim());
+					try {
+						process.kill(-bashPid, "SIGKILL");
+					} catch {
+						// Cooperative cleanup already removed the process group.
+					}
+				}
+				await provisioner.dispose();
+			}
+		},
+	);
+
+	it.runIf(process.platform !== "win32")(
 		"interrupts the full process group of a stubborn bash cell",
 		{ timeout: 180_000 },
 		async () => {

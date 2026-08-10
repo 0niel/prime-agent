@@ -61,8 +61,8 @@ if _prime_agent_os.name == "posix" and not getattr(
                 # IPython's own wait_for may raise before it reaches its later
                 # terminate/kill calls, so keep the escalation inside the group
                 # proxy and guarantee stubborn descendants are reaped.
-                self._loop.call_later(0.05, self._signal_group, _prime_agent_signal.SIGTERM)
-                self._loop.call_later(0.10, self._signal_group, _prime_agent_signal.SIGKILL)
+                self._loop.call_later(0.10, self._signal_group, _prime_agent_signal.SIGTERM)
+                self._loop.call_later(0.20, self._signal_group, _prime_agent_signal.SIGKILL)
 
         def terminate(self):
             self._signal_group(_prime_agent_signal.SIGTERM)
