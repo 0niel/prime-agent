@@ -24,9 +24,64 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 const RLM_BOOTSTRAP_BASE_CODE = `
 import asyncio
 import os as _prime_agent_os
+import signal as _prime_agent_signal
+import IPython.core.magics.script as _prime_agent_script_magics
 
 _prime_agent_os.environ["NO_COLOR"] = "1"
 get_ipython().colors = "nocolor"
+
+# IPython signals only the script process when a %%bash/%%script cell is
+# interrupted. Non-interactive shells do not forward that signal to their
+# foreground child, so isolate each script in a process group and make the
+# existing SIGINT -> SIGTERM -> SIGKILL escalation target the whole group.
+if _prime_agent_os.name == "posix" and not getattr(
+    _prime_agent_script_magics.asyncio, "_prime_agent_process_groups", False
+):
+    _prime_agent_real_asyncio = _prime_agent_script_magics.asyncio
+
+    class _PrimeAgentProcessGroup:
+        def __init__(self, process):
+            self._process = process
+            self._loop = _prime_agent_real_asyncio.get_running_loop()
+            self._interrupt_escalation_scheduled = False
+
+        def __getattr__(self, name):
+            return getattr(self._process, name)
+
+        def _signal_group(self, sig):
+            try:
+                _prime_agent_os.killpg(self.pid, sig)
+            except ProcessLookupError:
+                pass
+
+        def send_signal(self, sig):
+            self._signal_group(sig)
+            if sig == _prime_agent_signal.SIGINT and not self._interrupt_escalation_scheduled:
+                self._interrupt_escalation_scheduled = True
+                # IPython's own wait_for may raise before it reaches its later
+                # terminate/kill calls, so keep the escalation inside the group
+                # proxy and guarantee stubborn descendants are reaped.
+                self._loop.call_later(0.05, self._signal_group, _prime_agent_signal.SIGTERM)
+                self._loop.call_later(0.10, self._signal_group, _prime_agent_signal.SIGKILL)
+
+        def terminate(self):
+            self._signal_group(_prime_agent_signal.SIGTERM)
+
+        def kill(self):
+            self._signal_group(_prime_agent_signal.SIGKILL)
+
+    class _PrimeAgentScriptAsyncio:
+        _prime_agent_process_groups = True
+
+        def __getattr__(self, name):
+            return getattr(_prime_agent_real_asyncio, name)
+
+        async def create_subprocess_exec(self, *args, **kwargs):
+            kwargs["start_new_session"] = True
+            process = await _prime_agent_real_asyncio.create_subprocess_exec(*args, **kwargs)
+            return _PrimeAgentProcessGroup(process)
+
+    _prime_agent_script_magics.asyncio = _PrimeAgentScriptAsyncio()
 
 try:
     import nest_asyncio as _prime_agent_nest_asyncio

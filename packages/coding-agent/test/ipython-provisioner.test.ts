@@ -339,6 +339,64 @@ describe("IpythonKernelProvisioner", () => {
 		expect(existsSync(dill)).toBe(true);
 		expect(existsSync(manifest)).toBe(true);
 	});
+
+	it.runIf(process.platform !== "win32")(
+		"interrupts the full process group of a stubborn bash cell",
+		{ timeout: 180_000 },
+		async () => {
+			const provisioner = new IpythonKernelProvisioner(tempDir, {});
+			const bashPidFile = join(tempDir, "bash.pid");
+			const leafPidFile = join(tempDir, "leaf.pid");
+			const controller = new AbortController();
+			let bashPid: number | undefined;
+			let leafPid: number | undefined;
+			const isAlive = (pid: number | undefined): boolean => {
+				if (!pid) return false;
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			try {
+				const manager = await provisioner.ensure();
+				const execution = manager.execute(
+					`%%bash
+echo $$ > ${bashPidFile}
+bash -c 'trap "" INT TERM; echo $$ > ${leafPidFile}; while :; do sleep 1; done'`,
+					{ signal: controller.signal },
+				);
+				await vi.waitFor(
+					() => {
+						expect(existsSync(bashPidFile)).toBe(true);
+						expect(existsSync(leafPidFile)).toBe(true);
+					},
+					{ timeout: 10_000 },
+				);
+				bashPid = Number(readFileSync(bashPidFile, "utf8").trim());
+				leafPid = Number(readFileSync(leafPidFile, "utf8").trim());
+				controller.abort();
+				await expect(execution).resolves.toMatchObject({ status: "aborted" });
+				await vi.waitFor(
+					() => {
+						expect(isAlive(bashPid)).toBe(false);
+						expect(isAlive(leafPid)).toBe(false);
+					},
+					{ timeout: 5_000 },
+				);
+				await expect(manager.execute('print("next")')).resolves.toMatchObject({
+					status: "ok",
+					stdout: "next\n",
+				});
+			} finally {
+				for (const pid of [leafPid, bashPid]) {
+					if (isAlive(pid)) process.kill(pid!, "SIGKILL");
+				}
+				await provisioner.dispose();
+			}
+		},
+	);
 });
 
 describe("KernelManager session cleanup during startup", () => {
