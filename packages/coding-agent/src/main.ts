@@ -193,6 +193,15 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "acp" | "dae
 	return appMode === "json" ? "json" : "text";
 }
 
+/**
+ * ACP sessions with a session file are resident so a subsequent --continue
+ * can reattach. Every other mode, and ACP --no-session, remains owned by the
+ * client that created it.
+ */
+export function isClientOwnedDaemonSession(appMode: AppMode, noSession?: boolean): boolean {
+	return appMode !== "acp" || noSession === true;
+}
+
 // `prime-agent agents` opens the agents view directly.
 export function parseAgentsViewCommand(args: string[]): { explicitAgentsView: boolean; args: string[] } {
 	if (args[0] === "agents") {
@@ -1537,7 +1546,7 @@ export async function main(args: string[], options?: MainOptions) {
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
 				continueRecent: parsed.continue,
 				// A no-session ACP invocation has nothing to reattach to; complete its worker on disconnect.
-				clientOwned: appMode !== "acp" || parsed.noSession,
+				clientOwned: isClientOwnedDaemonSession(appMode, parsed.noSession),
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
 			}));

@@ -1,5 +1,6 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, TextContent, Transport } from "@earendil-works/pi-ai";
+import { ENV_AGENT_DIR } from "../../config.js";
 import type {
 	AgentSessionMessageDeliveryMode,
 	AgentSessionMessageReceipt,
@@ -57,9 +58,8 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
-// Protocol 8 also advertises ACP resident-session capability.
 export const DAEMON_SCHEMA_REVISION = 14;
-export const DAEMON_SCHEMA_ID = "protocol-8-schema-14-816309b1cd50";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-816309b1cd50";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -199,6 +199,56 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 	return Object.keys(env).length > 0 ? env : undefined;
 }
 
+/**
+ * Non-secret launch settings that may survive a supervisor restart in a
+ * resident worker descriptor. Model credentials deliberately do not belong
+ * here: the first worker launch inherits the caller environment, but a JSON
+ * descriptor must never become an at-rest copy of a caller's credentials.
+ */
+export const DAEMON_PERSISTED_LAUNCH_ENV_KEYS = [
+	// Process/runtime locations needed to relaunch the same installed CLI.
+	"HOME",
+	"PATH",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+	"XDG_CACHE_HOME",
+	"XDG_CONFIG_HOME",
+	"XDG_DATA_HOME",
+	"XDG_RUNTIME_DIR",
+	"XDG_STATE_HOME",
+	// ENV_AGENT_DIR is the current application's configurable agent directory.
+	// PI_CODING_AGENT_DIR remains for compatibility with the upstream CLI.
+	ENV_AGENT_DIR,
+	"PI_CODING_AGENT_DIR",
+	// Deliberately non-secret Prime Agent behavior, telemetry, and package settings.
+	"PI_OFFLINE",
+	"PI_PACKAGE_DIR",
+	"PI_SKIP_VERSION_CHECK",
+	"DO_NOT_TRACK",
+	"PRIME_AGENT_TELEMETRY",
+	"PRIME_AGENT_TELEMETRY_ENDPOINT",
+	"PRIME_AGENT_TRACES_BASE_URL",
+	"PRIME_AGENT_DOWNLOAD_BASE_URL",
+] as const;
+
+/** Select the explicitly non-secret launch settings safe to persist on disk. */
+export function filterPersistedDaemonLaunchEnv(
+	source: Readonly<Record<string, string>> | undefined,
+): Record<string, string> | undefined {
+	if (!source) return undefined;
+	const env: Record<string, string> = {};
+	for (const key of DAEMON_PERSISTED_LAUNCH_ENV_KEYS) {
+		const value = source[key];
+		if (value !== undefined) env[key] = value;
+	}
+	return Object.keys(env).length > 0 ? env : undefined;
+}
+
+/**
+ * Collect the caller environment for the initial worker spawn. The
+ * supervisor filters it before it is written to a resident-worker descriptor.
+ */
 export function collectDaemonLaunchEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(source)) {
