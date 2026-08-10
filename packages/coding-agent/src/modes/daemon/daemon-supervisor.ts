@@ -960,7 +960,11 @@ export class DaemonSupervisor {
 					delete descriptor.pid;
 					delete descriptor.processStartId;
 				}
+				// Client-owned workers require the caller's transient launch environment,
+				// which is intentionally never persisted. Keep their descriptors recoverable
+				// until the owner reconnects rather than creating an unwakeable passive root.
 				const passive =
+					descriptor.ownerClientId === undefined &&
 					!descriptor.stopRequestedAt &&
 					(alreadyPassivated || descriptor.pid === undefined || !isProcessAlive(descriptor.pid))
 						? await this.passivatedSummaryForDescriptor(descriptor)
@@ -1000,8 +1004,8 @@ export class DaemonSupervisor {
 
 	private descriptorHasRecoverableWork(descriptor: DaemonWorkerDescriptor, info: SessionInfo): boolean {
 		try {
-			if (new WorkerRecoveryJournal(descriptor.recoveryJournalPath).getLatest().some((record) => record.busy))
-				return true;
+			const journal = new WorkerRecoveryJournal(descriptor.recoveryJournalPath);
+			if (journal.hasUnreadableRecords() || journal.getLatest().some((record) => record.busy)) return true;
 			const artifactDir = join(dirname(dirname(info.path)), "session-artifacts", info.id);
 			const cronStore = AgentCronJobStore.forSessionArtifacts();
 			cronStore.registerSessionArtifact(info.id, artifactDir);
@@ -3373,10 +3377,10 @@ export class DaemonSupervisor {
 	}
 
 	private commandExplicitlyWakesWorker(command: DaemonCommand): boolean {
-		// List/status queries deliberately remain metadata-only. Every command in
-		// this list is an explicit user operation which needs a runtime to change,
-		// resume, or export this one session. Keep destructive root kill out: its
-		// tombstone path must be able to remove a passivated descriptor directly.
+		// Metadata reads deliberately remain processless. These are the explicit
+		// operations which need a worker runtime to change, interrupt, or resume
+		// the session. Root kill is handled before forwarding so its tombstone path
+		// can remove a passivated descriptor without waking it.
 		switch (command.type) {
 			case "prompt":
 			case "prompt_and_wait":
@@ -3387,10 +3391,15 @@ export class DaemonSupervisor {
 			case "append_custom_message":
 			case "resume_queue":
 			case "send_message":
+			case "agent_messages_pause":
+			case "agent_messages_resume":
 			case "agent_messages_clear":
+			case "abort":
 			case "start_side_question":
+			case "abort_side_question":
 			case "execute_bash":
 			case "execute_bash_and_wait":
+			case "abort_bash":
 			case "clear_queue":
 			case "abort_and_clear_queue":
 			case "cron_add":

@@ -21,25 +21,32 @@ export interface WorkerRecoveryRecord {
 	recordedAt: string;
 }
 
-function parseRecords(path: string): Map<string, WorkerRecoveryRecord> {
+interface ParsedRecords {
+	latest: Map<string, WorkerRecoveryRecord>;
+	hasInvalidRecords: boolean;
+}
+
+function parseRecords(path: string): ParsedRecords {
 	const latest = new Map<string, WorkerRecoveryRecord>();
 	let contents: string;
 	try {
 		contents = readFileSync(path, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-			return latest;
+			return { latest, hasInvalidRecords: false };
 		}
 		throw error;
 	}
+	let hasInvalidRecords = false;
 	for (const line of contents.split("\n")) {
-		if (!line) {
+		if (!line.trim()) {
 			continue;
 		}
 		let record: WorkerRecoveryRecord;
 		try {
 			record = JSON.parse(line) as WorkerRecoveryRecord;
 		} catch {
+			hasInvalidRecords = true;
 			continue;
 		}
 		if (
@@ -50,17 +57,22 @@ function parseRecords(path: string): Map<string, WorkerRecoveryRecord> {
 			typeof record.operation === "string"
 		) {
 			latest.set(record.activeSessionId, record);
+		} else {
+			hasInvalidRecords = true;
 		}
 	}
-	return latest;
+	return { latest, hasInvalidRecords };
 }
 
 export class WorkerRecoveryJournal {
 	private readonly latest: Map<string, WorkerRecoveryRecord>;
+	private readonly hasInvalidRecords: boolean;
 
 	constructor(private readonly path: string) {
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-		this.latest = parseRecords(path);
+		const parsed = parseRecords(path);
+		this.latest = parsed.latest;
+		this.hasInvalidRecords = parsed.hasInvalidRecords;
 	}
 
 	record(input: Omit<WorkerRecoveryRecord, "version" | "recordedAt">): void {
@@ -88,8 +100,12 @@ export class WorkerRecoveryJournal {
 		return [...this.latest.values()];
 	}
 
+	hasUnreadableRecords(): boolean {
+		return this.hasInvalidRecords;
+	}
+
 	static readLatest(path: string): WorkerRecoveryRecord[] {
-		return [...parseRecords(path).values()];
+		return [...parseRecords(path).latest.values()];
 	}
 
 	private append(record: WorkerRecoveryRecord): void {

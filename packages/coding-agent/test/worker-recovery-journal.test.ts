@@ -44,7 +44,7 @@ describe("WorkerRecoveryJournal", () => {
 		);
 	});
 
-	it("compacts stable checkpoints and ignores a truncated final record", () => {
+	it("compacts stable checkpoints while preserving a truncated final record as recoverable", () => {
 		const path = createPath();
 		const journal = new WorkerRecoveryJournal(path);
 		journal.record({
@@ -64,5 +64,6 @@ describe("WorkerRecoveryJournal", () => {
 		expect(WorkerRecoveryJournal.readLatest(path)).toEqual([
 			expect.objectContaining({ activeSessionId: "active-1", busy: false, operation: "bash_end" }),
 		]);
+		expect(new WorkerRecoveryJournal(path).hasUnreadableRecords()).toBe(true);
 	});
 });
