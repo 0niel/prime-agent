@@ -492,12 +492,10 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.deleteRlmSubagentRuntime("reused-child", childSessions[0], baseOptions.assignmentId);
 		expect(maps.subagentRuntimes.get("reused-child")?.session).toBe(b.session);
 		expect(childDisposals[1]).not.toHaveBeenCalled();
-		await runtime.deleteRlmSubagentRuntime(
-			"reused-child",
-			b.session,
-			baseOptions.assignmentId,
-			"bbbbbbbb-bbbb-4bbb-8bbb-000000000001",
-		);
+		// The normal inline owner does not carry C03 operation IDs through this
+		// delete call. Its matching session is still sufficient authority to clean up.
+		await runtime.deleteRlmSubagentRuntime("reused-child", b.session, baseOptions.assignmentId);
+		expect(maps.subagentRuntimes.has("reused-child")).toBe(false);
 	});
 
 	it("releases a failed child run from the inline runtime host", async () => {

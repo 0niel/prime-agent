@@ -467,7 +467,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (
 			!runtime ||
 			(assignmentId !== undefined && currentAssignment !== assignmentId) ||
-			((operationId !== undefined || currentOperation !== undefined) && currentOperation !== operationId)
+			(operationId !== undefined && currentOperation !== operationId) ||
+			(operationId === undefined &&
+				currentOperation !== undefined &&
+				childSession !== undefined &&
+				runtime.session !== childSession)
 		) {
 			await childSession?.disposeAsync();
 			return;

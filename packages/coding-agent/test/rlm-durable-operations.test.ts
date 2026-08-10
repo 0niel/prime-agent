@@ -284,7 +284,7 @@ describe("RLM durable operation store", () => {
 		).toBe("already_materialized");
 	});
 
-	it("only ignores a malformed non-newline final tail; malformed interior becomes uncertainty", () => {
+	it("ignores and repairs every non-newline final tail before a subsequent append", () => {
 		const f = fixture();
 		const store = openRlmDurableOperationStore(f.parentArtifacts);
 		store.admit(f.admission);
@@ -293,6 +293,17 @@ describe("RLM durable operation store", () => {
 		expect(readRlmDurableOperationRegistry(f.parentArtifacts).hasUncertainRecords).toBe(false);
 		appendFileSync(ledger, "\n");
 		expect(readRlmDurableOperationRegistry(f.parentArtifacts).hasUncertainRecords).toBe(true);
+
+		const g = fixture();
+		const torn = openRlmDurableOperationStore(g.parentArtifacts);
+		torn.admit(g.admission);
+		const tornLedger = join(g.parentArtifacts, "rlm-operation-ledger.jsonl");
+		const complete = readFileSync(tornLedger, "utf8").trimEnd();
+		writeFileSync(tornLedger, complete);
+		expect(readRlmDurableOperationRegistry(g.parentArtifacts).operations.size).toBe(0);
+		torn.admit(g.admission);
+		expect(readRlmDurableOperationRegistry(g.parentArtifacts).operations.size).toBe(1);
+		expect(readFileSync(tornLedger, "utf8")).toMatch(/\n$/);
 	});
 
 	it("rejects UUID, terminal projection, traversal, symlink escape, and forged session identity", () => {

@@ -10,6 +10,7 @@ import {
 	chmodSync,
 	closeSync,
 	fsyncSync,
+	ftruncateSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -271,6 +272,7 @@ export interface RlmDurableIo {
 	closeSync: typeof closeSync;
 	writeSync: typeof writeSync;
 	fsyncSync: typeof fsyncSync;
+	ftruncateSync: typeof ftruncateSync;
 	readFileSync: typeof readFileSync;
 	realpathSync: typeof realpathSync;
 	renameSync: typeof renameSync;
@@ -308,6 +310,7 @@ const defaultIo: RlmDurableIo = {
 	closeSync,
 	writeSync,
 	fsyncSync,
+	ftruncateSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
@@ -817,11 +820,13 @@ function readJsonl(path: string, io: RlmDurableIo, registry: RlmDurableOperation
 			registry.diagnostics = [...registry.diagnostics, `${kind}: empty complete line ${i + 1}`];
 			continue;
 		}
+		// A final record becomes authoritative only with its newline delimiter. A
+		// crash may leave valid JSON without that delimiter; ignore the whole tail
+		// so a later append can truncate it instead of concatenating two records.
+		if (!hasFinalNewline && i === count - 1) continue;
 		try {
 			parsed.push(JSON.parse(line));
 		} catch {
-			// Only an invalid physical final tail without a newline is crash-tolerated.
-			if (!hasFinalNewline && i === count - 1) continue;
 			registry.hasUncertainRecords = true;
 			registry.diagnostics = [...registry.diagnostics, `${kind}: malformed complete line ${i + 1}`];
 		}
@@ -1132,14 +1137,35 @@ function globalUncertain(registry: RlmDurableOperationRegistry, message: string)
 }
 
 function appendJsonl(path: string, record: unknown, io: RlmDurableIo): void {
+	// Never append after a crash-torn physical record. It is not authority until
+	// its newline landed, and retaining it would merge two JSON values into one
+	// malformed line. Read before opening so ENOENT remains the normal first-write path.
+	let retainedBytes: number | undefined;
+	try {
+		const existing = io.readFileSync(path, "utf8") as string;
+		if (existing && !existing.endsWith("\n")) {
+			const newline = existing.lastIndexOf("\n");
+			retainedBytes = Buffer.byteLength(newline < 0 ? "" : existing.slice(0, newline + 1));
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
 	const fd = io.openSync(path, "a", 0o600);
 	try {
+		if (retainedBytes !== undefined) io.ftruncateSync(fd, retainedBytes);
 		writeAll(fd, Buffer.from(`${JSON.stringify(record)}\n`), io);
 		io.fsyncSync(fd);
 	} finally {
 		io.closeSync(fd);
 	}
 	io.chmodSync(path, 0o600);
+	// File fsync alone cannot persist a newly-created directory entry.
+	const directory = io.openSync(dirname(path), "r");
+	try {
+		io.fsyncSync(directory);
+	} finally {
+		io.closeSync(directory);
+	}
 }
 function writeAll(fd: number, data: Buffer, io: RlmDurableIo): void {
 	let offset = 0;
