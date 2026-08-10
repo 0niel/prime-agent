@@ -88,8 +88,11 @@ describe.sequential("MCP OAuth provider", () => {
 			vi.fn(async (input: unknown): Promise<Response> => {
 				const url = urlOf(input);
 				requested.push(url);
-				if (url === "https://resource.test/.well-known/oauth-protected-resource/mcp/v1") {
-					return jsonResponse({ authorization_servers: ["https://auth.test/tenant"] });
+				if (url === "https://resource.test/.well-known/oauth-protected-resource/mcp/v1?tenant=a") {
+					return jsonResponse({
+						resource: "https://resource.test/mcp/v1?tenant=a",
+						authorization_servers: ["https://auth.test/tenant"],
+					});
 				}
 				if (url === "https://auth.test/.well-known/oauth-authorization-server/tenant") {
 					return jsonResponse(externalMeta);
@@ -103,7 +106,7 @@ describe.sequential("MCP OAuth provider", () => {
 
 		const provider = createMcpOAuthProvider({
 			server: "external",
-			url: "https://resource.test/mcp/v1",
+			url: "https://resource.test/mcp/v1?tenant=a",
 			clientId: "configured-client",
 		});
 		const credentials = await provider.login({
@@ -120,8 +123,57 @@ describe.sequential("MCP OAuth provider", () => {
 		expect(credentials.access).toBe("external-access");
 		expect(new URL(authUrl).origin).toBe("https://auth.test");
 		expect(requested.slice(0, 2)).toEqual([
-			"https://resource.test/.well-known/oauth-protected-resource/mcp/v1",
+			"https://resource.test/.well-known/oauth-protected-resource/mcp/v1?tenant=a",
 			"https://auth.test/.well-known/oauth-authorization-server/tenant",
+		]);
+	});
+
+	it("uses OIDC path-append discovery for pathful issuers", async () => {
+		let authUrl = "";
+		const requested: string[] = [];
+		const issuer = "https://auth.test/tenant";
+		const oidcMeta = {
+			...META,
+			issuer,
+			authorization_endpoint: "https://auth.test/tenant/authorize",
+			token_endpoint: "https://auth.test/tenant/token",
+		};
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown): Promise<Response> => {
+				const url = urlOf(input);
+				requested.push(url);
+				if (url === "https://resource.test/.well-known/oauth-protected-resource/mcp") {
+					return jsonResponse({ resource: "https://resource.test/mcp", authorization_servers: [issuer] });
+				}
+				if (url === "https://auth.test/tenant/.well-known/openid-configuration") return jsonResponse(oidcMeta);
+				if (url === oidcMeta.token_endpoint) return jsonResponse({ access_token: "oidc-access", expires_in: 3600 });
+				return new Response("not found", { status: 404 });
+			}),
+		);
+
+		const provider = createMcpOAuthProvider({
+			server: "oidc-path",
+			url: "https://resource.test/mcp",
+			clientId: "configured-client",
+		});
+		const credentials = await provider.login({
+			onAuth: (info) => {
+				authUrl = info.url;
+			},
+			onPrompt: async () => "",
+			onManualCodeInput: async () => {
+				const state = new URL(authUrl).searchParams.get("state") ?? "";
+				return `${REDIRECT}?code=oidc-code&state=${state}`;
+			},
+		});
+
+		expect(credentials.access).toBe("oidc-access");
+		expect(requested.slice(0, 4)).toEqual([
+			"https://resource.test/.well-known/oauth-protected-resource/mcp",
+			"https://auth.test/.well-known/oauth-authorization-server/tenant",
+			"https://auth.test/.well-known/openid-configuration/tenant",
+			"https://auth.test/tenant/.well-known/openid-configuration",
 		]);
 	});
 
@@ -137,7 +189,7 @@ describe.sequential("MCP OAuth provider", () => {
 					return new Response("not found", { status: 404 });
 				}
 				if (url.endsWith("/.well-known/oauth-protected-resource")) {
-					return jsonResponse({ authorization_servers: ["https://srv.test"] });
+					return jsonResponse({ resource: "https://srv.test/mcp", authorization_servers: ["https://srv.test"] });
 				}
 				if (url === "https://srv.test/.well-known/oauth-authorization-server") return jsonResponse(META);
 				if (url === META.token_endpoint) return jsonResponse({ access_token: "root-access", expires_in: 3600 });

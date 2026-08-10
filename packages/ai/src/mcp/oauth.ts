@@ -28,6 +28,7 @@ interface AuthServerMetadata {
 
 /** OAuth protected-resource metadata (RFC 9728). */
 interface ProtectedResourceMetadata {
+	resource: string;
 	authorization_servers?: string[];
 }
 
@@ -75,10 +76,28 @@ function randomState(): string {
 		.replace(/=/g, "");
 }
 
-function wellKnownCandidates(url: string, document: string): string[] {
-	const parsed = new URL(url);
+function protectedResourceCandidates(url: URL): string[] {
+	const path = url.pathname === "/" ? "" : url.pathname;
+	return [
+		...new Set([
+			`${url.origin}/.well-known/oauth-protected-resource${path}${url.search}`,
+			`${url.origin}/.well-known/oauth-protected-resource`,
+		]),
+	];
+}
+
+function authorizationServerCandidates(issuer: string): string[] {
+	const parsed = new URL(issuer);
+	if (parsed.search || parsed.hash) throw new Error(`OAuth issuer must not contain a query or fragment: ${issuer}`);
 	const path = parsed.pathname === "/" ? "" : parsed.pathname;
-	return [...new Set([`${parsed.origin}/.well-known/${document}${path}`, `${parsed.origin}/.well-known/${document}`])];
+	const candidates = [
+		`${parsed.origin}/.well-known/oauth-authorization-server${path}`,
+		`${parsed.origin}/.well-known/openid-configuration${path}`,
+	];
+	if (path) {
+		candidates.push(`${issuer.replace(/\/+$/, "")}/.well-known/openid-configuration`);
+	}
+	return [...new Set(candidates)];
 }
 
 function isAuthServerMetadata(value: unknown): value is AuthServerMetadata {
@@ -92,16 +111,21 @@ async function discoverAuthorizationServer(
 	attempts: string[],
 	errors: string[],
 ): Promise<AuthServerMetadata | undefined> {
-	for (const document of ["oauth-authorization-server", "openid-configuration"]) {
-		for (const candidate of wellKnownCandidates(issuer, document)) {
-			attempts.push(candidate);
-			try {
-				const metadata = await fetchJson(candidate);
-				if (isAuthServerMetadata(metadata)) return metadata;
+	for (const candidate of authorizationServerCandidates(issuer)) {
+		attempts.push(candidate);
+		try {
+			const metadata = await fetchJson(candidate);
+			if (!isAuthServerMetadata(metadata)) {
 				errors.push(`${candidate}: missing authorization_endpoint or token_endpoint`);
-			} catch (error) {
-				errors.push(String(error));
+				continue;
 			}
+			if (metadata.issuer !== issuer) {
+				errors.push(`${candidate}: issuer mismatch (expected ${issuer}, received ${String(metadata.issuer)})`);
+				continue;
+			}
+			return metadata;
+		} catch (error) {
+			errors.push(String(error));
 		}
 	}
 	return undefined;
@@ -110,15 +134,27 @@ async function discoverAuthorizationServer(
 /** Follow RFC 9728 resource metadata, then fall back to co-located AS discovery. */
 async function discover(url: string): Promise<AuthServerMetadata> {
 	const resourceUrl = new URL(url);
+	resourceUrl.hash = "";
+	const resourceIdentifier = resourceUrl.toString();
 	const attempts: string[] = [];
 	const errors: string[] = [];
 
-	for (const candidate of wellKnownCandidates(url, "oauth-protected-resource")) {
+	for (const candidate of protectedResourceCandidates(resourceUrl)) {
 		attempts.push(candidate);
 		try {
 			const resource = (await fetchJson(candidate)) as ProtectedResourceMetadata;
-			const issuers = Array.isArray(resource?.authorization_servers)
-				? resource.authorization_servers.filter((issuer): issuer is string => typeof issuer === "string")
+			if (resource?.resource !== resourceIdentifier) {
+				errors.push(
+					`${candidate}: resource mismatch (expected ${resourceIdentifier}, received ${String(resource?.resource)})`,
+				);
+				continue;
+			}
+			const issuers = Array.isArray(resource.authorization_servers)
+				? [
+						...new Set(
+							resource.authorization_servers.filter((issuer): issuer is string => typeof issuer === "string"),
+						),
+					].slice(0, 10)
 				: [];
 			if (issuers.length === 0) {
 				errors.push(`${candidate}: missing authorization_servers`);
