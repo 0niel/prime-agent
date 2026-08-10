@@ -152,69 +152,66 @@ export function transformMessages<TApi extends Api>(
 		return msg;
 	});
 
-	// Second pass: insert synthetic empty tool results for orphaned tool calls
-	// This preserves thinking signatures and satisfies API requirements
+	// Second pass: keep every tool result adjacent to its assistant tool call.
+	// Interrupted turns can persist a user/custom message before the real result arrives.
+	// Look ahead only until the next assistant turn, hoist the first matching real
+	// result for each call, and synthesize results only for calls still unresolved.
 	const result: Message[] = [];
-	let pendingToolCalls: ToolCall[] = [];
-	let existingToolResultIds = new Set<string>();
-	const insertSyntheticToolResults = () => {
-		if (pendingToolCalls.length > 0) {
-			for (const tc of pendingToolCalls) {
-				if (!existingToolResultIds.has(tc.id)) {
-					result.push({
-						role: "toolResult",
-						toolCallId: tc.id,
-						toolName: tc.name,
-						content: [{ type: "text", text: "No result provided" }],
-						isError: true,
-						timestamp: Date.now(),
-					} as ToolResultMessage);
-				}
-			}
-			pendingToolCalls = [];
-			existingToolResultIds = new Set();
-		}
-	};
-
 	for (let i = 0; i < transformed.length; i++) {
 		const msg = transformed[i];
 
-		if (msg.role === "assistant") {
-			// If we have pending orphaned tool calls from a previous assistant, insert synthetic results now
-			insertSyntheticToolResults();
+		if (msg.role === "toolResult") {
+			// Results are emitted with their matching assistant below. Anything left is
+			// an orphan or duplicate and is invalid model context.
+			continue;
+		}
 
-			// Skip errored/aborted assistant messages entirely.
-			// These are incomplete turns that shouldn't be replayed:
-			// - May have partial content (reasoning without message, incomplete tool calls)
-			// - Replaying them can cause API errors (e.g., OpenAI "reasoning without following item")
-			// - The model should retry from the last valid state
-			const assistantMsg = msg as AssistantMessage;
-			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
-				continue;
+		if (msg.role !== "assistant") {
+			result.push(msg);
+			continue;
+		}
+
+		// Skip errored/aborted assistant messages entirely.
+		// These are incomplete turns that shouldn't be replayed:
+		// - May have partial content (reasoning without message, incomplete tool calls)
+		// - Replaying them can cause API errors (e.g., OpenAI "reasoning without following item")
+		// - The model should retry from the last valid state
+		const assistantMsg = msg as AssistantMessage;
+		if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+			continue;
+		}
+
+		result.push(msg);
+		const toolCalls = assistantMsg.content.filter((block) => block.type === "toolCall") as ToolCall[];
+		if (toolCalls.length === 0) continue;
+
+		const pendingIds = new Set(toolCalls.map((toolCall) => toolCall.id));
+		const matchingResults = new Map<string, ToolResultMessage>();
+		for (let j = i + 1; j < transformed.length; j++) {
+			const candidate = transformed[j];
+			if (candidate.role === "assistant") break;
+			if (
+				candidate.role === "toolResult" &&
+				pendingIds.has(candidate.toolCallId) &&
+				!matchingResults.has(candidate.toolCallId)
+			) {
+				matchingResults.set(candidate.toolCallId, candidate);
 			}
+		}
 
-			// Track tool calls from this assistant message
-			const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall") as ToolCall[];
-			if (toolCalls.length > 0) {
-				pendingToolCalls = toolCalls;
-				existingToolResultIds = new Set();
-			}
-
-			result.push(msg);
-		} else if (msg.role === "toolResult") {
-			existingToolResultIds.add(msg.toolCallId);
-			result.push(msg);
-		} else if (msg.role === "user") {
-			// User message interrupts tool flow - insert synthetic results for orphaned calls
-			insertSyntheticToolResults();
-			result.push(msg);
-		} else {
-			result.push(msg);
+		result.push(...matchingResults.values());
+		for (const toolCall of toolCalls) {
+			if (matchingResults.has(toolCall.id)) continue;
+			result.push({
+				role: "toolResult",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				content: [{ type: "text", text: "No result provided" }],
+				isError: true,
+				timestamp: Date.now(),
+			});
 		}
 	}
-
-	// If the conversation ends with unresolved tool calls, synthesize results now.
-	insertSyntheticToolResults();
 
 	return result;
 }

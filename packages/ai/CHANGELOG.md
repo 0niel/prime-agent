@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed interrupted tool results being replayed after interposed user messages ([#1102](https://github.com/PrimeIntellect-ai/prime-agent/pull/1102)).
+
 ## [0.7.1] - 2026-08-07
 
 ## [0.7.0] - 2026-08-05

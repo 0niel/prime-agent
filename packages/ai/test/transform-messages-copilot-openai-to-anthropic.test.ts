@@ -188,4 +188,87 @@ describe("OpenAI to Anthropic session migration for Copilot Claude", () => {
 			content: [{ type: "text", text: "No result provided" }],
 		});
 	});
+
+	it("hoists a delayed real tool result before an interposed user message", () => {
+		const model = makeCopilotClaudeModel();
+		const messages: Message[] = [
+			makeAssistantMessage([
+				{ type: "toolCall", id: "call_1|fc_1", name: "bash", arguments: { command: "sleep 1" } },
+			]),
+			{ role: "user", content: "Update restart requested", timestamp: 2 },
+			{
+				role: "toolResult",
+				toolCallId: "call_1|fc_1",
+				toolName: "bash",
+				content: [{ type: "text", text: "Request was aborted" }],
+				isError: true,
+				timestamp: 3,
+			},
+		];
+
+		const result = transformMessages(messages, model, anthropicNormalizeToolCallId);
+
+		expect(result.map((message) => message.role)).toEqual(["assistant", "toolResult", "user"]);
+		expect(result[1]).toMatchObject({
+			role: "toolResult",
+			toolCallId: "call_1_fc_1",
+			content: [{ type: "text", text: "Request was aborted" }],
+		});
+	});
+
+	it("preserves delayed real results and synthesizes only genuinely missing results", () => {
+		const model = makeCopilotClaudeModel();
+		const messages: Message[] = [
+			makeAssistantMessage([
+				{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "one" } },
+				{ type: "toolCall", id: "call_2", name: "read", arguments: { path: "two" } },
+			]),
+			{ role: "user", content: "interrupt", timestamp: 2 },
+			{
+				role: "toolResult",
+				toolCallId: "call_2",
+				toolName: "read",
+				content: [{ type: "text", text: "real result" }],
+				isError: false,
+				timestamp: 3,
+			},
+		];
+
+		const result = transformMessages(messages, model, anthropicNormalizeToolCallId);
+		const toolResults = result.filter((message) => message.role === "toolResult");
+
+		expect(toolResults).toHaveLength(2);
+		expect(toolResults[0]).toMatchObject({ toolCallId: "call_2", isError: false });
+		expect(toolResults[1]).toMatchObject({
+			toolCallId: "call_1",
+			isError: true,
+			content: [{ type: "text", text: "No result provided" }],
+		});
+	});
+
+	it("drops orphan and duplicate tool results without crossing the next assistant turn", () => {
+		const model = makeCopilotClaudeModel();
+		const duplicate = {
+			role: "toolResult" as const,
+			toolCallId: "call_1",
+			toolName: "read",
+			content: [{ type: "text" as const, text: "duplicate" }],
+			isError: false,
+			timestamp: 3,
+		};
+		const messages: Message[] = [
+			makeAssistantMessage([{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "one" } }]),
+			{ ...duplicate, content: [{ type: "text", text: "first" }] },
+			duplicate,
+			makeAssistantMessage([{ type: "toolCall", id: "call_2", name: "read", arguments: { path: "two" } }]),
+			{ ...duplicate, content: [{ type: "text", text: "late orphan" }] },
+		];
+
+		const result = transformMessages(messages, model, anthropicNormalizeToolCallId);
+		const toolResults = result.filter((message) => message.role === "toolResult");
+
+		expect(toolResults).toHaveLength(2);
+		expect(toolResults[0]).toMatchObject({ toolCallId: "call_1", content: [{ text: "first" }] });
+		expect(toolResults[1]).toMatchObject({ toolCallId: "call_2", isError: true });
+	});
 });
