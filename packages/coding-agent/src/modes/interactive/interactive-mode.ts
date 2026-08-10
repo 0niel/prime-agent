@@ -928,6 +928,14 @@ export class InteractiveMode {
 	// Serializes session event handling; see subscribeToAgent
 	private sessionEventQueue: Promise<void> = Promise.resolve();
 	private sessionEventGeneration = 0;
+	// Streaming progress is replaceable: retain only the newest update until the
+	// next turn, but always put it back on the normal event tail before a
+	// structural transition.
+	private progressFlushTimer?: ReturnType<typeof setTimeout>;
+	private progressFlushGeneration = 0;
+	private pendingProgressEvent?: AgentConnectionSessionEvent;
+	private progressFlushStopped = false;
+	private readonly progressChildStatuses = new Map<string, AgentConnectionRlmChildAgentSnapshot["status"]>();
 	private fastModeToggleQueue: Promise<void> = Promise.resolve();
 
 	// Tool execution tracking: toolCallId -> component
@@ -5030,20 +5038,110 @@ export class InteractiveMode {
 		};
 	}
 
+	private isReplaceableProgressEvent(event: AgentConnectionSessionEvent): boolean {
+		if (event.type === "message_update") return event.message?.role === "assistant";
+		if (event.type === "tool_execution_update") return true;
+		if (event.type !== "rlm_child_update") return false;
+
+		const { id, status } = event.child;
+		const previous = this.progressChildStatuses.get(id);
+		if (status !== "queued" && status !== "running") {
+			this.progressChildStatuses.delete(id);
+			return false;
+		}
+		this.progressChildStatuses.set(id, status);
+		// The first observation and queued/running edge affect the child summary;
+		// preserve them, and coalesce only later snapshots in the same state.
+		return previous === status;
+	}
+
+	/** Add work to the one UI-owned event tail, and keep that tail usable after errors. */
+	private enqueueSessionEvent(
+		event: AgentConnectionSessionEvent,
+		generation: number,
+		options: { preserveAcrossReplacement?: boolean } = {},
+	): Promise<void> {
+		const run = this.sessionEventQueue.then(() => {
+			if (
+				this.progressFlushStopped ||
+				(!options.preserveAcrossReplacement && generation !== this.sessionEventGeneration)
+			) {
+				return;
+			}
+			return this.handleEvent(event);
+		});
+		this.sessionEventQueue = run.catch(() => {});
+		return run;
+	}
+
+	/**
+	 * Apply the latest replaceable progress update on a later turn. This is UI
+	 * work only; it neither delays nor limits agent/provider work.
+	 */
+	private queueProgressEvent(event: AgentConnectionSessionEvent, sessionGeneration: number): void {
+		if (this.progressFlushStopped || sessionGeneration !== this.sessionEventGeneration) return;
+		this.pendingProgressEvent = event;
+		if (this.progressFlushTimer) return;
+
+		const progressGeneration = this.progressFlushGeneration;
+		this.progressFlushTimer = setTimeout(() => {
+			this.progressFlushTimer = undefined;
+			if (
+				this.progressFlushStopped ||
+				progressGeneration !== this.progressFlushGeneration ||
+				sessionGeneration !== this.sessionEventGeneration
+			) {
+				return;
+			}
+			const pending = this.pendingProgressEvent;
+			this.pendingProgressEvent = undefined;
+			if (pending) {
+				void this.enqueueSessionEvent(pending, sessionGeneration).catch(() => {});
+			}
+		}, 0);
+	}
+
+	/** Put retained progress ahead of the next structural event on the existing tail. */
+	private flushPendingProgress(): void {
+		if (this.progressFlushTimer) {
+			clearTimeout(this.progressFlushTimer);
+			this.progressFlushTimer = undefined;
+		}
+		const pending = this.pendingProgressEvent;
+		this.pendingProgressEvent = undefined;
+		if (pending && !this.progressFlushStopped) {
+			// A replacement advances sessionEventGeneration synchronously. This event
+			// was already received by the old UI and is deliberately ordered before
+			// that replacement, so it must not be discarded by that advance.
+			void this.enqueueSessionEvent(pending, this.sessionEventGeneration, { preserveAcrossReplacement: true }).catch(() => {});
+		}
+	}
+
+	/** Invalidate timers and retained updates before a replacement or UI teardown. */
+	private cancelPendingProgress(): void {
+		this.progressFlushGeneration++;
+		if (this.progressFlushTimer) {
+			clearTimeout(this.progressFlushTimer);
+			this.progressFlushTimer = undefined;
+		}
+		this.pendingProgressEvent = undefined;
+		this.progressChildStatuses?.clear();
+	}
+
 	private subscribeToAgent(): void {
 		this.unsubscribe = this.agentConnection.subscribe(async (event) => {
 			try {
 				if (event.type === "session_event") {
-					// Connection adapters dispatch without awaiting, so serialize events.
-					// Replacement advances the generation before entering this queue, which
-					// prevents already-queued source events from mutating the target UI.
 					const generation = this.sessionEventGeneration;
-					const run = this.sessionEventQueue.then(() =>
-						generation === this.sessionEventGeneration ? this.handleEvent(event.event) : undefined,
-					);
-					this.sessionEventQueue = run.catch(() => {});
-					await run;
+					if (this.isReplaceableProgressEvent(event.event)) {
+						this.queueProgressEvent(event.event, generation);
+					} else {
+						this.flushPendingProgress();
+						await this.enqueueSessionEvent(event.event, generation);
+					}
 				} else if (event.type === "session_replaced") {
+					this.flushPendingProgress();
+					this.cancelPendingProgress();
 					const generation = ++this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return;
@@ -5058,6 +5156,8 @@ export class InteractiveMode {
 					this.sessionEventQueue = run.catch(() => {});
 					await run;
 				} else if (event.type === "session_resynced") {
+					this.flushPendingProgress();
+					this.cancelPendingProgress();
 					const generation = this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return false;
@@ -9700,6 +9800,10 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 	}
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {
+		// Cancel before detaching the connection or stopping the TUI: a delayed
+		// progress callback must never repaint or mutate a stopped UI.
+		this.progressFlushStopped = true;
+		this.cancelPendingProgress();
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 		this.clearEscapeRepeat();

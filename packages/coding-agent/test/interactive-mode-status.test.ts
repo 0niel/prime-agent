@@ -1102,6 +1102,7 @@ describe("InteractiveMode pending bash components", () => {
 			},
 		} as unknown as InteractiveMode;
 
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: unknown): void }).subscribeToAgent.call(
 			fakeThis,
 		);
@@ -1307,6 +1308,7 @@ describe("InteractiveMode connection events", () => {
 			showError: vi.fn(),
 		};
 
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
 			fakeThis,
 		);
@@ -1356,6 +1358,7 @@ describe("InteractiveMode connection events", () => {
 			showError: vi.fn(),
 		};
 
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
 			fakeThis,
 		);
@@ -1405,6 +1408,7 @@ describe("InteractiveMode connection events", () => {
 			handleConnectionExtensionUiRequest: vi.fn(),
 			showError: vi.fn(),
 		};
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
 			fakeThis,
 		);
@@ -1587,6 +1591,7 @@ describe("InteractiveMode connection events", () => {
 			ui: { requestRender: vi.fn() },
 			showError: vi.fn(),
 		};
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
 			fakeThis,
 		);
@@ -1598,6 +1603,145 @@ describe("InteractiveMode connection events", () => {
 
 		expect(fakeThis.handleEvent).not.toHaveBeenCalled();
 		expect(fakeThis.renderInitialMessages).toHaveBeenCalledOnce();
+	});
+
+	test("coalesces active progress and flushes its latest state before a terminal event", async () => {
+		vi.useFakeTimers();
+		try {
+			type Event = { type: "session_event"; event: AgentConnectionSessionEvent };
+			let listener: ((event: Event) => Promise<void>) | undefined;
+			const handled: string[] = [];
+			const fakeThis = {
+				agentConnection: {
+					subscribe: (callback: (event: Event) => Promise<void>) => {
+						listener = callback;
+						return vi.fn();
+					},
+				},
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				progressFlushGeneration: 0,
+				progressFlushStopped: false,
+				handleEvent: vi.fn(async (event: { type: string; partialResult?: { content: unknown[] } }) => {
+					handled.push(event.type === "tool_execution_update" ? String(event.partialResult?.content[0]) : event.type);
+				}),
+				showError: vi.fn(),
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
+				fakeThis,
+			);
+
+			const progress = (value: string) =>
+				listener?.({
+					type: "session_event",
+					event: {
+						type: "tool_execution_update",
+						toolCallId: "tool-1",
+						partialResult: { content: [value] },
+					},
+				} as unknown as Event);
+			progress("first");
+			progress("latest");
+			expect(vi.getTimerCount()).toBe(1);
+			expect((fakeThis as unknown as { pendingProgressEvent?: { partialResult?: { content: string[] } } }).pendingProgressEvent)
+				.toMatchObject({ partialResult: { content: ["latest"] } });
+
+			const terminal = listener?.({ type: "session_event", event: { type: "agent_end" } as AgentConnectionSessionEvent });
+			await terminal;
+			expect(handled).toEqual(["latest", "agent_end"]);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("invalidates retained progress before UI stop so no stale callback mutates the UI", async () => {
+		vi.useFakeTimers();
+		try {
+			const handleEvent = vi.fn(async () => {});
+			const fakeThis = {
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				progressFlushGeneration: 0,
+				progressFlushStopped: false,
+				handleEvent,
+				unregisterSignalHandlers: vi.fn(),
+				clearCtrlCExitHint: vi.fn(),
+				clearEscapeRepeat: vi.fn(),
+				settingsManager: { getShowTerminalProgress: () => false },
+				ui: { terminal: { setProgress: vi.fn() } },
+				stopWorkingLoader: vi.fn(),
+				endFeatureHintRun: vi.fn(),
+				stopWorkingPulse: vi.fn(),
+				stopGoalTrayTimer: vi.fn(),
+				closeHeartbeatManager: vi.fn(),
+				clearExtensionTerminalInputListeners: vi.fn(),
+				footer: { dispose: vi.fn() },
+				footerDataProvider: { dispose: vi.fn() },
+				isInitialized: false,
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			const queueProgressEvent = (
+				InteractiveMode.prototype as unknown as {
+					queueProgressEvent(this: typeof fakeThis, event: AgentConnectionSessionEvent, generation: number): void;
+				}
+			).queueProgressEvent;
+			queueProgressEvent.call(fakeThis, { type: "tool_execution_update" } as AgentConnectionSessionEvent, 0);
+			expect(vi.getTimerCount()).toBe(1);
+			(InteractiveMode.prototype as unknown as { stop(this: typeof fakeThis): void }).stop.call(fakeThis);
+			await vi.runAllTimersAsync();
+			await fakeThis.sessionEventQueue;
+			expect(handleEvent).not.toHaveBeenCalled();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("invalidates old-generation progress before a replacement and does not rearm it", async () => {
+		vi.useFakeTimers();
+		try {
+			type Event =
+				| { type: "session_event"; event: AgentConnectionSessionEvent }
+				| { type: "session_replaced"; state: AgentConnectionState };
+			let listener: ((event: Event) => Promise<void>) | undefined;
+			const handled: string[] = [];
+			const fakeThis = {
+				agentConnection: { subscribe: (callback: (event: Event) => Promise<void>) => ((listener = callback), vi.fn()) },
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				progressFlushGeneration: 0,
+				progressFlushStopped: false,
+				handleEvent: vi.fn(async (event: { type: string; partialResult?: { content: unknown[] } }) => {
+					handled.push(event.type === "tool_execution_update" ? String(event.partialResult?.content[0]) : event.type);
+				}),
+				resetSideQuestion: vi.fn(),
+				resetExtensionUI: vi.fn(),
+				applyConnectionStateSnapshot: vi.fn(),
+				resetCurrentSessionRenderState: vi.fn(),
+				rebindCurrentSession: vi.fn(async () => {}),
+				renderInitialMessages: vi.fn(async () => {}),
+				ui: { requestRender: vi.fn() },
+				showError: vi.fn(),
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
+				fakeThis,
+			);
+			listener?.({
+				type: "session_event",
+				event: { type: "tool_execution_update", toolCallId: "tool-1", partialResult: { content: ["old"] } },
+			} as unknown as Event);
+			expect(vi.getTimerCount()).toBe(1);
+			await listener?.({ type: "session_replaced", state: createConnectionState() });
+			await vi.runAllTimersAsync();
+			expect(handled).toEqual(["old"]);
+			expect((fakeThis as unknown as { pendingProgressEvent?: unknown }).pendingProgressEvent).toBeUndefined();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
