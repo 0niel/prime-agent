@@ -739,6 +739,27 @@ export interface SessionActionRecoverySnapshot {
 	actions: SessionActionRecoveryAction[];
 }
 
+/** Reject recovery data the scheduler cannot admit before it is allowed to mutate state. */
+export function validateSessionActionRecoverySnapshot(
+	snapshot: SessionActionRecoverySnapshot,
+	existingActionIds: Iterable<string> = [],
+): void {
+	if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
+		throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
+	}
+	const actionIds = new Set(existingActionIds);
+	for (const recovered of snapshot.actions) {
+		if (actionIds.has(recovered.id)) throw new Error(`Duplicate session action id: ${recovered.id}`);
+		actionIds.add(recovered.id);
+		if (
+			recovered.payload.kind === "turn" &&
+			recovered.payload.records.some((record) => record.ownerActionId !== recovered.id)
+		) {
+			throw new Error(`Session action ${recovered.id} has invalid delivery correlation`);
+		}
+	}
+}
+
 function cloneCustomMessage(message: CustomMessage): CustomMessage {
 	return {
 		...message,
@@ -4908,21 +4929,18 @@ export class AgentSession {
 		});
 	}
 
+	/** Validates recovery data against immutable snapshot and current scheduler invariants. */
+	validateSessionActionRecoverySnapshot(snapshot: SessionActionRecoverySnapshot): void {
+		validateSessionActionRecoverySnapshot(
+			snapshot,
+			this._actionStore.ownedActions().map((action) => action.id),
+		);
+	}
+
 	/** Restores queued work and returns the exact durable IDs admitted to the scheduler. */
 	async restoreSessionActions(snapshot: SessionActionRecoverySnapshot): Promise<readonly string[]> {
-		if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
-			throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
-		}
-		const actionIds = new Set(this._actionStore.ownedActions().map((action) => action.id));
+		this.validateSessionActionRecoverySnapshot(snapshot);
 		const actions = snapshot.actions.map((recovered): QueuedSessionAction => {
-			if (actionIds.has(recovered.id)) throw new Error(`Duplicate session action id: ${recovered.id}`);
-			actionIds.add(recovered.id);
-			if (
-				recovered.payload.kind === "turn" &&
-				recovered.payload.records.some((record) => record.ownerActionId !== recovered.id)
-			) {
-				throw new Error(`Session action ${recovered.id} has invalid delivery correlation`);
-			}
 			const payload: PreparedTurnPayload | PreparedCommandPayload =
 				recovered.payload.kind === "turn"
 					? {

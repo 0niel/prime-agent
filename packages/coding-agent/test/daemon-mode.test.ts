@@ -602,9 +602,17 @@ describe("daemon mode helpers", () => {
 			const restoreSessionActions = vi.fn(async (snapshot: SessionActionRecoverySnapshot) =>
 				snapshot.actions.map((action) => action.id),
 			);
+			const validateSessionActionRecoverySnapshot = vi.fn((snapshot: SessionActionRecoverySnapshot) => {
+				const actionIds = new Set<string>();
+				for (const action of snapshot.actions) {
+					if (actionIds.has(action.id)) throw new Error(`Duplicate session action id: ${action.id}`);
+					actionIds.add(action.id);
+				}
+			});
 			Object.assign(state.runtime, {
 				session: {
 					sessionId: "session",
+					validateSessionActionRecoverySnapshot,
 					get unfinishedActionCount() {
 						return unfinished.length;
 					},
@@ -623,6 +631,22 @@ describe("daemon mode helpers", () => {
 				formatVersion: 1 as const,
 				actions: actionIds.map((id) => ({ id })),
 			} as unknown as SessionActionRecoverySnapshot;
+			const duplicateSnapshot = {
+				formatVersion: 1 as const,
+				actions: [{ id: "duplicate" }, { id: "duplicate" }],
+			} as unknown as SessionActionRecoverySnapshot;
+			// Validate before durable allocation: duplicate IDs must neither invoke the
+			// mutating restore nor leave orphaned crash evidence visible after restart.
+			await expect(
+				handle(makeClient("client", "active"), {
+					type: "restore_actions",
+					activeSessionId: "active",
+					snapshot: duplicateSnapshot,
+				}),
+			).rejects.toThrow("Duplicate session action id: duplicate");
+			expect(restoreSessionActions).not.toHaveBeenCalled();
+			expect(WorkerRecoveryJournal.readLatest(journalPath).filter((record) => record.busy)).toHaveLength(0);
+			expect(new WorkerRecoveryJournal(journalPath).getLatest()).toEqual([]);
 			// N=0 clears the exact admission synchronously; restore failure does the
 			// same, without touching a later successful restore's identities.
 			await handle(makeClient("client", "active"), {

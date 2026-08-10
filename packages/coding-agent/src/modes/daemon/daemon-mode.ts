@@ -4244,6 +4244,10 @@ export class AgentDaemon {
 
 			case "restore_actions": {
 				const state = this.getSessionState(command.activeSessionId);
+				// Reject every snapshot-local invariant before allocating crash evidence.
+				// In particular, duplicate IDs would collapse a Map entry and make exact
+				// cleanup impossible if the scheduler rejects the snapshot.
+				state.runtime.session.validateSessionActionRecoverySnapshot(command.snapshot);
 				// Allocate one durable identity per declared action before restore can
 				// mutate the scheduler. This leaves crash evidence fail-closed if the
 				// worker dies between admission and its response.
