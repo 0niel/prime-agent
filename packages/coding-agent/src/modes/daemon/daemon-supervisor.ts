@@ -432,6 +432,16 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		Number.isInteger(descriptor.pid) &&
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string");
+	// A processless recovering descriptor is a deliberate durable hand-off. Any
+	// process identity it retains, however, must be a complete, valid pair: a
+	// partial or object-shaped identity is untrusted input, not an invitation to
+	// probe, signal, or passivate an arbitrary process.
+	const validRecoveringProcess =
+		(descriptor.pid === undefined && descriptor.processStartId === undefined) ||
+		(Number.isInteger(descriptor.pid) &&
+			(descriptor.pid ?? 0) > 0 &&
+			typeof descriptor.processStartId === "string" &&
+			descriptor.processStartId.length > 0);
 	const knownLifecycle = isDaemonWorkerLifecycle(descriptor.lifecycle);
 	return (
 		descriptor.version === 1 &&
@@ -444,7 +454,8 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		// a valid process identity, and unknown legacy states do too until their
 		// first normalization pass, so malformed input remains fail-closed.
 		(knownLifecycle
-			? descriptor.lifecycle === "passivated" || descriptor.lifecycle === "recovering" || validLegacyProcess
+			? descriptor.lifecycle === "passivated" ||
+				(descriptor.lifecycle === "recovering" ? validRecoveringProcess : validLegacyProcess)
 			: validLegacyProcess) &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
 		typeof descriptor.socketPath === "string" &&
