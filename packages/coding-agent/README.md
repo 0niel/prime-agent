@@ -211,7 +211,7 @@ Sessions auto-save as flat JSONL files under `~/.prime/agent/sessions/`. Each se
 ```bash
 prime-agent -c                  # Continue most recent session
 prime-agent -r [path|id]        # Browse past sessions or resume one directly
-prime-agent --no-session        # Ephemeral mode (don't save)
+prime-agent --no-session        # Do not persist this session transcript or artifacts
 prime-agent --fork <path|id>    # Fork specific session file or ID into a new session
 ```
 
@@ -566,7 +566,7 @@ Use `prime-agent model list [search]` to list available models.
 | `-r`, `--resume [path\|id]` | Open the searchable session view, or resume a specific session file or partial UUID |
 | `--fork <path\|id>` | Fork specific session file or partial UUID into a new session |
 | `--session-dir <dir>` | Custom session storage directory |
-| `--no-session` | Ephemeral mode (don't save) |
+| `--no-session` | Do not persist this session transcript or artifacts; not a sandbox or fully stateless mode |
 
 Use `prime-agent session export <file> [output]` to export a saved session to HTML.
 
@@ -599,6 +599,8 @@ Combine `--no-*` with explicit flags to load exactly what you need, ignoring set
 ### Autonomous Options
 
 Autonomous mode is disabled by default. `--autonomous` or any of its sub-options enables host-managed continuations for unattended work.
+
+Autonomous budgets and gates are not a security sandbox. See [Security and Sandboxing](docs/security.md) before unattended use.
 
 | Option | Description |
 |--------|-------------|
