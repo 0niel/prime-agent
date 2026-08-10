@@ -89,7 +89,12 @@ export interface SwarmBenchmarkConfig {
 export interface SwarmManifest {
 	readonly schemaVersion: typeof SWARM_EVIDENCE_SCHEMA_VERSION;
 	readonly benchmarkVersion: "b00a";
+	/** Public configuration identity, not an authenticity signature. */
 	readonly fingerprint: string;
+	/** Stable identity of the deterministic oracle/cost/summary subset. */
+	readonly deterministicBundleId?: string;
+	/** Artifact-index commitment; trust this value out of band for mutation detection. */
+	readonly artifactBundleId?: string;
 	readonly scenario: string;
 	readonly assignments: readonly AssignmentSpec[];
 	readonly faultSchedule: readonly FakeProviderFaultSchedule[];
@@ -188,31 +193,131 @@ function isSafeInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-/** No arbitrary fixture content enters normal artifacts.  Fixed identifiers remain for joins/order. */
-export function redactEvidence<T>(value: T, key?: string): T {
-	if (typeof value === "string") {
-		const safe =
-			(key === "nodeId" && /^worker-\d{4}$/.test(value)) ||
-			(key === "requestId" && /^request-\d{4}$/.test(value)) ||
-			(key === "parentNodeId" && (value === "root" || /^worker-\d{4}$/.test(value))) ||
-			((key === "id" || key === "role") &&
-				(value === "run" || /^worker-\d{4}$/.test(value) || /^role-\d{4}$/.test(value))) ||
-			(key === "kind" && ["node", "role", "run"].includes(value)) ||
-			(key === "phase" &&
-				["before_dispatch", "after_admission", "after_terminal", "after_cleanup"].includes(value)) ||
-			(key === "type" && (EVENT_TYPES as readonly string[]).includes(value)) ||
-			(key === "schemaVersion" && value === SWARM_EVIDENCE_SCHEMA_VERSION) ||
-			(key === "benchmarkVersion" && value === "b00a") ||
-			((key === "fingerprint" || key === "sha256") && /^[0-9a-f]{64}$/.test(value)) ||
-			(key === "path" && (EVIDENCE_FILES as readonly string[]).includes(value));
-		return (safe ? value : REDACTED) as T;
+/** Content-free strings and object keys are allowlisted independently. */
+const SAFE_EVIDENCE_KEYS = new Set([
+	"schemaVersion",
+	"benchmarkVersion",
+	"fingerprint",
+	"deterministicBundleId",
+	"artifactBundleId",
+	"scenario",
+	"assignments",
+	"faultSchedule",
+	"priceCard",
+	"metadata",
+	"runtime",
+	"artifacts",
+	"events",
+	"processSamples",
+	"costAttribution",
+	"summary",
+	"path",
+	"bytes",
+	"sha256",
+	"nodeId",
+	"parentNodeId",
+	"role",
+	"requested",
+	"resolved",
+	"provider",
+	"model",
+	"revision",
+	"effort",
+	"inputTokens",
+	"outputTokens",
+	"actions",
+	"type",
+	"milliseconds",
+	"message",
+	"code",
+	"reason",
+	"sequence",
+	"elapsedMilliseconds",
+	"requestId",
+	"detail",
+	"phase",
+	"source",
+	"processes",
+	"pid",
+	"parentPid",
+	"startTime",
+	"rssBytes",
+	"heapUsedBytes",
+	"externalBytes",
+	"label",
+	"totalRssBytes",
+	"id",
+	"kind",
+	"directInputTokens",
+	"directOutputTokens",
+	"directCost",
+	"downstreamInputTokens",
+	"downstreamOutputTokens",
+	"downstreamCost",
+	"admitted",
+	"started",
+	"completed",
+	"failed",
+	"delivered",
+	"cleanedUp",
+	"independentDispatch",
+	"version",
+	"inputPerMillionTokens",
+	"outputPerMillionTokens",
+]);
+function safeEvidenceString(value: string, key?: string): boolean {
+	return (
+		(key === "nodeId" && /^worker-\d{4}$/.test(value)) ||
+		(key === "requestId" && /^request-\d{4}$/.test(value)) ||
+		(key === "parentNodeId" && (value === "root" || /^worker-\d{4}$/.test(value))) ||
+		((key === "id" || key === "role") &&
+			(value === "run" || /^worker-\d{4}$/.test(value) || /^role-\d{4}$/.test(value))) ||
+		(key === "kind" && ["node", "role", "run"].includes(value)) ||
+		(key === "phase" && ["before_dispatch", "after_admission", "after_terminal", "after_cleanup"].includes(value)) ||
+		(key === "type" && (EVENT_TYPES as readonly string[]).includes(value)) ||
+		(key === "schemaVersion" && value === SWARM_EVIDENCE_SCHEMA_VERSION) ||
+		(key === "benchmarkVersion" && value === "b00a") ||
+		((key === "fingerprint" || key === "deterministicBundleId" || key === "artifactBundleId" || key === "sha256") &&
+			/^[0-9a-f]{64}$/.test(value)) ||
+		(key === "path" && (EVIDENCE_FILES as readonly string[]).includes(value))
+	);
+}
+/** No arbitrary fixture content, including object keys, enters normal artifacts. */
+export function redactEvidence<T>(value: T, key?: string, redactObjectKeys = false): T {
+	if (typeof value === "string") return (safeEvidenceString(value, key) ? value : REDACTED) as T;
+	if (Array.isArray(value)) return value.map((item) => redactEvidence(item, undefined, redactObjectKeys)) as T;
+	if (isRecord(value)) {
+		const entries = Object.entries(value).map(([entryKey, item]) => {
+			const safeKey = !redactObjectKeys && SAFE_EVIDENCE_KEYS.has(entryKey);
+			return [
+				safeKey ? entryKey : REDACTED,
+				redactEvidence(item, safeKey ? entryKey : undefined, redactObjectKeys || key === "metadata"),
+			];
+		});
+		return Object.fromEntries(entries) as T;
 	}
-	if (Array.isArray(value)) return value.map((item) => redactEvidence(item)) as T;
-	if (isRecord(value))
-		return Object.fromEntries(
-			Object.entries(value).map(([entryKey, item]) => [entryKey, redactEvidence(item, entryKey)]),
-		) as T;
 	return value;
+}
+function assertContentFree(value: unknown, key?: string, untrustedObjectKeys = false): void {
+	if (typeof value === "string") {
+		assert(value === REDACTED || safeEvidenceString(value, key), `non-content-free string: ${key ?? "value"}`);
+		return;
+	}
+	if (value === null || typeof value === "boolean" || typeof value === "number") return;
+	if (Array.isArray(value))
+		return void value.forEach((item) => assertContentFree(item, undefined, untrustedObjectKeys));
+	assert(isRecord(value), "non-content-free value type");
+	for (const [entryKey, item] of Object.entries(value)) {
+		assert(
+			entryKey === REDACTED || (!untrustedObjectKeys && SAFE_EVIDENCE_KEYS.has(entryKey)),
+			`non-content-free key: ${entryKey}`,
+		);
+		assertContentFree(
+			item,
+			SAFE_EVIDENCE_KEYS.has(entryKey) ? entryKey : undefined,
+			untrustedObjectKeys || key === "metadata",
+		);
+	}
 }
 function money(tokens: number, pricePerMillion: number): number {
 	return (tokens * pricePerMillion) / MICRO_TOKENS;
@@ -291,7 +396,7 @@ function publicConfig(config: SwarmBenchmarkConfig): Omit<SwarmManifest, "finger
 		assignments,
 		faultSchedule: faults,
 		priceCard: redactEvidence(config.priceCard),
-		metadata: redactEvidence(config.metadata ?? {}),
+		metadata: redactEvidence(config.metadata ?? {}, undefined, true),
 	};
 }
 /** Creates a public, content-free manifest whose fingerprint is recomputable from disk. */
@@ -539,6 +644,19 @@ function oracleEvent(event: SwarmEvent): Omit<SwarmEvent, "elapsedMilliseconds">
 function lines(values: readonly unknown[]): string {
 	return `${values.map(canonicalJson).join("\n")}\n`;
 }
+/** Only these normalized artifacts are deterministic across equivalent fixture runs. */
+function deterministicBundleId(
+	files: Pick<
+		Record<(typeof EVIDENCE_FILES)[number], string>,
+		"oracle.jsonl" | "cost-attribution.json" | "summary.json"
+	>,
+): string {
+	return fingerprint({
+		oracle: files["oracle.jsonl"],
+		costAttribution: files["cost-attribution.json"],
+		summary: files["summary.json"],
+	});
+}
 function fileContents(evidence: SwarmEvidence): Record<(typeof EVIDENCE_FILES)[number], string> {
 	const redacted = redactEvidence(evidence);
 	return {
@@ -562,9 +680,14 @@ export async function writeSwarmEvidence(directory: string, evidence: SwarmEvide
 		sha256: sha256(files[path]),
 		schemaVersion: SWARM_EVIDENCE_SCHEMA_VERSION,
 	}));
-	const manifest = { ...redactEvidence(evidence.manifest), artifacts };
+	const manifest = {
+		...redactEvidence(evidence.manifest),
+		deterministicBundleId: deterministicBundleId(files),
+		artifactBundleId: fingerprint(artifacts),
+		artifacts,
+	};
 	await writeFile(join(directory, "manifest.json"), `${canonicalJson(manifest)}\n`, { encoding: "utf8", mode: 0o600 });
-	await verifySwarmEvidence(directory);
+	await verifySwarmEvidence(directory, manifest.artifactBundleId);
 }
 function parseCanonicalJson(raw: string, label: string): unknown {
 	let parsed: unknown;
@@ -610,6 +733,15 @@ function requireManifest(manifest: unknown): asserts manifest is SwarmManifest &
 		"invalid manifest shape",
 	);
 	assert(Array.isArray(manifest.artifacts), "manifest has no artifact index");
+	assert(
+		typeof manifest.deterministicBundleId === "string" && /^[0-9a-f]{64}$/.test(manifest.deterministicBundleId),
+		"invalid deterministic bundle identity",
+	);
+	assert(
+		typeof manifest.artifactBundleId === "string" && /^[0-9a-f]{64}$/.test(manifest.artifactBundleId),
+		"invalid artifact bundle identity",
+	);
+	assertContentFree(manifest);
 	const source = {
 		schemaVersion: manifest.schemaVersion,
 		benchmarkVersion: manifest.benchmarkVersion,
@@ -630,6 +762,8 @@ function verifyEvents(events: unknown[], oracle: unknown[], assignments: unknown
 		assert(isRecord(events[index]) && isRecord(oracle[index]), "invalid event record");
 		const event = events[index]!,
 			logical = oracle[index]!;
+		assertContentFree(event);
+		assertContentFree(logical);
 		assert(
 			event.sequence === logical.sequence &&
 				event.type === logical.type &&
@@ -652,6 +786,40 @@ function verifyEvents(events: unknown[], oracle: unknown[], assignments: unknown
 				event.requestId === `request-${event.nodeId.slice("worker-".length)}`,
 			"invalid event identity",
 		);
+		assert(
+			canonicalJson(logical) === canonicalJson(oracleEvent(event as SwarmEvent)),
+			"oracle contains non-logical event data",
+		);
+		const detail = event.detail;
+		const exactDetail = (keys: readonly string[]) =>
+			assert(
+				(detail === undefined && keys.length === 0) ||
+					(isRecord(detail) && canonicalJson(Object.keys(detail).sort()) === canonicalJson([...keys].sort())),
+				`invalid event detail: ${event.type}`,
+			);
+		switch (event.type) {
+			case "dispatch_admitted":
+			case "delivery_completed":
+			case "cleanup_completed":
+				exactDetail([]);
+				break;
+			case "provider_request_started":
+				exactDetail(["role", "requested", "resolved"]);
+				break;
+			case "progress":
+				exactDetail(["message"]);
+				break;
+			case "restart":
+				exactDetail(["reason"]);
+				break;
+			case "provider_failure":
+				exactDetail(["code", "message"]);
+				break;
+			case "provider_completed":
+				exactDetail(["outputTokens"]);
+				assert(isRecord(detail) && isSafeInteger(detail.outputTokens), "invalid completion usage");
+				break;
+		}
 		const lifecycle = byNode.get(event.nodeId as string) ?? [];
 		lifecycle.push(event);
 		byNode.set(event.nodeId as string, lifecycle);
@@ -713,7 +881,12 @@ function verifySummary(events: Record<string, unknown>[], summary: unknown, assi
 		"terminal event invariant failed",
 	);
 }
-function verifyCosts(costs: unknown, assignments: unknown[], priceCard: Record<string, unknown>): void {
+function verifyCosts(
+	costs: unknown,
+	assignments: unknown[],
+	priceCard: Record<string, unknown>,
+	events: Record<string, unknown>[],
+): void {
 	assert(Array.isArray(costs), "invalid cost attribution");
 	const inputPrice = priceCard.inputPerMillionTokens,
 		outputPrice = priceCard.outputPerMillionTokens;
@@ -736,7 +909,21 @@ function verifyCosts(costs: unknown, assignments: unknown[], priceCard: Record<s
 		"node-cost set mismatch",
 	);
 	const nodeById = new Map(nodes.map((node) => [node.id as string, node]));
+	const completedOutputByNode = new Map<string, number>();
+	for (const event of events)
+		if (event.type === "provider_completed") {
+			assert(isRecord(event.detail) && isSafeInteger(event.detail.outputTokens), "invalid terminal usage");
+			assert(!completedOutputByNode.has(event.nodeId as string), "duplicate terminal usage");
+			completedOutputByNode.set(event.nodeId as string, event.detail.outputTokens);
+		}
 	for (const node of nodes) {
+		const assignment = assignmentRows.find((candidate) => candidate.nodeId === node.id);
+		assert(assignment, `missing assignment for cost node: ${node.id}`);
+		assert(node.directInputTokens === assignment.inputTokens, `assignment input usage mismatch: ${node.id}`);
+		assert(
+			node.directOutputTokens === (completedOutputByNode.get(node.id as string) ?? 0),
+			`terminal output usage mismatch: ${node.id}`,
+		);
 		assert(
 			node.directCost ===
 				money(node.directInputTokens as number, inputPrice) + money(node.directOutputTokens as number, outputPrice),
@@ -798,8 +985,43 @@ function verifyCosts(costs: unknown, assignments: unknown[], priceCard: Record<s
 			`run tree invariant failed: ${suffix}`,
 		);
 }
+function verifyProcessSamples(samples: unknown): void {
+	assert(Array.isArray(samples) && samples.length === 4, "invalid process sample count");
+	const expected = ["before_dispatch", "after_admission", "after_terminal", "after_cleanup"];
+	let priorSequence = 0;
+	for (let index = 0; index < samples.length; index++) {
+		const sample = samples[index];
+		assert(isRecord(sample) && sample.phase === expected[index], "invalid process sample phase");
+		assert(isSafeInteger(sample.sequence) && sample.sequence > priorSequence, "invalid process sample sequence");
+		priorSequence = sample.sequence as number;
+		assert(
+			typeof sample.elapsedMilliseconds === "number" &&
+				Number.isFinite(sample.elapsedMilliseconds) &&
+				sample.elapsedMilliseconds >= 0,
+			"invalid process sample timing",
+		);
+		assert(
+			typeof sample.source === "string" && Array.isArray(sample.processes) && isSafeInteger(sample.totalRssBytes),
+			"invalid process sample shape",
+		);
+		let total = 0;
+		for (const process of sample.processes) {
+			assert(
+				isRecord(process) && isSafeInteger(process.pid) && isSafeInteger(process.rssBytes),
+				"invalid process record",
+			);
+			if (process.parentPid !== undefined) assert(isSafeInteger(process.parentPid), "invalid process parent");
+			for (const key of ["heapUsedBytes", "externalBytes"])
+				if (process[key] !== undefined) assert(isSafeInteger(process[key]), `invalid process ${key}`);
+			total += process.rssBytes as number;
+		}
+		assert(sample.totalRssBytes === total, "process RSS total mismatch");
+		assertContentFree(sample);
+	}
+}
+
 /** Strict verifier: expected set only, no links/extras, canonical bytes, hashes, and semantic joins. */
-export async function verifySwarmEvidence(directory: string): Promise<void> {
+export async function verifySwarmEvidence(directory: string, trustedArtifactBundleId: string): Promise<void> {
 	const root = await realpath(directory);
 	const names = (await readdir(root)).sort();
 	assert(
@@ -839,6 +1061,11 @@ export async function verifySwarmEvidence(directory: string): Promise<void> {
 		);
 	}
 	assert(indexed.size === EVIDENCE_FILES.length, "missing indexed artifact");
+	assert(manifest.artifactBundleId === fingerprint(manifest.artifacts), "artifact bundle identity mismatch");
+	assert(
+		typeof trustedArtifactBundleId === "string" && /^[0-9a-f]{64}$/.test(trustedArtifactBundleId),
+		"trusted artifact bundle identity is required",
+	);
 	const events = parseCanonicalJsonl(await readFile(join(root, "events.jsonl"), "utf8"), "events.jsonl");
 	const oracle = parseCanonicalJsonl(await readFile(join(root, "oracle.jsonl"), "utf8"), "oracle.jsonl");
 	verifyEvents(events, oracle, manifest.assignments);
@@ -851,8 +1078,20 @@ export async function verifySwarmEvidence(directory: string): Promise<void> {
 		parseCanonicalJson(await readFile(join(root, "cost-attribution.json"), "utf8"), "cost-attribution.json"),
 		manifest.assignments,
 		manifest.priceCard,
+		events as Record<string, unknown>[],
 	);
-	parseCanonicalJson(await readFile(join(root, "process-samples.json"), "utf8"), "process-samples.json");
+	const processSamples = parseCanonicalJson(
+		await readFile(join(root, "process-samples.json"), "utf8"),
+		"process-samples.json",
+	);
+	verifyProcessSamples(processSamples);
+	const deterministic = deterministicBundleId({
+		"oracle.jsonl": await readFile(join(root, "oracle.jsonl"), "utf8"),
+		"cost-attribution.json": await readFile(join(root, "cost-attribution.json"), "utf8"),
+		"summary.json": await readFile(join(root, "summary.json"), "utf8"),
+	});
+	assert(manifest.deterministicBundleId === deterministic, "deterministic bundle identity mismatch");
+	assert(manifest.artifactBundleId === trustedArtifactBundleId, "trusted artifact bundle identity mismatch");
 }
 export function createFixedFanoutScenario(fanout: (typeof SUPPORTED_SWARM_FANOUTS)[number]): SwarmBenchmarkConfig {
 	return {

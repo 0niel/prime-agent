@@ -17,7 +17,8 @@ Each fanout writes an owner-only (`0700` directory, `0600` files), canonical
 artifact set:
 
 - `manifest.json` — public/content-free schema input, recomputable fingerprint,
-  and fixed artifact hash/byte index;
+  fixed artifact hash/byte index, a deterministic-subset identity, and an
+  artifact-index commitment which callers can retain out-of-band;
 - `events.jsonl` — canonical runtime-timing evidence with stable `worker-NNNN`
   and `request-NNNN` joins;
 - `oracle.jsonl` — exact logical event order and fields, deliberately excluding
@@ -26,14 +27,31 @@ artifact set:
 - `cost-attribution.json` — exact direct/downstream input/output/cost tree;
 - `summary.json` — terminal, delivery, cleanup, and fixture dispatch accounting.
 
-Normal on-disk evidence is content-free. Arbitrary string values, including
-metadata, provider/model/error/progress text, filenames, paths, credentials,
-Unicode, and split chunks are replaced before serialization. Stable structural
-IDs, event type/order, counts, and numeric economics are retained. The writer
-verifies the artifact immediately; `verifySwarmEvidence()` fails closed on a
-missing/extra file, link, duplicate/unexpected index, non-canonical JSON/JSONL,
-hash/size mismatch, fingerprint mismatch, oracle/event mismatch, bad event
-identity/order, summary mismatch, or invalid cost-tree/economic invariant.
+Normal on-disk evidence is content-free. Arbitrary string **keys and values**,
+including metadata, provider/model/error/progress text, filenames, paths,
+credentials, Unicode, and split chunks are replaced before serialization.
+Stable structural IDs, event type/order, counts, and numeric economics are
+retained. The writer verifies the artifact immediately; `verifySwarmEvidence()`
+fails closed on a missing/extra file, link, duplicate/unexpected index,
+non-canonical JSON/JSONL, hash/size mismatch, fingerprint mismatch,
+non-content-free key/value or event/oracle detail, malformed process sample,
+oracle/event mismatch, bad event identity/order, assignment/terminal-usage
+cost mismatch, summary mismatch, or invalid cost-tree/economic invariant.
+
+## Determinism and authenticity contract
+
+Only the normalized logical subset—`oracle.jsonl`, `cost-attribution.json`, and
+`summary.json`—is deterministic. Its SHA-256 `deterministicBundleId` is stable
+across equivalent fixture runs. `events.jsonl` (elapsed timings) and
+`process-samples.json` (live sampler observations such as PID/RSS) are
+explicitly volatile and are **not** a deterministic replay claim.
+
+The manifest index detects ordinary at-rest corruption but is mutable with the
+artifact directory. For adversarial mutation protection, retain the emitted
+`artifactBundleId` outside that directory (or sign it) and pass it as the required second argument to
+`verifySwarmEvidence(directory, trustedArtifactBundleId)`. That trusted
+commitment makes artifact-index rehashing fail closed. B00A does not claim a
+signing/key-management implementation; that integration remains B00B.
 
 `runSwarmBenchmark()` maps local fake assignments directly into `Promise.all`
 without a queue, semaphore, retry, local limiter, or synthetic 429. Its
