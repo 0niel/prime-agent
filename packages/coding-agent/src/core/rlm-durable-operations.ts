@@ -1108,15 +1108,33 @@ function atomicCache(path: string, body: string, io: RlmDurableIo): void {
 	}
 }
 
+/**
+ * Replaceable operator cache, deliberately narrower than the JSONL authority.
+ * Never spread reducer records here: deliveries retain outbox/inbox records for
+ * authenticated recovery, and those records contain terminal message bodies.
+ */
 function bodylessIndex(registry: RlmDurableOperationRegistry): unknown {
 	return {
 		version: 1,
-		operations: [...registry.operations.values()].map(({ parentSessionFile, childSessionFile, ...operation }) => ({
-			...operation,
-			parentSessionFile,
-			childSessionFile,
+		operations: [...registry.operations.values()].map((operation) => ({
+			parentSessionId: operation.parentSessionId,
+			childId: operation.childId,
+			assignmentId: operation.assignmentId,
+			operationId: operation.operationId,
+			deliveryId: operation.deliveryId,
+			lifecycle: operation.lifecycle,
+			terminal: operation.terminal,
+			uncertain: operation.uncertain,
 		})),
-		deliveries: [...registry.deliveries.values()].map((delivery) => ({ ...delivery })),
+		deliveries: [...registry.deliveries.values()].map((delivery) => ({
+			operationKey: delivery.operationKey,
+			deliveryId: delivery.deliveryId,
+			terminal: delivery.terminal,
+			outboxed: delivery.outboxed,
+			received: delivery.received,
+			consumed: delivery.consumed,
+			uncertain: delivery.uncertain,
+		})),
 		uncertain: registry.hasUncertainRecords,
 	};
 }

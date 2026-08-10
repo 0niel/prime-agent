@@ -62,8 +62,25 @@ function deserializeSessionInfo(session: SessionInfoWire): SessionInfo {
 interface SavedRlmSubagentRegistryEntry {
 	type?: unknown;
 	childId?: unknown;
+	assignmentId?: unknown;
+	operationId?: unknown;
+	deliveryId?: unknown;
 	sessionFile?: unknown;
 	status?: unknown;
+}
+
+/** Read-only, private registry incarnation key. Legacy rows remain display-only. */
+function savedRlmIncarnationKey(entry: SavedRlmSubagentRegistryEntry): string | undefined {
+	if (typeof entry.childId !== "string") return undefined;
+	if (entry.assignmentId === undefined && entry.operationId === undefined && entry.deliveryId === undefined)
+		return `${entry.childId}\0legacy`;
+	if (
+		typeof entry.assignmentId !== "string" ||
+		typeof entry.operationId !== "string" ||
+		typeof entry.deliveryId !== "string"
+	)
+		return undefined;
+	return `${entry.childId}\0${entry.assignmentId}\0${entry.operationId}\0${entry.deliveryId}`;
 }
 
 export async function listSavedSessionSiblings(sessionPath: string): Promise<SessionInfo[]> {
@@ -81,18 +98,28 @@ export async function listSavedSessionSiblings(sessionPath: string): Promise<Ses
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [target];
 		throw error;
 	}
-	const latest = new Map<string, SavedRlmSubagentRegistryEntry>();
+	// Preserve the first durable incarnation position when a later lifecycle row
+	// updates A. A selector reused by B must still select B, not be overwritten by
+	// A's late completion/deletion. This parser has no authority to wake, write, or
+	// materialize C03 delivery files.
+	const latestByIncarnation = new Map<string, SavedRlmSubagentRegistryEntry>();
 	for (const line of contents.split(/\r?\n/)) {
 		if (!line.trim()) continue;
 		try {
 			const entry = JSON.parse(line) as SavedRlmSubagentRegistryEntry;
-			if (entry.type === "rlm_subagent" && typeof entry.childId === "string") latest.set(entry.childId, entry);
+			if (entry.type !== "rlm_subagent") continue;
+			const key = savedRlmIncarnationKey(entry);
+			if (key) latestByIncarnation.set(key, entry);
 		} catch {
 			// Ignore malformed registry history just like the owning worker does.
 		}
 	}
+	const newestBySelector = new Map<string, SavedRlmSubagentRegistryEntry>();
+	for (const entry of latestByIncarnation.values()) {
+		if (typeof entry.childId === "string") newestBySelector.set(entry.childId, entry);
+	}
 	const siblingPaths = new Set<string>([resolve(target.path)]);
-	for (const entry of latest.values()) {
+	for (const entry of newestBySelector.values()) {
 		if (entry.status !== "deleted" && typeof entry.sessionFile === "string")
 			siblingPaths.add(resolve(entry.sessionFile));
 	}

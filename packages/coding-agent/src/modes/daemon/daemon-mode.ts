@@ -2648,8 +2648,12 @@ export class AgentDaemon {
 						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 						candidate.runtime.metadata.rlmChildId === options.id &&
 						candidate.runtime.metadata.assignmentId === assignmentId &&
+						candidate.runtime.metadata.operationId === operationId &&
 						candidate.runtime.session === runtime.session,
 				);
+				// Awaited registry I/O may have allowed a reused selector to replace this
+				// operation. Recheck the full compound identity before close/dispose.
+				if (operationId && !current(options, runtime)) return;
 				if (state && this.sessions.get(state.activeSessionId) === state) {
 					await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
 				} else {
@@ -2702,6 +2706,9 @@ export class AgentDaemon {
 						persisted = { ...persisted, assignmentId };
 					} else assignmentId = persisted.assignmentId;
 				}
+				// A retained C03 child passes its operation; an explicit selector delete
+				// resolves the newest durable C03 incarnation, while legacy stays undefined.
+				const operationId = requestedOperationId ?? persisted?.operationId;
 				// Callback cleanup carries an operation; it is never a selector or
 				// assignment-only capability.  A legacy explicit delete has no operation
 				// and intentionally retains its historical catalog behavior.
@@ -2718,7 +2725,8 @@ export class AgentDaemon {
 						candidate.runtime.metadata.kind === "subagent" &&
 						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 						candidate.runtime.metadata.rlmChildId === childId &&
-						(assignmentId === undefined || candidate.runtime.metadata.assignmentId === assignmentId),
+						(assignmentId === undefined || candidate.runtime.metadata.assignmentId === assignmentId) &&
+						(operationId === undefined || candidate.runtime.metadata.operationId === operationId),
 				);
 				if (!assignmentId && !state) {
 					await childSession?.disposeAsync();
@@ -2734,7 +2742,28 @@ export class AgentDaemon {
 					await childSession?.disposeAsync();
 					return;
 				}
+				if (operationId && (!assignmentId || persisted?.operationId !== operationId)) return;
+				if (assignmentId && operationId) {
+					const artifactDir = parent.sessionManager.getSessionArtifactDir?.();
+					if (!artifactDir) throw new Error("Durable RLM deletion requires parent artifact");
+					// The exact C03 lifecycle transition precedes the C01 deletion and close.
+					if (
+						!openRlmDurableOperationStore(artifactDir).recordRelease(
+							{ parentSessionId: parent.sessionId, assignmentId, operationId },
+							"deleted",
+						)
+					)
+						throw new Error(`Failed to persist durable deletion for RLM subagent ${childId}`);
+				}
 				if (assignmentId) await this.recordRlmSubagentDeletion(parentState, childId, assignmentId);
+				// C01 append awaited above; reject a late A before it can close B.
+				if (
+					state &&
+					(this.sessions.get(state.activeSessionId) !== state ||
+						state.runtime.metadata.assignmentId !== assignmentId ||
+						state.runtime.metadata.operationId !== operationId)
+				)
+					return;
 				const staleSession =
 					state && childSession && state.runtime.session !== childSession ? childSession : undefined;
 				try {
@@ -2888,26 +2917,33 @@ export class AgentDaemon {
 						)
 							throw new Error("Failed durable RLM child materialization");
 					}
-					this.recordRlmSubagentRegistryEntry(parentState, {
-						childId: options.id,
-						assignmentId,
-						operationId: options.operationId,
-						deliveryId: options.deliveryId,
-						sessionName: options.sessionName,
-						sessionDir: options.sessionDir,
-						sessionFile: runtime.session.sessionFile,
-						rlmDepth: options.rlmDepth,
-						rlmMaxDepth: options.rlmMaxDepth,
-						rlmParentNodeId: options.rlmParentNodeId,
-						prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
-						spawnCode: options.spawnCode,
-						model: {
-							provider: options.model.provider,
-							modelId: options.model.id,
-						},
-						status: "running",
-						createdAt: runtime.metadata.createdAt,
-					});
+					if (
+						!this.recordRlmSubagentRegistryEntry(parentState, {
+							childId: options.id,
+							assignmentId,
+							operationId: options.operationId,
+							deliveryId: options.deliveryId,
+							sessionName: options.sessionName,
+							sessionDir: options.sessionDir,
+							sessionFile: runtime.session.sessionFile,
+							rlmDepth: options.rlmDepth,
+							rlmMaxDepth: options.rlmMaxDepth,
+							rlmParentNodeId: options.rlmParentNodeId,
+							prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
+							spawnCode: options.spawnCode,
+							model: {
+								provider: options.model.provider,
+								modelId: options.model.id,
+							},
+							status: "running",
+							createdAt: runtime.metadata.createdAt,
+						})
+					) {
+						// C01 publication is a second durable boundary.  The C03 materialized
+						// fact remains recoverably pending, but this unpublished runtime must
+						// never become addressable or start prompt work.
+						throw new Error("Failed to persist running RLM subagent registry entry");
+					}
 				}
 				options.onSessionPublished?.(runtime.session);
 			},
@@ -3362,21 +3398,36 @@ export class AgentDaemon {
 			);
 			// The session transcript is authoritative for mutable metadata such as a
 			// later user-assigned name; the registry value is only the spawn snapshot.
-			const registered = parentState.runtime.session.registerRlmChildSession(
-				entry.childId,
-				runtime.session,
-				undefined,
-				entry.assignmentId,
-			);
+			const registered = entry.operationId
+				? parentState.runtime.session.registerRlmChildSession(
+						entry.childId,
+						runtime.session,
+						undefined,
+						entry.assignmentId,
+						entry.operationId,
+					)
+				: parentState.runtime.session.registerRlmChildSession(
+						entry.childId,
+						runtime.session,
+						undefined,
+						entry.assignmentId,
+					);
 			// The explicit assignment is the authority boundary for lazy hydration.
 			// Keep the historical rebinding adapter only for an old session host that
 			// does not accept the fourth argument.
 			const assignmentBound = entry.assignmentId
-				? parentState.runtime.session.rebindRlmChildSessionAssignment?.(
-						entry.childId,
-						runtime.session,
-						entry.assignmentId,
-					)
+				? entry.operationId
+					? parentState.runtime.session.rebindRlmChildSessionAssignment?.(
+							entry.childId,
+							runtime.session,
+							entry.assignmentId,
+							entry.operationId,
+						)
+					: parentState.runtime.session.rebindRlmChildSessionAssignment?.(
+							entry.childId,
+							runtime.session,
+							entry.assignmentId,
+						)
 				: undefined;
 			if (!registered || assignmentBound === false) {
 				await this.closeSession(state, "replaced");
@@ -3431,6 +3482,7 @@ export class AgentDaemon {
 					entry.childId,
 					runtime.session,
 					entry.assignmentId,
+					entry.operationId,
 				);
 				try {
 					await this.closeSession(state, "replaced");

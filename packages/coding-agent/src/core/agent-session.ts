@@ -1257,6 +1257,8 @@ export class AgentSession {
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _rlmChildSessions = new Map<string, AgentSession>();
 	private _rlmChildSessionAssignments = new Map<string, string>();
+	/** C03 operation companion for every retained C03 child; absent only for legacy rows. */
+	private _rlmChildSessionOperations = new Map<string, string>();
 	// Tombstones are attempt-scoped: a late A deletion must never hide B.
 	private _deletedRlmChildIds = new Set<string>();
 	// Failed explicit deletes stay hidden from listings but retain their original
@@ -1274,6 +1276,7 @@ export class AgentSession {
 	// still forward to root; torn down when the retained child is disposed.
 	private _rlmChildUnsubscribes = new Map<string, () => void>();
 	private _rlmChildUnsubscribeAssignments = new Map<string, string>();
+	private _rlmChildUnsubscribeOperations = new Map<string, string>();
 	/** Latest recap for this session, written by the daemon summarizer; read by a parent to label its child snapshots. */
 	private _currentRecap?: string;
 
@@ -4061,10 +4064,13 @@ export class AgentSession {
 			unsubscribe();
 		}
 		this._rlmChildUnsubscribes.clear();
+		this._rlmChildUnsubscribeOperations.clear();
 		for (const session of this._rlmChildSessions.values()) {
 			await session.disposeAsync().catch(() => undefined);
 		}
 		this._rlmChildSessions.clear();
+		this._rlmChildSessionAssignments.clear();
+		this._rlmChildSessionOperations.clear();
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
 		try {
@@ -9465,13 +9471,20 @@ export class AgentSession {
 		}
 	}
 
-	private _deleteRlmSubagentSession(childId: string, assignmentId?: string, session?: AgentSession): Promise<void> {
+	private _deleteRlmSubagentSession(
+		childId: string,
+		assignmentId?: string,
+		session?: AgentSession,
+		operationId?: string,
+	): Promise<void> {
 		if (this._subagentRuntimeHost) {
 			// Preserve the established assignment-aware host ABI. A daemon host treats
 			// assignment-less deletes as explicit durable migration, never as callback authority.
-			return this._subagentRuntimeHost.assignmentIdentityFenced
+			if (!this._subagentRuntimeHost.assignmentIdentityFenced)
+				return this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
+			return operationId === undefined
 				? this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session, assignmentId)
-				: this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
+				: this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session, assignmentId, operationId);
 		}
 		return session?.disposeAsync() ?? Promise.resolve();
 	}
@@ -9490,18 +9503,27 @@ export class AgentSession {
 
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun, expectedAssignmentId?: string): void {
 		const assignmentId = expectedAssignmentId ?? run?.assignmentId ?? this._rlmChildSessionAssignments.get(childId);
+		const operationId = run?.operationId ?? this._rlmChildSessionOperations.get(childId);
 		// A callback which cannot name its assignment is a legacy/display path and has
 		// no authority to mutate a C01 child incarnation.
 		if (!assignmentId) return;
 		if (run && run.assignmentId !== assignmentId) return;
-		if (this._rlmChildUnsubscribeAssignments.get(childId) === assignmentId) {
+		if (
+			this._rlmChildUnsubscribeAssignments.get(childId) === assignmentId &&
+			this._rlmChildUnsubscribeOperations.get(childId) === operationId
+		) {
 			this._rlmChildUnsubscribes.get(childId)?.();
 			this._rlmChildUnsubscribes.delete(childId);
 			this._rlmChildUnsubscribeAssignments.delete(childId);
+			this._rlmChildUnsubscribeOperations.delete(childId);
 		}
-		if (this._rlmChildSessionAssignments.get(childId) === assignmentId) {
+		if (
+			this._rlmChildSessionAssignments.get(childId) === assignmentId &&
+			this._rlmChildSessionOperations.get(childId) === operationId
+		) {
 			this._rlmChildSessions.delete(childId);
 			this._rlmChildSessionAssignments.delete(childId);
+			this._rlmChildSessionOperations.delete(childId);
 			this._rlmChildCleanupFailures.delete(childId);
 		}
 		if (this._activeRlmChildRuns.get(childId)?.assignmentId === assignmentId) {
@@ -9558,10 +9580,12 @@ export class AgentSession {
 					if (this._activeRlmChildRuns.get(childId) === run) {
 						this._rlmChildSessions.set(childId, liveSession);
 						this._rlmChildSessionAssignments.set(childId, run.assignmentId);
+						this._rlmChildSessionOperations.set(childId, run.operationId);
 						this._rlmChildCleanupFailures.set(childId, subagent);
 						if (run.unsubscribe) {
 							this._rlmChildUnsubscribes.set(childId, run.unsubscribe);
 							this._rlmChildUnsubscribeAssignments.set(childId, run.assignmentId);
+							this._rlmChildUnsubscribeOperations.set(childId, run.operationId);
 						}
 						this._activeRlmChildRuns.delete(childId);
 					}
@@ -9593,8 +9617,9 @@ export class AgentSession {
 		// a compatibility map, but it must not make this explicit deletion forget
 		// the incarnation it admitted.
 		const retainedAssignmentId = this._rlmChildSessionAssignments.get(childId);
+		const retainedOperationId = this._rlmChildSessionOperations.get(childId);
 		try {
-			await this._deleteRlmSubagentSession(childId, retainedAssignmentId, retained);
+			await this._deleteRlmSubagentSession(childId, retainedAssignmentId, retained, retainedOperationId);
 		} catch (error) {
 			if (this._disposed || this._disposing) {
 				this._removeRlmSubagentTracking(childId, undefined, this._rlmChildSessionAssignments.get(childId));
@@ -9627,21 +9652,25 @@ export class AgentSession {
 		session: AgentSession,
 		unsubscribe?: () => void,
 		assignmentId?: string,
+		operationId?: string,
 	): boolean {
 		const run = this._activeRlmChildRuns.get(childId);
 		// Older in-process hosts may register a freshly restored child directly.
 		// Mint an internal assignment for that synchronous compatibility path; all
 		// asynchronous C01 callbacks supply their captured assignment explicitly.
 		const expectedAssignmentId = assignmentId ?? run?.assignmentId ?? randomUUID();
+		const expectedOperationId = operationId ?? run?.operationId;
 		const retainedAssignmentId = this._rlmChildSessionAssignments.get(childId);
+		const retainedOperationId = this._rlmChildSessionOperations.get(childId);
 		// A live run must name its immutable assignment. Hydration has no live run,
 		// but it has already persisted a fresh assignment; it may bind only an empty
 		// slot (or its own prior binding), never a selector reused by another child.
 		if (
 			!expectedAssignmentId ||
 			(run
-				? run.assignmentId !== expectedAssignmentId
-				: retainedAssignmentId !== undefined && retainedAssignmentId !== expectedAssignmentId)
+				? run.assignmentId !== expectedAssignmentId || run.operationId !== expectedOperationId
+				: (retainedAssignmentId !== undefined && retainedAssignmentId !== expectedAssignmentId) ||
+					(retainedOperationId !== undefined && retainedOperationId !== expectedOperationId))
 		)
 			return false;
 		// A child can finish concurrently while the parent is (or has) torn down; don't
@@ -9657,7 +9686,7 @@ export class AgentSession {
 		// compatibility shims; daemon-owned hosts always receive and verify assignmentId.
 		const completionResult = completeRuntime
 			? this._subagentRuntimeHost?.assignmentIdentityFenced
-				? completeRuntime(childId, session, expectedAssignmentId, run?.operationId)
+				? completeRuntime(childId, session, expectedAssignmentId, expectedOperationId)
 				: completeRuntime(childId, session)
 			: undefined;
 		if (completionResult === false) {
@@ -9669,9 +9698,11 @@ export class AgentSession {
 		}
 		this._rlmChildSessions.set(childId, session);
 		this._rlmChildSessionAssignments.set(childId, expectedAssignmentId);
+		if (expectedOperationId) this._rlmChildSessionOperations.set(childId, expectedOperationId);
 		if (unsubscribe) {
 			this._rlmChildUnsubscribes.set(childId, unsubscribe);
 			this._rlmChildUnsubscribeAssignments.set(childId, expectedAssignmentId);
+			if (expectedOperationId) this._rlmChildUnsubscribeOperations.set(childId, expectedOperationId);
 		}
 		return true;
 	}
@@ -9681,24 +9712,46 @@ export class AgentSession {
 	 * altering the historical register callback arity.  The session identity guard
 	 * prevents an A hydration continuation from rebinding a replacement B.
 	 */
-	rebindRlmChildSessionAssignment(childId: string, session: AgentSession, assignmentId: string): boolean {
+	rebindRlmChildSessionAssignment(
+		childId: string,
+		session: AgentSession,
+		assignmentId: string,
+		operationId?: string,
+	): boolean {
 		if (this._rlmChildSessions.get(childId) !== session) return false;
 		// Hydration can resume after a selector has been rebound. The same session
 		// object is not sufficient authority: only the assignment which installed it
 		// may refresh its binding.
 		const currentAssignmentId = this._rlmChildSessionAssignments.get(childId);
+		const currentOperationId = this._rlmChildSessionOperations.get(childId);
 		if (currentAssignmentId !== undefined && currentAssignmentId !== assignmentId) return false;
+		if (currentOperationId !== undefined && currentOperationId !== operationId) return false;
 		this._rlmChildSessionAssignments.set(childId, assignmentId);
-		if (this._rlmChildUnsubscribes.has(childId)) this._rlmChildUnsubscribeAssignments.set(childId, assignmentId);
+		if (operationId) this._rlmChildSessionOperations.set(childId, operationId);
+		if (this._rlmChildUnsubscribes.has(childId)) {
+			this._rlmChildUnsubscribeAssignments.set(childId, assignmentId);
+			if (operationId) this._rlmChildUnsubscribeOperations.set(childId, operationId);
+		}
 		return true;
 	}
 
 	/** Stop retaining an idle daemon child without deleting its durable registry row. */
-	releaseRlmChildSession(childId: string, session: AgentSession, assignmentId?: string): (() => void) | false {
+	releaseRlmChildSession(
+		childId: string,
+		session: AgentSession,
+		assignmentId?: string,
+		operationId?: string,
+	): (() => void) | false {
 		const run = this._activeRlmChildRuns.get(childId);
 		const expectedAssignmentId = assignmentId ?? run?.assignmentId ?? this._rlmChildSessionAssignments.get(childId);
+		const expectedOperationId = operationId ?? run?.operationId ?? this._rlmChildSessionOperations.get(childId);
 		if (!expectedAssignmentId) return false;
-		if (run?.session === session && run.status === "done" && run.assignmentId === expectedAssignmentId) {
+		if (
+			run?.session === session &&
+			run.status === "done" &&
+			run.assignmentId === expectedAssignmentId &&
+			run.operationId === expectedOperationId
+		) {
 			const unsubscribe = run.unsubscribe ?? noopRlmChildEventUnsubscribe;
 			run.unsubscribe = undefined;
 			if (this._activeRlmChildRuns.get(childId)?.assignmentId === expectedAssignmentId)
@@ -9707,16 +9760,22 @@ export class AgentSession {
 		}
 		if (
 			this._rlmChildSessions.get(childId) !== session ||
-			this._rlmChildSessionAssignments.get(childId) !== expectedAssignmentId
+			this._rlmChildSessionAssignments.get(childId) !== expectedAssignmentId ||
+			this._rlmChildSessionOperations.get(childId) !== expectedOperationId
 		)
 			return false;
 		const unsubscribe = this._rlmChildUnsubscribes.get(childId) ?? noopRlmChildEventUnsubscribe;
-		if (this._rlmChildUnsubscribeAssignments.get(childId) === expectedAssignmentId) {
+		if (
+			this._rlmChildUnsubscribeAssignments.get(childId) === expectedAssignmentId &&
+			this._rlmChildUnsubscribeOperations.get(childId) === expectedOperationId
+		) {
 			this._rlmChildUnsubscribes.delete(childId);
 			this._rlmChildUnsubscribeAssignments.delete(childId);
+			this._rlmChildUnsubscribeOperations.delete(childId);
 		}
 		this._rlmChildSessions.delete(childId);
 		this._rlmChildSessionAssignments.delete(childId);
+		this._rlmChildSessionOperations.delete(childId);
 		return unsubscribe;
 	}
 
@@ -10202,7 +10261,7 @@ export class AgentSession {
 						}),
 					);
 				}
-				if (!this.registerRlmChildSession(run.id, child, undefined, run.assignmentId)) {
+				if (!this.registerRlmChildSession(run.id, child, undefined, run.assignmentId, run.operationId)) {
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
@@ -10288,7 +10347,7 @@ export class AgentSession {
 			} finally {
 				if (run.detachedDeletion && childRuntime) {
 					try {
-						await this._deleteRlmSubagentSession(run.id, run.assignmentId, childRuntime.session);
+						await this._deleteRlmSubagentSession(run.id, run.assignmentId, childRuntime.session, run.operationId);
 						// A retry can complete after its first failed delete retained the
 						// child. Remove only that captured session/assignment, never B.
 						if (
@@ -10302,6 +10361,7 @@ export class AgentSession {
 						if (!this._disposed && !this._disposing && this._activeRlmChildRuns.get(run.id) === run) {
 							this._rlmChildSessions.set(run.id, childRuntime.session);
 							this._rlmChildSessionAssignments.set(run.id, run.assignmentId);
+							this._rlmChildSessionOperations.set(run.id, run.operationId);
 							this._rlmChildCleanupFailures.set(run.id, run.detachedDeletion);
 						}
 					}

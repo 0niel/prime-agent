@@ -10918,7 +10918,7 @@ describe("C03 durable daemon publication", () => {
 			let publicationSawMaterialized = false;
 			const runtimeA = await internals.createRlmSubagentRuntime(
 				parent,
-				makeOptions(a.assignmentId, a.operationId, a.deliveryId, a.sessionDir, () => {
+				makeOptions(a.assignmentId!, a.operationId!, a.deliveryId!, a.sessionDir, () => {
 					const row = readRlmDurableOperationRegistry(fixture.parentArtifactDir).operations.get(
 						JSON.stringify([fixture.parentSessionId, a.assignmentId, a.operationId]),
 					);
@@ -10945,6 +10945,34 @@ describe("C03 durable daemon publication", () => {
 				throw new Error("injected child factory failure");
 			});
 			await expect(internals.createRlmSubagentRuntime(parent, b)).rejects.toThrow("injected child factory failure");
+			// A materialized child whose C01 running registry append fails remains an
+			// unpublished pending C03 fact: no callback can make it addressable.
+			const cDir = join(fixture.parentArtifactDir, "c03-C-registry-failed");
+			mkdirSync(cDir, { recursive: true });
+			const c = makeOptions(
+				"cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+				"cccccccc-cccc-4ccc-8ccc-000000000010",
+				"cccccccc-cccc-4ccc-8ccc-000000000020",
+				cDir,
+			);
+			host.admitRlmSubagentOperation?.(c);
+			const publication = vi.fn();
+			const append = vi
+				.spyOn(
+					fixture.daemon as unknown as { recordRlmSubagentRegistryEntry: () => boolean },
+					"recordRlmSubagentRegistryEntry",
+				)
+				.mockReturnValueOnce(false);
+			await expect(
+				internals.createRlmSubagentRuntime(parent, { ...c, onSessionPublished: publication as never }),
+			).rejects.toThrow("Failed to persist running RLM subagent registry entry");
+			append.mockRestore();
+			expect(publication).not.toHaveBeenCalled();
+			expect(
+				readRlmDurableOperationRegistry(fixture.parentArtifactDir).operations.get(
+					JSON.stringify([fixture.parentSessionId, c.assignmentId, c.operationId]),
+				)?.lifecycle,
+			).toBe("materialized");
 			ledger = readRlmDurableOperationRegistry(fixture.parentArtifactDir);
 			const admittedB = ledger.operations.get(
 				JSON.stringify([fixture.parentSessionId, b.assignmentId, b.operationId]),

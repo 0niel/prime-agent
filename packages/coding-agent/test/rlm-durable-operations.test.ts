@@ -337,6 +337,29 @@ describe("RLM durable operation store", () => {
 		expect(readRlmDurableOperationRegistry(f.parentArtifacts).operations.size).toBe(1);
 	});
 
+	it("projects a body-free cache after terminal delivery", () => {
+		const f = fixture();
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		const secret = "terminal body must never reach index";
+		store.admit(f.admission);
+		materialize(store, f);
+		store.appendOutbox(outbox(f, "done", secret));
+		store.recordTerminal({
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			deliveryId: delivery,
+			terminal: "done",
+		});
+		store.importOutbox(outbox(f, "done", secret));
+		store.rebuild();
+		const index = JSON.parse(readFileSync(join(f.parentArtifacts, "rlm-active-index.json"), "utf8"));
+		expect(JSON.stringify(index)).not.toContain(secret);
+		expect(index.deliveries[0]).not.toHaveProperty("outboxRecord");
+		expect(index.deliveries[0]).not.toHaveProperty("inboxRecord");
+		expect(index.deliveries[0]).not.toHaveProperty("message");
+	});
+
 	it("allows one exact deleted-assignment discard, never a materialized delivery", () => {
 		const f = fixture();
 		const store = openRlmDurableOperationStore(f.parentArtifacts);
