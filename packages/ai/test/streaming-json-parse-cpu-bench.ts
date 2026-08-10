@@ -58,10 +58,35 @@ function stats(values: number[]) {
 	const sorted = [...values].sort((a, b) => a - b);
 	return { min: sorted[0], median: sorted[Math.floor(sorted.length / 2)], max: sorted.at(-1) };
 }
-const repetitions = 7;
+function option(name: string, defaultValue: number): number {
+	const index = args.indexOf(name);
+	if (index === -1) return defaultValue;
+	const value = args[index + 1];
+	if (value === undefined) throw new Error(`${name} requires a value`);
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
+	return parsed;
+}
+
+// Defaults are deliberately local-friendly: the legacy baseline reparses each
+// prefix, so small chunks make its examined-input total grow quadratically.
+// The remote command below retains the original 1 MiB corpus sizes.
+const repetitions = option("--repetitions", 5);
+const escapedBytes = option("--escaped-bytes", 32 * 1024);
+const unicodeBytes = option("--unicode-bytes", 8 * 1024);
+const escapedChunkSize = option("--escaped-chunk-size", 64);
+const unicodeChunkSize = option("--unicode-chunk-size", 7);
 const results = [
-	{ name: "1MiB-escaped-nested-64", document: corpus(1024 * 1024, false), chunkSize: 64 },
-	{ name: "256KiB-unicode-nested-7", document: corpus(256 * 1024, true), chunkSize: 7 },
+	{
+		name: `escaped-nested-${escapedBytes}-${escapedChunkSize}`,
+		document: corpus(escapedBytes, false),
+		chunkSize: escapedChunkSize,
+	},
+	{
+		name: `unicode-nested-${unicodeBytes}-${unicodeChunkSize}`,
+		document: corpus(unicodeBytes, true),
+		chunkSize: unicodeChunkSize,
+	},
 ].map(({ name: corpusName, document, chunkSize }) => {
 	measured(document, chunkSize, "legacy");
 	measured(document, chunkSize, "incremental"); // unreported warm-ups

@@ -379,8 +379,11 @@ class IncrementalStreamingJsonParseState<T> implements StreamingJsonParseState<T
 		if (char === '"') {
 			this.stringToken = undefined;
 			if (token.rawControl) {
-				this.previewInvalid = this.frames.length > 1;
-				if (!this.previewInvalid) this.replaceCurrentValue(token.repairedValue);
+				// A closed raw-control string is only repairable once the whole
+				// enclosing document closes; partial-json rejects this prefix.
+				this.previewInvalid = true;
+				if (token.location)
+					this.repairedStringsAtRootClose.push({ location: token.location, value: token.repairedValue });
 			}
 			if (token.unicode !== undefined) token.invalidUnicode = true;
 			if (token.invalidUnicode) {
@@ -410,18 +413,19 @@ class IncrementalStreamingJsonParseState<T> implements StreamingJsonParseState<T
 			return;
 		}
 		if (char === "\u2028" || char === "\u2029") {
-			// partial-json's JSON.parse probe rejects these line separators while
-			// open, leaving the preceding display value intact.
+			// partial-json only exposes these separators after the next character.
 			token.repairedValue += char;
+			token.value += char;
 			return;
 		}
 		if (char.charCodeAt(0) < 0x20) {
-			// partial-json preserves the string up to the raw control while the
-			// string remains open. repairJson can expose the complete value once
-			// a later quote closes it.
+			// partial-json retains the prefix for whitespace controls, but rejects
+			// other raw controls immediately. Any following character makes the
+			// incomplete string invalid until repair can run on a closed root.
 			token.rawControl = true;
 			token.repairedValue += char;
-			this.updateStringPreview(token);
+			if (char.charCodeAt(0) < 0x09 || char.charCodeAt(0) > 0x0d) this.previewInvalid = true;
+			else this.updateStringPreview(token);
 			return;
 		}
 		token.repairedValue += char;

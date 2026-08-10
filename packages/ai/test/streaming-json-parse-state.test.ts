@@ -69,6 +69,8 @@ describe("incremental streaming JSON parse state", () => {
 			'{"escape":"\\q"}',
 			'{"unicode":"\\u12x"}',
 			'{"unicode":"\\uD83D\\uDE00"}',
+			'{"raw-control":"x\ny"}',
+			'{"line-separator":"x y"}',
 			'{"split":"😀"}',
 			'{"nested":[{"x":1},]}',
 			'{"number":1e+}',
