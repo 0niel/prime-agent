@@ -34,7 +34,9 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
+import { REPETITION_GUARD_DISABLED_ENV, RepetitionGuard } from "../utils/repetition-guard.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { formatStreamFailureMessage, recordStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -173,6 +175,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			let thinkingBlock: ThinkingContent | null = null;
 			const toolCallBlocksByIndex = new Map<number, StreamingToolCallBlock>();
 			const toolCallBlocksById = new Map<string, StreamingToolCallBlock>();
+			const repetitionGuard =
+				typeof process !== "undefined" && process.env[REPETITION_GUARD_DISABLED_ENV] === "1"
+					? undefined
+					: new RepetitionGuard();
 			const blocks = output.content as StreamingBlock[];
 			const getContentIndex = (block: StreamingBlock) => blocks.indexOf(block);
 			const finishBlock = (block: StreamingBlock) => {
@@ -330,6 +336,14 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 					if (foundReasoningField) {
 						const delta = deltaFields[foundReasoningField];
 						if (typeof delta === "string" && delta.length > 0) {
+							const repetition = repetitionGuard?.push(delta);
+							if (repetition) {
+								throw new StreamFailureError("Model reasoning became repetitively degenerate", {
+									kind: "degenerate_output",
+									providerErrorType: `repetition:${repetition.reason}`,
+									raw: JSON.stringify(repetition),
+								});
+							}
 							const block = ensureThinkingBlock(foundReasoningField);
 							block.thinking += delta;
 							stream.push({
@@ -407,10 +421,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.errorMessage = formatStreamFailureMessage(error);
 			// Some providers via OpenRouter give additional information in this field.
 			const rawMetadata = (error as any)?.error?.metadata?.raw;
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

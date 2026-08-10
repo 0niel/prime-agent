@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed runaway repetitive reasoning streams consuming their full output budget ([#1099](https://github.com/PrimeIntellect-ai/prime-agent/pull/1099)).
 - Fixed interrupted tool results being replayed after interposed user messages ([#1102](https://github.com/PrimeIntellect-ai/prime-agent/pull/1102)).
 
 ## [0.7.1] - 2026-08-07
