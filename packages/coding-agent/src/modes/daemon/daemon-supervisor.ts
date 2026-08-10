@@ -351,6 +351,17 @@ class SupervisorRecoveryCancelledError extends Error {
 	readonly code = "supervisor_recovery_cancelled" as const;
 }
 
+/**
+ * A recovery attempt publishes a replacement generation before it can connect
+ * or complete its create handshake. Keep that exact attempt's identity with
+ * its failure so the recovery loop can distinguish it from a real replacement
+ * that raced the old generation.
+ */
+const workerLaunchFailureAttempts = new WeakMap<
+	object,
+	{ worker: ResidentWorker; generation: string; cleanupVerified: boolean }
+>();
+
 class SnapshotLoadInvalidatedError extends Error {}
 
 function isSupervisorGenerationStale(error: unknown): boolean {
@@ -2446,6 +2457,30 @@ export class DaemonSupervisor {
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 	}
 
+	private recordWorkerLaunchFailure(error: unknown, worker: ResidentWorker, generation: string): void {
+		if (typeof error === "object" && error !== null) {
+			// Cleanup has not yet proved that a retry owns no live process.
+			workerLaunchFailureAttempts.set(error, { worker, generation, cleanupVerified: false });
+		}
+	}
+
+	private markWorkerLaunchFailureCleanupVerified(error: unknown, worker: ResidentWorker, generation: string): void {
+		if (typeof error !== "object" || error === null) return;
+		const attempt = workerLaunchFailureAttempts.get(error);
+		if (attempt?.worker === worker && attempt.generation === generation) {
+			attempt.cleanupVerified = true;
+		}
+	}
+
+	private workerLaunchFailureAttempt(
+		error: unknown,
+		worker: ResidentWorker,
+	): { generation: string; cleanupVerified: boolean } | undefined {
+		if (typeof error !== "object" || error === null) return undefined;
+		const attempt = workerLaunchFailureAttempts.get(error);
+		return attempt?.worker === worker ? attempt : undefined;
+	}
+
 	private async launchWorker(
 		command: DaemonCreateCommand,
 		existing?: ResidentWorker,
@@ -2688,25 +2723,70 @@ export class DaemonSupervisor {
 				throw error;
 			}
 			await this.assertRecoveryAllowed();
-			const shouldResumeRecovery =
+			const ownsPublishedAttempt =
 				existing !== undefined &&
+				this.matchesCurrentWorker(worker, workerGeneration) &&
 				!this.shuttingDown &&
 				worker.descriptor.stopRequestedAt === undefined &&
 				worker.stopRevision === recoveryStopRevision;
-			await this.stopWorker(worker, existing === undefined, true, false, existing !== undefined).catch((stopError) =>
-				this.log(`Could not stop failed worker ${workerId}: ${String(stopError)}`),
-			);
+			// Tag before cleanup: cleanup may correctly restore a processless
+			// recovering descriptor, but the recovery loop must still know that this
+			// particular newly-published generation failed rather than was replaced.
+			if (ownsPublishedAttempt) {
+				this.recordWorkerLaunchFailure(error, worker, workerGeneration);
+			}
+			let failedWorkerStopped = false;
+			try {
+				await this.stopWorker(worker, existing === undefined, true, false, existing !== undefined);
+				failedWorkerStopped = true;
+			} catch (stopError) {
+				this.log(`Could not stop failed worker ${workerId}: ${String(stopError)}`);
+				// We cannot prove that this published process is gone. Preserve its
+				// current identity and durably mark the outcome failed; do not clear it,
+				// signal again, or silently leave a process-bearing `recovering` record.
+				if (
+					ownsPublishedAttempt &&
+					this.matchesCurrentWorker(worker, workerGeneration) &&
+					worker.descriptor.stopRequestedAt === undefined &&
+					worker.stopRevision === recoveryStopRevision
+				) {
+					worker.descriptor.lifecycle = "failed";
+					worker.descriptor.lastError = `Failed launch cleanup could not verify worker exit: ${
+						stopError instanceof Error ? stopError.message : String(stopError)
+					}`;
+					try {
+						this.persistWorker(worker);
+					} catch (persistError) {
+						this.reportCleanupFailure(`failed worker launch ${workerId}`, persistError);
+					}
+				}
+			}
 			if (
-				shouldResumeRecovery &&
+				ownsPublishedAttempt &&
+				failedWorkerStopped &&
+				// stopWorker removes its own completed generation. An absent map entry
+				// is therefore still ours; another resident object is a replacement
+				// and must never be overwritten by this stale recovery.
+				(this.workers.get(workerId) === undefined || this.matchesCurrentWorker(worker, workerGeneration)) &&
 				!this.shuttingDown &&
 				worker.descriptor.stopRequestedAt === undefined &&
 				worker.stopRevision === recoveryStopRevision
 			) {
+				this.markWorkerLaunchFailureCleanupVerified(error, worker, workerGeneration);
 				await this.assertRecoveryAllowed();
+				// stopWorker verified that this newly-published process is gone. Do not
+				// leave its now-stale identity as authority for the next retry.
+				delete worker.descriptor.process;
+				delete worker.descriptor.pid;
+				delete worker.descriptor.processStartId;
 				worker.intentionalStop = false;
+				worker.stopFinalized = undefined;
+				worker.stopFailure = undefined;
+				// A recovering descriptor is durable only while it carries an exact
+				// process identity. This is intentionally in-memory state until the
+				// retry publishes its own process-bearing generation.
 				worker.descriptor.lifecycle = "recovering";
 				this.workers.set(workerId, worker);
-				this.persistWorker(worker);
 			}
 			throw error;
 		}
@@ -3205,7 +3285,7 @@ export class DaemonSupervisor {
 
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
 		if (worker.quarantined) return;
-		const generation = worker.descriptor.generation;
+		let generation = worker.descriptor.generation;
 		// A live legacy selector can only occur in an unnormalized in-memory
 		// harness: loadWorkerDescriptors normalizes it before publication. Do not
 		// reconnect, replace, or signal it; preserve the conservative durable fail.
@@ -3307,6 +3387,35 @@ export class DaemonSupervisor {
 					await this.launchWorker(worker.descriptor.createCommand, worker);
 					return;
 				} catch (error) {
+					// launchWorker may have atomically published a fresh generation before
+					// its spawn/handshake failed. That is this recovery's own failed
+					// attempt, not a cancellation of the older generation that entered
+					// this loop. A true replacement/stop never matches this exact tag.
+					const launchFailure = this.workerLaunchFailureAttempt(error, worker);
+					// A failed cleanup leaves a process-bearing failed descriptor. It is
+					// deliberately not retryable: this loop has no proof it owns a dead
+					// process and must not signal or replace it on the next pass.
+					if (launchFailure) {
+						if (launchFailure.generation !== worker.descriptor.generation) {
+							// A distinct, concurrently-published generation won. The
+							// tagged error cannot authorize any mutation of that worker.
+							return;
+						}
+						// The failed launch published this generation. Adopt it before
+						// returning so the finally block can release this completed
+						// recovery attempt rather than strand its stale promise.
+						generation = launchFailure.generation;
+						if (!launchFailure.cleanupVerified) {
+							return;
+						}
+						if (!this.isWorkerRecoveryCancelled(worker, generation)) {
+							// Cleanup proved the fresh process is gone. Keep its
+							// processless recovering state in memory and immediately
+							// proceed to the next retry; such a state is intentionally
+							// never persisted.
+							continue;
+						}
+					}
 					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker, generation)) {
 						return;
 					}

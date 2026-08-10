@@ -182,7 +182,31 @@ async function waitForFile(path: string): Promise<void> {
 	}
 }
 
-function createExistingLaunchWorker(root: string, descriptorDir: string) {
+type ExistingLaunchWorker = {
+	descriptor: {
+		workerId: string;
+		generation?: string;
+		lifecycle: string;
+		process?: { pid: number; processStartId: string };
+		pid?: number;
+		lastError?: string;
+		[key: string]: unknown;
+	};
+	descriptorPath: string;
+	summaries: Map<string, SessionSummary>;
+	snapshotCache: Map<string, DaemonAttachResult>;
+	snapshotGenerations: Map<string, Map<string, never>>;
+	transcriptCaches: Map<string, never>;
+	incomingTranscriptActiveSessionIds: Set<string>;
+	duplicateIncomingTranscriptChunkIndexes: Map<string, number>;
+	snapshotTransferFrames: Map<string, never>;
+	snapshotLoads: Map<string, Promise<DaemonAttachResult>>;
+	intentionalStop: boolean;
+	stopRevision: number;
+	[key: string]: unknown;
+};
+
+function createExistingLaunchWorker(root: string, descriptorDir: string): ExistingLaunchWorker {
 	const workerId = "existing-worker";
 	const now = new Date().toISOString();
 	return {
@@ -206,6 +230,7 @@ function createExistingLaunchWorker(root: string, descriptorDir: string) {
 		descriptorPath: join(descriptorDir, `${workerId}.json`),
 		summaries: new Map<string, SessionSummary>(),
 		snapshotCache: new Map<string, DaemonAttachResult>(),
+		snapshotGenerations: new Map<string, Map<string, never>>(),
 		transcriptCaches: new Map<string, never>(),
 		incomingTranscriptActiveSessionIds: new Set<string>(),
 		duplicateIncomingTranscriptChunkIndexes: new Map<string, number>(),
@@ -725,6 +750,191 @@ describe("daemon worker supervisor monitoring", () => {
 		const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 		child.kill("SIGKILL");
 		await closed;
+	});
+
+	it("tags its own published replacement generation when real launch cleanup succeeds", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-real-launch-failure-test-"));
+		const descriptorDir = join(root, "descriptors");
+		const markerPath = join(root, "startup-marker");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.forceMissingProcessStartId = false;
+		workerLaunchTestState.fixtureMode = "successful-gate";
+		workerLaunchTestState.gateMarkerPath = markerPath;
+		const existing = createExistingLaunchWorker(root, descriptorDir);
+		const workers = new Map<string, typeof existing>([[existing.descriptor.workerId, existing]]);
+		const connectFailure = new Error("fresh launch handshake failed");
+		const connectWorker = vi.fn(async () => {
+			await waitForFile(markerPath);
+			throw connectFailure;
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			connectWorker,
+			syncAgentPeers: vi.fn(async () => undefined),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+		}) as {
+			launchWorker(
+				command: { type: "create"; config: { cwd: string; agentDir: string } },
+				existing: ExistingLaunchWorker,
+			): Promise<unknown>;
+			workerLaunchFailureAttempt(
+				error: unknown,
+				worker: ExistingLaunchWorker,
+			): { generation: string; cleanupVerified: boolean } | undefined;
+		};
+
+		const failure = await supervisor
+			.launchWorker({ type: "create", config: { cwd: root, agentDir: root } }, existing)
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+
+		expect(failure).toBe(connectFailure);
+		expect(connectWorker).toHaveBeenCalledOnce();
+		expect(supervisor.workerLaunchFailureAttempt(failure, existing)).toMatchObject({
+			generation: existing.descriptor.generation,
+			cleanupVerified: true,
+		});
+		expect(existing.descriptor).toMatchObject({ lifecycle: "recovering" });
+		expect(existing.descriptor).not.toHaveProperty("process");
+		expect(existing.descriptor).not.toHaveProperty("pid");
+		expect(existing.descriptor).not.toHaveProperty("processStartId");
+		expect(workers.get(existing.descriptor.workerId)).toBe(existing);
+	});
+
+	it("retries after real launchWorker catch tags a verified cleanup", async () => {
+		vi.useFakeTimers();
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-real-launch-retry-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.forceMissingProcessStartId = false;
+		workerLaunchTestState.fixtureMode = "successful-gate";
+		const worker = createExistingLaunchWorker(root, descriptorDir);
+		worker.descriptor.generation = randomUUID();
+		delete worker.descriptor.pid;
+		worker.descriptor.lifecycle = "passivated";
+		const workers = new Map<string, typeof worker>([[worker.descriptor.workerId, worker]]);
+		const firstFailure = new Error("first launch handshake failed");
+		let connectionCount = 0;
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			connectWorker: vi.fn(async (launched: ExistingLaunchWorker) => {
+				connectionCount++;
+				if (connectionCount === 1) throw firstFailure;
+				return {
+					request: vi.fn(async () => ({
+						success: true,
+						data: {
+							id: launched.descriptor.rootActiveSessionId,
+							activeSessionId: launched.descriptor.rootActiveSessionId,
+							sessionId: "session-real-launch-retry",
+							cwd: root,
+						},
+					})),
+				};
+			}),
+			subscribeWorker: vi.fn(async () => undefined),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+			recoverUncertainWorkerOperations: vi.fn(async () => undefined),
+			syncAgentPeers: vi.fn(async () => undefined),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+		}) as { recoverWorker(worker: ExistingLaunchWorker): Promise<void> };
+
+		const recovery = supervisor.recoverWorker(worker);
+		await vi.runAllTimersAsync();
+		await recovery;
+
+		expect(connectionCount).toBe(2);
+		expect(workerLaunchTestState.spawned).toHaveLength(2);
+		expect(worker.descriptor.lifecycle).toBe("ready");
+		expect(worker.descriptor.process).toMatchObject({ pid: workerLaunchTestState.spawned[1]!.child.pid });
+	});
+
+	it("keeps a failed fresh launch process and ends recovery when cleanup cannot be verified", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-failed-launch-cleanup-test-"));
+		const descriptorDir = join(root, "descriptors");
+		const markerPath = join(root, "startup-marker");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.forceMissingProcessStartId = false;
+		workerLaunchTestState.fixtureMode = "successful-gate";
+		workerLaunchTestState.gateMarkerPath = markerPath;
+		const worker = createExistingLaunchWorker(root, descriptorDir);
+		worker.descriptor.generation = randomUUID();
+		delete worker.descriptor.pid;
+		worker.descriptor.lifecycle = "passivated";
+		const workers = new Map<string, typeof worker>([[worker.descriptor.workerId, worker]]);
+		const connectFailure = new Error("fresh launch handshake failed");
+		const cleanupFailure = new Error("could not verify child exit");
+		const persistProcesslessRecoveryFailure = vi.fn();
+		const signalTrackedWorker = vi.fn();
+		const stopWorker = vi.fn(async () => {
+			throw cleanupFailure;
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			connectWorker: vi.fn(async () => {
+				await waitForFile(markerPath);
+				throw connectFailure;
+			}),
+			stopWorker,
+			persistWorker: vi.fn(),
+			persistProcesslessRecoveryFailure,
+			signalTrackedWorker,
+			recoverUncertainWorkerOperations: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			recoverWorker(worker: ExistingLaunchWorker): Promise<void>;
+			workerLaunchFailureAttempt(
+				error: unknown,
+				worker: ExistingLaunchWorker,
+			): { cleanupVerified: boolean; generation: string } | undefined;
+		};
+
+		await supervisor.recoverWorker(worker);
+
+		expect(stopWorker).toHaveBeenCalledOnce();
+		expect(workerLaunchTestState.spawned).toHaveLength(1);
+		expect(worker.descriptor.lifecycle).toBe("failed");
+		expect(worker.descriptor.process).toEqual({
+			pid: workerLaunchTestState.spawned[0]!.child.pid,
+			processStartId: expect.any(String),
+		});
+		expect(worker.descriptor.lastError).toContain(cleanupFailure.message);
+		expect(persistProcesslessRecoveryFailure).not.toHaveBeenCalled();
+		expect(signalTrackedWorker).not.toHaveBeenCalled();
+		expect(supervisor.workerLaunchFailureAttempt(connectFailure, worker)).toMatchObject({
+			cleanupVerified: false,
+			generation: worker.descriptor.generation,
+		});
+		// No second launch or recovery cleanup may signal/replace the retained process.
+		expect(workerLaunchTestState.spawned).toHaveLength(1);
 	});
 
 	it("rolls back a published worker when shutdown admission and rollback persistence fail", async () => {
@@ -1515,6 +1725,155 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(supervisor.connectWorker).not.toHaveBeenCalled();
 		expect(supervisor.recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker, false);
 		expect(supervisor.launchWorker).toHaveBeenCalledWith(worker.descriptor.createCommand, worker);
+	});
+
+	it("retries an existing worker when its freshly-published launch generation fails", async () => {
+		vi.useFakeTimers();
+		type RecoveryWorker = {
+			descriptor: {
+				workerId: string;
+				generation: string;
+				rootActiveSessionId: string;
+				createCommand: { type: "create" };
+				lifecycle: "recovering" | "ready" | "passivated";
+				consecutiveFailures: number;
+				lastFailureAt?: string;
+				lastError?: string;
+				process?: { pid: number; processStartId: string };
+			};
+			intentionalStop: boolean;
+			stopRevision: number;
+			recovery?: Promise<void>;
+			client?: { close(): void };
+		};
+		type RecoveryHarness = {
+			workers: Map<string, RecoveryWorker>;
+			shuttingDown: boolean;
+			persistWorker: ReturnType<typeof vi.fn>;
+			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
+			launchWorker: ReturnType<typeof vi.fn>;
+			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
+			recordWorkerLaunchFailure(error: unknown, worker: RecoveryWorker, generation: string): void;
+			markWorkerLaunchFailureCleanupVerified(error: unknown, worker: RecoveryWorker, generation: string): void;
+			recoverWorker(worker: RecoveryWorker): Promise<void>;
+		};
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-fresh-launch-failure",
+				generation: "old-generation",
+				rootActiveSessionId: "active-1",
+				createCommand: { type: "create" },
+				lifecycle: "recovering",
+				consecutiveFailures: 0,
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		let supervisor!: RecoveryHarness;
+		const launchWorker = vi.fn(async () => {
+			if (launchWorker.mock.calls.length === 1) {
+				worker.descriptor.generation = "failed-fresh-generation";
+				const error = new Error("fresh launch handshake failed");
+				supervisor.recordWorkerLaunchFailure(error, worker, worker.descriptor.generation);
+				// The mocked launch represents the production path after cleanup has
+				// verified the freshly-published process stopped.
+				supervisor.markWorkerLaunchFailureCleanupVerified(error, worker, worker.descriptor.generation);
+				throw error;
+			}
+			worker.descriptor.generation = "retried-generation";
+			worker.descriptor.lifecycle = "ready";
+			return worker;
+		});
+		const persistWorker = vi.fn();
+		supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			persistWorker,
+			recoverUncertainWorkerOperations: vi.fn(async () => {}),
+			launchWorker,
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			log: vi.fn(),
+		}) as RecoveryHarness;
+
+		const recovery = supervisor.recoverWorker(worker);
+		await vi.runAllTimersAsync();
+		await recovery;
+
+		expect(launchWorker).toHaveBeenCalledTimes(2);
+		expect(worker.descriptor).toMatchObject({ generation: "retried-generation", lifecycle: "ready" });
+		// Verified cleanup bypasses processless failure persistence and retries directly.
+		expect(persistWorker).not.toHaveBeenCalled();
+	});
+
+	it("fences a fresh launch failure when a concurrent replacement publishes another generation", async () => {
+		vi.useFakeTimers();
+		type RecoveryWorker = {
+			descriptor: {
+				workerId: string;
+				generation: string;
+				rootActiveSessionId: string;
+				createCommand: { type: "create" };
+				lifecycle: "recovering" | "ready";
+				consecutiveFailures: number;
+			};
+			intentionalStop: boolean;
+			stopRevision: number;
+			recovery?: Promise<void>;
+		};
+		type RecoveryHarness = {
+			workers: Map<string, RecoveryWorker>;
+			shuttingDown: boolean;
+			persistWorker: ReturnType<typeof vi.fn>;
+			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
+			launchWorker: ReturnType<typeof vi.fn>;
+			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
+			recordWorkerLaunchFailure(error: unknown, worker: RecoveryWorker, generation: string): void;
+			markWorkerLaunchFailureCleanupVerified(error: unknown, worker: RecoveryWorker, generation: string): void;
+			recoverWorker(worker: RecoveryWorker): Promise<void>;
+		};
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-replaced-during-launch-failure",
+				generation: "old-generation",
+				rootActiveSessionId: "active-1",
+				createCommand: { type: "create" },
+				lifecycle: "recovering",
+				consecutiveFailures: 0,
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const persistWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			persistWorker,
+			recoverUncertainWorkerOperations: vi.fn(async () => {}),
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			log: vi.fn(),
+		}) as RecoveryHarness;
+		supervisor.launchWorker = vi.fn(async () => {
+			worker.descriptor.generation = "failed-fresh-generation";
+			const error = new Error("fresh launch handshake failed");
+			supervisor.recordWorkerLaunchFailure(error, worker, worker.descriptor.generation);
+			// A newer supervisor attempt won after the failure was tagged. Its state
+			// is not evidence that the old recovery can persist or retry against.
+			worker.descriptor.generation = "concurrent-replacement-generation";
+			worker.descriptor.lifecycle = "ready";
+			throw error;
+		});
+
+		const recovery = supervisor.recoverWorker(worker);
+		await vi.runAllTimersAsync();
+		await recovery;
+
+		expect(supervisor.launchWorker).toHaveBeenCalledOnce();
+		expect(worker.descriptor).toMatchObject({
+			generation: "concurrent-replacement-generation",
+			lifecycle: "ready",
+			consecutiveFailures: 0,
+		});
+		expect(persistWorker).not.toHaveBeenCalled();
 	});
 
 	it("does not relaunch a live worker whose process identity is unknown", async () => {
