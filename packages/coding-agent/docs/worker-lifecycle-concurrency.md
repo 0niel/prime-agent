@@ -4,15 +4,15 @@ This document is the authoritative contract for the daemon supervisor and worker
 
 ## State and observability
 
-A worker registration is observable as `starting`, `running`, `recovering`, or a stop tombstone (`stopRequestedAt`). A stop tombstone is observable before signalling begins and remains observable until descriptor deletion. A retry/relaunch replaces the registration's process generation; it must remove a rescinded stop tombstone before publishing the successor. A child run is observable as `queued`, `running`, then exactly one terminal `done`, `error`, or `cancelled`; a cancelled run stays tracked until its detached cleanup settles, so a second cancellation is accepted rather than mistaken for a completed selector.
+A worker descriptor lifecycle is exactly `starting`, `ready`, `recovering`, `stopping`, or `failed`. Descriptor removal is represented by `removed`; session archival is represented by `archive`. A stop tombstone (`stopRequestedAt`) is published before signalling and remains until a successfully authorized removal. A retry/relaunch replaces the process generation and removes a rescinded tombstone before publishing its successor. A child run is observable as `queued`, `running`, then exactly one terminal `done`, `error`, or `cancelled`; a cancelled run stays tracked until detached cleanup settles.
 
-The immutable authority tuple for a process operation is:
+The exact authority tuple for every TERM/KILL and destructive descriptor/archive commit is:
 
 ```text
-(workerId, pid, processStartId, supervisor generation, stopRevision)
+(workerId, pid, processStartId, supervisorGeneration, stopRevision, stopRequestedAt)
 ```
 
-Capture it before an asynchronous operation. The worker ID alone is never authority to signal, delete, archive, or reclaim. `processStartId` distinguishes a reused PID, supervisor generation fences an obsolete supervisor, and `stopRevision` fences a rescinded/replaced stop. The operation must revalidate its applicable tuple and tombstone **after every `await`**, immediately before every signal, and immediately before every destructive commit. A failed revalidation is a no-op/abort of that operation, never authority to act on its successor.
+`supervisorGeneration` is the immutable `this.generation`, and its durable ownership record must match through `await this.assertCurrentOwnership()`. The worker ID alone is never authority to signal, delete, archive, or reclaim. `processStartId` distinguishes a reused PID and `stopRevision`/`stopRequestedAt` fence a rescinded or replaced stop. Immediately before each TERM/KILL and destructive descriptor, artifact, or archive commit, the implementation awaits ownership assertion, then makes the complete tuple assertion and fresh process-identity check with **no await in between**. A failed, unreadable, or lost ownership check fails closed: no signal/delete/archive is performed, and the tombstone/retry record remains for recovery by a new owner.
 
 ## Process truth table
 
@@ -32,7 +32,7 @@ In particular, unreadable is neither dead nor recycled. It cannot justify cleanu
 
 `stopWorker` owns the foreground stop attempt. Every concurrent call increments the per-worker stop count for the duration of its own call; decrementation is in `finally`. The count is observability/accounting, **not** a permission to coalesce incompatible calls. Each attempt has a captured authority tuple and must fail closed if a retry/relaunch changes it.
 
-A timed-out descriptor stop schedules exactly one `stopFinalization` promise. That promise owns background escalation and cleanup; concurrent timeouts and stale-reclaim callers join it rather than sending another signal or deleting state. Finalization retries transient cleanup after the process is confirmed gone, but exits if the tuple/tombstone was rescinded. Reclaim first requires `gone` or `recycled`, then joins finalization for a bounded user-visible wait. If cleanup exceeds that wait, it returns an honest retry/pending error; it never returns the stale registration as reusable. Retries/relaunches own publication of the successor and must invalidate all previous stop authority before awaiting startup work.
+A timed-out descriptor stop schedules exactly one `stopFinalization` promise. That promise owns background escalation and cleanup; concurrent timeouts and stale-reclaim callers join it rather than sending another signal or deleting state. Finalization retries transient cleanup after the process is confirmed gone, but exits if the tuple/tombstone was rescinded **or ownership is lost**. Reclaim first requires `gone` or `recycled`, then joins finalization for a bounded user-visible wait. If ownership is unreadable or lost, it retains the tombstone/retry record for the successor; it never returns the stale registration as reusable. Adoption/recovery asserts ownership only at an actual adjacent commit/signal boundary, while finalizer and foreground stop paths reassert after every wait. Retries/relaunches own publication of the successor and must invalidate all previous stop authority before awaiting startup work.
 
 A foreground request has bounded waits (worker shutdown RPC and liveness deadlines). Long escalation, archival, and retry work continue in the owned finalizer without holding the user request open.
 
@@ -42,7 +42,7 @@ The implementation uses short synchronous mutations and promise ownership, rathe
 
 1. Mutate one worker's descriptor/map state, stop count, child terminal state, or finalizer slot synchronously.
 2. Capture the authority tuple and release that state before any await, RPC, process probe, signal wait, catalog call, socket write, or child disposal.
-3. After every await, reacquire only the necessary state and revalidate authority before the next effect.
+3. After every await, reacquire only the necessary state and revalidate authority before the next effect. For TERM/KILL or a destructive descriptor/archive commit, `await this.assertCurrentOwnership()` is the final await; the full tuple assertion and fresh process identity follow synchronously and immediately before the effect.
 
 Allowed ordering is: global supervisor admission/mutation fence -> worker registration -> worker-local snapshot/child bookkeeping. A worker-local operation must not acquire the global fence while holding worker bookkeeping. There is **no await under any of these locks/bookkeeping mutations** and no lock may be retained while calling client, catalog, process, or extension code. Promise slots (`stopFinalization`, snapshot loads, child publication) are single-flight ownership tokens, not locks; await their promise only after publishing the slot.
 

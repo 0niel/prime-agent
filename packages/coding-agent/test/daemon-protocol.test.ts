@@ -122,7 +122,7 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("gates honest worker-state reporting at its introducing schema revision", () => {
-		// Revision 14 adds the "stopping" workerState and stops reporting
+		// Revision 15 adds the "stopping" workerState and stops reporting
 		// disconnected workers as "ready". The field is optional and old clients
 		// ignore unknown values, so no capability gate is needed; the revision
 		// lets version probes distinguish daemons with the old semantics.

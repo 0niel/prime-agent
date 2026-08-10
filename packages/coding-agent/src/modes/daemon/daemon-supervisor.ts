@@ -991,7 +991,18 @@ export class DaemonSupervisor {
 		renameSync(tempPath, worker.descriptorPath);
 	}
 
-	private deleteWorkerDescriptor(worker: ResidentWorker): void {
+	/** Remove a registration only while this generation still owns its exact worker incarnation. */
+	private async deleteWorkerDescriptor(
+		worker: ResidentWorker,
+		descriptor: DaemonWorkerDescriptor = worker.descriptor,
+		stopRevision = worker.stopRevision,
+		stopRequestedAt = descriptor.stopRequestedAt,
+	): Promise<void> {
+		// This assertion is deliberately the final await before the tuple check and
+		// destructive unlink. Lost or unreadable ownership retains the descriptor
+		// (and, for stops, its tombstone) for the next owner to recover.
+		await this.assertCurrentOwnership();
+		this.assertWorkerReclaimCommitCurrent(worker, descriptor, stopRevision, stopRequestedAt);
 		try {
 			rmSync(worker.descriptorPath, { force: true });
 			rmSync(worker.descriptor.recoveryJournalPath, { force: true });
@@ -2381,7 +2392,11 @@ export class DaemonSupervisor {
 					1000,
 				);
 				await this.assertRecoveryAllowed();
-				client.onFrame((frame) => this.handleWorkerFrame(worker, frame));
+				client.onFrame((frame) =>
+					void this.handleWorkerFrame(worker, frame).catch((error) =>
+						this.log(`Worker frame handling failed for ${worker.descriptor.workerId}: ${String(error)}`),
+					),
+				);
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
 				worker.client?.close();
 				worker.client = client;
@@ -2426,7 +2441,7 @@ export class DaemonSupervisor {
 				// supervisor while its intentional stop is being adopted. Legacy or
 				// unreadable identity deliberately keeps the tombstone for retries.
 				const descriptor = worker.descriptor;
-				this.signalCurrentWorker(
+				await this.signalCurrentWorker(
 					worker,
 					descriptor,
 					worker.stopRevision,
@@ -2877,15 +2892,17 @@ export class DaemonSupervisor {
 		await this.assertRecoveryAllowed();
 		const descriptor = worker.descriptor;
 		if (killWorkerProcess) {
-			this.signalCurrentWorker(worker, descriptor, worker.stopRevision, descriptor.stopRequestedAt, "SIGKILL");
+			await this.signalCurrentWorker(worker, descriptor, worker.stopRevision, descriptor.stopRequestedAt, "SIGKILL");
 		}
 		const orphanProcessJournalPath = descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
 			try {
 				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
-					if (!isOrphanProcessIdentityCurrent(orphan)) {
-						continue;
-					}
+					// Ownership and fresh orphan identity must remain adjacent to the
+					// signal. A successor owns any retry if this check fails.
+					await this.assertCurrentOwnership();
+					this.assertWorkerTupleCurrent(worker, descriptor, worker.stopRevision, descriptor.stopRequestedAt);
+					if (!isOrphanProcessIdentityCurrent(orphan)) continue;
 					const { pid } = orphan;
 					try {
 						process.kill(-pid, "SIGKILL");
@@ -2897,6 +2914,8 @@ export class DaemonSupervisor {
 						}
 					}
 				}
+				await this.assertCurrentOwnership();
+				this.assertWorkerTupleCurrent(worker, descriptor, worker.stopRevision, descriptor.stopRequestedAt);
 				clearOrphanProcessJournal(orphanProcessJournalPath);
 			} catch (error) {
 				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
@@ -4218,9 +4237,13 @@ export class DaemonSupervisor {
 			activeSessionId === worker.descriptor.rootActiveSessionId &&
 			!this.shuttingDown
 		) {
+			const descriptor = worker.descriptor;
+			const stopRevision = worker.stopRevision;
 			worker.intentionalStop = true;
-			this.workers.delete(worker.descriptor.workerId);
-			this.deleteWorkerDescriptor(worker);
+			await this.assertCurrentOwnership();
+			this.assertWorkerReclaimCommitCurrent(worker, descriptor, stopRevision, descriptor.stopRequestedAt);
+			await this.deleteWorkerDescriptor(worker, descriptor, stopRevision, descriptor.stopRequestedAt);
+			this.workers.delete(descriptor.workerId);
 			void this.syncAgentPeers().catch(() => undefined);
 		}
 	}
@@ -4607,34 +4630,69 @@ export class DaemonSupervisor {
 	 * fails closed for legacy descriptors and transiently unreadable process
 	 * identity. Callers retain the tombstone/retry authority in that case.
 	 */
-	private signalCurrentWorker(
+	private assertWorkerTupleCurrent(
+		worker: ResidentWorker,
+		descriptor: DaemonWorkerDescriptor,
+		stopRevision: number,
+		stopRequestedAt: string | undefined,
+	): void {
+		if (
+			this.workers.get(descriptor.workerId) !== worker ||
+			worker.descriptor !== descriptor ||
+			worker.descriptor.pid !== descriptor.pid ||
+			worker.descriptor.processStartId !== descriptor.processStartId ||
+			worker.stopRevision !== stopRevision ||
+			worker.descriptor.stopRequestedAt !== stopRequestedAt
+		) {
+			throw new Error(`Session worker ${descriptor.workerId} changed during lifecycle operation`);
+		}
+	}
+
+	/**
+	 * Destructive descriptor/artifact/archive commits may only reclaim an
+	 * incarnation observed gone or recycled. Unreadable and still-current are
+	 * retained for finalization/recovery; no stale supervisor gets to erase them.
+	 */
+	private assertWorkerReclaimCommitCurrent(
+		worker: ResidentWorker,
+		descriptor: DaemonWorkerDescriptor,
+		stopRevision: number,
+		stopRequestedAt: string | undefined,
+	): void {
+		this.assertWorkerTupleCurrent(worker, descriptor, stopRevision, stopRequestedAt);
+		const identity = this.processIdentity(descriptor.pid, descriptor.processStartId);
+		if (identity !== "gone" && identity !== "replaced") {
+			throw new Error(`Session worker ${descriptor.workerId} is not safely reclaimable`);
+		}
+	}
+
+	private async signalCurrentWorker(
 		worker: ResidentWorker,
 		descriptor: DaemonWorkerDescriptor,
 		stopRevision: number,
 		stopRequestedAt: string | undefined,
 		signal: NodeJS.Signals,
 		directChild?: ChildProcess,
-	): boolean {
+	): Promise<boolean> {
 		const { pid, processStartId } = descriptor;
+		// Do not move an await below this point: ownership, the full immutable
+		// tuple, and fresh process identity must be adjacent to TERM/KILL.
+		await this.assertCurrentOwnership();
+		try {
+			this.assertWorkerTupleCurrent(worker, descriptor, stopRevision, stopRequestedAt);
+		} catch {
+			return false;
+		}
 		if (
 			processStartId === undefined ||
-			this.workers.get(descriptor.workerId) !== worker ||
-			worker.descriptor !== descriptor ||
-			worker.descriptor.pid !== pid ||
-			worker.descriptor.processStartId !== processStartId ||
-			worker.stopRevision !== stopRevision ||
-			worker.descriptor.stopRequestedAt !== stopRequestedAt ||
 			(directChild !== undefined &&
 				(directChild.pid !== pid || directChild.exitCode !== null || directChild.signalCode !== null)) ||
 			this.processIdentity(pid, processStartId) !== "current"
 		) {
 			return false;
 		}
-		if (directChild) {
-			directChild.kill(signal);
-		} else {
-			signalProcessGroupOrProcess(pid, signal);
-		}
+		if (directChild) directChild.kill(signal);
+		else signalProcessGroupOrProcess(pid, signal);
 		return true;
 	}
 
@@ -4747,7 +4805,7 @@ export class DaemonSupervisor {
 			}
 		} else {
 			assertStopStillApplies();
-			this.signalCurrentWorker(
+			await this.signalCurrentWorker(
 				worker,
 				entryDescriptor,
 				entryStopRevision,
@@ -4785,7 +4843,7 @@ export class DaemonSupervisor {
 			assertStopStillApplies();
 			// signalCurrentWorker performs a fresh, unthrottled identity check;
 			// cached liveness may be old enough for pid reuse.
-			this.signalCurrentWorker(
+			await this.signalCurrentWorker(
 				worker,
 				entryDescriptor,
 				entryStopRevision,
@@ -4812,15 +4870,19 @@ export class DaemonSupervisor {
 		assertStopStillApplies();
 		if (removeDescriptor && worker.descriptor.archiveOnStop) {
 			if (force) {
-				this.reclaimStoppedWorkerCronLock(worker);
+				await this.reclaimStoppedWorkerCronLock(worker, entryDescriptor, entryStopRevision, entryStopRequestedAt);
 			}
-			await this.finalizeArchivedWorkerStop(worker);
+			await this.finalizeArchivedWorkerStop(worker, entryDescriptor, entryStopRevision, entryStopRequestedAt);
 			assertStopStillApplies();
 		}
-		this.workers.delete(worker.descriptor.workerId);
+		// The final authority check must be immediately adjacent to map/descriptor
+		// deletion. If ownership vanished, retain the tombstone for recovery.
+		await this.assertCurrentOwnership();
+		assertStopStillApplies();
 		if (removeDescriptor) {
-			this.deleteWorkerDescriptor(worker);
+			await this.deleteWorkerDescriptor(worker, entryDescriptor, entryStopRevision, entryStopRequestedAt);
 		}
+		this.workers.delete(worker.descriptor.workerId);
 		if (!this.shuttingDown) {
 			void this.syncAgentPeers().catch(() => undefined);
 			this.broadcastHeartbeatsChanged();
@@ -4886,8 +4948,14 @@ export class DaemonSupervisor {
 			}
 			if (!killed && Date.now() >= sigkillDeadline) {
 				// signalCurrentWorker makes a fresh exact observation immediately
-				// before signalling. A miss keeps the tombstone and escalation armed.
-				killed = this.signalCurrentWorker(worker, descriptor, stopRevision, stopRequestedAt, "SIGKILL");
+				// before signalling. Ownership loss is terminal for this finalizer:
+				// leave its tombstone for the successor rather than retrying as stale.
+				try {
+					killed = await this.signalCurrentWorker(worker, descriptor, stopRevision, stopRequestedAt, "SIGKILL");
+				} catch (error) {
+					if (isSupervisorGenerationStale(error)) return;
+					throw error;
+				}
 			}
 			await unrefDelay(STOP_FINALIZATION_RECHECK_MS);
 		}
@@ -4902,33 +4970,44 @@ export class DaemonSupervisor {
 				this.log(`Finalized timed-out stop for worker ${worker.descriptor.workerId}`);
 				return;
 			} catch (error) {
+				if (isSupervisorGenerationStale(error)) return;
 				this.reportCleanupFailure(`timed-out worker stop ${worker.descriptor.workerId}`, error);
 				await unrefDelay(STOP_FINALIZATION_RETRY_MS);
 			}
 		}
 	}
 
-	private async finalizeArchivedWorkerStop(worker: ResidentWorker): Promise<void> {
+	private async finalizeArchivedWorkerStop(
+		worker: ResidentWorker,
+		descriptor: DaemonWorkerDescriptor,
+		stopRevision: number,
+		stopRequestedAt: string | undefined,
+	): Promise<void> {
 		const context = this.workerSessionArtifactContext(worker);
-		if (!context) {
-			return;
-		}
-		if (worker.descriptor.rootSessionId) {
-			const cronStore = AgentCronJobStore.forSessionArtifacts();
-			cronStore.registerSessionArtifact(worker.descriptor.rootSessionId, context.artifactDir);
-			cronStore.cancelJobsForSession({
-				sessionId: worker.descriptor.rootSessionId,
-				sessionFile: context.sessionFile,
-			});
-			await this.catalog.archive(context.sessionFile, worker.descriptor.rootSessionId);
-		}
+		if (!context || !descriptor.rootSessionId) return;
+		const cronStore = AgentCronJobStore.forSessionArtifacts();
+		// The catalog call is an await. Its destructive archive commit is protected
+		// by the catalog's request boundary; local destructive artifact updates are
+		// re-authorized after it and are never made by a lost owner.
+		await this.assertCurrentOwnership();
+		this.assertWorkerReclaimCommitCurrent(worker, descriptor, stopRevision, stopRequestedAt);
+		cronStore.registerSessionArtifact(descriptor.rootSessionId, context.artifactDir);
+		cronStore.cancelJobsForSession({ sessionId: descriptor.rootSessionId, sessionFile: context.sessionFile });
+		await this.catalog.archive(context.sessionFile, descriptor.rootSessionId);
+		await this.assertCurrentOwnership();
+		this.assertWorkerReclaimCommitCurrent(worker, descriptor, stopRevision, stopRequestedAt);
 	}
 
-	private reclaimStoppedWorkerCronLock(worker: ResidentWorker): void {
+	private async reclaimStoppedWorkerCronLock(
+		worker: ResidentWorker,
+		descriptor: DaemonWorkerDescriptor,
+		stopRevision: number,
+		stopRequestedAt: string | undefined,
+	): Promise<void> {
 		const context = this.workerSessionArtifactContext(worker);
-		if (!context) {
-			return;
-		}
+		if (!context) return;
+		await this.assertCurrentOwnership();
+		this.assertWorkerReclaimCommitCurrent(worker, descriptor, stopRevision, stopRequestedAt);
 		rmSync(join(context.artifactDir, `${SESSION_SCHEDULED_JOBS_FILENAME}.lock`), { recursive: true, force: true });
 	}
 

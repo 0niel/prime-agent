@@ -368,6 +368,7 @@ describe("daemon worker supervisor monitoring", () => {
 			supervisorClaims: new Map([[client, oldClaim]]),
 			updateRestart: transaction,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			scheduleSupervisorFenceCheck: vi.fn(),
 			assertSupervisorClaimCurrent: vi.fn(async () => {
 				assertionReached.resolve();
@@ -456,6 +457,7 @@ describe("daemon worker supervisor monitoring", () => {
 			options: { worker: { authenticationToken: "token" } },
 			supervisorClaims: new Map(),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			clearSupervisorAvailabilityCheck: vi.fn(),
 			scheduleSupervisorFenceCheck: vi.fn(),
 			handleWorkerCommand,
@@ -595,6 +597,7 @@ describe("daemon worker supervisor monitoring", () => {
 			socketPath: join(root, "supervisor.sock"),
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed: vi.fn(async () => {
 				assertionCount++;
 				if (assertionCount === 3) {
@@ -665,6 +668,7 @@ describe("daemon worker supervisor monitoring", () => {
 			socketPath: join(root, "supervisor.sock"),
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
 			subscribeWorker: vi.fn(async () => undefined),
@@ -723,6 +727,7 @@ describe("daemon worker supervisor monitoring", () => {
 			socketPath: join(root, "supervisor.sock"),
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
 			persistWorker: vi.fn(function (this: object, worker: object) {
@@ -783,6 +788,7 @@ describe("daemon worker supervisor monitoring", () => {
 			socketPath: join(root, "supervisor.sock"),
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
 			persistWorker: vi.fn(function (this: object, worker: object) {
@@ -875,6 +881,7 @@ describe("daemon worker supervisor monitoring", () => {
 			socketPath: join(root, "supervisor.sock"),
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
 			stopWorker: controlledStopWorker,
@@ -928,6 +935,7 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			signalCleanupHandlers: [],
 			workers: new Map(),
 			clients: new Set(),
@@ -1046,6 +1054,7 @@ describe("daemon worker supervisor monitoring", () => {
 			...createSupervisorSnapshotState(),
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed,
 			persistWorker,
 			syncAgentPeers: vi.fn(async () => undefined),
@@ -1105,6 +1114,7 @@ describe("daemon worker supervisor monitoring", () => {
 			...createSupervisorSnapshotState(),
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed,
 			persistWorker,
 			syncAgentPeers: vi.fn(async () => undefined),
@@ -1176,6 +1186,7 @@ describe("daemon worker supervisor monitoring", () => {
 			...createSupervisorSnapshotState(),
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed,
 			persistWorker,
 			syncAgentPeers: vi.fn(async () => undefined),
@@ -1403,6 +1414,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 		}) as RecoveryHarness;
 
 		const recovery = supervisor.recoverWorker(worker);
@@ -1451,6 +1463,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			connectWorker: vi.fn(),
 			recoverUncertainWorkerOperations: vi.fn(async () => {}),
 			launchWorker: vi.fn(async () => worker),
@@ -1511,6 +1524,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			connectWorker: vi.fn(async () => {
 				throw new Error("worker socket unavailable");
 			}),
@@ -1576,6 +1590,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			connectWorker: vi.fn(async () => ({})),
 			subscribeWorker: vi.fn(async () => {}),
 			refreshWorkerSummaries: vi.fn(async () => {}),
@@ -1701,22 +1716,29 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it.each(["SIGTERM", "SIGKILL"] as const)(
 		"fails closed for a legacy worker identity before %s",
-		(signal) => {
+		async (signal) => {
 			const worker = {
 				descriptor: { workerId: "worker-legacy-signal", pid: 111_121 },
 				stopRevision: 0,
 			};
 			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 				workers: new Map([[worker.descriptor.workerId, worker]]),
+				assertCurrentOwnership: vi.fn(async () => undefined),
 				processIdentity: vi.fn(),
 			}) as {
-				signalCurrentWorker(target: object, descriptor: object, revision: number, stopAt: undefined, signal: string): boolean;
+				signalCurrentWorker(
+					target: object,
+					descriptor: object,
+					revision: number,
+					stopAt: undefined,
+					signal: string,
+				): Promise<boolean>;
 				processIdentity: ReturnType<typeof vi.fn>;
 			};
 			const childProcessModule = await import("../src/utils/child-process.js");
 			const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
 			try {
-				expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 0, undefined, signal)).toBe(false);
+				await expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 0, undefined, signal)).resolves.toBe(false);
 				expect(supervisor.processIdentity).not.toHaveBeenCalled();
 				expect(killSpy).not.toHaveBeenCalled();
 			} finally {
@@ -1732,15 +1754,22 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			processIdentity: vi.fn(() => "replaced"),
 		}) as {
-			signalCurrentWorker(target: object, descriptor: object, revision: number, stopAt: undefined, signal: string): boolean;
+			signalCurrentWorker(
+				target: object,
+				descriptor: object,
+				revision: number,
+				stopAt: undefined,
+				signal: string,
+			): Promise<boolean>;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
 		try {
-			expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 2, undefined, "SIGTERM")).toBe(false);
-			expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 2, undefined, "SIGKILL")).toBe(false);
+			await expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 2, undefined, "SIGTERM")).resolves.toBe(false);
+			await expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 2, undefined, "SIGKILL")).resolves.toBe(false);
 			expect(killSpy).not.toHaveBeenCalled();
 		} finally {
 			killSpy.mockRestore();
@@ -1819,6 +1848,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -1867,6 +1897,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -1916,6 +1947,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -1971,6 +2003,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -2026,6 +2059,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			persistWorker: vi.fn(),
 			persistWorkerStopTombstone: vi.fn(),
 			reclaimStoppedWorkerCronLock: vi.fn(),
@@ -2085,6 +2119,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			persistWorker: vi.fn(),
 			persistWorkerStopTombstone: vi.fn(),
 			reclaimStoppedWorkerCronLock: vi.fn(),
@@ -2143,6 +2178,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -2195,6 +2231,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -2253,6 +2290,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -2308,6 +2346,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -2351,6 +2390,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -2516,6 +2556,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			// Cleanup hangs past the bounded reclaim wait.
 			stopWorker: vi.fn(() => new Promise<void>(() => {})),
 			persistWorker: vi.fn(),
@@ -2562,6 +2603,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			shuttingDown: false,
+			assertCurrentOwnership: vi.fn(async () => undefined),
 			stopWorker,
 			persistWorker: vi.fn(),
 			log: vi.fn(),
@@ -3252,4 +3294,80 @@ describe("daemon worker supervisor monitoring", () => {
 		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/resident-1.*recovering.*disconnected/);
 		expect(requestWorker).not.toHaveBeenCalled();
 	});
+	it("fails closed on ownership loss during signal, descriptor removal, and archive finalization", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-ownership-finalizer-"));
+		const descriptorPath = join(root, "worker.json");
+		const recoveryJournalPath = join(root, "worker.recovery.jsonl");
+		writeFileSync(descriptorPath, "descriptor");
+		writeFileSync(recoveryJournalPath, "journal");
+		const descriptor = {
+			workerId: "ownership-lost-worker",
+			pid: process.pid,
+			processStartId: "exact-process",
+			rootSessionId: "root-session",
+			sessionFile: join(root, "session.jsonl"),
+			stopRequestedAt: "stop-tombstone",
+		};
+		const worker = { descriptor, descriptorPath, intentionalStop: true, stopRevision: 0 };
+		const signalModule = await import("../src/utils/child-process.js");
+		const leaseModule = await import("../src/core/session-lease.js");
+		let alive = true;
+		const signalSpy = vi.spyOn(signalModule, "signalProcessGroupOrProcess").mockImplementation(() => {
+			alive = false;
+		});
+		const aliveSpy = vi.spyOn(signalModule, "isProcessAlive").mockImplementation(() => alive);
+		const startIdSpy = vi.spyOn(leaseModule, "getProcessStartId").mockReturnValue("exact-process");
+		const archive = vi.fn(async () => {});
+		const ownershipLost = Object.assign(new Error("ownership lost"), { code: "supervisor_generation_stale" });
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[descriptor.workerId, worker]]),
+			assertCurrentOwnership: vi.fn(async () => {
+				throw ownershipLost;
+			}),
+			catalog: { archive },
+			workerSessionArtifactContext: vi.fn(() => ({ sessionFile: descriptor.sessionFile, artifactDir: root })),
+		}) as unknown as {
+			signalCurrentWorker(
+				target: object,
+				row: object,
+				revision: number,
+				tombstone: string,
+				signal: NodeJS.Signals,
+			): Promise<boolean>;
+			deleteWorkerDescriptor(target: object, row: object, revision: number, tombstone: string): Promise<void>;
+			finalizeArchivedWorkerStop(target: object, row: object, revision: number, tombstone: string): Promise<void>;
+			assertCurrentOwnership: ReturnType<typeof vi.fn>;
+		};
+		try {
+			await expect(
+				supervisor.signalCurrentWorker(worker, descriptor, 0, descriptor.stopRequestedAt, "SIGKILL"),
+			).rejects.toMatchObject({ code: "supervisor_generation_stale" });
+			await expect(
+				supervisor.deleteWorkerDescriptor(worker, descriptor, 0, descriptor.stopRequestedAt),
+			).rejects.toMatchObject({ code: "supervisor_generation_stale" });
+			await expect(
+				supervisor.finalizeArchivedWorkerStop(worker, descriptor, 0, descriptor.stopRequestedAt),
+			).rejects.toMatchObject({ code: "supervisor_generation_stale" });
+			expect(signalSpy).not.toHaveBeenCalled();
+			expect(archive).not.toHaveBeenCalled();
+			expect(existsSync(descriptorPath)).toBe(true); // retained tombstone/retry record
+
+			// A successor with durable ownership may safely complete the exact same tuple.
+			supervisor.assertCurrentOwnership.mockResolvedValue(undefined);
+			await expect(
+				supervisor.signalCurrentWorker(worker, descriptor, 0, descriptor.stopRequestedAt, "SIGKILL"),
+			).resolves.toBe(true);
+			await supervisor.finalizeArchivedWorkerStop(worker, descriptor, 0, descriptor.stopRequestedAt);
+			await supervisor.deleteWorkerDescriptor(worker, descriptor, 0, descriptor.stopRequestedAt);
+			expect(signalSpy).toHaveBeenCalledWith(process.pid, "SIGKILL");
+			expect(archive).toHaveBeenCalledWith(descriptor.sessionFile, descriptor.rootSessionId);
+			expect(existsSync(descriptorPath)).toBe(false);
+		} finally {
+			signalSpy.mockRestore();
+			aliveSpy.mockRestore();
+			startIdSpy.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 });
