@@ -38,7 +38,12 @@ export const MAX_ARTIFACT_BYTES_PER_CHILD_SESSION = 2 * 1024 * 1024 * 1024;
 export const MAX_STREAM_CHUNK_BYTES = 64 * 1024;
 export const DEFAULT_CHILD_RESULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// C04 generates result, handle, assignment, operation, and delivery identifiers with
+// randomUUID (v4). SessionManager is the sole exception: its session filenames
+// are keyed by UUIDv7. Keep those validation domains separate so accepting a
+// real child session ID cannot accidentally widen any opaque authority ID.
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const statuses = new Set(["completed", "failed", "cancelled", "timed_out", "stalled", "unknown_after_crash"]);
 const kinds = new Set(["terminal_output", "diagnostic", "trajectory", "attachment"]);
@@ -177,6 +182,10 @@ export async function createOrGetTerminalChildResult(
 	const now = input.now?.() ?? new Date();
 	if (!Number.isFinite(now.getTime())) throw new Error("C04 time is invalid");
 	const candidate = validateCandidate(input.candidate);
+	const artifactInputs = candidateArtifactInputs(candidate);
+	// The diagnostic is an artifact too. Validate the combined count before any
+	// object is published so a rejected candidate cannot consume quota.
+	if (artifactInputs.length > MAX_ARTIFACTS_PER_RESULT) throw new Error("artifact count exceeds C04 limit");
 	const indexPath = safePath(root, "operation-index", `${owner.operationId}.json`);
 	const existing = readIndex(indexPath);
 	// A committed operation is immutable.  We do not touch a retry stream until its
@@ -192,13 +201,11 @@ export async function createOrGetTerminalChildResult(
 	const release = reserveOperationAndQuota(root, owner, indexPath);
 	const resultId = randomUuid();
 	const artifacts: C04OpaqueArtifactReference[] = [];
+	const publishedHandleIndexes: string[] = [];
+	let resultPublished = false;
 	let reservedBytes = aggregateBytes(root, owner);
 	try {
-		for (const artifact of [
-			...(candidate.artifacts ?? []),
-			...(candidate.error?.diagnostic ? [candidate.error.diagnostic] : []),
-		]) {
-			if (artifacts.length >= MAX_ARTIFACTS_PER_RESULT) throw new Error("artifact count exceeds C04 limit");
+		for (const artifact of artifactInputs) {
 			const written = await writeArtifact(root, owner, resultId, artifact, reservedBytes);
 			reservedBytes += written.byteLength;
 			artifacts.push(written);
@@ -241,22 +248,36 @@ export async function createOrGetTerminalChildResult(
 			requestDigest,
 		};
 		assertStored(stored);
+		// readStored rejects files over this cap. Check the complete durable record,
+		// rather than only its public projection, before publishing anything.
+		assertStoredJsonSize(stored);
 		// Initial result publication is immutable: a final name is never rename-overwritten.
 		atomicExclusiveJson(safePath(root, "results", `${resultId}.json`), stored);
-		for (const artifact of artifacts)
+		resultPublished = true;
+		for (const artifact of artifacts) {
 			atomicExclusiveJson(safePath(root, "handle-index", `${artifact.handleId}.json`), {
 				version: 1,
 				resultId,
 				owner,
 				handleId: artifact.handleId,
 			});
+			publishedHandleIndexes.push(artifact.handleId);
+		}
 		const index = { version: 1, resultId, owner, requestDigest };
 		try {
 			atomicExclusiveJson(indexPath, index);
 		} catch (error) {
 			const raced = readIndex(indexPath);
-			if (raced && sameOwner(raced.owner, owner) && raced.requestDigest === requestDigest)
+			if (raced && sameOwner(raced.owner, owner) && raced.requestDigest === requestDigest) {
+				// Another process won the immutable operation index. This writer's
+				// independently published result is not authoritative: remove every
+				// object/index it created before returning the winner.
+				for (const handleId of publishedHandleIndexes)
+					safeUnlink(safePath(root, "handle-index", `${handleId}.json`));
+				if (resultPublished) safeUnlink(safePath(root, "results", `${resultId}.json`));
+				for (const artifact of artifacts) safeUnlink(safePath(root, "objects", `${artifact.handleId}.blob`));
 				return projection(readStored(root, raced.resultId));
+			}
 			appendAudit(root, "uncertain", "immutable_conflict", owner.operationId);
 			throw error;
 		}
@@ -264,6 +285,12 @@ export async function createOrGetTerminalChildResult(
 		appendAudit(root, "linked", "operation_indexed", resultId);
 		return projection(stored);
 	} catch (error) {
+		// A terminal record is all-or-nothing. A failed result/index/handle commit
+		// must not strand published blobs that would evade future aggregate quota.
+		for (const handleId of publishedHandleIndexes)
+			safeUnlink(safePath(root, "handle-index", `${handleId}.json`));
+		if (resultPublished) safeUnlink(safePath(root, "results", `${resultId}.json`));
+		for (const artifact of artifacts) safeUnlink(safePath(root, "objects", `${artifact.handleId}.blob`));
 		if (!(error instanceof Error && error.message === "C04 immutable operation conflict"))
 			appendAudit(root, "uncertain", "storage_failed", owner.operationId);
 		throw error;
@@ -397,11 +424,18 @@ export function recordChildResultDisposition(
 				: artifact,
 		);
 		if (canonicalJson(changed) !== canonicalJson(result.artifacts)) {
+			// A handle-specific delete preserves the result and every other retained
+			// handle. The result itself becomes unavailable only when a whole-result
+			// disposition is requested or its last retained artifact is removed.
+			const retentionState =
+				input.handleId && changed.some((artifact) => artifact.retentionState === "retained")
+					? "retained"
+					: input.disposition;
 			// State and audit are durable before bytes become unreachable.
 			atomicJson(safePath(root, "results", `${result.resultId}.json`), {
 				...result,
 				artifacts: changed,
-				retentionState: input.disposition,
+				retentionState,
 			});
 			appendAudit(root, input.disposition, input.disposition, input.handleId ?? input.resultId);
 			for (const artifact of changed)
@@ -453,8 +487,12 @@ function validateOwner(value: C04ChildResultOwner): C04ChildResultOwner {
 		])
 	)
 		throw new Error("invalid C04 owner");
-	for (const key of ["parentSessionId", "childSessionId", "assignmentId", "operationId", "deliveryId"] as const)
-		if (!isUuid(value[key])) throw new Error(`invalid C04 owner ${key}`);
+	// SessionManager persists UUIDv7 session files. The parent and child session
+	// identifiers therefore use v7; C04-issued correlation identifiers remain v4.
+	for (const key of ["parentSessionId", "childSessionId"] as const)
+		if (!isUuidV7(value[key])) throw new Error(`invalid C04 owner ${key}`);
+	for (const key of ["assignmentId", "operationId", "deliveryId"] as const)
+		if (!isUuidV4(value[key])) throw new Error(`invalid C04 owner ${key}`);
 	if (
 		typeof value.childSessionFile !== "string" ||
 		!value.childSessionFile ||
@@ -495,7 +533,7 @@ function validateCandidate(
 		throw new Error("invalid C04 facts");
 	const normalizedFacts = facts.map((f) => ({
 		claim: safeText(f.claim, 1024, 4096, "fact"),
-		...(typeof f.evidenceRef === "string" && isUuid(f.evidenceRef) ? { evidenceRef: f.evidenceRef } : {}),
+		...(typeof f.evidenceRef === "string" && isUuidV4(f.evidenceRef) ? { evidenceRef: f.evidenceRef } : {}),
 	}));
 	const nextActions = Array.isArray(value.nextActions) ? value.nextActions : [];
 	if (nextActions.length > MAX_NEXT_ACTIONS) throw new Error("too many next actions");
@@ -580,6 +618,19 @@ function validateArtifact(value: unknown): C04ArtifactInput {
 		throw new Error("invalid C04 artifact: payload must be an AsyncIterable<Uint8Array>");
 	return value as C04ArtifactInput;
 }
+function candidateArtifactInputs(
+	candidate: ReturnType<typeof validateCandidate>,
+): C04ArtifactInput[] {
+	return [
+		...(candidate.artifacts ?? []),
+		...(candidate.error?.diagnostic ? [candidate.error.diagnostic] : []),
+	];
+}
+function assertStoredJsonSize(value: StoredChildResult): void {
+	if (Buffer.byteLength(canonicalJson(value)) > MAX_CHILD_RESULT_JSON_BYTES)
+		throw new Error("C04 result record too large");
+}
+
 async function writeArtifact(
 	root: string,
 	owner: C04ChildResultOwner,
@@ -643,8 +694,7 @@ function aggregateBytes(root: string, owner: C04ChildResultOwner): number {
 			if (
 				r.owner.parentSessionId === owner.parentSessionId &&
 				r.owner.childSessionId === owner.childSessionId &&
-				r.owner.childSessionFile === owner.childSessionFile &&
-				r.owner.assignmentId === owner.assignmentId
+				r.owner.childSessionFile === owner.childSessionFile
 			)
 				total += r.artifacts.reduce((n, a) => n + (a.retentionState === "retained" ? a.byteLength : 0), 0);
 		} catch {
@@ -657,13 +707,13 @@ const operationReservations = new Set<string>();
 /** Reservation ownership is a nonce-bound fact. A losing writer never unlinks
  * a name it did not create, including during the create-one/create-two cut. */
 function reserveOperationAndQuota(root: string, owner: C04ChildResultOwner, indexPath: string): () => void {
-	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}:${owner.assignmentId}`;
+	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}:${owner.childSessionFile}`;
 	if (operationReservations.has(key)) throw immutableConflict(root, owner.operationId);
 	const reservation = safePath(root, "operation-index", `.${owner.operationId}.reserve`);
 	const quotaReservation = safePath(
 		root,
 		"operation-index",
-		`.quota.${owner.childSessionId}.${owner.assignmentId}.reserve`,
+		`.quota.${owner.parentSessionId}.${owner.childSessionId}.reserve`,
 	);
 	const nonce = randomUuid();
 	const token = canonicalJson({ version: 1, owner, indexPath, nonce });
@@ -783,7 +833,7 @@ function safePath(root: string, directory: string, name?: string): string {
 	return target;
 }
 function readStored(root: string, resultId: string): StoredChildResult {
-	if (!isUuid(resultId)) throw new Error("invalid result ID");
+	if (!isUuidV4(resultId)) throw new Error("invalid result ID");
 	const path = safePath(root, "results", `${resultId}.json`);
 	const stat = lstatSync(path);
 	if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_CHILD_RESULT_JSON_BYTES)
@@ -803,7 +853,7 @@ function readIndex(
 			!isObject(x) ||
 			!exactKeys(x, ["version", "resultId", "owner", "requestDigest"]) ||
 			x.version !== 1 ||
-			!isUuid(x.resultId) ||
+			!isUuidV4(x.resultId) ||
 			!SHA256.test(x.requestDigest)
 		)
 			return undefined;
@@ -821,7 +871,7 @@ function readHandleIndex(
 	root: string,
 	handleId: string,
 ): { resultId: string; owner: C04ChildResultOwner; handleId: string } {
-	if (!isUuid(handleId)) throw new Error("invalid handle");
+	if (!isUuidV4(handleId)) throw new Error("invalid handle");
 	const path = safePath(root, "handle-index", `${handleId}.json`);
 	const st = lstatSync(path);
 	if (!st.isFile() || st.isSymbolicLink() || st.size > 4096) throw new Error("not found");
@@ -831,7 +881,7 @@ function readHandleIndex(
 		!exactKeys(index, ["version", "resultId", "owner", "handleId"]) ||
 		index.version !== 1 ||
 		index.handleId !== handleId ||
-		!isUuid(index.resultId)
+		!isUuidV4(index.resultId)
 	)
 		throw new Error("not found");
 	return { resultId: index.resultId, owner: validateOwner(index.owner as C04ChildResultOwner), handleId };
@@ -923,7 +973,7 @@ function assertStored(value: unknown): asserts value is StoredChildResult {
 				isObject(fact) &&
 				exactKeys(fact, ["claim", ...optionalKeys(fact, ["evidenceRef"])]) &&
 				typeof fact.claim === "string" &&
-				(fact.evidenceRef === undefined || isUuid(fact.evidenceRef)),
+				(fact.evidenceRef === undefined || isUuidV4(fact.evidenceRef)),
 		) ||
 		!Array.isArray(value.nextActions) ||
 		value.nextActions.length > MAX_NEXT_ACTIONS ||
@@ -938,11 +988,9 @@ function assertStored(value: unknown): asserts value is StoredChildResult {
 		!SHA256.test(value.requestDigest)
 	)
 		throw new Error("invalid C04 result record");
-	if (
-		value.retentionState === "retained" &&
-		(value.artifacts as C04OpaqueArtifactReference[]).some((a) => a.retentionState !== "retained")
-	)
-		throw new Error("C04 retention consistency mismatch");
+	// A live result may have some explicitly deleted handles while retaining
+	// others. A non-retained result, however, must never advertise a readable
+	// artifact. This is the atomic retention boundary for partial deletion.
 	if (
 		value.retentionState !== "retained" &&
 		(value.artifacts as C04OpaqueArtifactReference[]).some((a) => a.retentionState === "retained")
@@ -964,7 +1012,7 @@ function assertReference(value: unknown): asserts value is C04ChildResultReferen
 			"retentionState",
 			...optionalKeys(value, ["error"]),
 		]) ||
-		!isUuid(value.resultId) ||
+		!isUuidV4(value.resultId) ||
 		!statuses.has(value.status) ||
 		!retentionStates.has(value.retentionState)
 	)
@@ -985,7 +1033,7 @@ function assertReference(value: unknown): asserts value is C04ChildResultReferen
 		if (!exactKeys(value.error, ["code", "message", ...optionalKeys(value.error, ["diagnosticRef"])]))
 			throw new Error("invalid error");
 		safeText(value.error.message, 1024, 4096, "error");
-		if (value.error.diagnosticRef !== undefined && !isUuid(value.error.diagnosticRef))
+		if (value.error.diagnosticRef !== undefined && !isUuidV4(value.error.diagnosticRef))
 			throw new Error("invalid diagnostic reference");
 	}
 	if (Buffer.byteLength(canonicalJson(value)) > MAX_CHILD_RESULT_JSON_BYTES)
@@ -1007,7 +1055,7 @@ function assertArtifactRef(value: unknown, resultId: string): asserts value is C
 			"retentionState",
 		]) ||
 		value.version !== 1 ||
-		!isUuid(value.handleId) ||
+		!isUuidV4(value.handleId) ||
 		value.resultId !== resultId ||
 		!kinds.has(value.kind) ||
 		!contentTypes.has(value.contentType) ||
@@ -1016,8 +1064,8 @@ function assertArtifactRef(value: unknown, resultId: string): asserts value is C
 		value.byteLength > MAX_ARTIFACT_BYTES ||
 		typeof value.sha256 !== "string" ||
 		!SHA256.test(value.sha256) ||
-		!isUuid(value.creatorAssignmentId) ||
-		!isUuid(value.ownerSessionId) ||
+		!isUuidV4(value.creatorAssignmentId) ||
+		!isUuidV7(value.ownerSessionId) ||
 		!retentionStates.has(value.retentionState)
 	)
 		throw new Error("invalid C04 artifact reference");
@@ -1028,8 +1076,10 @@ function publishExclusive(temp: string, path: string): void {
 	// FD; a collision can never overwrite an immutable object name.
 	const source = openSyncNoFollow(temp, "r");
 	let destination: number | undefined;
+	let created = false;
 	try {
 		destination = openSyncNoFollow(path, "wx", 0o600);
+		created = true;
 		const buffer = Buffer.allocUnsafe(MAX_STREAM_CHUNK_BYTES);
 		for (;;) {
 			const count = readSync(source, buffer, 0, buffer.length, null);
@@ -1037,11 +1087,16 @@ function publishExclusive(temp: string, path: string): void {
 			writeAll(destination, buffer.subarray(0, count));
 		}
 		fsyncSync(destination);
+	} catch (error) {
+		// Only remove a name this invocation won exclusively. A collision is never
+		// ours to remove, while an interrupted copy must not leave an orphan blob.
+		if (created) safeUnlink(path);
+		throw error;
 	} finally {
 		closeSync(source);
 		if (destination !== undefined) closeSync(destination);
+		safeUnlink(temp);
 	}
-	safeUnlink(temp);
 }
 function atomicJson(path: string, value: unknown): void {
 	const temp = `${path}.${randomUuid()}.tmp`;
@@ -1061,14 +1116,24 @@ function atomicJson(path: string, value: unknown): void {
 	}
 }
 function atomicExclusiveJson(path: string, value: unknown): void {
-	const fd = openSyncNoFollow(path, "wx", 0o600);
+	let created = false;
+	let fd: number | undefined;
 	try {
+		fd = openSyncNoFollow(path, "wx", 0o600);
+		created = true;
 		writeAll(fd, Buffer.from(canonicalJson(value)));
 		fsyncSync(fd);
-	} finally {
 		closeSync(fd);
+		fd = undefined;
+		fsyncDirectory(dirname(path));
+	} catch (error) {
+		if (fd !== undefined) closeSync(fd);
+		// An exclusive open proves this invocation owns a partially committed name.
+		// Remove it on every failed write/fsync so retries cannot find a corrupt
+		// result, handle index, or operation index.
+		if (created) safeUnlink(path);
+		throw error;
 	}
-	fsyncDirectory(dirname(path));
 }
 function appendAudit(root: string, action: AuditAction, reason: string, id: string): void {
 	try {
@@ -1183,8 +1248,11 @@ function sha256(value: string): string {
 function randomUuid(): string {
 	return randomUUID();
 }
-function isUuid(value: unknown): value is string {
-	return typeof value === "string" && UUID.test(value);
+function isUuidV4(value: unknown): value is string {
+	return typeof value === "string" && UUID_V4.test(value);
+}
+function isUuidV7(value: unknown): value is string {
+	return typeof value === "string" && UUID_V7.test(value);
 }
 function isObject(value: unknown): value is Record<string, any> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);

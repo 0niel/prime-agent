@@ -1,22 +1,32 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	createOrGetTerminalChildResult,
 	getChildResultProjection,
+	MAX_ARTIFACTS_PER_RESULT,
+	MAX_CHILD_RESULT_JSON_BYTES,
+	MAX_ARTIFACT_BYTES,
+	MAX_ARTIFACT_BYTES_PER_CHILD_SESSION,
 	MAX_STREAM_CHUNK_BYTES,
 	readOwnedArtifact,
 	recordChildResultDisposition,
 	resolveOwnedChildResult,
 } from "../src/core/rlm-child-results.js";
 
+// SessionManager emits UUIDv7 session IDs; the remaining C04 correlation
+// identifiers are its own opaque UUIDv4 authority IDs.
 const ids = [
-	"11111111-1111-4111-8111-111111111111",
-	"22222222-2222-4222-8222-222222222222",
+	"0196f4a0-1234-7000-8000-111111111111",
+	"0196f4a0-5678-7000-8000-222222222222",
 	"33333333-3333-4333-8333-333333333333",
 	"44444444-4444-4444-8444-444444444444",
 	"55555555-5555-4555-8555-555555555555",
+	"66666666-6666-4666-8666-666666666666",
+	"77777777-7777-4777-8777-777777777777",
+	"88888888-8888-4888-8888-888888888888",
+	"99999999-9999-4999-8999-999999999999",
 ];
 function owner(file: string) {
 	return {
@@ -217,6 +227,201 @@ describe("C04 bounded child results", () => {
 				recordChildResultDisposition(input.owner, { resultId: result.resultId, disposition: "deleted" }, artifacts),
 			).toBe(true);
 			expect(readOwnedArtifact(grant.capability, { offset: 0, length: 7 })).toBeUndefined();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts the UUIDv7 child binding emitted by SessionManager without widening C04 identifiers", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-v7-binding-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, "{}\n");
+		try {
+			const result = await createOrGetTerminalChildResult({
+				owner: owner(file),
+				childArtifactRoot: artifacts,
+				candidate: { status: "completed", summary: "v7 child", preview: "safe" },
+			});
+			expect(getChildResultProjection(owner(file), result.resultId, artifacts)).toEqual(result);
+			await expect(
+				createOrGetTerminalChildResult({
+					owner: { ...owner(file), assignmentId: ids[1] },
+					childArtifactRoot: artifacts,
+					candidate: { status: "completed", summary: "bad authority", preview: "safe" },
+				}),
+			).rejects.toThrow("assignmentId");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("caps the complete stored JSON before publishing and leaves no artifacts for a valid-field oversize record", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-json-cap-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, "{}\n");
+		try {
+			const withinCap = await createOrGetTerminalChildResult({
+				owner: owner(file),
+				childArtifactRoot: artifacts,
+				candidate: {
+					status: "completed",
+					summary: "😀".repeat(4096),
+					preview: "😀".repeat(2048),
+					facts: [{ claim: "f".repeat(4096) }],
+					nextActions: ["n".repeat(2048)],
+				},
+			});
+			const resultPath = join(artifacts, "rlm-child-results", "results", `${withinCap.resultId}.json`);
+			expect(Buffer.byteLength(readFileSync(resultPath))).toBeLessThanOrEqual(MAX_CHILD_RESULT_JSON_BYTES);
+			expect(getChildResultProjection(owner(file), withinCap.resultId, artifacts)).toEqual(withinCap);
+
+			await expect(
+				createOrGetTerminalChildResult({
+					owner: { ...owner(file), operationId: ids[5], deliveryId: ids[6] },
+					childArtifactRoot: artifacts,
+					candidate: {
+						status: "completed",
+						summary: "😀".repeat(4096),
+						preview: "😀".repeat(2048),
+						facts: Array.from({ length: 32 }, () => ({ claim: "f".repeat(4096) })),
+						nextActions: Array.from({ length: 16 }, () => "n".repeat(2048)),
+					},
+				}),
+			).rejects.toThrow("result record too large");
+			const c04 = join(artifacts, "rlm-child-results");
+			expect(readdirSync(join(c04, "objects"))).toEqual([]);
+			expect(readdirSync(join(c04, "handle-index"))).toEqual([]);
+			expect(readdirSync(join(c04, "results"))).toEqual([`${withinCap.resultId}.json`]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves a sibling artifact and a readable result after a handle-specific delete", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-partial-delete-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, "{}\n");
+		const stream = (value: string) =>
+			(async function* () {
+				yield new TextEncoder().encode(value);
+			})();
+		try {
+			const input = {
+				owner: owner(file),
+				childArtifactRoot: artifacts,
+				candidate: {
+					status: "completed" as const,
+					summary: "two objects",
+					preview: "safe",
+					artifacts: [
+						{ kind: "terminal_output" as const, contentType: "text/plain" as const, data: stream("first") },
+						{ kind: "attachment" as const, contentType: "text/plain" as const, data: stream("second") },
+					],
+				},
+			};
+			const result = await createOrGetTerminalChildResult(input);
+			expect(
+				recordChildResultDisposition(input.owner, { resultId: result.resultId, handleId: result.artifacts[0]!.handleId, disposition: "deleted" }, artifacts),
+			).toBe(true);
+			const projected = getChildResultProjection(input.owner, result.resultId, artifacts)!;
+			expect(projected.retentionState).toBe("retained");
+			expect(projected.artifacts[0]!.retentionState).toBe("deleted");
+			const retained = resolveOwnedChildResult(input.owner, result.artifacts[1]!.handleId, artifacts)!;
+			expect(new TextDecoder().decode(readOwnedArtifact(retained.capability, { offset: 0, length: 16 }))).toBe("second");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("prevalidates combined artifacts and rolls back failed publication without bypassing child-session quota", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-rollback-quota-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, "{}\n");
+		const data = (value = "x") =>
+			(async function* () {
+				yield new TextEncoder().encode(value);
+			})();
+		try {
+			const tooMany = Array.from({ length: MAX_ARTIFACTS_PER_RESULT }, () => ({
+				kind: "attachment" as const,
+				contentType: "text/plain" as const,
+				data: data(),
+			}));
+			await expect(
+				createOrGetTerminalChildResult({
+					owner: owner(file),
+					childArtifactRoot: artifacts,
+					candidate: {
+						status: "failed",
+						summary: "too many",
+						preview: "safe",
+						error: { message: "diagnostic counts too", diagnostic: { kind: "diagnostic", contentType: "text/plain", data: data() } },
+						artifacts: tooMany,
+					},
+				}),
+			).rejects.toThrow("artifact count");
+
+			const c04 = join(artifacts, "rlm-child-results");
+			mkdirSync(join(c04, "operation-index"), { recursive: true });
+			writeFileSync(join(c04, "operation-index", `${ids[3]}.json`), "not-an-index");
+			await expect(
+				createOrGetTerminalChildResult({
+					owner: owner(file),
+					childArtifactRoot: artifacts,
+					candidate: { status: "completed", summary: "commit collision", preview: "safe", artifacts: [{ kind: "attachment", contentType: "text/plain", data: data("orphan") }] },
+				}),
+			).rejects.toThrow();
+			expect(readdirSync(join(c04, "objects"))).toEqual([]);
+			expect(readdirSync(join(c04, "results"))).toEqual([]);
+			expect(readdirSync(join(c04, "handle-index"))).toEqual([]);
+
+			const quotaResultId = ids[5];
+			const quotaOwner = { ...owner(file), assignmentId: ids[6], operationId: ids[7], deliveryId: ids[8] };
+			const quotaArtifacts = Array.from({ length: 4 }, (_, index) => ({
+				version: 1,
+				handleId: [ids[3], ids[4], ids[7], ids[8]][index]!,
+				resultId: quotaResultId,
+				kind: "attachment",
+				contentType: "application/octet-stream",
+				byteLength: MAX_ARTIFACT_BYTES,
+				sha256: "0".repeat(64),
+				creatorAssignmentId: quotaOwner.assignmentId,
+				ownerSessionId: quotaOwner.childSessionId,
+				retentionState: "retained",
+			}));
+			writeFileSync(
+				join(c04, "results", `${quotaResultId}.json`),
+				JSON.stringify({
+					schemaVersion: 1, version: 1, resultId: quotaResultId, owner: quotaOwner, status: "completed", summary: "quota", preview: "safe",
+					facts: [], nextActions: [], model: { initialResolvedSelector: "unknown", terminalResolvedSelector: "unknown" }, artifacts: quotaArtifacts,
+					retentionState: "retained", committedAt: "2026-01-01T00:00:00.000Z", retention: { disposition: "retain_until", expiresAt: "2027-01-01T00:00:00.000Z" }, requestDigest: "1".repeat(64),
+				}),
+			);
+			await expect(
+				createOrGetTerminalChildResult({
+					owner: { ...owner(file), assignmentId: ids[8], operationId: ids[6], deliveryId: ids[7] },
+					childArtifactRoot: artifacts,
+					candidate: { status: "completed", summary: "new assignment", preview: "safe", artifacts: [{ kind: "attachment", contentType: "text/plain", data: data() }] },
+				}),
+			).rejects.toThrow("session artifact quota");
+			expect(MAX_ARTIFACT_BYTES * 4).toBe(MAX_ARTIFACT_BYTES_PER_CHILD_SESSION);
+			expect(readdirSync(join(c04, "objects"))).toEqual([]);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
