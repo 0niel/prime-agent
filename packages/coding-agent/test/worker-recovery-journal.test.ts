@@ -25,7 +25,18 @@ const generationB = "22222222-2222-4222-8222-222222222222";
 const operationA = "33333333-3333-4333-8333-333333333333";
 const operationB = "44444444-4444-4444-8444-444444444444";
 
-function recordingFileSystem(events: string[], failTempFsync = false): WorkerRecoveryJournalFileSystem {
+function recordingFileSystem(
+	events: string[],
+	{
+		failTempFsync = false,
+		maximumWriteLength,
+		zeroTempWrite = false,
+	}: {
+		failTempFsync?: boolean;
+		maximumWriteLength?: number;
+		zeroTempWrite?: boolean;
+	} = {},
+): WorkerRecoveryJournalFileSystem {
 	const descriptors = new Map<number, string>();
 	return {
 		mkdirSync,
@@ -39,9 +50,15 @@ function recordingFileSystem(events: string[], failTempFsync = false): WorkerRec
 			events.push(`open:${flags}:${descriptors.get(fd)}:${mode?.toString(8) ?? ""}`);
 			return fd;
 		},
-		writeSync(fd, data) {
+		writeSync(fd, data, offset, length) {
 			events.push(`write:${descriptors.get(fd)}`);
-			return writeSync(fd, data);
+			if (zeroTempWrite && descriptors.get(fd) === "temp") return 0;
+			return writeSync(
+				fd,
+				data,
+				offset,
+				maximumWriteLength === undefined ? length : Math.min(length, maximumWriteLength),
+			);
 		},
 		fsyncSync(fd) {
 			events.push(`fsync:${descriptors.get(fd)}`);
@@ -208,7 +225,6 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 			"fsync:journal",
 			"close:journal",
 			"open:wx:temp:600",
-			"write:temp",
 			"fsync:temp",
 			"close:temp",
 			"rename",
@@ -223,7 +239,7 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 		const tempPath = `${file}.fixed.tmp`;
 		const events: string[] = [];
 		const journal = new WorkerRecoveryJournal(file, {
-			fileSystem: recordingFileSystem(events, true),
+			fileSystem: recordingFileSystem(events, { failTempFsync: true }),
 			makeTempPath: () => tempPath,
 		});
 		journal.record({ ...base, busy: true });
@@ -237,6 +253,44 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 		);
 		// The failed compaction also keeps the live instance conservative.
 		expect(journal.getLatest()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ busy: true, operationId: operationB })]),
+		);
+	});
+	it("writes every byte when the filesystem reports partial writes", () => {
+		const file = path();
+		const events: string[] = [];
+		const journal = new WorkerRecoveryJournal(file, {
+			fileSystem: recordingFileSystem(events, { maximumWriteLength: 1 }),
+			makeTempPath: (journalPath) => `${journalPath}.partial.tmp`,
+		});
+		journal.record({ ...base, busy: true, operationId: operationA });
+		journal.record({ ...base, busy: true, operationId: operationB, sessionFile: "é".repeat(4096) });
+		journal.record({ ...base, busy: false, operationId: operationA });
+		expect(events.filter((event) => event === "write:temp")).toHaveLength(
+			Buffer.byteLength(readFileSync(file, "utf8")),
+		);
+		expect(WorkerRecoveryJournal.readLatest(file)).toEqual([
+			expect.objectContaining({ busy: true, operationId: operationB }),
+		]);
+	});
+
+	it("fails before replacement when a write makes zero progress", () => {
+		const file = path();
+		const tempPath = `${file}.zero.tmp`;
+		const events: string[] = [];
+		const journal = new WorkerRecoveryJournal(file, {
+			fileSystem: recordingFileSystem(events, { zeroTempWrite: true }),
+			makeTempPath: () => tempPath,
+		});
+		journal.record({ ...base, busy: true, operationId: operationA });
+		journal.record({ ...base, busy: true, operationId: operationB });
+		expect(() => journal.record({ ...base, busy: false, operationId: operationA })).toThrow(
+			"Recovery journal write made no forward progress",
+		);
+		expect(events).toContain("unlink");
+		expect(events).not.toContain("rename");
+		expect(() => readFileSync(tempPath, "utf8")).toThrow();
+		expect(WorkerRecoveryJournal.readLatest(file)).toEqual(
 			expect.arrayContaining([expect.objectContaining({ busy: true, operationId: operationB })]),
 		);
 	});

@@ -87,7 +87,7 @@ export interface WorkerRecoveryJournalFileSystem {
 	mkdirSync(path: string, options: { recursive: true; mode: number }): string | undefined;
 	readFileSync(path: string, encoding: "utf8"): string;
 	openSync(path: string, flags: string, mode?: number): number;
-	writeSync(fd: number, data: string): number;
+	writeSync(fd: number, data: Uint8Array, offset: number, length: number): number;
 	fsyncSync(fd: number): void;
 	closeSync(fd: number): void;
 	chmodSync(path: string, mode: number): void;
@@ -268,7 +268,7 @@ export class WorkerRecoveryJournal {
 	private append(record: WorkerRecoveryRecord): void {
 		const fd = this.fileSystem.openSync(this.path, "a", 0o600);
 		try {
-			this.fileSystem.writeSync(fd, `${JSON.stringify(record)}\n`);
+			this.writeAll(fd, `${JSON.stringify(record)}\n`);
 			this.fileSystem.fsyncSync(fd);
 		} finally {
 			this.fileSystem.closeSync(fd);
@@ -297,7 +297,7 @@ export class WorkerRecoveryJournal {
 			// Exclusive creation makes cleanup safe: this invocation owns this temp file.
 			tempFd = this.fileSystem.openSync(tempPath, "wx", 0o600);
 			this.fileSystem.chmodSync(tempPath, 0o600);
-			this.fileSystem.writeSync(tempFd, contents);
+			this.writeAll(tempFd, contents);
 			this.fileSystem.fsyncSync(tempFd);
 			this.fileSystem.closeSync(tempFd);
 			tempFd = undefined;
@@ -320,6 +320,16 @@ export class WorkerRecoveryJournal {
 				}
 			}
 			throw error;
+		}
+	}
+
+	private writeAll(fd: number, contents: string): void {
+		const bytes = Buffer.from(contents);
+		for (let offset = 0; offset < bytes.length; ) {
+			const written = this.fileSystem.writeSync(fd, bytes, offset, bytes.length - offset);
+			if (!Number.isSafeInteger(written) || written <= 0 || written > bytes.length - offset)
+				throw new Error("Recovery journal write made no forward progress");
+			offset += written;
 		}
 	}
 
