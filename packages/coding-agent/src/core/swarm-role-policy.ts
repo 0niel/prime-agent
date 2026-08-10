@@ -115,7 +115,13 @@ function exactSelector(value: unknown): string {
 	if (typeof value !== "string") fail("model profile model must be a string");
 	const selector = value.trim();
 	const slash = selector.indexOf("/");
-	if (!selector || slash <= 0 || slash !== selector.lastIndexOf("/") || slash === selector.length - 1 || /\s/.test(selector))
+	if (
+		!selector ||
+		slash <= 0 ||
+		slash !== selector.lastIndexOf("/") ||
+		slash === selector.length - 1 ||
+		/\s/.test(selector)
+	)
 		fail("model profile model must be an exact provider/model selector");
 	return selector;
 }
