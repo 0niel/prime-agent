@@ -430,6 +430,7 @@ describe("daemon supervisor resident workers", () => {
 			lifecycle: "resident",
 			launchEnv: {
 				PRIME_AGENT_TRACES_BASE_URL: launchEnvSentinel,
+				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
 				PRIME_AGENT_TEST_CREDENTIAL: "must-not-be-persisted",
 				OPENAI_API_KEY: "must-not-be-persisted",
 				AWS_SECRET_ACCESS_KEY: "must-not-be-persisted",
@@ -449,7 +450,10 @@ describe("daemon supervisor resident workers", () => {
 		);
 		const descriptor = readWorkerDescriptor(agentDir);
 		// The endpoint survives restart, but credentials never enter the descriptor.
-		expect(descriptor.launchEnv).toEqual({ PRIME_AGENT_TRACES_BASE_URL: launchEnvSentinel });
+		expect(descriptor.launchEnv).toEqual({
+			PRIME_AGENT_TRACES_BASE_URL: launchEnvSentinel,
+			TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+		});
 		expect(JSON.stringify(descriptor)).not.toContain("must-not-be-persisted");
 		expect(JSON.stringify(descriptor)).not.toContain("AWS_SECRET_ACCESS_KEY");
 		expect(JSON.stringify(descriptor)).not.toContain("GH_TOKEN");
