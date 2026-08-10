@@ -22,6 +22,8 @@ const WORKER = new URL("./rss-campaign-worker.ts", import.meta.url);
 const DEFAULT_TIMEOUT_MS = 60_000;
 const REAP_GRACE_MS = 250;
 const REAP_VERIFY_MS = 1_000;
+const SCAN_ATTEMPTS = 3;
+const SCAN_RETRY_DELAY_MS = 2;
 const SCHEMA_VERSION = 2;
 
 type SupportedPlatform = "linux";
@@ -100,6 +102,8 @@ interface Config {
 	testIgnoreTerm: boolean;
 	// Test-only deterministic final-observation fault injection.
 	testFailFinalScan: boolean;
+	// Test-only one-shot final-observation fault injection for retry coverage.
+	testFailFinalScanOnce: boolean;
 }
 
 interface GroupOwnership {
@@ -152,6 +156,7 @@ function config(): Config {
 		identityCaptureDelayMs: safeInteger("--test-identity-capture-delay-ms", 0, 0),
 		testIgnoreTerm: process.argv.includes("--test-ignore-term"),
 		testFailFinalScan: process.argv.includes("--test-fail-final-scan"),
+		testFailFinalScanOnce: process.argv.includes("--test-fail-final-scan-once"),
 	};
 }
 
@@ -281,6 +286,23 @@ async function groupSnapshot(pgid: number, injectFailure = false): Promise<Group
 	return sorted.length === 0 ? { kind: "empty" } : { kind: "records", records: sorted };
 }
 
+/**
+ * A /proc scan is only accepted when it completes coherently. Short-lived
+ * procfs read/parse races are retried, but a retry never turns an unavailable
+ * scan into an empty one without a later positive complete scan.
+ */
+async function groupSnapshotWithRetries(
+	pgid: number,
+	shouldInjectFailure: (attempt: number) => boolean = () => false,
+): Promise<GroupSnapshot> {
+	for (let attempt = 0; attempt < SCAN_ATTEMPTS; attempt += 1) {
+		const snapshot = await groupSnapshot(pgid, shouldInjectFailure(attempt));
+		if (snapshot.kind !== "unavailable") return snapshot;
+		if (attempt + 1 < SCAN_ATTEMPTS) await pause(SCAN_RETRY_DELAY_MS);
+	}
+	return { kind: "unavailable" };
+}
+
 async function collectorAvailable(): Promise<boolean> {
 	const own = await procRecord(process.pid);
 	return own !== undefined && own.rssKiB >= 0 && Number.isSafeInteger(own.start) && Number.isSafeInteger(own.pgid);
@@ -323,7 +345,7 @@ async function reapOwnGroup(ownership?: GroupOwnership): Promise<ReapResult> {
 	if (!ownership) return { reaped: true, collectionFailed: false };
 	let collectionFailed = false;
 	const signalOwnedGroup = async (signal: NodeJS.Signals): Promise<boolean> => {
-		const snapshot = await groupSnapshot(ownership.pgid);
+		const snapshot = await groupSnapshotWithRetries(ownership.pgid);
 		const records = snapshotRecords(snapshot);
 		if (!records) {
 			collectionFailed = true;
@@ -342,19 +364,23 @@ async function reapOwnGroup(ownership?: GroupOwnership): Promise<ReapResult> {
 	};
 	if (!(await signalOwnedGroup("SIGTERM"))) return { reaped: false, collectionFailed };
 	await pause(REAP_GRACE_MS);
-	let snapshot = await groupSnapshot(ownership.pgid);
+	let snapshot = await groupSnapshotWithRetries(ownership.pgid);
 	let records = snapshotRecords(snapshot);
 	if (!records) return { reaped: false, collectionFailed: true };
 	if (records.length === 0) return { reaped: true, collectionFailed };
 	if (!(await signalOwnedGroup("SIGKILL"))) return { reaped: false, collectionFailed };
 	const deadline = monotonicMs() + REAP_VERIFY_MS;
-	do {
+	for (;;) {
 		await pause(10);
-		snapshot = await groupSnapshot(ownership.pgid);
+		snapshot = await groupSnapshotWithRetries(ownership.pgid);
 		records = snapshotRecords(snapshot);
-		if (!records) return { reaped: false, collectionFailed: true };
-	} while (records.length > 0 && monotonicMs() < deadline);
-	return { reaped: records.length === 0, collectionFailed };
+		if (records?.length === 0) return { reaped: true, collectionFailed };
+		if (records === undefined) collectionFailed = true;
+		// After SIGKILL, a short /proc outage need not decide the result. Keep
+		// checking through the existing verification deadline, but only a later
+		// complete empty scan can establish a successful reap/final zero.
+		if (monotonicMs() >= deadline) return { reaped: false, collectionFailed };
+	}
 }
 
 function workerArguments(settings: Config, fanout: number, scratch: string): string[] {
@@ -514,7 +540,10 @@ async function runCell(
 			}
 
 			const reap = await reapOwnGroup(ownership);
-			const finalSnapshot = await groupSnapshot(ownership.pgid, settings.testFailFinalScan);
+			const finalSnapshot = await groupSnapshotWithRetries(
+				ownership.pgid,
+				(attempt) => settings.testFailFinalScan || (settings.testFailFinalScanOnce && attempt === 0),
+			);
 			const finalRecords = snapshotRecords(finalSnapshot);
 			const finalCollectionFailed = finalRecords === undefined;
 			if (finalRecords) samples.push(sample("final", finalRecords));

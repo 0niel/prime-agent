@@ -125,6 +125,22 @@ describe("B00B RSS campaign", () => {
 	);
 
 	it.skipIf(process.platform !== "linux")(
+		"retries one unavailable final scan and still requires a positive empty final snapshot",
+		async () => {
+			const output = join(await directory("final-scan-retry"), "output");
+			await campaign(output, ["--fanout", "1", "--repetitions", "1", "--test-fail-final-scan-once"]);
+			const result = await run(output, 1, 1);
+			expect(result.status).toBe("complete");
+			expect(result.reasonCode).toBeNull();
+			expect(result.finalRssKiB).toBe(0);
+			expect((result.samples as { phase: string; totalRssKiB: number }[]).at(-1)).toMatchObject({
+				phase: "final",
+				totalRssKiB: 0,
+			});
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")(
 		"does not arm timeout or release descendants before exact ownership capture",
 		async () => {
 			const root = await directory("delayed-ownership");
