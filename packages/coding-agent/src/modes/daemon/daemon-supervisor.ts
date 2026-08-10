@@ -1825,6 +1825,7 @@ export class DaemonSupervisor {
 					assertAgentFamilyReach(
 						this.familyCatalogEntry(source.summary),
 						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
+						await this.familyCatalogEntries(),
 					);
 				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
@@ -1840,7 +1841,11 @@ export class DaemonSupervisor {
 			}
 			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
 			if (source && command.agentOrigin === true) {
-				assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
+				assertAgentFamilyReach(
+					this.familyCatalogEntry(source.summary),
+					this.familyCatalogEntry(target.summary),
+					await this.familyCatalogEntries(),
+				);
 			}
 			if (source) {
 				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {

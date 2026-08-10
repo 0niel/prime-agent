@@ -2883,7 +2883,11 @@ export class AgentDaemon {
 		for (const passive of await this.listPassiveRlmSubagents()) {
 			if (residentIds.has(passive.info.id)) continue;
 			try {
-				assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.passiveAgentFamilyEntry(passive));
+				assertAgentFamilyReach(
+					this.agentFamilyEntry(currentState),
+					this.passiveAgentFamilyEntry(passive),
+					this.agentFamilyCatalogEntries(),
+				);
 			} catch (error) {
 				if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) continue;
 				throw error;
@@ -5256,6 +5260,10 @@ export class AgentDaemon {
 		};
 	}
 
+	private agentFamilyCatalogEntries(): AgentFamilyCatalogEntry[] {
+		return [...this.sessions.values()].map((state) => this.agentFamilyEntry(state));
+	}
+
 	private passiveAgentFamilyEntry(passive: PassiveRlmSubagent): AgentFamilyCatalogEntry {
 		const entry = passive.entry;
 		const depth = passive.info.rlmDepth ?? entry.rlmDepth ?? passive.chain.length;
@@ -5296,7 +5304,11 @@ export class AgentDaemon {
 		}
 		const passive = await this.findPassiveRlmSubagent(target);
 		if (!passive) return this.getOrHydrateBoundSessionState(target);
-		assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.passiveAgentFamilyEntry(passive));
+		assertAgentFamilyReach(
+			this.agentFamilyEntry(currentState),
+			this.passiveAgentFamilyEntry(passive),
+			this.agentFamilyCatalogEntries(),
+		);
 		return this.hydratePassiveRlmSubagent(passive);
 	}
 
@@ -5324,7 +5336,11 @@ export class AgentDaemon {
 
 	private isAgentFamilyReachable(currentState: ActiveSessionState, targetState: ActiveSessionState): boolean {
 		try {
-			assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.agentFamilyEntry(targetState));
+			assertAgentFamilyReach(
+				this.agentFamilyEntry(currentState),
+				this.agentFamilyEntry(targetState),
+				this.agentFamilyCatalogEntries(),
+			);
 			return true;
 		} catch (error) {
 			if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) return false;
@@ -5334,7 +5350,11 @@ export class AgentDaemon {
 
 	private assertAgentFamilyReachable(currentState: ActiveSessionState, targetState: ActiveSessionState): void {
 		if (currentState.activeSessionId === targetState.activeSessionId) return;
-		assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.agentFamilyEntry(targetState));
+		assertAgentFamilyReach(
+			this.agentFamilyEntry(currentState),
+			this.agentFamilyEntry(targetState),
+			this.agentFamilyCatalogEntries(),
+		);
 	}
 
 	private agentMessageRelationship(
@@ -5342,7 +5362,11 @@ export class AgentDaemon {
 		targetState: ActiveSessionState,
 	): AgentFamilyRelationship | undefined {
 		if (!fromState) return undefined;
-		return agentFamilyRelationship(this.agentFamilyEntry(targetState), this.agentFamilyEntry(fromState));
+		return agentFamilyRelationship(
+			this.agentFamilyEntry(targetState),
+			this.agentFamilyEntry(fromState),
+			this.agentFamilyCatalogEntries(),
+		);
 	}
 
 	private async sendAgentSessionMessage(options: {
@@ -5380,6 +5404,7 @@ export class AgentDaemon {
 							assertAgentFamilyReach(
 								this.agentFamilyEntry(options.fromState),
 								this.passiveAgentFamilyEntry(passiveSubagent),
+								this.agentFamilyCatalogEntries(),
 							);
 						}
 						targetState = await this.hydratePassiveRlmSubagent(passiveSubagent);

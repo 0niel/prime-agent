@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+	AGENT_FAMILY_REACH_ERROR,
 	AGENT_MESSAGE_SOURCE,
 	AgentSessionMessageRateLimiter,
 	assertAgentFamilyReach,
@@ -261,7 +262,7 @@ describe("agent session bus", () => {
 		});
 	});
 
-	it("authorizes exactly one persisted nuclear-family edge", () => {
+	it("authorizes only structurally verified nuclear-family edges", () => {
 		const root = { id: "root", depth: 0, status: "running" as const, sessionPath: "/root" };
 		const otherRoot = { id: "other-root", depth: 0, status: "running" as const, sessionPath: "/other" };
 		const child = {
@@ -299,6 +300,46 @@ describe("agent session bus", () => {
 			parentSessionId: "root",
 			parentSessionPath: "/root",
 		};
+		const malformedRoot = {
+			id: "malformed-root",
+			depth: 0,
+			status: "idle" as const,
+			parentSessionId: "root",
+			parentSessionPath: "/root",
+		};
+		const contradictoryChild = {
+			id: "contradictory-child",
+			depth: 1,
+			status: "idle" as const,
+			parentSessionId: "root",
+			parentSessionPath: "/other",
+		};
+		const malformedSiblingA = {
+			id: "malformed-sibling-a",
+			depth: 2,
+			status: "idle" as const,
+			parentSessionId: "root",
+			parentSessionPath: "/root",
+		};
+		const malformedSiblingB = {
+			id: "malformed-sibling-b",
+			depth: 2,
+			status: "idle" as const,
+			parentSessionId: "root",
+			parentSessionPath: "/root",
+		};
+		const catalog = [
+			root,
+			child,
+			sibling,
+			idOnlySibling,
+			grandchild,
+			depthSkippingDescendant,
+			malformedRoot,
+			contradictoryChild,
+			malformedSiblingA,
+			malformedSiblingB,
+		];
 
 		expect(assertAgentFamilyReach(root, otherRoot)).toBe("sibling");
 		expect(() => assertAgentFamilyReach(root, { id: "orphan", depth: 3, status: "inactive" })).toThrow(
@@ -310,19 +351,64 @@ describe("agent session bus", () => {
 				{ id: "orphan-b", depth: 3, status: "inactive" },
 			),
 		).toThrow("Agent reach is limited to parent, siblings, and children");
-		expect(assertAgentFamilyReach(root, child)).toBe("child");
-		expect(assertAgentFamilyReach(child, root)).toBe("parent");
-		expect(assertAgentFamilyReach(child, sibling)).toBe("sibling");
-		expect(assertAgentFamilyReach(sibling, idOnlySibling)).toBe("sibling");
-		expect(() => assertAgentFamilyReach(root, grandchild)).toThrow(
-			"Agent reach is limited to parent, siblings, and children",
+
+		// Direct immediate family remains available for path-only and id-only persisted parent links.
+		expect(assertAgentFamilyReach(root, child, catalog)).toBe("child");
+		expect(assertAgentFamilyReach(child, root, catalog)).toBe("parent");
+		expect(assertAgentFamilyReach(child, sibling, catalog)).toBe("sibling");
+		expect(assertAgentFamilyReach(sibling, child, catalog)).toBe("sibling");
+		expect(assertAgentFamilyReach(sibling, idOnlySibling, catalog)).toBe("sibling");
+		expect(assertAgentFamilyReach(idOnlySibling, sibling, catalog)).toBe("sibling");
+
+		// A claimed parent must exist exactly one depth above the child in the supplied catalog.
+		for (const malformed of [depthSkippingDescendant, malformedRoot]) {
+			expect(() => assertAgentFamilyReach(root, malformed, catalog)).toThrow(AGENT_FAMILY_REACH_ERROR);
+			expect(() => assertAgentFamilyReach(malformed, root, catalog)).toThrow(AGENT_FAMILY_REACH_ERROR);
+		}
+		for (const claimedParent of [root, otherRoot]) {
+			expect(() => assertAgentFamilyReach(claimedParent, contradictoryChild, catalog)).toThrow(
+				AGENT_FAMILY_REACH_ERROR,
+			);
+			expect(() => assertAgentFamilyReach(contradictoryChild, claimedParent, catalog)).toThrow(
+				AGENT_FAMILY_REACH_ERROR,
+			);
+		}
+		expect(() => assertAgentFamilyReach(root, grandchild, catalog)).toThrow(AGENT_FAMILY_REACH_ERROR);
+		expect(() => assertAgentFamilyReach(sibling, grandchild, catalog)).toThrow(AGENT_FAMILY_REACH_ERROR);
+
+		// Depth-two records jointly claiming the depth-zero root cannot invent a sibling relationship.
+		expect(() => assertAgentFamilyReach(malformedSiblingA, malformedSiblingB, catalog)).toThrow(
+			AGENT_FAMILY_REACH_ERROR,
 		);
-		expect(() => assertAgentFamilyReach(sibling, grandchild)).toThrow(
-			"Agent reach is limited to parent, siblings, and children",
+		expect(() => assertAgentFamilyReach(malformedSiblingB, malformedSiblingA, catalog)).toThrow(
+			AGENT_FAMILY_REACH_ERROR,
 		);
-		expect(() => assertAgentFamilyReach(root, depthSkippingDescendant)).toThrow(
-			"Agent reach is limited to parent, siblings, and children",
-		);
+		expect(buildAgentFamilyRoster(malformedSiblingA, catalog).entries).toEqual([]);
+		expect(buildAgentFamilyRoster(root, catalog).entries.map((entry) => entry.id)).toEqual([
+			"child",
+			"id-only-sibling",
+			"sibling",
+		]);
+
+		// A catalog-resolved depth-two sibling pair remains a legitimate immediate family.
+		const deepParent = { id: "deep-parent", depth: 1, status: "running" as const, sessionPath: "/deep-parent" };
+		const deepSiblingA = {
+			id: "deep-sibling-a",
+			depth: 2,
+			status: "idle" as const,
+			parentSessionId: "deep-parent",
+			parentSessionPath: "/deep-parent",
+		};
+		const deepSiblingB = {
+			id: "deep-sibling-b",
+			depth: 2,
+			status: "idle" as const,
+			parentSessionPath: "/deep-parent",
+		};
+		const deepCatalog = [deepParent, deepSiblingA, deepSiblingB];
+		expect(() => assertAgentFamilyReach(deepSiblingA, deepSiblingB)).toThrow(AGENT_FAMILY_REACH_ERROR);
+		expect(assertAgentFamilyReach(deepSiblingA, deepSiblingB, deepCatalog)).toBe("sibling");
+		expect(assertAgentFamilyReach(deepSiblingB, deepSiblingA, deepCatalog)).toBe("sibling");
 	});
 
 	it("collapses depth-zero name reservations to the root scope", () => {
