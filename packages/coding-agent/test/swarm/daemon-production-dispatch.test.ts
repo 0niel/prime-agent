@@ -5,7 +5,16 @@
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -37,6 +46,43 @@ async function eventually(predicate: () => boolean, code: string, timeoutMs = 15
 	throw new Error(code);
 }
 
+async function waitForProcessGone(pid: number): Promise<void> {
+	await eventually(() => {
+		try {
+			process.kill(pid, 0);
+			return false;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ESRCH";
+		}
+	}, `B00B_WORKER_${pid}_SURVIVED`);
+}
+
+function recursiveFiles(directory: string): string[] {
+	if (!existsSync(directory)) return [];
+	const result: string[] = [];
+	for (const entry of readdirSync(directory)) {
+		const path = join(directory, entry);
+		try {
+			if (lstatSync(path).isDirectory()) result.push(...recursiveFiles(path));
+			else result.push(path);
+		} catch {
+			// Supervisor cleanup may atomically rename/remove a descriptor mid-scan.
+		}
+	}
+	return result;
+}
+
+function assertNoFixtureKey(texts: readonly string[], key: string): void {
+	const normalizedKey = key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+	for (const text of texts) {
+		const decoded = text.replace(/\\u([\dA-Fa-f]{4})/g, (_, hex: string) =>
+			String.fromCharCode(Number.parseInt(hex, 16)),
+		);
+		expect(decoded).not.toContain(key);
+		expect(decoded.replace(/[^a-zA-Z0-9]/g, "").toLowerCase()).not.toContain(normalizedKey);
+	}
+}
+
 function summary(value: unknown): SessionSummary {
 	if (!value || typeof value !== "object") throw new Error("B00B_MISSING_SESSION_SUMMARY");
 	return value as SessionSummary;
@@ -55,6 +101,7 @@ function requestId(body: string): string {
 interface LocalProvider {
 	readonly url: string;
 	readonly entered: readonly string[];
+	readonly maxInFlight: number;
 	close(): Promise<void>;
 }
 
@@ -65,6 +112,8 @@ interface LocalProvider {
  */
 async function localProvider(): Promise<LocalProvider> {
 	const entered: string[] = [];
+	let inFlight = 0;
+	let maxInFlight = 0;
 	const server = createServer((request, response) => {
 		let body = "";
 		request.setEncoding("utf8");
@@ -79,10 +128,15 @@ async function localProvider(): Promise<LocalProvider> {
 				response.writeHead(400).end("B00B_BAD_LOCAL_REQUEST");
 				return;
 			}
+
 			entered.push(id);
-			if (id === "request-0003") {
+			inFlight += 1;
+			maxInFlight = Math.max(maxInFlight, inFlight);
+			const attempt = entered.filter((entry) => entry === id).length;
+			if (id === "request-0003" && attempt === 1) {
 				response.writeHead(429, { "content-type": "application/json", "retry-after": "0" });
 				response.end(JSON.stringify({ error: { message: "fixture upstream 429", type: "rate_limit_error" } }));
+				inFlight -= 1;
 				return;
 			}
 			const emitSuccess = () => {
@@ -103,7 +157,9 @@ async function localProvider(): Promise<LocalProvider> {
 					choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
 					usage: { prompt_tokens: 7, completion_tokens: 11, total_tokens: 18 },
 				});
+
 				response.end("data: [DONE]\n\n");
+				inFlight -= 1;
 			};
 			// Keep this upstream request in flight until its root's real abort signal
 			// closes the transport; no sibling shares this timer.
@@ -113,10 +169,15 @@ async function localProvider(): Promise<LocalProvider> {
 	});
 	await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 	const address = server.address();
-	if (!address || typeof address === "string") throw new Error("B00B_LOCAL_FIXTURE_NO_PORT");
+
+	if (!address || typeof address === "string" || address.address !== "127.0.0.1")
+		throw new Error("B00B_LOCAL_FIXTURE_NOT_LOOPBACK_ONLY");
 	return {
 		url: `http://127.0.0.1:${address.port}/v1`,
 		entered,
+		get maxInFlight() {
+			return maxInFlight;
+		},
 		close: () => new Promise<void>((resolveClose) => server.close(() => resolveClose())),
 	};
 }
@@ -242,7 +303,7 @@ describe("B00B real daemon production dispatch", () => {
 				providers: {
 					"b00b-local": {
 						baseUrl: upstream.url,
-						apiKey: "fixture-key",
+						apiKey: "fixture-key-B00B-canary",
 						api: "openai-completions",
 						models: [{ id: "fixture-a", api: "openai-completions", reasoning: false, input: ["text"] }],
 					},
@@ -272,7 +333,11 @@ describe("B00B real daemon production dispatch", () => {
 		const fast = await create("fast-root");
 		const cancelled = await create("cancelled-root");
 		const rateLimited = await create("rate-limited-root");
-		expect(new Set([fast.workerPid, cancelled.workerPid, rateLimited.workerPid]).size).toBe(3);
+
+		const workerPids = [fast.workerPid, cancelled.workerPid, rateLimited.workerPid];
+		expect(workerPids.every((pid): pid is number => typeof pid === "number" && pid > 1)).toBe(true);
+		const concreteWorkerPids = workerPids as number[];
+		expect(new Set(concreteWorkerPids).size).toBe(3);
 
 		const blocked = await attachThenPause(socketPath, active(fast));
 		const draining = await connect(socketPath, supervisor);
@@ -298,9 +363,11 @@ describe("B00B real daemon production dispatch", () => {
 		expect(admissions.every((item) => item.success)).toBe(true);
 		await eventually(() => new Set(upstream.entered).size === 3, "B00B_PROVIDER_ENTRY_TIMEOUT");
 		expect(upstream.entered.filter((id) => id === "request-0001")).toHaveLength(1);
+
 		expect(upstream.entered.filter((id) => id === "request-0002")).toHaveLength(1);
-		// Existing per-request retry behavior may re-enter only the upstream-429 root.
-		expect(upstream.entered.filter((id) => id === "request-0003").length).toBeGreaterThanOrEqual(1);
+
+		// All three independently created workers enter the real upstream before
+		// cancellation; a provider-side barrier is not faked by the client.
 
 		// Abort and HTTP 429 are root-local. They cannot prevent the draining
 		// attachment's independent root from reaching a normal terminal.
@@ -334,6 +401,19 @@ describe("B00B real daemon production dispatch", () => {
 		expect(catchupData.snapshot?.messages?.length).toBeGreaterThanOrEqual(2);
 		expect(catchupData.replay?.toSequence).toBeGreaterThanOrEqual(blocked.cursor.sequence);
 
+		await eventually(
+			() => upstream.entered.filter((id) => id === "request-0003").length === 2,
+			"B00B_429_RETRY_TIMEOUT",
+		);
+		const rateLimitedIdle = await control.request(
+			{ type: "wait_for_idle", activeSessionId: active(rateLimited) },
+			30_000,
+		);
+		expect(rateLimitedIdle.success).toBe(true);
+		const rateLimitedMessages = await control.request({ type: "get_messages", activeSessionId: active(rateLimited) });
+		expect(JSON.stringify(rateLimitedMessages)).toContain("fixture-resolved");
+		expect(upstream.entered.filter((id) => id === "request-0003")).toHaveLength(2);
+
 		const cancelledIdle = await control.request(
 			{ type: "wait_for_idle", activeSessionId: active(cancelled) },
 			30_000,
@@ -345,7 +425,17 @@ describe("B00B real daemon production dispatch", () => {
 		// no test code implements a permit, semaphore, or fabricated response.
 		expect(upstream.entered).toContain("request-0003");
 
+		const capturedTexts = [
+			(supervisor as ChildProcess & { b00bStderr?: () => string }).b00bStderr?.() ?? "",
+			...recursiveFiles(agentDir)
+				.filter((path) => path !== join(agentDir, "models.json"))
+				.map((path) => readFileSync(path, "utf8")),
+		];
+		assertNoFixtureKey(capturedTexts, "fixture-key-B00B-canary");
 		const shutdown = await control.request({ type: "shutdown" }, 10_000);
 		expect(shutdown.success).toBe(true);
+		await Promise.all(concreteWorkerPids.map((pid) => waitForProcessGone(pid)));
+		await eventually(() => !existsSync(socketPath), "B00B_SUPERVISOR_SOCKET_SURVIVED");
+		expect(recursiveFiles(join(agentDir, "daemon-workers")).filter((path) => path.endsWith(".tmp"))).toEqual([]);
 	}, 60_000);
 });
