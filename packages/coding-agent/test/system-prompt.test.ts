@@ -52,6 +52,8 @@ describe("buildRlmPrompt", () => {
 				"You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
 				"When you are done, stop calling tools and state your final answer.",
 				"",
+				"For prose that you write yourself, use ASD-STE100 simplified technical English unless the user asks for another style. Use short direct sentences. Use active voice. Put one instruction in each sentence. Use common approved words. Keep required technical terms, code, commands, identifiers, quotations, and URLs unchanged. Do not change user-provided text.",
+				"",
 				"Working directory: /repo",
 				"Conversation log: /repo/.pi/sessions/session.jsonl",
 				"Recursive agent depth: 0",
@@ -551,6 +553,29 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).not.toContain("asyncio.create_task");
 		expect(prompt).not.toContain("await <skill_import>");
 		expect(prompt).not.toContain("await refine.run()");
+	});
+
+	test("adds the simplified-English rule only to the default prompt", () => {
+		const defaultPrompt = buildSystemPrompt({
+			selectedTools: ["ipython"],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+		});
+		const customPrompt = buildSystemPrompt({
+			customPrompt: "Use the user-provided style.",
+			selectedTools: ["ipython"],
+			contextFiles: [],
+			skills: [],
+			cwd: "/repo",
+		});
+
+		expect(defaultPrompt).toContain(
+			"For prose that you write yourself, use ASD-STE100 simplified technical English unless the user asks for another style.",
+		);
+		expect(defaultPrompt).toContain("Do not change user-provided text.");
+		expect(customPrompt).toContain("Use the user-provided style.");
+		expect(customPrompt).not.toContain("For prose that you write yourself, use ASD-STE100");
 	});
 
 	test("custom prompt override bypasses the rlm harness body", () => {

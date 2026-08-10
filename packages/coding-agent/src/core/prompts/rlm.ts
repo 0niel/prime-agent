@@ -75,6 +75,8 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		"You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
 		"When you are done, stop calling tools and state your final answer.",
 		"",
+		"For prose that you write yourself, use ASD-STE100 simplified technical English unless the user asks for another style. Use short direct sentences. Use active voice. Put one instruction in each sentence. Use common approved words. Keep required technical terms, code, commands, identifiers, quotations, and URLs unchanged. Do not change user-provided text.",
+		"",
 		`Working directory: ${cwd}`,
 		`Conversation log: ${messagesPath}`,
 		`Recursive agent depth: ${depth}`,
