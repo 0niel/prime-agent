@@ -2998,6 +2998,113 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(client.attachedActiveSessionIds).toEqual(new Set());
 	});
 
+	it("retains the orphan journal and never uses the pid fallback after its identity changes", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-orphan-recycle-"));
+		const orphanJournalPath = join(root, "worker.orphans.jsonl");
+		const orphanPid = 987_651;
+		writeFileSync(
+			orphanJournalPath,
+			`${JSON.stringify({
+				version: 1,
+				pid: orphanPid,
+				ownerPid: process.pid,
+				processStartId: "orphan:original",
+				active: true,
+				recordedAt: new Date().toISOString(),
+			})}\n`,
+		);
+		const worker = {
+			descriptor: {
+				workerId: "worker-orphan-recycle",
+				pid: process.pid,
+				processStartId: "worker:current",
+				rootActiveSessionId: "root-active",
+				recoveryJournalPath: join(root, "worker.recovery.jsonl"),
+				orphanProcessJournalPath,
+			},
+			stopRevision: 0,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			assertCurrentOwnership: vi.fn(async () => {}),
+			assertWorkerTupleCurrent: vi.fn(),
+			log: vi.fn(),
+		});
+		const sessionLeaseModule = await import("../src/core/session-lease.js");
+		const startId = vi
+			.spyOn(sessionLeaseModule, "getProcessStartId")
+			.mockReturnValueOnce("orphan:original")
+			.mockReturnValueOnce("orphan:recycled");
+		const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number) => {
+			if (pid === -orphanPid) throw new Error("process group unavailable");
+			return true;
+		}) as typeof process.kill);
+		try {
+			await supervisor.recoverUncertainWorkerOperations(worker, false);
+			expect(kill).toHaveBeenCalledWith(-orphanPid, "SIGKILL");
+			expect(kill).not.toHaveBeenCalledWith(orphanPid, "SIGKILL");
+			expect(readFileSync(orphanJournalPath, "utf8")).toContain("orphan:original");
+		} finally {
+			kill.mockRestore();
+			startId.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses the orphan pid fallback only after a fresh exact identity observation", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-orphan-fallback-"));
+		const orphanJournalPath = join(root, "worker.orphans.jsonl");
+		const orphanPid = 987_652;
+		writeFileSync(
+			orphanJournalPath,
+			`${JSON.stringify({
+				version: 1,
+				pid: orphanPid,
+				ownerPid: process.pid,
+				processStartId: "orphan:current",
+				active: true,
+				recordedAt: new Date().toISOString(),
+			})}\n`,
+		);
+		const worker = {
+			descriptor: {
+				workerId: "worker-orphan-fallback",
+				pid: process.pid,
+				processStartId: "worker:current",
+				rootActiveSessionId: "root-active",
+				recoveryJournalPath: join(root, "worker.recovery.jsonl"),
+				orphanProcessJournalPath,
+			},
+			stopRevision: 0,
+		};
+		const ownership = vi.fn(async () => {});
+		const tuple = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			assertCurrentOwnership: ownership,
+			assertWorkerTupleCurrent: tuple,
+			log: vi.fn(),
+		});
+		const sessionLeaseModule = await import("../src/core/session-lease.js");
+		const startId = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("orphan:current");
+		const kill = vi.spyOn(process, "kill").mockImplementation(((pid: number) => {
+			if (pid === -orphanPid) throw new Error("process group unavailable");
+			return true;
+		}) as typeof process.kill);
+		try {
+			await supervisor.recoverUncertainWorkerOperations(worker, false);
+			expect(kill).toHaveBeenNthCalledWith(1, -orphanPid, "SIGKILL");
+			expect(kill).toHaveBeenNthCalledWith(2, orphanPid, "SIGKILL");
+			expect(ownership).toHaveBeenCalledTimes(3);
+			expect(tuple).toHaveBeenCalledTimes(3);
+			expect(existsSync(orphanJournalPath)).toBe(false);
+		} finally {
+			kill.mockRestore();
+			startId.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("marks each busy worker session interrupted independently", async () => {
 		type RecoveryWorker = {
 			descriptor: {

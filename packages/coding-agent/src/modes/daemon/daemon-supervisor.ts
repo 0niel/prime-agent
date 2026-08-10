@@ -2897,16 +2897,32 @@ export class DaemonSupervisor {
 		const orphanProcessJournalPath = descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
 			try {
+				let retainOrphanJournal = false;
 				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
 					// Ownership and fresh orphan identity must remain adjacent to the
 					// signal. A successor owns any retry if this check fails.
 					await this.assertCurrentOwnership();
 					this.assertWorkerTupleCurrent(worker, descriptor, worker.stopRevision, descriptor.stopRequestedAt);
-					if (!isOrphanProcessIdentityCurrent(orphan)) continue;
+					if (!isOrphanProcessIdentityCurrent(orphan)) {
+						// Keep the durable retry authority when the pid is recycled or
+						// its generation cannot be observed.
+						retainOrphanJournal = true;
+						continue;
+					}
 					const { pid } = orphan;
 					try {
 						process.kill(-pid, "SIGKILL");
 					} catch {
+						// A failed group signal says nothing about a later positive-pid
+						// signal. Re-observe this exact orphan and current supervisor
+						// ownership immediately before the fallback; do not add an await
+						// after these checks.
+						await this.assertCurrentOwnership();
+						this.assertWorkerTupleCurrent(worker, descriptor, worker.stopRevision, descriptor.stopRequestedAt);
+						if (!isOrphanProcessIdentityCurrent(orphan)) {
+							retainOrphanJournal = true;
+							continue;
+						}
 						try {
 							process.kill(pid, "SIGKILL");
 						} catch {
@@ -2916,7 +2932,9 @@ export class DaemonSupervisor {
 				}
 				await this.assertCurrentOwnership();
 				this.assertWorkerTupleCurrent(worker, descriptor, worker.stopRevision, descriptor.stopRequestedAt);
-				clearOrphanProcessJournal(orphanProcessJournalPath);
+				if (!retainOrphanJournal) {
+					clearOrphanProcessJournal(orphanProcessJournalPath);
+				}
 			} catch (error) {
 				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
 			}

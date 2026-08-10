@@ -296,14 +296,22 @@ export async function runOwnedSessionWorkerFrontend(
 				// The worker process group may already be fully reaped.
 			}
 		}
+		let retainOrphanJournal = false;
 		for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, workerPid)) {
 			if (!isOrphanProcessIdentityCurrent(orphan)) {
+				retainOrphanJournal = true;
 				continue;
 			}
 			const { pid } = orphan;
 			try {
 				process.kill(process.platform === "win32" ? pid : -pid, "SIGKILL");
 			} catch {
+				// A failed group signal does not bind a later pid signal. Re-observe
+				// the exact orphan immediately before the positive-pid fallback.
+				if (!isOrphanProcessIdentityCurrent(orphan)) {
+					retainOrphanJournal = true;
+					continue;
+				}
 				try {
 					process.kill(pid, "SIGKILL");
 				} catch {
@@ -311,7 +319,9 @@ export async function runOwnedSessionWorkerFrontend(
 				}
 			}
 		}
-		clearOrphanProcessJournal(orphanProcessJournalPath);
+		if (!retainOrphanJournal) {
+			clearOrphanProcessJournal(orphanProcessJournalPath);
+		}
 	};
 
 	if (profile === "rpc") {
