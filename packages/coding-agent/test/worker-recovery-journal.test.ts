@@ -112,6 +112,31 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 		expect(journal.getLatest()).toEqual([]);
 	});
 
+	it("allows an exact completion after session materialization changes checkpoint metadata", () => {
+		const journal = new WorkerRecoveryJournal(path());
+		// The operation begins before its in-memory session has a file. The daemon
+		// reconstructs session metadata at completion, after materialization changes it.
+		journal.record({ ...base, busy: true, sessionId: "draft" });
+
+		// Operation equality remains an authority fence even when the payload changes.
+		journal.record({
+			...base,
+			busy: false,
+			operation: "tool_execution",
+			sessionId: "materialized",
+			sessionFile: "/sessions/materialized.jsonl",
+		});
+		expect(journal.getLatest()).toEqual([expect.objectContaining({ busy: true, operation: "prompt" })]);
+
+		journal.record({
+			...base,
+			busy: false,
+			sessionId: "materialized",
+			sessionFile: "/sessions/materialized.jsonl",
+		});
+		expect(journal.getLatest()).toEqual([]);
+	});
+
 	it("retains a busy operation across restart when a different allowed operation replays its terminal token", () => {
 		const file = path();
 		const journal = new WorkerRecoveryJournal(file);

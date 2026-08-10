@@ -121,6 +121,41 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("clears an exact token after session materialization changes its checkpoint metadata", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-materialized-recovery-"));
+		const journalPath = join(root, "worker-recovery.jsonl");
+		const previousJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = journalPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-materialized-recovery.sock", {
+				defaultSessionConfig: { agentDir: root, cwd: root },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "test" },
+			});
+			const state = makeState("active");
+			Object.assign(state, { eventGeneration: "11111111-1111-4111-8111-111111111111" });
+			Object.assign(state.runtime, { session: { sessionId: "draft" } });
+			const internals = daemon as unknown as {
+				beginWorkerRecoveryOperation(state: ActiveSessionState, operation: "prompt"): unknown;
+				completeWorkerRecoveryOperation(state: ActiveSessionState, token: unknown): void;
+			};
+
+			const token = internals.beginWorkerRecoveryOperation(state, "prompt");
+			// writeWorkerRecoveryOperation re-reads the session at completion. A
+			// persisted draft can materialize or branch while this token is live.
+			Object.assign(state.runtime.session, {
+				sessionId: "materialized",
+				sessionFile: join(root, "materialized.jsonl"),
+			});
+			internals.completeWorkerRecoveryOperation(state, token);
+			expect(WorkerRecoveryJournal.readLatest(journalPath)).toEqual([]);
+		} finally {
+			if (previousJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousJournal;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("uses exact operation tokens for admission cancellation, active steer, rejection, and observation checkpoints", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-operation-token-edges-"));
 		const journalPath = join(root, "worker-recovery.jsonl");
