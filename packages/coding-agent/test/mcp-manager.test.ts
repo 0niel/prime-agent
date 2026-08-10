@@ -146,6 +146,25 @@ describe("McpManager", () => {
 		});
 	});
 
+	it("keeps an anonymous user integration enabled despite stale credentials with its id", () => {
+		// A server may previously have been OAuth-enabled, then deliberately reconfigured
+		// as public. Stale auth.json state must not change that explicit configuration.
+		authStorage.set("mcp:public", {
+			type: "oauth",
+			access: "stale-token",
+			refresh: "r",
+			expires: Date.now() + 3600_000,
+		});
+		const manager = new McpManager({
+			authStorage,
+			getUserServers: () => ({
+				public: { type: "http", url: "https://public.test/mcp" },
+			}),
+		});
+
+		expect(manager.listStatus().find((s) => s.server === "public")?.enabled).toBe(true);
+	});
+
 	it("honors a bearer-token env var for user-declared servers", () => {
 		process.env.MY_MCP_TOKEN = "secret";
 		try {

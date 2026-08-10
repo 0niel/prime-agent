@@ -262,6 +262,112 @@ class McpIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(captured["headers"], {"X-Extra": "1"})
 
+    def test_open_session_preserves_static_authorization_for_anonymous_server(self):
+        captured = {}
+
+        class _CM:
+            async def __aenter__(self_inner):
+                return ("read", "write", None)
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        def transport(url, headers=None):
+            captured["headers"] = headers
+            return _CM()
+
+        self._run_open_session_with_transport(
+            transport,
+            config={
+                "requiresAuth": False,
+                "headers": {"Authorization": "Basic explicit", "X-Extra": "1"},
+            },
+            write_auth=False,
+        )
+        self.assertEqual(captured["headers"], {"Authorization": "Basic explicit", "X-Extra": "1"})
+
+    def test_open_session_resolved_bearer_overrides_static_authorization(self):
+        captured = {}
+
+        class _CM:
+            async def __aenter__(self_inner):
+                return ("read", "write", None)
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        def transport(url, headers=None):
+            captured["headers"] = headers
+            return _CM()
+
+        self._run_open_session_with_transport(
+            transport,
+            config={"headers": {"Authorization": "Basic explicit", "X-Extra": "1"}},
+        )
+        self.assertEqual(
+            captured["headers"], {"Authorization": "Bearer tok-xyz", "X-Extra": "1"}
+        )
+
+    def test_open_session_closes_session_transport_and_client_in_reverse_order(self):
+        self._write_auth(
+            {"type": "oauth", "access": "tok", "refresh": "r", "expires": (time.time() + 3600) * 1000}
+        )
+        events = []
+
+        class _Context:
+            def __init__(self, name, value):
+                self.name = name
+                self.value = value
+
+            async def __aenter__(self):
+                events.append(f"enter:{self.name}")
+                return self.value
+
+            async def __aexit__(self, *a):
+                events.append(f"exit:{self.name}")
+                return False
+
+        def transport(url, *, http_client=None):
+            events.append("transport-created")
+            return _Context("transport", ("read", "write", None))
+
+        class Session:
+            async def initialize(self):
+                events.append("initialized")
+
+            async def call_tool(self, name, arguments):
+                events.append("called")
+                return type("R", (), {"content": [], "structuredContent": None})()
+
+        def build_client(headers):
+            events.append("client-created")
+            return _Context("client", object())
+
+        async def fake_host_request(req_type, payload):
+            return {}
+
+        with mock.patch.object(mcp_base, "host_request", fake_host_request), \
+             mock.patch.object(mcp_base, "_resolve_streamable_http", lambda: transport), \
+             mock.patch.object(mcp_base, "_build_mcp_http_client", build_client), \
+             mock.patch("mcp.ClientSession", return_value=_Context("session", Session())):
+            _run(_Integration().call_tool("noop", {}))
+
+        self.assertEqual(
+            events,
+            [
+                "client-created",
+                "enter:client",
+                "transport-created",
+                "enter:transport",
+                "enter:session",
+                "initialized",
+                "called",
+                "exit:session",
+                "exit:transport",
+                "exit:client",
+            ],
+        )
+
     def test_open_session_uses_http_client_signature(self):
         # streamable_http_client(url, *, http_client=...) — must NOT pass headers=
         captured = {}
