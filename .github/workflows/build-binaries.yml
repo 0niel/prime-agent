@@ -118,6 +118,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: release-context
+    outputs:
+      source_commit: ${{ steps.source-commit.outputs.commit }}
     permissions:
       contents: read
     env:
@@ -132,6 +134,10 @@ jobs:
         with:
           ref: ${{ env.BUILD_REF }}
           persist-credentials: false
+
+      - name: Record checked-out commit
+        id: source-commit
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -157,8 +163,15 @@ jobs:
           npm run release:pack -- \
             --channel stable \
             --version "$PRODUCTION_VERSION" \
+            --commit "$(git rev-parse HEAD)" \
             --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
             --out-dir packages/coding-agent/release/production
+          npm run release:verify -- \
+            --artifact-dir packages/coding-agent/release/production/artifacts \
+            --channel stable \
+            --version "$PRODUCTION_VERSION" \
+            --commit "$(git rev-parse HEAD)" \
+            --dry-run
 
       - name: Pack beta release
         if: env.PUBLISH_BETA == 'true'
@@ -169,8 +182,15 @@ jobs:
           npm run release:pack -- \
             --channel beta \
             --version "$BETA_VERSION" \
+            --commit "$(git rev-parse HEAD)" \
             --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
             --out-dir packages/coding-agent/release/beta
+          npm run release:verify -- \
+            --artifact-dir packages/coding-agent/release/beta/artifacts \
+            --channel beta \
+            --version "$BETA_VERSION" \
+            --commit "$(git rev-parse HEAD)" \
+            --dry-run
 
       - name: Upload production artifacts
         if: env.PUBLISH_PRODUCTION == 'true'
@@ -199,6 +219,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       BETA_VERSION: ${{ needs.release-context.outputs.beta_version }}
       BUILD_REF: ${{ needs.release-context.outputs.build_ref }}
+      SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
       PRODUCTION_VERSION: ${{ needs.release-context.outputs.production_version }}
       PUBLISH_BETA: ${{ needs.release-context.outputs.publish_beta }}
       PUBLISH_PRODUCTION: ${{ needs.release-context.outputs.publish_production }}
@@ -225,6 +246,9 @@ jobs:
         with:
           name: prime-agent-beta
           path: release-artifacts/beta
+
+      - name: Confirm publication checkout matches packed source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
 
       - name: Prepare installer
         run: |
@@ -259,6 +283,12 @@ jobs:
           RELEASE_PREFIX="releases/v${PRODUCTION_VERSION}"
           TARBALL="$PRODUCTION_DIR/prime-agent-${PRODUCTION_VERSION}.tgz"
 
+          npm run release:verify -- \
+            --artifact-dir "$PRODUCTION_DIR" \
+            --channel stable \
+            --version "$PRODUCTION_VERSION" \
+            --commit "$SOURCE_COMMIT" \
+            --dry-run
           test -f "$TARBALL"
           test -f "$PRODUCTION_DIR/SHA256SUMS"
           test -f "$PRODUCTION_DIR/stable"
@@ -327,6 +357,12 @@ jobs:
           RELEASE_PREFIX="releases/v${BETA_VERSION}"
           TARBALL="$BETA_DIR/prime-agent-${BETA_VERSION}.tgz"
 
+          npm run release:verify -- \
+            --artifact-dir "$BETA_DIR" \
+            --channel beta \
+            --version "$BETA_VERSION" \
+            --commit "$SOURCE_COMMIT" \
+            --dry-run
           test -f "$TARBALL"
           test -f "$BETA_DIR/SHA256SUMS"
           test -f "$BETA_DIR/beta"

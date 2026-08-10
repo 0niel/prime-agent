@@ -36,6 +36,7 @@ function parseArgs(args) {
 	const parsed = {
 		baseUrl: defaultBaseUrl,
 		channel: "stable",
+		commit: undefined,
 		outDir: defaultOutputDir,
 		version: undefined,
 	};
@@ -49,6 +50,15 @@ function parseArgs(args) {
 					throw new Error("--channel must be stable or beta");
 				}
 				parsed.channel = value;
+				i += 1;
+				break;
+			}
+			case "--commit": {
+				const value = args[i + 1];
+				if (!value || !/^[0-9a-f]{40}$/.test(value)) {
+					throw new Error("--commit must be a lowercase 40-character Git commit SHA");
+				}
+				parsed.commit = value;
 				i += 1;
 				break;
 			}
@@ -86,13 +96,16 @@ function parseArgs(args) {
 	if (!parsed.baseUrl) {
 		throw new Error("--base-url or PRIME_AGENT_DOWNLOAD_BASE_URL is required");
 	}
+	if (!parsed.commit) {
+		throw new Error("--commit is required");
+	}
 
 	parsed.baseUrl = parsed.baseUrl.replace(/\/+$/, "");
 	return parsed;
 }
 
 function printHelp() {
-	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version x.y.z] [--out-dir path]
+	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url --commit sha [--channel stable|beta] [--version x.y.z] [--out-dir path]
 
 Creates private npm tarballs for R2 distribution:
 
@@ -330,6 +343,9 @@ function main() {
 	const manifestName = args.channel === "stable" ? "latest.json" : "beta.json";
 	writeJson(join(artifactsDir, manifestName), {
 		version: `v${releaseVersion}`,
+		source: {
+			commit: args.commit,
+		},
 		package: publicPackageName,
 		tarball: `releases/v${releaseVersion}/${artifactFiles.get("coding-agent")}`,
 		tarballs: tarballs.map((tarball) => ({
