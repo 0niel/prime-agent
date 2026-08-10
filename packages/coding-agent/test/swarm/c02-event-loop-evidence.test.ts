@@ -1,29 +1,16 @@
-/** Deterministic, test-only C02 event-loop evidence; no production/provider path is imported. */
-import { execFile as execFileCallback } from "node:child_process";
-import { generateKeyPairSync, sign } from "node:crypto";
+/** Authenticated C02 evidence from the integrated owner, daemon attachment, and UI seams. */
+import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { cpus, tmpdir } from "node:os";
 import { join } from "node:path";
-import { monitorEventLoopDelay } from "node:perf_hooks";
-import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
+import { C02_FANOUT, type C02IntegratedRepetition, runC02IntegratedRepetition } from "./c02-integrated-harness.js";
 import {
-	artifactBundleIdForSwarmEvidenceCapability,
-	canonicalJson,
-	createSwarmEvidenceTrustRoot,
-	createSwarmManifest,
-	type ProcessSampler,
-	runSwarmBenchmark,
-	SWARM_EVIDENCE_COMMITMENT_SCHEMA,
-	type SwarmEvidence,
-	swarmEvidenceCommitmentPayload,
-	verifyAuthenticatedSwarmEvidence,
-	verifySwarmEvidence,
-	writeSwarmEvidence,
-} from "./swarm-evidence.js";
+	verifySignedProductionEvidence,
+	verifySignedProductionEvidenceFreshProcess,
+	writeSignedProductionEvidence,
+} from "./production-evidence-adapter.js";
 
-const execFile = promisify(execFileCallback);
-const FANOUT = 64;
 const WARMUP_REPETITIONS = 1;
 const MEASURED_REPETITIONS = 3;
 const cleanups: string[] = [];
@@ -32,215 +19,9 @@ afterEach(async () => {
 	await Promise.all(cleanups.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-type Repetition = {
-	parentPendingHighWater: number;
-	uiPendingHighWater: number;
-	slowCatchupPendingHighWater: number;
-	slowCatchupScheduleHighWater: number;
-	slowCatchupPromiseHighWater: number;
-	timersScheduled: number;
-	timersCancelled: number;
-	timersFired: number;
-	terminalDeliveries: number;
-	healthyAttachmentLive: number;
-	hookErrors: number;
-	observerErrors: number;
-	beforeToolVetoes: number;
-	droppedReplaceableProgress: number;
-	teardownPending: number;
-	delayP50Milliseconds: number;
-	delayP95Milliseconds: number;
-	delayP99Milliseconds: number;
-	delayMaxMilliseconds: number;
-};
-
-const nextMacrotask = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
-const waitForDelaySample = () => new Promise<void>((resolve) => setTimeout(resolve, 25));
-const milliseconds = (nanoseconds: number) => nanoseconds / 1_000_000;
-
-/**
- * Models C02 ownership at the event-loop seam only. Stream dispatch is an
- * immediate Promise.all fanout: this fixture intentionally has no admission
- * queue, provider request, semaphore, limiter, retry, or synthetic 429.
- */
-async function runRepetition(measured: boolean): Promise<Repetition> {
-	let pendingChildren = new Map<number, "running">();
-	let parentPendingHighWater = 0;
-	let pendingProgress: number | undefined;
-	let uiPendingHighWater = 0;
-	let droppedReplaceableProgress = 0;
-	let childFlush: ReturnType<typeof setTimeout> | undefined;
-	let progressFlush: ReturnType<typeof setTimeout> | undefined;
-	let slowDrain: ReturnType<typeof setTimeout> | undefined;
-	const slowPending = new Set<number>();
-	let slowCatchupPendingHighWater = 0;
-	let slowCatchupScheduleHighWater = 0;
-	let slowCatchupPromiseHighWater = 0;
-	let activeSlowCatchups = 0;
-	let timersScheduled = 0;
-	let timersCancelled = 0;
-	let timersFired = 0;
-	let terminalDeliveries = 0;
-	let hookErrors = 0;
-	let observerErrors = 0;
-	let beforeToolVetoes = 0;
-	let healthyAttachmentLive = true;
-	const terminalCounts = new Map<number, number>();
-
-	const delay = monitorEventLoopDelay({ resolution: 10 });
-	if (measured) delay.enable();
-	try {
-		const scheduleSlowCatchup = () => {
-			if (slowDrain) return;
-			slowCatchupScheduleHighWater = Math.max(slowCatchupScheduleHighWater, 1);
-			timersScheduled++;
-			slowDrain = setTimeout(() => {
-				slowDrain = undefined;
-				timersFired++;
-				activeSlowCatchups++;
-				slowCatchupPromiseHighWater = Math.max(slowCatchupPromiseHighWater, activeSlowCatchups);
-				// A slow attachment gets its latest state only, while the healthy one stays live.
-				slowPending.clear();
-				activeSlowCatchups--;
-			}, 0);
-		};
-		const queueProgress = (child: number) => {
-			if (pendingProgress !== undefined) droppedReplaceableProgress++;
-			pendingProgress = child;
-			uiPendingHighWater = Math.max(uiPendingHighWater, 1);
-			if (progressFlush) return;
-			timersScheduled++;
-			progressFlush = setTimeout(() => {
-				progressFlush = undefined;
-				timersFired++;
-				pendingProgress = undefined;
-			}, 0);
-		};
-		const queueChild = (child: number) => {
-			pendingChildren.set(child, "running");
-			parentPendingHighWater = Math.max(parentPendingHighWater, pendingChildren.size);
-			if (childFlush) return;
-			timersScheduled++;
-			childFlush = setTimeout(() => {
-				childFlush = undefined;
-				timersFired++;
-				pendingChildren = new Map();
-			}, 0);
-		};
-		const terminal = (child: number) => {
-			// Structural terminal updates synchronously defeat stale pending activity.
-			pendingChildren.delete(child);
-			if (pendingProgress === child) pendingProgress = undefined;
-			terminalCounts.set(child, (terminalCounts.get(child) ?? 0) + 1);
-			terminalDeliveries++;
-		};
-		const observe = () => {
-			try {
-				throw new Error("test observer failure");
-			} catch {
-				observerErrors++;
-			}
-		};
-		const afterHook = () => {
-			try {
-				throw new Error("test after-hook failure");
-			} catch {
-				hookErrors++;
-			}
-		};
-		const beforeHook = () => {
-			try {
-				throw new Error("test veto");
-			} catch {
-				beforeToolVetoes++;
-			}
-		};
-
-		if (measured) delay.reset(); // The excluded warmup cannot affect recorded delay percentiles.
-		await Promise.all(
-			Array.from({ length: FANOUT }, async (_, child) => {
-				queueChild(child);
-				queueProgress(child);
-				slowPending.add(0); // One latest per active session, despite every child stream updating it.
-				slowCatchupPendingHighWater = Math.max(slowCatchupPendingHighWater, slowPending.size);
-				scheduleSlowCatchup();
-				if (child === 0) observe();
-				if (child === 1) afterHook();
-				if (child === 2) beforeHook();
-				await Promise.resolve(); // all 64 child streams have already entered independently
-				terminal(child);
-			}),
-		);
-		await nextMacrotask();
-		if (measured) await waitForDelaySample();
-
-		// One macrotask settles each owner; teardown sees no stale C02 work.
-		expect(childFlush).toBeUndefined();
-		expect(progressFlush).toBeUndefined();
-		expect(slowDrain).toBeUndefined();
-		expect(pendingChildren.size).toBe(0);
-		expect(pendingProgress).toBeUndefined();
-		expect(slowPending.size).toBe(0);
-		expect(timersScheduled).toBe(timersFired + timersCancelled);
-		expect(healthyAttachmentLive).toBe(true);
-		expect([...terminalCounts.values()]).toHaveLength(FANOUT);
-		expect([...terminalCounts.values()].every((count) => count === 1)).toBe(true);
-		expect(parentPendingHighWater).toBeLessThanOrEqual(FANOUT);
-		expect(uiPendingHighWater).toBeLessThanOrEqual(1);
-		expect(slowCatchupPendingHighWater).toBeLessThanOrEqual(1);
-		expect(slowCatchupScheduleHighWater).toBe(1);
-		expect(slowCatchupPromiseHighWater).toBe(1);
-		expect(hookErrors).toBe(1);
-		expect(observerErrors).toBe(1);
-		expect(beforeToolVetoes).toBe(1);
-
-		const stats = measured
-			? {
-					delayP50Milliseconds: milliseconds(delay.percentile(50)),
-					delayP95Milliseconds: milliseconds(delay.percentile(95)),
-					delayP99Milliseconds: milliseconds(delay.percentile(99)),
-					delayMaxMilliseconds: milliseconds(delay.max),
-				}
-			: {
-					delayP50Milliseconds: 0,
-					delayP95Milliseconds: 0,
-					delayP99Milliseconds: 0,
-					delayMaxMilliseconds: 0,
-				};
-		return {
-			parentPendingHighWater,
-			uiPendingHighWater,
-			slowCatchupPendingHighWater,
-			slowCatchupScheduleHighWater,
-			slowCatchupPromiseHighWater,
-			timersScheduled,
-			timersCancelled,
-			timersFired,
-			terminalDeliveries,
-			healthyAttachmentLive: Number(healthyAttachmentLive),
-			hookErrors,
-			observerErrors,
-			beforeToolVetoes,
-			droppedReplaceableProgress,
-			teardownPending: 0,
-			...stats,
-		};
-	} finally {
-		for (const timer of [childFlush, progressFlush, slowDrain]) {
-			if (!timer) continue;
-			clearTimeout(timer);
-			timersCancelled++;
-		}
-		pendingChildren.clear();
-		pendingProgress = undefined;
-		slowPending.clear();
-		healthyAttachmentLive = false;
-		delay.disable();
-	}
-}
-
-function arrays(repetitions: readonly Repetition[]) {
-	const values = <Key extends keyof Repetition>(key: Key) => repetitions.map((repetition) => repetition[key]);
+function samples(repetitions: readonly C02IntegratedRepetition[]) {
+	const values = <Key extends keyof C02IntegratedRepetition>(key: Key) =>
+		repetitions.map((repetition) => repetition[key]);
 	return {
 		c02ParentPendingHighWater: values("parentPendingHighWater"),
 		c02UiPendingHighWater: values("uiPendingHighWater"),
@@ -264,94 +45,81 @@ function arrays(repetitions: readonly Repetition[]) {
 	};
 }
 
-async function verifyFresh(directory: string, commitmentPath: string, publicKeyPem: string): Promise<void> {
-	const moduleUrl = new URL("./swarm-evidence.ts", import.meta.url).href;
-	const program = `import { createSwarmEvidenceTrustRoot as r, verifyAuthenticatedSwarmEvidence as v } from ${JSON.stringify(moduleUrl)}; import { readFile } from "node:fs/promises"; await v(process.argv[1], await readFile(process.argv[2], "utf8"), r(Buffer.from(process.argv[3], "base64").toString("utf8")));`;
-	await execFile(
-		process.execPath,
-		[
-			"--import",
-			"tsx",
-			"--input-type=module",
-			"--eval",
-			program,
-			directory,
-			commitmentPath,
-			Buffer.from(publicKeyPem).toString("base64"),
-		],
-		{ cwd: process.cwd(), maxBuffer: 256 * 1024 },
-	);
-}
-
-describe("C02 deterministic event-loop evidence", () => {
-	test("records three fresh 64-child repetitions with canonical B00B verification", async () => {
-		const warmup = await runRepetition(false);
-		expect(warmup.terminalDeliveries).toBe(FANOUT);
-		const repetitions: Repetition[] = [];
-		for (let repetition = 0; repetition < MEASURED_REPETITIONS; repetition++)
-			repetitions.push(await runRepetition(true));
+describe("C02 integrated event-loop evidence", () => {
+	test("observes fresh owner, attachment, and UI lifecycle repetitions through B00B", async () => {
+		// Excluded warm-up owns a fresh AgentSession, supervisor, clients, UI harness, and delay monitor.
+		const warmup = await runC02IntegratedRepetition(false);
+		expect(warmup.terminalDeliveries).toBe(C02_FANOUT);
+		const repetitions: C02IntegratedRepetition[] = [];
+		for (let index = 0; index < MEASURED_REPETITIONS; index++)
+			repetitions.push(await runC02IntegratedRepetition(true));
 		for (const repetition of repetitions) {
+			expect(repetition.parentPendingHighWater).toBe(C02_FANOUT);
+			expect(repetition.uiPendingHighWater).toBe(1);
+			expect(repetition.slowCatchupPendingHighWater).toBe(1);
+			expect(repetition.slowCatchupScheduleHighWater).toBe(1);
+			expect(repetition.slowCatchupPromiseHighWater).toBe(1);
+			expect(repetition.terminalDeliveries).toBe(C02_FANOUT);
+			expect(repetition.healthyAttachmentLive).toBe(1);
+			expect(repetition.hookErrors).toBe(1);
+			expect(repetition.observerErrors).toBeGreaterThanOrEqual(1);
+			expect(repetition.beforeToolVetoes).toBe(1);
+			expect(repetition.teardownPending).toBe(0);
 			expect(repetition.delayP99Milliseconds).toBeLessThanOrEqual(50);
 			expect(repetition.delayMaxMilliseconds).toBeLessThanOrEqual(100);
-			expect(repetition.teardownPending).toBe(0);
 		}
 
-		const sampler: ProcessSampler = { sample: () => [] };
-		const config = {
-			scenario: "c02-event-loop-scripted-local-fixture",
-			assignments: Array.from({ length: FANOUT }, (_, index) => ({
-				nodeId: `child-${index + 1}`,
-				role: "event-loop-child",
-				requested: { provider: "b00b-scripted", model: "fixture-zero" },
-				inputTokens: 0,
-				outputTokens: 0,
-			})),
-			priceCard: { version: "c02-test-only", inputPerMillionTokens: 0, outputPerMillionTokens: 0 },
-			processSampler: sampler,
-			metadata: {
-				c02Fanout: FANOUT,
-				c02WarmupRepetitions: WARMUP_REPETITIONS,
-				c02MeasuredRepetitions: MEASURED_REPETITIONS,
-				...arrays(repetitions),
-				c02EnvironmentNodeMajor: Number(process.versions.node.split(".")[0]),
-				c02EnvironmentProcessorCount: cpus().length,
-				c02EnvironmentPlatformKnown: true,
-			},
-		};
-		const manifest = createSwarmManifest(config);
-		expect(manifest.metadata.c02Fanout).toBe(FANOUT);
-		const evidence: SwarmEvidence = await runSwarmBenchmark(config);
-		const artifactDirectory = await mkdtemp(join(tmpdir(), "c02-event-loop-artifact-"));
-		const trustDirectory = await mkdtemp(join(tmpdir(), "c02-event-loop-trust-"));
+		const artifactDirectory = await mkdtemp(join(tmpdir(), "c02-integrated-artifact-"));
+		const trustDirectory = await mkdtemp(join(tmpdir(), "c02-integrated-trust-"));
 		cleanups.push(artifactDirectory, trustDirectory);
-		const capability = await writeSwarmEvidence(artifactDirectory, evidence);
-		await expect(verifySwarmEvidence(artifactDirectory, capability)).resolves.toBeUndefined();
-
-		const artifactBundleId = artifactBundleIdForSwarmEvidenceCapability(capability);
 		const keys = generateKeyPairSync("ed25519");
 		const publicKeyPem = keys.publicKey.export({ type: "spki", format: "pem" }).toString();
-		const commitmentPath = join(trustDirectory, "artifact-commitment.json");
-		await writeFile(
-			commitmentPath,
-			`${canonicalJson({
-				schemaVersion: SWARM_EVIDENCE_COMMITMENT_SCHEMA,
-				artifactBundleId,
-				signature: sign(
-					null,
-					Buffer.from(canonicalJson(swarmEvidenceCommitmentPayload(artifactBundleId))),
-					keys.privateKey,
-				).toString("base64"),
-			})}\n`,
-		);
-		await verifyAuthenticatedSwarmEvidence(
+		const written = await writeSignedProductionEvidence(
 			artifactDirectory,
-			await readFile(commitmentPath, "utf8"),
-			createSwarmEvidenceTrustRoot(publicKeyPem),
+			trustDirectory,
+			{
+				scenario: "c02-integrated-owner-attachment-ui",
+				attempts: Array.from({ length: C02_FANOUT }, (_, index) => ({
+					requestId: `request-${String(index + 1).padStart(4, "0")}` as `request-${string}`,
+					attempt: 1,
+					requested: { provider: "b00b-scripted", model: "fixture-zero" },
+					resolved: {
+						api: "b00b-scripted",
+						provider: "b00b-scripted",
+						model: "fixture-zero",
+						responseModel: "fixture-zero-resolved",
+					},
+					terminal: "done" as const,
+					usage: { inputMicroTokens: 0, outputMicroTokens: 0, cacheReadMicroTokens: 0, cacheWriteMicroTokens: 0 },
+				})),
+				priceCard: {
+					version: "c02-integrated-test-only",
+					inputMicroCurrencyPerMillionMicroTokens: 0,
+					outputMicroCurrencyPerMillionMicroTokens: 0,
+				},
+				metadata: {
+					c02Fanout: C02_FANOUT,
+					c02WarmupRepetitions: WARMUP_REPETITIONS,
+					c02MeasuredRepetitions: MEASURED_REPETITIONS,
+					...samples(repetitions),
+					c02EnvironmentNodeMajor: Number(process.versions.node.split(".")[0]),
+					c02EnvironmentProcessorCount: cpus().length,
+					c02EnvironmentPlatformKnown: true,
+				},
+			},
+			keys.privateKey,
 		);
-		await expect(verifyFresh(artifactDirectory, commitmentPath, publicKeyPem)).resolves.toBeUndefined();
-
-		// The signature binds the out-of-band writer identity; mutation cannot pass a fresh verifier.
+		await expect(
+			verifySignedProductionEvidence(artifactDirectory, written.commitmentPath, publicKeyPem),
+		).resolves.toBeUndefined();
+		await expect(
+			verifySignedProductionEvidenceFreshProcess(artifactDirectory, written.commitmentPath, publicKeyPem),
+		).resolves.toBeUndefined();
 		await writeFile(join(artifactDirectory, "summary.json"), "{}\n");
-		await expect(verifyFresh(artifactDirectory, commitmentPath, publicKeyPem)).rejects.toBeDefined();
-	}, 30_000);
+		await expect(
+			verifySignedProductionEvidenceFreshProcess(artifactDirectory, written.commitmentPath, publicKeyPem),
+		).rejects.toThrow("B00B_EVIDENCE_FRESH_VERIFY_FAILED");
+		// The trust-root commitment is stored separately from the mutable artifact root.
+		expect(await readFile(written.commitmentPath, "utf8")).toContain(written.artifactBundleId);
+	}, 60_000);
 });

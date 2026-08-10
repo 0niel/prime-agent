@@ -922,15 +922,44 @@ function verifyC02Metadata(metadata: Record<string, unknown>): void {
 		"unknown C02 event-loop metadata",
 	);
 	for (const key of C02_NUMERIC_METADATA_KEYS)
-		assert(typeof metadata[key] === "number" && Number.isFinite(metadata[key]), `invalid C02 metric: ${key}`);
+		assert(
+			typeof metadata[key] === "number" && Number.isSafeInteger(metadata[key]) && (metadata[key] as number) >= 0,
+			`invalid C02 metric: ${key}`,
+		);
 	for (const key of C02_NUMERIC_ARRAY_METADATA_KEYS)
 		assert(
 			Array.isArray(metadata[key]) &&
-				metadata[key].every((value) => typeof value === "number" && Number.isFinite(value)),
+				metadata[key].length === 3 &&
+				metadata[key].every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0),
 			`invalid C02 metric samples: ${key}`,
 		);
 	for (const key of C02_BOOLEAN_METADATA_KEYS)
 		assert(typeof metadata[key] === "boolean", `invalid C02 status: ${key}`);
+
+	assert(metadata.c02Fanout === 64, "C02 evidence requires 64 streams");
+	assert(metadata.c02WarmupRepetitions === 1, "C02 evidence requires one excluded warmup");
+	assert(metadata.c02MeasuredRepetitions === 3, "C02 evidence requires three measured repetitions");
+	const sample = (key: (typeof C02_NUMERIC_ARRAY_METADATA_KEYS)[number]) => metadata[key] as number[];
+	for (let index = 0; index < 3; index++) {
+		assert(sample("c02ParentPendingHighWater")[index] === 64, "invalid C02 owner coalescer bound");
+		assert(sample("c02UiPendingHighWater")[index] <= 1, "invalid C02 UI coalescer bound");
+		assert(sample("c02SlowCatchupPendingHighWater")[index] <= 1, "invalid C02 slow attachment bound");
+		assert(sample("c02SlowCatchupScheduleHighWater")[index] === 1, "invalid C02 slow scheduler bound");
+		assert(sample("c02SlowCatchupPromiseHighWater")[index] === 1, "invalid C02 slow latch bound");
+		assert(
+			sample("c02TimersScheduled")[index] === sample("c02TimersCancelled")[index] + sample("c02TimersFired")[index],
+			"invalid C02 timer accounting",
+		);
+		assert(sample("c02TerminalDeliveries")[index] === 64, "invalid C02 terminal delivery count");
+		assert(sample("c02HealthyAttachmentLive")[index] === 1, "invalid C02 healthy attachment delivery");
+		assert(sample("c02HookErrors")[index] === 1, "invalid C02 after-hook isolation result");
+		assert(sample("c02ObserverErrors")[index] >= 1, "invalid C02 observer isolation result");
+		assert(sample("c02BeforeToolVetoes")[index] === 1, "invalid C02 before-hook veto result");
+		assert(sample("c02DroppedReplaceableProgress")[index] === 63, "invalid C02 UI replacement count");
+		assert(sample("c02TeardownPending")[index] === 0, "invalid C02 teardown result");
+		assert(sample("c02DelayP99Milliseconds")[index] <= 50, "C02 p99 delay threshold exceeded");
+		assert(sample("c02DelayMaxMilliseconds")[index] <= 100, "C02 max delay threshold exceeded");
+	}
 }
 
 function requireManifest(manifest: unknown): asserts manifest is SwarmManifest & { artifacts: EvidenceArtifact[] } {
