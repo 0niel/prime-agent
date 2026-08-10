@@ -11,6 +11,12 @@ export interface RlmPromptOptions {
 	activeTools?: string[];
 }
 
+const DEFAULT_CONTROL_LOOP_PROMPT = [
+	"Use a nonblocking control loop for slow or asynchronous work: start the work, record its handle or output location, then end your turn. Check its result only on a later turn or when a reply arrives.",
+	"Do not use blocking polling loops or long blocking sleeps to await background work. Short, legitimate asynchronous waits that are needed to complete the current operation are allowed.",
+	"If a runtime offers `follow_up` or `steer`, use its documented contract when appropriate; this prompt neither implements nor guarantees callback delivery, follow-up scheduling, or user-input priority.",
+].join("\n");
+
 const IPYTHON_CONTROL_PROMPT = [
 	"IPython is the agent's long-lived notebook: a persistent control environment for reasoning, context management, state, tool orchestration, and recursive subcalls. Use it to keep intermediate variables, inspect and transform outputs, write small helper functions, and preserve useful state across turns or compaction.",
 	"",
@@ -26,8 +32,7 @@ const IPYTHON_CONTROL_PROMPT = [
 	"",
 	"Python state in the kernel, by contrast, persists across cells: named variables, helper functions, classes, imports, notes, parsed outputs, and helper data structures all remain available in every later turn. Tool calls are themselves Python `await` expressions, so their return values can be bound to variables and composed into program logic just like any other call.",
 	"",
-	"Do not block the kernel waiting on slow external work: never poll with `time.sleep()` loops or long blocking sleeps to await a background run, sandbox, sub-agent, or remote job. A blocked cell holds the turn open, wastes wall-clock, and stops the user from interacting. Instead kick off the work, record its handle or output location, end your turn, and check the result on a later turn (or when a reply arrives).",
-	"If a runtime offers `follow_up` or `steer`, use its documented contract; this prompt neither implements nor guarantees callback delivery, follow-up scheduling, or user-input priority.",
+	"Do not poll slow external work from the kernel with `time.sleep()` loops. Use the nonblocking control loop in the default guidance instead.",
 	"",
 	"Continual harness state is available as `rlm.harness` and `rlm.get_harness_state()`. CRUD calls are local to this Prime Agent session by default: `rlm.harness.create_memory(...)`, `rlm.harness.update_memory(...)`, `rlm.harness.delete_memory(...)`, `rlm.harness.create_skill(...)`, `rlm.harness.update_skill(...)`, `rlm.harness.delete_skill(...)`, `rlm.harness.create_subagent(...)`, `rlm.harness.update_subagent(...)`, `rlm.harness.delete_subagent(...)`, `rlm.harness.create_prompt_note(...)`, `rlm.harness.update_prompt_note(...)`, `rlm.harness.delete_prompt_note(...)`, plus `rlm.harness.record_refinement(...)` and `rlm.harness.overview()`. Use `global_=True` only for stable cross-session lessons; Python reserves `global`, so literal `global=True` is invalid syntax.",
 	"",
@@ -74,6 +79,8 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		"You are a general purpose agent that uses code to solve tasks.",
 		"You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
 		"When you are done, stop calling tools and state your final answer.",
+		"",
+		DEFAULT_CONTROL_LOOP_PROMPT,
 		"",
 		"For prose that you write yourself, use ASD-STE100 simplified technical English unless the user asks for another style. Use short direct sentences. Use active voice. Put one instruction in each sentence. Use common approved words. Keep required technical terms, code, commands, identifiers, quotations, and URLs unchanged. Do not change user-provided text.",
 		"",
