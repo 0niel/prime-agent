@@ -1550,7 +1550,12 @@ export class AgentSession {
 			return;
 		}
 
-		this._pendingRlmChildUpdates.set(rlmChildUpdateKey(child), { event, isCurrent });
+		// Map.set preserves an existing key's insertion order. A replacement is a
+		// new source event, so delete first to make retained flush order match the
+		// order of the newest snapshots rather than their first occurrence.
+		const key = rlmChildUpdateKey(child);
+		this._pendingRlmChildUpdates.delete(key);
+		this._pendingRlmChildUpdates.set(key, { event, isCurrent });
 		if (this._rlmChildUpdateFlushTimer !== undefined) return;
 		const generation = this._rlmChildUpdateGeneration;
 		this._rlmChildUpdateFlushTimer = setTimeout(() => {
