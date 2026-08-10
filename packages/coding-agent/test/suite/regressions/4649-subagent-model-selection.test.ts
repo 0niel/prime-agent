@@ -113,6 +113,43 @@ describe("ENG-4649 subagent model selection", () => {
 		}
 	});
 
+	it("keeps a Luna child selectable when ChatGPT discovery returns an empty catalog", async () => {
+		const codexProvider = "openai-codex";
+		const harness = await createHarness({
+			provider: codexProvider,
+			models: [{ id: "gpt-5.6-sol" }, { id: "gpt-5.6-luna" }],
+		});
+		const fetchModels = vi.fn(
+			async () =>
+				new Response(JSON.stringify({ models: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		vi.stubGlobal("fetch", fetchModels);
+		try {
+			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-empty-catalog"));
+			const lunaSelector = `${codexProvider}/gpt-5.6-luna`;
+			await expect(harness.session.findRlmModels("luna", 8)).resolves.toMatchObject({
+				models: [{ selector: lunaSelector }],
+			});
+			await harness.session.findRlmModels("luna", 8);
+
+			harness.setResponses([fauxAssistantMessage("Luna child completed")]);
+			await expect(harness.session.runRlmChild("run on Luna", { model: lunaSelector })).resolves.toMatchObject({
+				model: lunaSelector,
+			});
+			await vi.waitFor(async () => {
+				const child = (await harness.session.listRlmSubagents()).subagents[0];
+				expect(harness.session.getRlmChildSession(child!.rlm_child_id)?.model?.id).toBe("gpt-5.6-luna");
+			});
+			expect(fetchModels).toHaveBeenCalledOnce();
+		} finally {
+			vi.unstubAllGlobals();
+			harness.cleanup();
+		}
+	});
+
 	it("includes private Prime models authorized for the selected team", async () => {
 		const harness = await createHarness({ provider, models: [{ id: "parent-model" }] });
 		const fetchModels = vi.fn(
