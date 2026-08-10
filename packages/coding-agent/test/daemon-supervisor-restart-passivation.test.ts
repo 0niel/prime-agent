@@ -517,14 +517,53 @@ describe("daemon supervisor restart passivation", () => {
 		mkdirSync(artifact(completed), { recursive: true });
 		writeFileSync(
 			join(artifact(orphan), "scheduled-jobs.json"),
-			JSON.stringify({ jobs: [], dispatches: [{ id: "orphan", jobId: "missing", claimedAt: new Date(0).toISOString(), scheduledFor: new Date(0).toISOString() }] }),
+			JSON.stringify({
+				jobs: [],
+				dispatches: [
+					{
+						id: "orphan",
+						jobId: "missing",
+						claimedAt: new Date(0).toISOString(),
+						scheduledFor: new Date(0).toISOString(),
+					},
+				],
+			}),
 		);
 		writeFileSync(
 			join(artifact(completed), "scheduled-jobs.json"),
-			JSON.stringify({ jobs: [{ id: "done", status: "completed", source: "cron", activeSessionId: completedEntry.rootActiveSessionId, sessionId: completed.id, sessionFile: completed.sessionFile, cwd: fixture.root, prompt: "done", schedule: { kind: "once", expression: "once" }, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), runCount: 1 }], dispatches: [{ id: "matched", jobId: "done", claimedAt: new Date(0).toISOString(), scheduledFor: new Date(0).toISOString() }] }),
+			JSON.stringify({
+				jobs: [
+					{
+						id: "done",
+						status: "completed",
+						source: "cron",
+						activeSessionId: completedEntry.rootActiveSessionId,
+						sessionId: completed.id,
+						sessionFile: completed.sessionFile,
+						cwd: fixture.root,
+						prompt: "done",
+						schedule: { kind: "once", expression: "once" },
+						createdAt: new Date(0).toISOString(),
+						updatedAt: new Date(0).toISOString(),
+						runCount: 1,
+					},
+				],
+				dispatches: [
+					{
+						id: "matched",
+						jobId: "done",
+						claimedAt: new Date(0).toISOString(),
+						scheduledFor: new Date(0).toISOString(),
+					},
+				],
+			}),
 		);
-		for (const entry of [orphanEntry, completedEntry]) writeFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), JSON.stringify(entry));
-		const supervisor = new DaemonSupervisor(fixture.socketPath, { defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir }, descriptorDir: fixture.descriptorDir }) as unknown as SupervisorInternals;
+		for (const entry of [orphanEntry, completedEntry])
+			writeFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), JSON.stringify(entry));
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
 		await supervisor.loadWorkerDescriptors();
 		expect(supervisor.workers.get(orphanEntry.workerId)?.descriptor.lifecycle).toBe("recovering");
 		expect(supervisor.workers.get(completedEntry.workerId)?.descriptor.lifecycle).toBe("passivated");
@@ -592,9 +631,26 @@ describe("daemon supervisor restart passivation", () => {
 	it("clears stale process identity before persisting an owner-owned no-env passive worker", async () => {
 		const fixture = fixtureRoot();
 		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
-		const entry = { ...descriptor(fixture, "owner-no-env", session), ownerClientId: "owner-client", lifecycle: "ready" as const };
-		const supervisor = new DaemonSupervisor(fixture.socketPath, { defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir }, descriptorDir: fixture.descriptorDir }) as unknown as SupervisorInternals;
-		const worker = { descriptor: entry, descriptorPath: join(fixture.descriptorDir, "owner-no-env.json"), summaries: new Map(), snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(), intentionalStop: false, stopRevision: 0 };
+		const entry = {
+			...descriptor(fixture, "owner-no-env", session),
+			ownerClientId: "owner-client",
+			lifecycle: "ready" as const,
+		};
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const worker = {
+			descriptor: entry,
+			descriptorPath: join(fixture.descriptorDir, "owner-no-env.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
 		writeFileSync(worker.descriptorPath, JSON.stringify(entry));
 		supervisor.workers.set(entry.workerId, worker);
 		await (
@@ -898,8 +954,25 @@ describe("daemon supervisor restart passivation", () => {
 	it("does not recreate a deleted descriptor when a later stop requests archive", async () => {
 		const fixture = fixtureRoot();
 		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
-		const supervisor = new DaemonSupervisor(fixture.socketPath, { defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir }, descriptorDir: fixture.descriptorDir }) as unknown as SupervisorInternals;
-		const worker = { descriptor: (() => { const { pid: _pid, processStartId: _start, ...passive } = descriptor(fixture, "already-deleted", session); return { ...passive, lifecycle: "passivated" as const }; })(), descriptorPath: join(fixture.descriptorDir, "already-deleted.json"), summaries: new Map(), snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(), intentionalStop: false, stopFinalized: false, stopRevision: 0 };
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const worker = {
+			descriptor: (() => {
+				const { pid: _pid, processStartId: _start, ...passive } = descriptor(fixture, "already-deleted", session);
+				return { ...passive, lifecycle: "passivated" as const };
+			})(),
+			descriptorPath: join(fixture.descriptorDir, "already-deleted.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopFinalized: false,
+			stopRevision: 0,
+		};
 		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
 		supervisor.workers.set(worker.descriptor.workerId, worker);
 		await supervisor.stopWorker(worker, true);

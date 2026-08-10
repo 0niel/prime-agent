@@ -264,11 +264,7 @@ export class AgentCronJobStore {
 			// or terminal-state mismatch may represent work whose result was lost. A
 			// completed one-shot dispatch is safe: its durable terminal job proves there
 			// is no schedule left to revive.
-			if (
-				!job ||
-				job.sessionId !== sessionId ||
-				(job.status !== "active" && job.status !== "completed")
-			) {
+			if (!job || job.sessionId !== sessionId || (job.status !== "active" && job.status !== "completed")) {
 				return true;
 			}
 		}
