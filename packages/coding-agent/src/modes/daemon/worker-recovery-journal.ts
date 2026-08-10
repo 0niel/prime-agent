@@ -201,8 +201,13 @@ export class WorkerRecoveryJournal {
 		this.latest = parsed.latest;
 		this.hasInvalidRecords = parsed.hasInvalidRecords;
 		// Upgrade journals written before completed v2 identities were pruned.
-		// A restart must not expose their historical terminal records forever.
-		if ([...this.latest.values()].some((record) => isV2(record) && !record.busy)) this.compact();
+		// A restart must not expose their historical terminal records forever. Raw
+		// malformed lines are fail-closed recovery evidence, however: rewriting a
+		// parsed subset would silently erase both that evidence and the unreadable
+		// signal on the next restart.
+		if (!this.hasInvalidRecords && [...this.latest.values()].some((record) => isV2(record) && !record.busy)) {
+			this.compact();
+		}
 	}
 
 	/**
@@ -247,16 +252,12 @@ export class WorkerRecoveryJournal {
 		// or getLatest history. v1 remains conservative uncertainty; every busy v2
 		// identity remains exact crash evidence.
 		if (!record.busy) {
-			try {
-				this.compact();
-			} catch (error) {
-				// The append is durable, but a failed replacement must not make this
-				// process forget any retained sibling evidence before the caller decides
-				// how to recover.
-				if (previous) this.latest.set(key, previous);
-				else this.latest.delete(key);
-				throw error;
-			}
+			// The terminal append is already durable. Do not roll it back in memory:
+			// restoring `previous` would let a later successful compaction rewrite its
+			// old busy record and resurrect completed work. compact() still propagates
+			// replacement failures to the caller, because it may not have durably
+			// retained the complete sibling evidence set.
+			this.compact();
 		}
 	}
 
@@ -284,6 +285,10 @@ export class WorkerRecoveryJournal {
 	}
 
 	private compact(): void {
+		// Parsed records are not a lossless representation of malformed input. Do
+		// not replace the journal while it contains any such raw evidence; otherwise
+		// a compaction would make future recovery appear safe merely by deleting it.
+		if (this.hasInvalidRecords) return;
 		// Completed v2 operations are deliberately omitted. Keeping their UUID-keyed
 		// terminal entries would make a long-lived idle worker retain one record per
 		// historical operation. v1 has no identity fence and is therefore preserved

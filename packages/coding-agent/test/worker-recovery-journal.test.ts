@@ -24,6 +24,7 @@ const generationA = "11111111-1111-4111-8111-111111111111";
 const generationB = "22222222-2222-4222-8222-222222222222";
 const operationA = "33333333-3333-4333-8333-333333333333";
 const operationB = "44444444-4444-4444-8444-444444444444";
+const operationC = "55555555-5555-4555-8555-555555555555";
 
 function recordingFileSystem(
 	events: string[],
@@ -32,12 +33,14 @@ function recordingFileSystem(
 		maximumWriteLength,
 		zeroTempWrite = false,
 	}: {
-		failTempFsync?: boolean;
+		failTempFsync?: boolean | number;
 		maximumWriteLength?: number;
 		zeroTempWrite?: boolean;
 	} = {},
 ): WorkerRecoveryJournalFileSystem {
 	const descriptors = new Map<number, string>();
+	let remainingTempFsyncFailures =
+		typeof failTempFsync === "number" ? failTempFsync : failTempFsync ? Number.POSITIVE_INFINITY : 0;
 	return {
 		mkdirSync,
 		readFileSync,
@@ -62,7 +65,8 @@ function recordingFileSystem(
 		},
 		fsyncSync(fd) {
 			events.push(`fsync:${descriptors.get(fd)}`);
-			if (failTempFsync && descriptors.get(fd) === "temp") {
+			if (remainingTempFsyncFailures > 0 && descriptors.get(fd) === "temp") {
+				remainingTempFsyncFailures--;
 				const error = new Error("injected temporary-file fsync failure") as NodeJS.ErrnoException;
 				error.code = "EIO";
 				throw error;
@@ -284,6 +288,72 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 			"fsync:directory",
 			"close:directory",
 		]);
+	});
+
+	it("keeps a durably appended completion after compaction fails, then never resurrects it", () => {
+		const file = path();
+		const tempPath = `${file}.failed.tmp`;
+		const journal = new WorkerRecoveryJournal(file, {
+			fileSystem: recordingFileSystem([], { failTempFsync: 1 }),
+			makeTempPath: () => tempPath,
+		});
+		journal.record({ ...base, busy: true, operationId: operationA });
+		journal.record({ ...base, busy: true, operationId: operationB });
+
+		// The terminal append commits before replacement. A replacement failure is
+		// reported to the caller, but must not restore A's old busy checkpoint.
+		expect(() => journal.record({ ...base, busy: false, operationId: operationA })).toThrow(
+			"injected temporary-file fsync failure",
+		);
+		expect(journal.getLatest()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ busy: false, operationId: operationA }),
+				expect.objectContaining({ busy: true, operationId: operationB }),
+			]),
+		);
+
+		// A completion replay is a no-op because A remains terminal in memory.
+		journal.record({ ...base, busy: false, operationId: operationA });
+		expect(journal.getLatest()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ busy: false, operationId: operationA })]),
+		);
+
+		// A later healthy compaction retains B while omitting the durable terminals.
+		// It must never rebuild A from the stale busy record; the same holds on restart.
+		journal.record({ ...base, busy: true, operationId: operationC });
+		journal.record({ ...base, busy: false, operationId: operationC });
+		expect(journal.getLatest()).toEqual([expect.objectContaining({ busy: true, operationId: operationB })]);
+		const restarted = new WorkerRecoveryJournal(file);
+		expect(restarted.getLatest()).toEqual([expect.objectContaining({ busy: true, operationId: operationB })]);
+	});
+
+	it("never compacts malformed raw history, including terminal records, across restarts", () => {
+		const file = path();
+		const received = { version: 2, ...base, busy: true, recordedAt: new Date().toISOString() };
+		const completed = { version: 2, ...base, busy: false, recordedAt: new Date().toISOString() };
+		const malformed = "{malformed raw recovery evidence}";
+		const contents = `${JSON.stringify(received)}\n${malformed}\n${JSON.stringify(completed)}\n`;
+		appendFileSync(file, contents);
+
+		const first = new WorkerRecoveryJournal(file);
+		expect(first.hasUnreadableRecords()).toBe(true);
+		expect(first.getLatest()).toEqual([expect.objectContaining({ busy: false, operationId: operationA })]);
+		expect(readFileSync(file, "utf8")).toBe(contents);
+
+		// Both constructor auto-compaction and a completion-triggered compaction
+		// must fail closed by retaining the exact raw corruption for future recovery.
+		first.record({ ...base, busy: true, operationId: operationB });
+		first.record({ ...base, busy: false, operationId: operationB });
+		expect(readFileSync(file, "utf8")).toContain(malformed);
+		const second = new WorkerRecoveryJournal(file);
+		expect(second.hasUnreadableRecords()).toBe(true);
+		expect(second.getLatest()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ busy: false, operationId: operationA })]),
+		);
+		expect(readFileSync(file, "utf8")).toContain(malformed);
+		const third = new WorkerRecoveryJournal(file);
+		expect(third.hasUnreadableRecords()).toBe(true);
+		expect(readFileSync(file, "utf8")).toContain(malformed);
 	});
 
 	it("fails closed on replacement sync failure without removing a busy sibling journal record", () => {
