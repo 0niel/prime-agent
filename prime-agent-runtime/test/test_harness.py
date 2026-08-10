@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -997,16 +998,35 @@ class HarnessStateTest(unittest.TestCase):
         self.assertIsNone(_lock_owner(duplicate.read_bytes()))
         self.assertIsNone(_lock_owner(b'{"pid":1,"nonce":"' + b"a" * 32 + b'","process_start":"100","created_at":"2026-01-01T00:00:00.000Z"}\n'))
 
-    def test_shared_legacy_fixture_migrates_to_canonical_v2(self) -> None:
-        fixture = Path(__file__).parent / "fixtures" / "harness_state" / "legacy-v1-normalized.json"
+    def test_cross_runtime_fixture_manifest_and_canonical_v2_round_trip(self) -> None:
+        root = Path(__file__).parent / "fixtures" / "harness_state"
+        typescript_root = Path(__file__).parents[2] / "packages" / "coding-agent" / "test" / "fixtures" / "harness-state"
+        manifest = json.loads((root / "expected-canonical-sha256.json").read_text("utf-8"))
+        self.assertEqual(set(manifest), {path.name for path in root.iterdir()} - {"expected-canonical-sha256.json"})
+        for name, expected in manifest.items():
+            raw = (root / name).read_bytes()
+            self.assertEqual(raw, (typescript_root / name).read_bytes(), name)
+            self.assertEqual(expected, {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}, name)
+
+        canonical = (root / "v2-populated.json").read_bytes()
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "harness_state.json"
-            path.write_bytes(fixture.read_bytes())
+            path.write_bytes(canonical)
+            loaded = HarnessState(path)
+            self.assertFalse(loaded.recovered)
+            self.assertEqual(loaded.snapshot().sha256, hashlib.sha256(canonical).hexdigest())
+            self.assertEqual(path.read_bytes(), canonical)
+
+    def test_shared_legacy_fixture_migrates_to_the_canonical_v2_fixture(self) -> None:
+        root = Path(__file__).parent / "fixtures" / "harness_state"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "harness_state.json"
+            path.write_bytes((root / "legacy-v1-normalized.json").read_bytes())
             state = HarnessState(path)
             self.assertEqual(state.get("memory", "legacy_nfc").version, 2)
             self.assertEqual(state.refinements[0].changes, ["migration"])
-            state.create_memory("New", "canonical", id="new")
-            self.assertEqual(json.loads(path.read_bytes())["schema"], 2)
+            state.save()
+            self.assertEqual(path.read_bytes(), (root / "v2-populated.json").read_bytes())
 
     def test_atomic_state_file_is_owner_only_after_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

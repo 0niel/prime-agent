@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	appendFileSync,
 	chmodSync,
@@ -1220,18 +1221,42 @@ describe("harness refinement", () => {
 		expect(recovered.recovery).toBe("invalid_entry");
 	});
 
-	it("migrates the shared normalized legacy fixture on mutation", () => {
-		const dir = makeTempDir();
-		writeFileSync(
-			getHarnessStatePath(dir),
-			readFileSync(new URL("./fixtures/harness-state/legacy-v1-normalized.json", import.meta.url)),
+	it("verifies the shared fixture manifest and accepts canonical v2 byte-identically", () => {
+		const root = new URL("./fixtures/harness-state/", import.meta.url);
+		const pythonRoot = new URL("../../../prime-agent-runtime/test/fixtures/harness_state/", import.meta.url);
+		const manifest = JSON.parse(readFileSync(new URL("expected-canonical-sha256.json", root), "utf8")) as Record<
+			string,
+			{ bytes: number; sha256: string }
+		>;
+		expect(Object.keys(manifest).sort()).toEqual(
+			readdirSync(root)
+				.filter((name) => name !== "expected-canonical-sha256.json")
+				.sort(),
 		);
+		for (const [name, expected] of Object.entries(manifest)) {
+			const raw = readFileSync(new URL(name, root));
+			expect(raw).toEqual(readFileSync(new URL(name, pythonRoot)));
+			expect(expected).toEqual({ bytes: raw.length, sha256: createHash("sha256").update(raw).digest("hex") });
+		}
+
+		const dir = makeTempDir();
+		const canonical = readFileSync(new URL("v2-populated.json", root));
+		writeFileSync(getHarnessStatePath(dir), canonical);
+		const state = loadHarnessState(dir, "local");
+		expect(state.recovered).toBe(false);
+		expect(state.snapshot.sha256).toBe(createHash("sha256").update(canonical).digest("hex"));
+		expect(readFileSync(getHarnessStatePath(dir))).toEqual(canonical);
+	});
+
+	it("migrates the shared legacy fixture to the canonical v2 fixture", () => {
+		const dir = makeTempDir();
+		const root = new URL("./fixtures/harness-state/", import.meta.url);
+		writeFileSync(getHarnessStatePath(dir), readFileSync(new URL("legacy-v1-normalized.json", root)));
 		const state = loadHarnessState(dir, "local");
 		expect(state.entries.memory.legacy_nfc.version).toBe(2);
 		expect(state.refinements[0].changes).toEqual(["migration"]);
-		seedEntry(state, "memory", "new");
 		saveHarnessState(dir, state);
-		expect(JSON.parse(readFileSync(getHarnessStatePath(dir), "utf8")).schema).toBe(2);
+		expect(readFileSync(getHarnessStatePath(dir))).toEqual(readFileSync(new URL("v2-populated.json", root)));
 	});
 
 	it("fails closed on duplicate-key or noncanonical lock owners", () => {

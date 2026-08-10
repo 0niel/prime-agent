@@ -2,7 +2,10 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
+	chmodSync,
+	closeSync,
 	existsSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -10,9 +13,6 @@ import {
 	statSync,
 	unlinkSync,
 	writeFileSync,
-	fsyncSync,
-	closeSync,
-	chmodSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -300,7 +300,10 @@ export interface LoadedHarnessState extends HarnessState {
 }
 
 export class HarnessGenerationConflict extends Error {
-	constructor(public readonly expected: HarnessSnapshot, public readonly actual: HarnessSnapshot) {
+	constructor(
+		public readonly expected: HarnessSnapshot,
+		public readonly actual: HarnessSnapshot,
+	) {
 		super("harness state changed while this operation was in progress");
 	}
 }
@@ -310,12 +313,27 @@ export class HarnessRecoveryRequired extends Error {}
 
 const MAX_SAFE_INTEGER = 9_007_199_254_740_991;
 const V2_KEYS = ["entries", "generation", "refinements", "schema"];
-const ENTRY_KEYS = ["arguments", "content", "created_at", "id", "kind", "metadata", "path", "reference", "scope", "source", "title", "updated_at", "version"];
+const ENTRY_KEYS = [
+	"arguments",
+	"content",
+	"created_at",
+	"id",
+	"kind",
+	"metadata",
+	"path",
+	"reference",
+	"scope",
+	"source",
+	"title",
+	"updated_at",
+	"version",
+];
 const EVENT_KEYS = ["changes", "created_at", "evidence", "id", "outcome", "trigger"];
 const ISO_MILLIS_Z = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
 
 function scalarCompare(left: string, right: string): number {
-	const a = Array.from(left); const b = Array.from(right);
+	const a = Array.from(left);
+	const b = Array.from(right);
 	for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
 		const delta = a[index].codePointAt(0)! - b[index].codePointAt(0)!;
 		if (delta) return delta;
@@ -328,21 +346,44 @@ function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
 	return actual.length === expected.length && actual.every((key, i) => key === expected[i]);
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+	return (
+		value !== null &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		Object.getPrototypeOf(value) === Object.prototype
+	);
 }
 function nfcString(value: unknown): value is string {
 	return typeof value === "string" && value === value.normalize("NFC") && !/[\uD800-\uDFFF]/.test(value);
 }
 function safeInteger(value: unknown, positive = false): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && !Object.is(value, -0) && value >= (positive ? 1 : 0) && value <= MAX_SAFE_INTEGER;
+	return (
+		typeof value === "number" &&
+		Number.isSafeInteger(value) &&
+		!Object.is(value, -0) &&
+		value >= (positive ? 1 : 0) &&
+		value <= MAX_SAFE_INTEGER
+	);
 }
 function validateJson(value: unknown): void {
 	if (value === null || typeof value === "boolean") return;
-	if (typeof value === "string") { if (!nfcString(value)) throw new Error("non_nfc"); return; }
-	if (typeof value === "number") { if (!safeInteger(value)) throw new Error("invalid_number"); return; }
-	if (Array.isArray(value)) { value.forEach(validateJson); return; }
+	if (typeof value === "string") {
+		if (!nfcString(value)) throw new Error("non_nfc");
+		return;
+	}
+	if (typeof value === "number") {
+		if (!safeInteger(value)) throw new Error("invalid_number");
+		return;
+	}
+	if (Array.isArray(value)) {
+		value.forEach(validateJson);
+		return;
+	}
 	if (!isRecord(value)) throw new Error("invalid_json_value");
-	for (const [key, child] of Object.entries(value)) { if (!nfcString(key)) throw new Error("non_nfc"); validateJson(child); }
+	for (const [key, child] of Object.entries(value)) {
+		if (!nfcString(key)) throw new Error("non_nfc");
+		validateJson(child);
+	}
 }
 function canonicalBytes(value: HarnessState): Buffer {
 	validateJson(value);
@@ -361,26 +402,77 @@ function snapshotFor(state: HarnessState): HarnessSnapshot {
 	const bytes = canonicalBytes(state);
 	return { generation: state.generation, sha256: createHash("sha256").update(bytes).digest("hex") };
 }
-function timestamp(value: unknown): boolean { return nfcString(value) && ISO_MILLIS_Z.test(value); }
+function timestamp(value: unknown): boolean {
+	return nfcString(value) && ISO_MILLIS_Z.test(value);
+}
 function validateSkill(reference: Record<string, unknown>): void {
-	if (reference.type !== "python" || !(nfcString(reference.import) || nfcString(reference.python_import)) || !(nfcString(reference.callable) || nfcString(reference.call_pattern))) throw new Error("invalid_skill_reference");
+	if (
+		reference.type !== "python" ||
+		!(nfcString(reference.import) || nfcString(reference.python_import)) ||
+		!(nfcString(reference.callable) || nfcString(reference.call_pattern))
+	)
+		throw new Error("invalid_skill_reference");
 }
 function validateV2(data: unknown): asserts data is HarnessState {
-	if (!isRecord(data) || !exactKeys(data, V2_KEYS) || data.schema !== 2 || !safeInteger(data.generation) || !isRecord(data.entries) || !exactKeys(data.entries, ["prompt", "memory", "skill", "subagent"]) || !Array.isArray(data.refinements)) throw new Error("invalid_shape");
+	if (
+		!isRecord(data) ||
+		!exactKeys(data, V2_KEYS) ||
+		data.schema !== 2 ||
+		!safeInteger(data.generation) ||
+		!isRecord(data.entries) ||
+		!exactKeys(data.entries, ["prompt", "memory", "skill", "subagent"]) ||
+		!Array.isArray(data.refinements)
+	)
+		throw new Error("invalid_shape");
 	const ids = new Set<string>();
 	for (const kind of ["prompt", "memory", "skill", "subagent"] as RefinementKind[]) {
 		const records = data.entries[kind];
 		if (!isRecord(records)) throw new Error("invalid_shape");
 		for (const [id, raw] of Object.entries(records)) {
-			if (!nfcString(id) || !id || ids.has(id) || !isRecord(raw) || !exactKeys(raw, ENTRY_KEYS) || raw.id !== id || raw.kind !== kind || !nfcString(raw.title) || !nfcString(raw.content) || !nfcString(raw.path) || !nfcString(raw.source) || !timestamp(raw.created_at) || !timestamp(raw.updated_at) || (raw.scope !== "local" && raw.scope !== "global") || !safeInteger(raw.version, true) || !isRecord(raw.reference) || !isRecord(raw.arguments) || !isRecord(raw.metadata)) throw new Error("invalid_entry");
-			validateJson(raw.reference); validateJson(raw.arguments); validateJson(raw.metadata);
+			if (
+				!nfcString(id) ||
+				!id ||
+				ids.has(id) ||
+				!isRecord(raw) ||
+				!exactKeys(raw, ENTRY_KEYS) ||
+				raw.id !== id ||
+				raw.kind !== kind ||
+				!nfcString(raw.title) ||
+				!nfcString(raw.content) ||
+				!nfcString(raw.path) ||
+				!nfcString(raw.source) ||
+				!timestamp(raw.created_at) ||
+				!timestamp(raw.updated_at) ||
+				(raw.scope !== "local" && raw.scope !== "global") ||
+				!safeInteger(raw.version, true) ||
+				!isRecord(raw.reference) ||
+				!isRecord(raw.arguments) ||
+				!isRecord(raw.metadata)
+			)
+				throw new Error("invalid_entry");
+			validateJson(raw.reference);
+			validateJson(raw.arguments);
+			validateJson(raw.metadata);
 			if (kind === "skill") validateSkill(raw.reference);
 			ids.add(id);
 		}
 	}
 	const refinementIds = new Set<string>();
 	for (const event of data.refinements) {
-		if (!isRecord(event) || !exactKeys(event, EVENT_KEYS) || !nfcString(event.id) || !event.id || refinementIds.has(event.id) || !nfcString(event.trigger) || !nfcString(event.evidence) || !nfcString(event.outcome) || !timestamp(event.created_at) || !Array.isArray(event.changes) || !event.changes.every(nfcString)) throw new Error("invalid_refinement");
+		if (
+			!isRecord(event) ||
+			!exactKeys(event, EVENT_KEYS) ||
+			!nfcString(event.id) ||
+			!event.id ||
+			refinementIds.has(event.id) ||
+			!nfcString(event.trigger) ||
+			!nfcString(event.evidence) ||
+			!nfcString(event.outcome) ||
+			!timestamp(event.created_at) ||
+			!Array.isArray(event.changes) ||
+			!event.changes.every(nfcString)
+		)
+			throw new Error("invalid_refinement");
 		refinementIds.add(event.id);
 	}
 }
@@ -389,24 +481,101 @@ function validateV2(data: unknown): asserts data is HarnessState {
  * before JSON.parse gives the value a chance to erase that evidence. */
 function rejectDuplicateKeys(text: string): void {
 	let i = 0;
-	const ws = () => { while (/\s/.test(text[i] ?? "")) i += 1; };
+	const ws = () => {
+		while (/\s/.test(text[i] ?? "")) i += 1;
+	};
 	const string = (): string => {
-		const start = i; if (text[i++] !== '"') throw new Error("invalid_json");
+		const start = i;
+		if (text[i++] !== '"') throw new Error("invalid_json");
 		let escaped = false;
-		while (i < text.length) { const char = text[i++]; if (!escaped && char === '"') return JSON.parse(text.slice(start, i)); if (!escaped && char === "\\") escaped = true; else escaped = false; }
+		while (i < text.length) {
+			const char = text[i++];
+			if (!escaped && char === '"') return JSON.parse(text.slice(start, i));
+			if (!escaped && char === "\\") escaped = true;
+			else escaped = false;
+		}
 		throw new Error("invalid_json");
 	};
-	const value = (): void => { ws(); const char = text[i]; if (char === "{") { object(); return; } if (char === "[") { i += 1; ws(); if (text[i] === "]") { i += 1; return; } while (true) { value(); ws(); if (text[i] === "]") { i += 1; return; } if (text[i++] !== ",") throw new Error("invalid_json"); } } if (char === '"') { string(); return; } const match = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(text.slice(i)); if (!match) throw new Error("invalid_json"); i += match[0].length; };
-	const object = (): void => { i += 1; ws(); const seen = new Set<string>(); if (text[i] === "}") { i += 1; return; } while (true) { ws(); const key = string(); if (seen.has(key)) throw new Error("duplicate_key"); seen.add(key); ws(); if (text[i++] !== ":") throw new Error("invalid_json"); value(); ws(); if (text[i] === "}") { i += 1; return; } if (text[i++] !== ",") throw new Error("invalid_json"); } };
-	value(); ws(); if (i !== text.length) throw new Error("invalid_json");
+	const value = (): void => {
+		ws();
+		const char = text[i];
+		if (char === "{") {
+			object();
+			return;
+		}
+		if (char === "[") {
+			i += 1;
+			ws();
+			if (text[i] === "]") {
+				i += 1;
+				return;
+			}
+			while (true) {
+				value();
+				ws();
+				if (text[i] === "]") {
+					i += 1;
+					return;
+				}
+				if (text[i++] !== ",") throw new Error("invalid_json");
+			}
+		}
+		if (char === '"') {
+			string();
+			return;
+		}
+		const match = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(text.slice(i));
+		if (!match) throw new Error("invalid_json");
+		i += match[0].length;
+	};
+	const object = (): void => {
+		i += 1;
+		ws();
+		const seen = new Set<string>();
+		if (text[i] === "}") {
+			i += 1;
+			return;
+		}
+		while (true) {
+			ws();
+			const key = string();
+			if (seen.has(key)) throw new Error("duplicate_key");
+			seen.add(key);
+			ws();
+			if (text[i++] !== ":") throw new Error("invalid_json");
+			value();
+			ws();
+			if (text[i] === "}") {
+				i += 1;
+				return;
+			}
+			if (text[i++] !== ",") throw new Error("invalid_json");
+		}
+	};
+	value();
+	ws();
+	if (i !== text.length) throw new Error("invalid_json");
 }
 function parseV2(raw: Buffer): { state: HarnessState; snapshot: HarnessSnapshot } {
-	let text: string; try { text = new TextDecoder("utf-8", { fatal: true }).decode(raw); } catch { throw new Error("invalid_utf8"); }
-	try { rejectDuplicateKeys(text); } catch (error) { throw error; }
-	let parsed: unknown; try { parsed = JSON.parse(text); } catch { throw new Error("invalid_json"); }
+	let text: string;
+	try {
+		text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+	} catch {
+		throw new Error("invalid_utf8");
+	}
+	rejectDuplicateKeys(text);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		throw new Error("invalid_json");
+	}
 	validateV2(parsed);
 	if (!raw.equals(canonicalBytes(parsed))) throw new Error("noncanonical_v2");
-	return { state: parsed, snapshot: { generation: parsed.generation, sha256: createHash("sha256").update(raw).digest("hex") } };
+	return {
+		state: parsed,
+		snapshot: { generation: parsed.generation, sha256: createHash("sha256").update(raw).digest("hex") },
+	};
 }
 function legacyVersion(value: unknown): number {
 	if (safeInteger(value, true)) return value;
@@ -475,19 +644,58 @@ function legacyState(raw: Buffer, scope: HarnessScope): { state: HarnessState; s
 		: [];
 	return { state, snapshot: { generation: 0, sha256: createHash("sha256").update(raw).digest("hex") } };
 }
-function readState(path: string, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot; legacy: boolean } {
-	if (!existsSync(path)) { const state = emptyHarnessState(); return { state, snapshot: snapshotFor(state), legacy: false }; }
+function readState(
+	path: string,
+	scope: HarnessScope,
+): { state: HarnessState; snapshot: HarnessSnapshot; legacy: boolean } {
+	if (!existsSync(path)) {
+		const state = emptyHarnessState();
+		return { state, snapshot: snapshotFor(state), legacy: false };
+	}
 	const raw = readFileSync(path);
-	try { const decoded = parseV2(raw); return { ...decoded, legacy: false }; } catch (error) { const legacy = legacyState(raw, scope); if (legacy) return { ...legacy, legacy: true }; throw error; }
+	try {
+		const decoded = parseV2(raw);
+		return { ...decoded, legacy: false };
+	} catch (error) {
+		const legacy = legacyState(raw, scope);
+		if (legacy) return { ...legacy, legacy: true };
+		throw error;
+	}
 }
 function processStart(pid: number): string | undefined {
-	try { return readFileSync(`/proc/${pid}/stat`, "utf8").trim().split(") ")[1]?.split(" ")[19]; } catch { /* macOS has no /proc */ }
-	try { const value = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); return value || undefined; } catch { return undefined; }
+	try {
+		return readFileSync(`/proc/${pid}/stat`, "utf8").trim().split(") ")[1]?.split(" ")[19];
+	} catch {
+		/* macOS has no /proc */
+	}
+	try {
+		const value = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+		return value || undefined;
+	} catch {
+		return undefined;
+	}
 }
 function ensureRoot(dir: string): void {
-	try { mkdirSync(dir, { recursive: true, mode: 0o700 }); const mode = statSync(dir).mode & 0o777; if (mode !== 0o700) { chmodSync(dir, 0o700); if ((statSync(dir).mode & 0o777) !== 0o700) throw new Error("mode"); } } catch (error) { throw new HarnessAtomicWriteUnsupported("owner-only harness root unavailable"); }
+	try {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const mode = statSync(dir).mode & 0o777;
+		if (mode !== 0o700) {
+			chmodSync(dir, 0o700);
+			if ((statSync(dir).mode & 0o777) !== 0o700) throw new Error("mode");
+		}
+	} catch {
+		throw new HarnessAtomicWriteUnsupported("owner-only harness root unavailable");
+	}
 }
-interface LockOwner { nonce: string; pid: number; process_start: string; created_at: string; }
+interface LockOwner {
+	nonce: string;
+	pid: number;
+	process_start: string;
+	created_at: string;
+}
 function parseLock(bytes: Buffer): LockOwner | undefined {
 	try {
 		const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -504,7 +712,12 @@ function parseLock(bytes: Buffer): LockOwner | undefined {
 			!timestamp(raw.created_at)
 		)
 			return undefined;
-		const owner = raw as LockOwner;
+		const owner: LockOwner = {
+			nonce: raw.nonce as string,
+			pid: raw.pid as number,
+			process_start: raw.process_start as string,
+			created_at: raw.created_at as string,
+		};
 		return bytes.equals(lockBytes(owner)) ? owner : undefined;
 	} catch {
 		return undefined;
@@ -517,45 +730,192 @@ function lockBytes(owner: LockOwner): Buffer {
 	);
 }
 function withHarnessLease<T>(path: string, operation: () => T): T {
-	const lock = `${path}.lock`; const nonce = randomUUID().replaceAll("-", ""); const start = processStart(process.pid); if (!start) throw new HarnessAtomicWriteUnsupported("process-start identity unavailable"); const owner: LockOwner = { nonce, pid: process.pid, process_start: start, created_at: now() }; const deadline = Date.now() + 2_000;
-	while (true) try { const fd = openSync(lock, "wx", 0o600); try { writeFileSync(fd, lockBytes(owner)); fsyncSync(fd); } finally { closeSync(fd); } break; } catch (error: any) {
-		if (error?.code !== "EEXIST") throw new HarnessAtomicWriteUnsupported("exclusive lease unavailable");
-		let bytes: Buffer; try { bytes = readFileSync(lock); } catch { if (Date.now() >= deadline) throw new HarnessLockBusy("harness state lease is busy"); continue; }
-		const other = parseLock(bytes); if (!other) throw new HarnessLockBusy("harness state lease is busy"); const otherStart = processStart(other.pid);
-		if (otherStart && otherStart === other.process_start) { if (Date.now() >= deadline) throw new HarnessLockBusy("harness state lease is busy"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20); continue; }
-		if (otherStart) { try { if (readFileSync(lock).equals(bytes)) unlinkSync(lock); } catch { /* race: retry bounded */ } continue; }
-		try { process.kill(other.pid, 0); } catch (check: any) { if (check?.code === "ESRCH") { try { if (readFileSync(lock).equals(bytes)) unlinkSync(lock); } catch { /* race */ } continue; } }
-		throw new HarnessLockBusy("harness state lease is busy");
+	const lock = `${path}.lock`;
+	const nonce = randomUUID().replaceAll("-", "");
+	const start = processStart(process.pid);
+	if (!start) throw new HarnessAtomicWriteUnsupported("process-start identity unavailable");
+	const owner: LockOwner = { nonce, pid: process.pid, process_start: start, created_at: now() };
+	const deadline = Date.now() + 2_000;
+	while (true)
+		try {
+			const fd = openSync(lock, "wx", 0o600);
+			try {
+				writeFileSync(fd, lockBytes(owner));
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+			break;
+		} catch (error: any) {
+			if (error?.code !== "EEXIST") throw new HarnessAtomicWriteUnsupported("exclusive lease unavailable");
+			let bytes: Buffer;
+			try {
+				bytes = readFileSync(lock);
+			} catch {
+				if (Date.now() >= deadline) throw new HarnessLockBusy("harness state lease is busy");
+				continue;
+			}
+			const other = parseLock(bytes);
+			if (!other) throw new HarnessLockBusy("harness state lease is busy");
+			const otherStart = processStart(other.pid);
+			if (otherStart && otherStart === other.process_start) {
+				if (Date.now() >= deadline) throw new HarnessLockBusy("harness state lease is busy");
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+				continue;
+			}
+			if (otherStart) {
+				try {
+					if (readFileSync(lock).equals(bytes)) unlinkSync(lock);
+				} catch {
+					/* race: retry bounded */
+				}
+				continue;
+			}
+			try {
+				process.kill(other.pid, 0);
+			} catch (check: any) {
+				if (check?.code === "ESRCH") {
+					try {
+						if (readFileSync(lock).equals(bytes)) unlinkSync(lock);
+					} catch {
+						/* race */
+					}
+					continue;
+				}
+			}
+			throw new HarnessLockBusy("harness state lease is busy");
+		}
+	try {
+		return operation();
+	} finally {
+		try {
+			const bytes = readFileSync(lock);
+			if (parseLock(bytes)?.nonce === nonce) unlinkSync(lock);
+		} catch {
+			/* never delete another owner */
+		}
 	}
-	try { return operation(); } finally { try { const bytes = readFileSync(lock); if (parseLock(bytes)?.nonce === nonce) unlinkSync(lock); } catch { /* never delete another owner */ } }
 }
-function writeAtomic(path: string, candidate: HarnessState, scope: HarnessScope): HarnessSnapshot {
-	const bytes = canonicalBytes(candidate); const dir = join(path, ".."); const temp = join(dir, `.${"harness_state.json"}.${process.pid}.${randomUUID().replaceAll("-", "")}.tmp`);
-	try { const fd = openSync(temp, "wx", 0o600); try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); } if ((statSync(temp).mode & 0o777) !== 0o600) throw new HarnessAtomicWriteUnsupported("owner-only temp unavailable"); renameSync(temp, path); const dirFd = openSync(dir, "r"); try { fsyncSync(dirFd); } finally { closeSync(dirFd); } const verified = parseV2(readFileSync(path)); if (verified.snapshot.generation !== candidate.generation || verified.snapshot.sha256 !== snapshotFor(candidate).sha256) throw new HarnessAtomicWriteUnsupported("post-rename verification failed"); if ((statSync(path).mode & 0o777) !== 0o600) throw new HarnessAtomicWriteUnsupported("owner-only state unavailable"); return verified.snapshot; } catch (error) { if (error instanceof HarnessAtomicWriteUnsupported) throw error; throw new HarnessAtomicWriteUnsupported("atomic harness-state write unavailable"); } finally { try { if (existsSync(temp)) unlinkSync(temp); } catch { /* only own temp; preserve original failure */ } }
+function writeAtomic(path: string, candidate: HarnessState): HarnessSnapshot {
+	const bytes = canonicalBytes(candidate);
+	const dir = join(path, "..");
+	const temp = join(dir, `.${"harness_state.json"}.${process.pid}.${randomUUID().replaceAll("-", "")}.tmp`);
+	try {
+		const fd = openSync(temp, "wx", 0o600);
+		try {
+			writeFileSync(fd, bytes);
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		if ((statSync(temp).mode & 0o777) !== 0o600)
+			throw new HarnessAtomicWriteUnsupported("owner-only temp unavailable");
+		renameSync(temp, path);
+		const dirFd = openSync(dir, "r");
+		try {
+			fsyncSync(dirFd);
+		} finally {
+			closeSync(dirFd);
+		}
+		const verified = parseV2(readFileSync(path));
+		if (
+			verified.snapshot.generation !== candidate.generation ||
+			verified.snapshot.sha256 !== snapshotFor(candidate).sha256
+		)
+			throw new HarnessAtomicWriteUnsupported("post-rename verification failed");
+		if ((statSync(path).mode & 0o777) !== 0o600)
+			throw new HarnessAtomicWriteUnsupported("owner-only state unavailable");
+		return verified.snapshot;
+	} catch (error) {
+		if (error instanceof HarnessAtomicWriteUnsupported) throw error;
+		throw new HarnessAtomicWriteUnsupported("atomic harness-state write unavailable");
+	} finally {
+		try {
+			if (existsSync(temp)) unlinkSync(temp);
+		} catch {
+			/* only own temp; preserve original failure */
+		}
+	}
 }
-function recoverLocked(path: string, scope: HarnessScope, reason: string): LoadedHarnessState {
-	const raw = readFileSync(path); const dir = join(path, ".."); const suffix = reason === "invalid_utf8" ? "bin" : "json"; const recovery = join(dir, `harness_state.corrupt.${Date.now()}.${randomUUID().replaceAll("-", "")}.${suffix}`);
-	try { const fd = openSync(recovery, "wx", 0o600); try { writeFileSync(fd, raw); fsyncSync(fd); } finally { closeSync(fd); } if ((statSync(recovery).mode & 0o777) !== 0o600) throw new Error("mode"); } catch { throw new HarnessRecoveryRequired("unable to preserve corrupt harness state"); }
-	const state = emptyHarnessState(); state.generation = 1; return { state, snapshot: writeAtomic(path, state, scope), recovered: true, recovery: reason };
+function recoverLocked(path: string, _scope: HarnessScope, reason: string): LoadedHarnessState {
+	const raw = readFileSync(path);
+	const dir = join(path, "..");
+	const suffix = reason === "invalid_utf8" ? "bin" : "json";
+	const recovery = join(dir, `harness_state.corrupt.${Date.now()}.${randomUUID().replaceAll("-", "")}.${suffix}`);
+	try {
+		const fd = openSync(recovery, "wx", 0o600);
+		try {
+			writeFileSync(fd, raw);
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		if ((statSync(recovery).mode & 0o777) !== 0o600) throw new Error("mode");
+	} catch {
+		throw new HarnessRecoveryRequired("unable to preserve corrupt harness state");
+	}
+	const state = emptyHarnessState();
+	state.generation = 1;
+	return { ...state, state, snapshot: writeAtomic(path, state), recovered: true, recovery: reason };
 }
 /** Load returns state and its CAS snapshot. Recovery is performed only under the shared lease. */
-export function loadHarnessState(harnessStateDir: string = getGlobalHarnessStateDir(), scope: HarnessScope = "global"): LoadedHarnessState {
-	ensureRoot(harnessStateDir); const path = getHarnessStatePath(harnessStateDir);
+export function loadHarnessState(
+	harnessStateDir: string = getGlobalHarnessStateDir(),
+	scope: HarnessScope = "global",
+): LoadedHarnessState {
+	ensureRoot(harnessStateDir);
+	const path = getHarnessStatePath(harnessStateDir);
 	return withHarnessLease(path, () => {
-		const loaded = (() => { try { const current = readState(path, scope); return { state: current.state, snapshot: current.snapshot, recovered: false }; } catch (error) { if (!existsSync(path)) throw error; return recoverLocked(path, scope, error instanceof Error ? error.message : "invalid_json"); } })();
+		const loaded: Pick<LoadedHarnessState, "state" | "snapshot" | "recovered" | "recovery"> = (() => {
+			try {
+				const current = readState(path, scope);
+				return { state: current.state, snapshot: current.snapshot, recovered: false };
+			} catch (error) {
+				if (!existsSync(path)) throw error;
+				return recoverLocked(path, scope, error instanceof Error ? error.message : "invalid_json");
+			}
+		})();
 		// Existing consumers received HarnessState directly. Keep that view while
 		// making the snapshot explicit and non-serializable in canonical bytes.
 		const result = loaded.state as LoadedHarnessState;
-		Object.defineProperties(result, { state: { value: loaded.state, enumerable: false }, snapshot: { value: loaded.snapshot, enumerable: false }, recovered: { value: loaded.recovered, enumerable: false }, recovery: { value: loaded.recovery, enumerable: false } });
+		Object.defineProperties(result, {
+			state: { value: loaded.state, enumerable: false },
+			snapshot: { value: loaded.snapshot, enumerable: false },
+			recovered: { value: loaded.recovered, enumerable: false },
+			recovery: { value: loaded.recovery, enumerable: false },
+		});
 		return result;
 	});
 }
 /** Commit a candidate under a caller-owned planning snapshot; no last-writer-wins default exists. */
-export function saveHarnessState(harnessStateDir: string, state: HarnessState, expected?: HarnessSnapshot, scope: HarnessScope = "global"): HarnessSnapshot {
+export function saveHarnessState(
+	harnessStateDir: string,
+	state: HarnessState,
+	expected?: HarnessSnapshot,
+	scope: HarnessScope = "global",
+): HarnessSnapshot {
 	const planningSnapshot = expected ?? (state as Partial<LoadedHarnessState>).snapshot;
 	if (!planningSnapshot) throw new HarnessRecoveryRequired("save requires the caller planning snapshot");
-	ensureRoot(harnessStateDir); const path = getHarnessStatePath(harnessStateDir);
-	return withHarnessLease(path, () => { let actual: HarnessSnapshot; try { actual = readState(path, scope).snapshot; } catch (error) { throw new HarnessRecoveryRequired("state must be reloaded before replacing corrupt content"); } if (actual.generation !== planningSnapshot.generation || actual.sha256 !== planningSnapshot.sha256) throw new HarnessGenerationConflict(planningSnapshot, actual); const candidate: HarnessState = { schema: 2, generation: actual.generation + 1, entries: state.entries, refinements: state.refinements }; validateV2(candidate); return writeAtomic(path, candidate, scope); });
+	ensureRoot(harnessStateDir);
+	const path = getHarnessStatePath(harnessStateDir);
+	return withHarnessLease(path, () => {
+		let actual: HarnessSnapshot;
+		try {
+			actual = readState(path, scope).snapshot;
+		} catch {
+			throw new HarnessRecoveryRequired("state must be reloaded before replacing corrupt content");
+		}
+		if (actual.generation !== planningSnapshot.generation || actual.sha256 !== planningSnapshot.sha256)
+			throw new HarnessGenerationConflict(planningSnapshot, actual);
+		const candidate: HarnessState = {
+			schema: 2,
+			generation: actual.generation + 1,
+			entries: state.entries,
+			refinements: state.refinements,
+		};
+		validateV2(candidate);
+		return writeAtomic(path, candidate);
+	});
 }
 
 export function mergeHarnessStates(globalState: HarnessState, localState?: HarnessState): HarnessState {
@@ -576,7 +936,6 @@ export function mergeHarnessStates(globalState: HarnessState, localState?: Harne
 	merged.refinements = [...globalState.refinements, ...(localState?.refinements ?? [])];
 	return merged;
 }
-
 
 export function getRefinementHistoryPath(harnessStateDir: string = getGlobalHarnessStateDir()): string {
 	return join(harnessStateDir, REFINEMENT_HISTORY_FILE_NAME);
