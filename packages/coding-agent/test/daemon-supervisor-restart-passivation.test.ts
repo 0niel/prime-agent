@@ -164,6 +164,82 @@ describe("daemon supervisor restart passivation", () => {
 		expect(supervisor.workers.get("unjudged")?.descriptor.lifecycle).toBe("recovering");
 	});
 
+	it("recovers terminal roots with paused or unreadable heartbeat artifacts", async () => {
+		const fixture = fixtureRoot();
+		const paused = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const unreadable = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const pausedCron = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const pausedEntry = descriptor(fixture, "paused-heartbeat", paused);
+		const unreadableEntry = descriptor(fixture, "unreadable-heartbeat", unreadable);
+		const pausedCronEntry = descriptor(fixture, "paused-cron", pausedCron);
+		const pausedArtifact = join(fixture.agentDir, "session-artifacts", paused.id);
+		const unreadableArtifact = join(fixture.agentDir, "session-artifacts", unreadable.id);
+		const pausedCronArtifact = join(fixture.agentDir, "session-artifacts", pausedCron.id);
+		mkdirSync(pausedArtifact, { recursive: true });
+		mkdirSync(unreadableArtifact, { recursive: true });
+		writeFileSync(
+			join(pausedArtifact, "scheduled-jobs.json"),
+			JSON.stringify({
+				jobs: [
+					{
+						id: "paused-heartbeat",
+						status: "paused",
+						source: "heartbeat",
+						activeSessionId: pausedEntry.rootActiveSessionId,
+						sessionId: paused.id,
+						sessionFile: paused.sessionFile,
+						cwd: fixture.root,
+						prompt: "wait for an explicit resume",
+						schedule: { kind: "interval", expression: "every 1m", intervalMs: 60_000 },
+						createdAt: new Date(0).toISOString(),
+						updatedAt: new Date(0).toISOString(),
+						runCount: 0,
+					},
+				],
+				dispatches: [],
+			}),
+		);
+		// A malformed artifact is not a proof of an empty heartbeat catalog.
+		writeFileSync(join(unreadableArtifact, "scheduled-jobs.json"), "{");
+		mkdirSync(pausedCronArtifact, { recursive: true });
+		writeFileSync(
+			join(pausedCronArtifact, "scheduled-jobs.json"),
+			JSON.stringify({
+				jobs: [
+					{
+						id: "paused-cron",
+						status: "paused",
+						source: "cron",
+						activeSessionId: pausedCronEntry.rootActiveSessionId,
+						sessionId: pausedCron.id,
+						sessionFile: pausedCron.sessionFile,
+						cwd: fixture.root,
+						prompt: "preserve passive scheduled behavior",
+						schedule: { kind: "interval", expression: "every 1m", intervalMs: 60_000 },
+						createdAt: new Date(0).toISOString(),
+						updatedAt: new Date(0).toISOString(),
+						runCount: 0,
+					},
+				],
+				dispatches: [],
+			}),
+		);
+		for (const entry of [pausedEntry, unreadableEntry, pausedCronEntry]) {
+			writeFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), JSON.stringify(entry));
+		}
+
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		await supervisor.loadWorkerDescriptors();
+
+		expect(supervisor.workers.get(pausedEntry.workerId)?.descriptor.lifecycle).toBe("recovering");
+		expect(supervisor.workers.get(unreadableEntry.workerId)?.descriptor.lifecycle).toBe("recovering");
+		// A paused non-heartbeat schedule has never required a runtime snapshot.
+		expect(supervisor.workers.get(pausedCronEntry.workerId)?.descriptor.lifecycle).toBe("passivated");
+	});
+
 	it("prepares only ready residents and retains processless roots for the replacement supervisor", async () => {
 		const fixture = fixtureRoot();
 		const passiveSession = persistSession(fixture.sessionDir, fixture.root, "completed");

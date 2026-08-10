@@ -25,7 +25,6 @@ import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "
 import {
 	type AgentCronJob,
 	AgentCronJobStore,
-	isHeartbeatCronJob,
 	migrateLegacyCronJobsToSessionArtifacts,
 	SESSION_SCHEDULED_JOBS_FILENAME,
 } from "../../core/cron-jobs.js";
@@ -1013,9 +1012,7 @@ export class DaemonSupervisor {
 			const artifactDir = join(dirname(dirname(info.path)), "session-artifacts", info.id);
 			const cronStore = AgentCronJobStore.forSessionArtifacts();
 			cronStore.registerSessionArtifact(info.id, artifactDir);
-			return cronStore
-				.list()
-				.some((job) => job.status === "active" || (!isHeartbeatCronJob(job) && job.status === "paused"));
+			return cronStore.hasRecoverableSessionArtifactState(info.id);
 		} catch {
 			// Recovery is safer than dropping an unreadable durable schedule/journal.
 			return true;

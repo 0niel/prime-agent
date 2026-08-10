@@ -219,6 +219,39 @@ export class AgentCronJobStore {
 		return this.readJobs().sort((a, b) => compareOptionalIso(a.nextRunAt, b.nextRunAt));
 	}
 
+	/**
+	 * Whether a persisted session schedule prevents replacing its worker with a
+	 * processless passive descriptor. Unlike list(), this deliberately does not
+	 * discard malformed records: a supervisor cannot reconstruct a heartbeat
+	 * catalog from data it cannot validate.
+	 */
+	hasRecoverableSessionArtifactState(sessionId: string): boolean {
+		if (!this.sessionArtifactMode) {
+			throw new Error("Recoverable artifact state requires session artifact mode");
+		}
+		const path = this.sessionArtifactFiles.get(sessionId);
+		if (!path || !existsSync(path)) {
+			return false;
+		}
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
+		if (!parsed || typeof parsed !== "object") {
+			return true;
+		}
+		const file = parsed as CronJobsFile;
+		if ((file.jobs !== undefined && !Array.isArray(file.jobs)) || (file.dispatches !== undefined && !Array.isArray(file.dispatches))) {
+			return true;
+		}
+		if ((file.jobs ?? []).some((job) => !isAgentCronJob(job))) {
+			return true;
+		}
+		if ((file.dispatches ?? []).some((dispatch) => !isAgentCronDispatchRecord(dispatch))) {
+			return true;
+		}
+		return (file.jobs as AgentCronJob[] | undefined ?? []).some(
+			(job) => job.status === "active" || (isHeartbeatCronJob(job) && job.status === "paused"),
+		);
+	}
+
 	create(input: CreateAgentCronJobInput): AgentCronJob {
 		const now = input.now ?? new Date();
 		const prompt = input.prompt.trim();
