@@ -330,6 +330,81 @@ describe("Codex WebSocket cancellation regressions", () => {
 		expect(constructed).toBe(2);
 	});
 
+	it("aborts a request cleaned up while its websocket is still connecting", async () => {
+		let socket: MockWebSocket | undefined;
+		let constructed: (() => void) | undefined;
+		const didConstruct = new Promise<void>((resolve) => {
+			constructed = resolve;
+		});
+		class MockWebSocket extends MockSocketBase {
+			constructor() {
+				super();
+				socket = this;
+				constructed?.();
+			}
+			send(): void {
+				throw new Error("cleaned-up socket must not send");
+			}
+		}
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		global.fetch = vi.fn(async () => completeSSE("must-not-fallback")) as typeof fetch;
+		const sessionId = "cleanup-connecting";
+		const pending = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "auto",
+			sessionId,
+		}).result();
+		await didConstruct;
+
+		cleanupSessionResources(sessionId);
+		socket?.dispatch("open", {});
+		const result = await Promise.race([
+			pending,
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("cleanup timed out")), 500)),
+		]);
+		expect(result.stopReason).toBe("aborted");
+		expect(socket?.closes.some(({ reason }) => reason === "aborted")).toBe(true);
+		expect(global.fetch).not.toHaveBeenCalled();
+		expect(getOpenAICodexWebSocketDebugStats(sessionId)).toBeUndefined();
+	});
+
+	it("aborts an open pending request during session cleanup without recreating fallback state", async () => {
+		let sent: (() => void) | undefined;
+		const didSend = new Promise<void>((resolve) => {
+			sent = resolve;
+		});
+		class MockWebSocket extends MockSocketBase {
+			constructor() {
+				super();
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+			send(): void {
+				sent?.();
+			}
+		}
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		global.fetch = vi.fn(async () => completeSSE("must-not-fallback")) as typeof fetch;
+		const sessionId = "cleanup-active";
+		const pending = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "auto",
+			sessionId,
+		}).result();
+		await didSend;
+
+		cleanupSessionResources(sessionId);
+		const result = await Promise.race([
+			pending,
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("cleanup timed out")), 500)),
+		]);
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Request was aborted");
+		expect(global.fetch).not.toHaveBeenCalled();
+		expect(getOpenAICodexWebSocketDebugStats(sessionId)).toBeUndefined();
+		await Promise.resolve();
+		expect(getOpenAICodexWebSocketDebugStats(sessionId)).toBeUndefined();
+	});
+
 	it("keeps sticky SSE fallback state when only debug stats are reset", async () => {
 		let constructed = 0;
 		class MockWebSocket extends MockSocketBase {

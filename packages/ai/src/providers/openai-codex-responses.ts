@@ -147,6 +147,11 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 	options?: OpenAICodexResponsesOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
+	const activeRequest = registerActiveWebSocketRequest(options?.sessionId);
+	const effectiveSignal = options?.signal
+		? AbortSignal.any([options.signal, activeRequest.controller.signal])
+		: activeRequest.controller.signal;
+	options = { ...options, signal: effectiveSignal };
 
 	(async () => {
 		const output: AssistantMessage = {
@@ -322,6 +327,8 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					: String(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
+		} finally {
+			activeRequest.unregister();
 		}
 	})();
 
@@ -692,6 +699,42 @@ export interface OpenAICodexWebSocketDebugStats {
 const websocketSessionCache = new Map<string, CachedWebSocketConnection>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
 const websocketSseFallbackSessions = new Set<string>();
+const activeWebSocketRequests = new Map<string | undefined, Set<AbortController>>();
+
+function registerActiveWebSocketRequest(sessionId: string | undefined): {
+	controller: AbortController;
+	unregister: () => void;
+} {
+	const controller = new AbortController();
+	let requests = activeWebSocketRequests.get(sessionId);
+	if (!requests) {
+		requests = new Set();
+		activeWebSocketRequests.set(sessionId, requests);
+	}
+	requests.add(controller);
+	return {
+		controller,
+		unregister: () => {
+			requests.delete(controller);
+			if (requests.size === 0 && activeWebSocketRequests.get(sessionId) === requests) {
+				activeWebSocketRequests.delete(sessionId);
+			}
+		},
+	};
+}
+
+function abortActiveWebSocketRequests(sessionId?: string): void {
+	const abortRequests = (requests: Set<AbortController> | undefined) => {
+		for (const controller of requests ?? []) controller.abort(createAbortError());
+	};
+	if (sessionId !== undefined) {
+		abortRequests(activeWebSocketRequests.get(sessionId));
+		activeWebSocketRequests.delete(sessionId);
+		return;
+	}
+	for (const requests of activeWebSocketRequests.values()) abortRequests(requests);
+	activeWebSocketRequests.clear();
+}
 
 function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats {
 	let stats = websocketDebugStats.get(sessionId);
@@ -727,6 +770,7 @@ export function resetOpenAICodexWebSocketDebugStats(sessionId?: string): void {
 }
 
 export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
+	abortActiveWebSocketRequests(sessionId);
 	const closeEntry = (entry: CachedWebSocketConnection) => {
 		if (entry.idleTimer) clearTimeout(entry.idleTimer);
 		closeWebSocketSilently(entry.socket, 1000, "debug_close");
@@ -1257,36 +1301,40 @@ async function processWebSocketStream(
 	onStart: () => void,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	const { socket, entry, reused, release } = await acquireWebSocket(url, headers, options?.sessionId, options?.signal);
+	const signal = options?.signal;
+	const { socket, entry, reused, release } = await acquireWebSocket(url, headers, options?.sessionId, signal);
 	let keepConnection = false;
-	const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
-	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
-	// WebSocket continuation still works via connection-scoped previous_response_id state.
-	const fullBody = body;
-	const requestBody = useCachedContext && entry ? buildCachedWebSocketRequestBody(entry, fullBody) : fullBody;
-	const stats = options?.sessionId ? getOrCreateWebSocketDebugStats(options.sessionId) : undefined;
-	if (stats) {
-		stats.requests++;
-		if (reused) stats.connectionsReused++;
-		else stats.connectionsCreated++;
-		if (useCachedContext) stats.cachedContextRequests++;
-		if (requestBody.store === true) stats.storeTrueRequests++;
-		stats.lastInputItems = requestBody.input?.length ?? 0;
-		if (requestBody.previous_response_id) {
-			stats.deltaRequests++;
-			stats.lastDeltaInputItems = requestBody.input?.length ?? 0;
-			stats.lastPreviousResponseId = requestBody.previous_response_id;
-		} else {
-			stats.fullContextRequests++;
-			stats.lastDeltaInputItems = undefined;
-			stats.lastPreviousResponseId = undefined;
-		}
-	}
 	let websocketStream: ReturnType<typeof createWebSocketEventStream> | undefined;
 	try {
-		throwIfAborted(options?.signal);
-		websocketStream = createWebSocketEventStream(socket, options?.signal);
-		throwIfAborted(options?.signal);
+		// acquireWebSocket always crosses an await boundary. Cleanup may have
+		// invalidated this request before this continuation resumes, so check
+		// before stats, cache continuation state, listeners, or send side effects.
+		throwIfAborted(signal);
+		const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
+		// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
+		// WebSocket continuation still works via connection-scoped previous_response_id state.
+		const fullBody = body;
+		const requestBody = useCachedContext && entry ? buildCachedWebSocketRequestBody(entry, fullBody) : fullBody;
+		const stats = options?.sessionId ? getOrCreateWebSocketDebugStats(options.sessionId) : undefined;
+		if (stats) {
+			stats.requests++;
+			if (reused) stats.connectionsReused++;
+			else stats.connectionsCreated++;
+			if (useCachedContext) stats.cachedContextRequests++;
+			if (requestBody.store === true) stats.storeTrueRequests++;
+			stats.lastInputItems = requestBody.input?.length ?? 0;
+			if (requestBody.previous_response_id) {
+				stats.deltaRequests++;
+				stats.lastDeltaInputItems = requestBody.input?.length ?? 0;
+				stats.lastPreviousResponseId = requestBody.previous_response_id;
+			} else {
+				stats.fullContextRequests++;
+				stats.lastDeltaInputItems = undefined;
+				stats.lastPreviousResponseId = undefined;
+			}
+		}
+		websocketStream = createWebSocketEventStream(socket, signal);
+		throwIfAborted(signal);
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(mapCodexEvents(websocketStream.events), output, stream, onStart),
@@ -1299,7 +1347,7 @@ async function processWebSocketStream(
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			},
 		);
-		throwIfAborted(options?.signal);
+		throwIfAborted(signal);
 		if (useCachedContext && entry && output.responseId) {
 			const responseItems = convertResponsesMessages(model, { messages: [output] }, CODEX_TOOL_CALL_PROVIDERS, {
 				includeSystemPrompt: false,
