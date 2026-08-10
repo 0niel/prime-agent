@@ -169,10 +169,33 @@ jobs:
       - name: Test npm 12 URL dependency policy
         run: npm run check:npm12-remote
 
+  windows-daemon-smoke:
+    name: Windows daemon native smoke
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test named-pipe supervisor and worker authentication
+        working-directory: packages/coding-agent
+        run: npx tsx ../../node_modules/vitest/dist/cli.js --run test/windows-daemon-smoke.test.ts
+
   build-check-test:
     name: build-check-test
     if: always()
-    needs: [build-check, test, python-runtime, npm12-compat]
+    needs: [build-check, test, python-runtime, npm12-compat, windows-daemon-smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Verify CI results
@@ -181,8 +204,10 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           PYTHON_RUNTIME_RESULT: ${{ needs.python-runtime.result }}
           NPM12_COMPAT_RESULT: ${{ needs.npm12-compat.result }}
+          WINDOWS_DAEMON_SMOKE_RESULT: ${{ needs.windows-daemon-smoke.result }}
         run: |
           test "$BUILD_CHECK_RESULT" = success
           test "$TEST_RESULT" = success
           test "$PYTHON_RUNTIME_RESULT" = success
           test "$NPM12_COMPAT_RESULT" = success
+          test "$WINDOWS_DAEMON_SMOKE_RESULT" = success

@@ -1,35 +1,28 @@
 import { describe, expect, it, vi } from "vitest";
 import { workerAuthenticationAttemptTimeoutMs } from "../../../src/modes/daemon/daemon-supervisor.js";
-import { createProcessStartIdCache } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
+import { processIdentityMatches } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
 
 describe("#1077 Windows worker authentication", () => {
-	it("reuses process start IDs across authentication retries", () => {
-		let now = 100;
-		const lookup = vi.fn((pid: number) => `win:${pid}`);
-		const cachedLookup = createProcessStartIdCache(lookup, 5000, () => now);
+	it("rejects a PID reused between immediate identity checks", () => {
+		const getStartId = vi.fn().mockReturnValueOnce("win:old").mockReturnValueOnce("win:reused");
+		const probe = { isAlive: vi.fn(() => true), getStartId };
+		const identity = { pid: 42, processStartId: "win:old" };
 
-		expect(cachedLookup(42)).toBe("win:42");
-		now = 5099;
-		expect(cachedLookup(42)).toBe("win:42");
-		expect(lookup).toHaveBeenCalledTimes(1);
-
-		now = 5100;
-		expect(cachedLookup(42)).toBe("win:42");
-		expect(lookup).toHaveBeenCalledTimes(2);
+		expect(processIdentityMatches(identity, false, probe)).toBe(true);
+		expect(processIdentityMatches(identity, false, probe)).toBe(false);
+		expect(getStartId).toHaveBeenCalledTimes(2);
 	});
 
-	it("starts the cache TTL after a slow Windows process lookup completes", () => {
-		let now = 100;
-		const lookup = vi.fn(() => {
-			now += 20_000;
-			return undefined;
-		});
-		const cachedLookup = createProcessStartIdCache(lookup, 5000, () => now);
+	it("checks process liveness fresh before querying its start ID", () => {
+		const isAlive = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(false);
+		const getStartId = vi.fn(() => "win:old");
+		const probe = { isAlive, getStartId };
+		const identity = { pid: 42, processStartId: "win:old" };
 
-		expect(cachedLookup(7)).toBeUndefined();
-		now += 4999;
-		expect(cachedLookup(7)).toBeUndefined();
-		expect(lookup).toHaveBeenCalledTimes(1);
+		expect(processIdentityMatches(identity, false, probe)).toBe(true);
+		expect(processIdentityMatches(identity, false, probe)).toBe(false);
+		expect(isAlive).toHaveBeenCalledTimes(2);
+		expect(getStartId).toHaveBeenCalledTimes(1);
 	});
 
 	it("allows a Windows authentication attempt to use the remaining connection budget", () => {
