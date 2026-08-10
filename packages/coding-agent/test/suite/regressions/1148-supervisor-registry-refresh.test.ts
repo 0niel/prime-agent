@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { acquireDaemonSupervisorOwnership } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
 
@@ -101,6 +102,36 @@ describe("#1148 supervisor registry pruning recovery", () => {
 		} finally {
 			await replacement.release();
 			await original.release();
+		}
+	});
+	it("does not reconstruct ownership when release races a guarded phase update", async () => {
+		const paths = fixture();
+		const generation = "release-race-generation";
+		const ownership = await acquireDaemonSupervisorOwnership({
+			...paths,
+			generation,
+			appVersion: "test",
+		});
+		const directory = ownerDirectory(paths.registryDir, generation);
+		rmSync(directory, { recursive: true, force: true });
+		const releaseGuard = await lockfile.lock(paths.registryDir, {
+			realpath: false,
+			lockfilePath: join(paths.registryDir, ".guard"),
+			stale: 5000,
+			update: 1000,
+		});
+		try {
+			const phaseUpdate = ownership.updatePhase("owner");
+			await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+			const releasing = ownership.release();
+			await Promise.resolve();
+			await releaseGuard();
+			await expect(phaseUpdate).resolves.toBeUndefined();
+			await expect(releasing).resolves.toBeUndefined();
+			expect(existsSync(directory)).toBe(false);
+		} finally {
+			await releaseGuard().catch(() => undefined);
+			await ownership.release();
 		}
 	});
 });

@@ -111,9 +111,9 @@ class DaemonShutdownAdmissionError extends Error {
 }
 
 class DaemonSupervisorOwnership {
-	private released = false;
-	private lost = false;
-	private refreshPromise?: Promise<void>;
+	private state: "active" | "lost" | "releasing" | "released" = "active";
+	private operationQueue: Promise<void> = Promise.resolve();
+	private releasePromise?: Promise<void>;
 	private refreshTimer?: ReturnType<typeof setInterval>;
 
 	constructor(
@@ -125,78 +125,116 @@ class DaemonSupervisorOwnership {
 	}
 
 	async assertCurrent(): Promise<void> {
-		if (this.released || this.lost) {
+		if (this.state !== "active") {
 			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
 		}
-		await this.refreshPromise;
-		const current = readOwnerRecord(this.ownerDirectory);
-		if (current && sameOwnerRecord(current, this.record)) {
-			return;
-		}
-		if (current || !(await this.assertOrRenew())) {
-			this.markLost();
-			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
-		}
+		return this.enqueueOperation(async () => {
+			if (this.state !== "active") {
+				throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+			}
+			const current = readOwnerRecord(this.ownerDirectory);
+			if (current && sameOwnerRecord(current, this.record)) {
+				return;
+			}
+			if (current) {
+				this.markLost();
+				throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+			}
+			const updated = await this.renew();
+			if (this.state !== "active" || !updated) {
+				if (this.state === "active") {
+					this.markLost();
+				}
+				throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+			}
+		});
 	}
 
 	async updatePhase(phase: DaemonSupervisorOwnerPhase): Promise<void> {
-		if (this.released) {
+		if (this.state !== "active") {
 			return;
 		}
-		if (
-			!(await this.assertOrRenew((owner) => {
+		return this.enqueueOperation(async () => {
+			if (this.state !== "active") {
+				return;
+			}
+			const updated = await this.renew((owner) => {
 				owner.phase = phase;
-			}))
-		) {
-			this.markLost();
-			throw new Error(`Daemon supervisor ownership was lost for ${this.record.socketPath}`);
-		}
+			});
+			if (this.state !== "active") {
+				return;
+			}
+			if (!updated) {
+				this.markLost();
+				throw new Error(`Daemon supervisor ownership was lost for ${this.record.socketPath}`);
+			}
+		});
 	}
 
 	async release(): Promise<void> {
-		if (this.released) {
+		if (this.state === "released") {
 			return;
 		}
+		if (this.releasePromise) {
+			return this.releasePromise;
+		}
+		const previousState = this.state;
+		this.state = "releasing";
 		this.stopRefreshTimer();
-		await this.refreshPromise;
-		let releasedDirectory: string | undefined;
-		try {
-			await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
-				const current = readOwnerRecord(this.ownerDirectory);
-				if (!current || current.token !== this.record.token) {
-					return;
+		this.releasePromise = this.enqueueOperation(async () => {
+			let releasedDirectory: string | undefined;
+			try {
+				await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
+					const current = readOwnerRecord(this.ownerDirectory);
+					if (!current || current.token !== this.record.token) {
+						return;
+					}
+					releasedDirectory = `${this.ownerDirectory}.released-${randomUUID()}`;
+					renameSync(this.ownerDirectory, releasedDirectory);
+				});
+				this.state = "released";
+			} finally {
+				if (releasedDirectory) {
+					rmSync(releasedDirectory, { recursive: true, force: true });
 				}
-				releasedDirectory = `${this.ownerDirectory}.released-${randomUUID()}`;
-				renameSync(this.ownerDirectory, releasedDirectory);
-			});
-			this.released = true;
-		} catch (error) {
-			if (!this.lost) {
+			}
+		}).catch((error) => {
+			this.state = previousState;
+			if (this.state === "active") {
 				this.startRefreshTimer();
 			}
 			throw error;
+		});
+		try {
+			await this.releasePromise;
 		} finally {
-			if (releasedDirectory) {
-				rmSync(releasedDirectory, { recursive: true, force: true });
-			}
+			this.releasePromise = undefined;
 		}
 	}
 
+	private enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
+		const result = this.operationQueue.then(operation);
+		this.operationQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
 	private startRefreshTimer(): void {
-		if (this.refreshTimer || this.released || this.lost) {
+		if (this.refreshTimer || this.state !== "active") {
 			return;
 		}
 		this.refreshTimer = setInterval(() => {
-			this.refreshPromise ??= this.assertOrRenew()
-				.then((renewed) => {
-					if (!renewed) {
-						this.markLost();
-					}
-				})
-				.catch(() => undefined)
-				.finally(() => {
-					this.refreshPromise = undefined;
-				});
+			void this.enqueueOperation(async () => {
+				if (this.state !== "active") {
+					return;
+				}
+				const updated = await this.renew();
+				if (this.state === "active" && !updated) {
+					this.markLost();
+				}
+			}).catch(() => undefined);
 		}, OWNER_REFRESH_MS);
 		this.refreshTimer.unref();
 	}
@@ -209,15 +247,20 @@ class DaemonSupervisorOwnership {
 	}
 
 	private markLost(): void {
-		this.lost = true;
+		if (this.state === "active") {
+			this.state = "lost";
+		}
 		this.stopRefreshTimer();
 	}
 
-	private async assertOrRenew(mutation?: (owner: DaemonSupervisorOwnerRecord) => void): Promise<boolean> {
-		if (this.released || this.lost) {
-			return false;
-		}
-		const updated = await renewDaemonSupervisorOwner(this.record, this.registryDir, this.ownerDirectory, mutation);
+	private async renew(mutation?: (owner: DaemonSupervisorOwnerRecord) => void): Promise<boolean> {
+		const updated = await renewDaemonSupervisorOwner(
+			this.record,
+			this.registryDir,
+			this.ownerDirectory,
+			() => this.state === "active",
+			mutation,
+		);
 		if (!updated) {
 			return false;
 		}
@@ -322,9 +365,13 @@ async function renewDaemonSupervisorOwner(
 	expected: DaemonSupervisorOwnerRecord,
 	registryDir: string,
 	ownerDirectory: string,
+	canRenew: () => boolean,
 	mutation?: (owner: DaemonSupervisorOwnerRecord) => void,
 ): Promise<DaemonSupervisorOwnerRecord | undefined> {
 	return withDaemonSupervisorRegistryGuard(registryDir, () => {
+		if (!canRenew()) {
+			return undefined;
+		}
 		const current = readOwnerRecord(ownerDirectory);
 		if (current) {
 			if (!sameOwnerRecord(current, expected)) {
