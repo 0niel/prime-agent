@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	closeOpenAICodexWebSocketSessions,
 	getOpenAICodexWebSocketDebugStats,
+	resetOpenAICodexWebSocketDebugStats,
 	streamOpenAICodexResponses,
 } from "../src/providers/openai-codex-responses.js";
+import { cleanupSessionResources } from "../src/session-resources.js";
 import type { Context, Model } from "../src/types.js";
 
 const originalFetch = global.fetch;
@@ -321,11 +323,37 @@ describe("Codex WebSocket cancellation regressions", () => {
 		expect(constructed).toBe(1);
 		expect(getOpenAICodexWebSocketDebugStats(sessionId)?.websocketFallbackActive).toBe(true);
 
-		closeOpenAICodexWebSocketSessions(sessionId);
+		cleanupSessionResources(sessionId);
 		expect(getOpenAICodexWebSocketDebugStats(sessionId)).toBeUndefined();
 
 		await streamOpenAICodexResponses(model, context, { apiKey: token, transport: "auto", sessionId }).result();
 		expect(constructed).toBe(2);
+	});
+
+	it("keeps sticky SSE fallback state when only debug stats are reset", async () => {
+		let constructed = 0;
+		class MockWebSocket extends MockSocketBase {
+			constructor() {
+				super();
+				constructed++;
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+			send(): void {
+				this.dispatch("error", { message: "transport unavailable" });
+			}
+		}
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		global.fetch = vi.fn(async () => completeSSE("fallback")) as typeof fetch;
+		const sessionId = "debug-reset-fallback";
+
+		await streamOpenAICodexResponses(model, context, { apiKey: token, transport: "auto", sessionId }).result();
+		expect(constructed).toBe(1);
+		resetOpenAICodexWebSocketDebugStats(sessionId);
+		expect(getOpenAICodexWebSocketDebugStats(sessionId)).toBeUndefined();
+
+		await streamOpenAICodexResponses(model, context, { apiKey: token, transport: "auto", sessionId }).result();
+		expect(constructed).toBe(1);
+		expect(global.fetch).toHaveBeenCalledTimes(2);
 	});
 
 	it("evicts an active aborted cached socket", async () => {

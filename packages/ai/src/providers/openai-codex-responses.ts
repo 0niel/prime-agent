@@ -721,11 +721,9 @@ export function getOpenAICodexWebSocketDebugStats(sessionId: string): OpenAICode
 export function resetOpenAICodexWebSocketDebugStats(sessionId?: string): void {
 	if (sessionId) {
 		websocketDebugStats.delete(sessionId);
-		websocketSseFallbackSessions.delete(sessionId);
 		return;
 	}
 	websocketDebugStats.clear();
-	websocketSseFallbackSessions.clear();
 }
 
 export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
