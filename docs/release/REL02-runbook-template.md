@@ -15,29 +15,32 @@ A required check has only these decision values:
 
 Do not overwrite a completed record. A correction is a new immutable record that links the superseded record and retains its digest.
 
-## 1. Release identity, immutable manifest, and source freeze
+## 1. Release identity, canonical immutable manifest, and source freeze
 
-Set `<VERSION>` before any release action. Store the canonical release manifest at this **versioned, immutable path**:
-
-```text
-releases/prime-agent/<VERSION>/release-manifest.json
-```
-
-The manifest is append-only/WORM after its digest is recorded. It must contain the full Prime Agent and Verifiers SHAs, candidate version/channel, build command and immutable toolchain/image identities, ordered GSM8K IDs and lifecycle seeds, every distributable filename/size/SHA-256 **and immutable stored-object path/version**, and the REL01 dry-run digest. Store each subsequent freeze, build, publication, and verification record in the immutable evidence index; do not mutate the frozen manifest to add later evidence. Store its detached digest at:
+Set `<VERSION>` before any release action. REL01's canonical release manifest is the immutable versioned object:
 
 ```text
-releases/prime-agent/<VERSION>/release-manifest.json.sha256
+releases/v<VERSION>/manifest.json
 ```
+
+The manifest is append-only/WORM after publication. It must contain the full Prime Agent and Verifiers SHAs, candidate version/channel, build command and immutable toolchain/image identities, ordered GSM8K IDs and lifecycle seeds, every distributable filename/size/SHA-256 **and immutable stored-object path/version**, and the REL01 dry-run digest. Its exact SHA-256 must be recorded as the `manifest.json` entry in the immutable versioned checksum file:
+
+```text
+releases/v<VERSION>/SHA256SUMS
+```
+
+For example, the required checksum entry is `<MANIFEST_SHA256>  manifest.json`. Store each subsequent freeze, build, publication, and verification record in the immutable evidence index; do not mutate the frozen manifest to add later evidence.
 
 | Field | Required recorded value |
 | --- | --- |
 | Release channel and candidate version | `<stable-or-beta> / <VERSION>` |
 | Prime Agent selected commit | `<PA_SHA: exactly 40 lowercase hex>` |
 | Verifiers selected commit | `<VERIFIERS_SHA: exactly 40 lowercase hex>` |
-| Immutable manifest path | `releases/prime-agent/<VERSION>/release-manifest.json` |
+| Canonical immutable manifest path | `releases/v<VERSION>/manifest.json` |
 | Manifest SHA-256 | `<MANIFEST_SHA256: 64 lowercase hex>` |
-| Detached manifest-digest path and contents | `releases/prime-agent/<VERSION>/release-manifest.json.sha256 / <MANIFEST_SHA256  release-manifest.json>` |
-| Freeze record path and SHA-256 | `releases/prime-agent/<VERSION>/freeze/source-freeze.json / <FREEZE_RECORD_SHA256>` |
+| Immutable checksum path and manifest entry | `releases/v<VERSION>/SHA256SUMS / <MANIFEST_SHA256  manifest.json>` |
+| Root pointer binding | `<ROOT_POINTER_PATH> / {"manifest":"releases/v<VERSION>/manifest.json","sha256":"<MANIFEST_SHA256>"}` |
+| Freeze record path and SHA-256 | `releases/v<VERSION>/freeze/source-freeze.json / <FREEZE_RECORD_SHA256>` |
 | Exact REL01 dry-run output path and SHA-256 | `<IMMUTABLE_PATH> / <REL01_DRY_RUN_SHA256>` |
 
 ### Paired SHA, freeze, and rebuild checks
@@ -87,12 +90,12 @@ For every external action, first use an idempotent **create-or-verify** operatio
 
 | Ordered step | Target and required verification | Create-or-verify record path + SHA-256 | Result (`PASS` / `HOLD`) |
 | --- | --- | --- | --- |
-| 1. Freeze and manifest | Create-or-verify the versioned manifest, detached digest, and paired source freeze; read all three back and match the recorded digests. | `<IMMUTABLE_PATH> / <SHA256>` | `<PASS / HOLD>` |
+| 1. Freeze and manifest | Create-or-verify `releases/v<VERSION>/manifest.json`, its `releases/v<VERSION>/SHA256SUMS` entry, and the paired source freeze. Read each back; recompute the manifest SHA-256 and require it to equal the `SHA256SUMS` `manifest.json` entry. | `<IMMUTABLE_PATH> / <SHA256>` | `<PASS / HOLD>` |
 | 2. Artifact storage | Create-or-verify every versioned artifact object at the manifest's immutable object path/version; read back exact bytes and match every manifest SHA-256. Record each artifact object's immutable path/version, object metadata/read-back outcome, and hash in the operation record. | `<IMMUTABLE_PATH> / <SHA256>` | `<PASS / HOLD>` |
 | 3. Protected production tag | Create-or-verify `v<VERSION>` by non-force ref API. Peel annotated or lightweight tag and require exactly `<PA_SHA>`; record remote tag read-back. | `<IMMUTABLE_PATH> / <SHA256>` | `<PASS / HOLD>` |
 | 4. Release publication | Only after step 3 PASS, create-or-verify the release entry bound to `v<VERSION>` and the manifest digest; read it back. | `<IMMUTABLE_PATH> / <SHA256>` | `<PASS / HOLD>` |
 | 5. Fresh distribution verification | Only after step 4 PASS, perform and record the fresh checks in section 4. | `<IMMUTABLE_PATH> / <SHA256>` | `<PASS / HOLD>` |
-| 6. Final channel/pointer advance | Only after steps 1–5 PASS, create-or-verify the channel pointer/deployment. It must resolve to the tagged `v<VERSION>` artifact/commit and manifest SHA-256; immediately read it back. | `<IMMUTABLE_PATH> / <SHA256>` | `<PASS / HOLD>` |
+| 6. Final channel/pointer advance | Only after steps 1–5 PASS, create-or-verify the root channel pointer/deployment. It must bind `{"manifest":"releases/v<VERSION>/manifest.json","sha256":"<MANIFEST_SHA256>"}` and resolve to the tagged `v<VERSION>` artifact/commit; immediately read it back and verify both fields. | `<IMMUTABLE_PATH> / <SHA256>` | `<PASS / HOLD>` |
 
 **Ordering is mandatory:** the protected tag is established and verified before publication; the channel pointer/deployment is the final external mutation, after tagged publication and fresh distribution verification PASS. An existing tag is acceptable only if it peels exactly to `<PA_SHA>`; a mismatch is **HOLD**. Repository protection must prohibit tag mutation and deletion for the release credential. Re-fetch/re-read the tag immediately before the final pointer action and again after it; either mismatch is **HOLD**.
 
@@ -148,7 +151,7 @@ Create an immutable evidence index for this attempt before final approval. It mu
 
 ## Completion
 
-- [ ] Versioned manifest path, detached digest, and read-back evidence are recorded.
+- [ ] Canonical `releases/v<VERSION>/manifest.json`, its `SHA256SUMS` manifest entry, and their read-back evidence are recorded.
 - [ ] The paired Prime Agent and Verifiers SHA freeze, two separate clean-room builds, and their output-hash comparisons all PASS with immutable evidence.
 - [ ] Fixed GSM8K IDs, lifecycle seeds, and raw canary evidence are recorded.
 - [ ] Every external action has a create-or-verify record.
