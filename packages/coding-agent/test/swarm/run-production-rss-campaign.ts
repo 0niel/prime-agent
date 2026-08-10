@@ -16,6 +16,7 @@ import {
 	MAX_RSS_SAMPLE_GAP_MS,
 	validateRssSampleCadence,
 } from "./rss-campaign-cadence.js";
+import { type ProcessRecord, type ProcessStat, parseProcessStat, processRecordFromStatus } from "./rss-proc.js";
 
 const FANOUTS = [1, 4, 16, 64] as const;
 const WORKER = new URL("./rss-campaign-worker.ts", import.meta.url);
@@ -29,14 +30,6 @@ const SCHEMA_VERSION = 2;
 type SupportedPlatform = "linux";
 type Phase = "baseline" | "started" | "barrier-held" | "terminals" | "cleanup" | "final";
 type Status = "complete" | "failed" | "timed_out" | "unsupported";
-
-interface ProcessRecord {
-	pid: number;
-	ppid: number;
-	pgid: number;
-	start: number;
-	rssKiB: number;
-}
 
 interface ProcessSample {
 	phase: Phase;
@@ -183,39 +176,17 @@ async function writeOwnerFile(path: string, content: string): Promise<void> {
 	await chmod(path, 0o600);
 }
 
-interface ProcessIdentity {
-	pid: number;
-	ppid: number;
-	pgid: number;
-	start: number;
-}
-
-function parseProcessIdentity(pid: number, statLine: string): ProcessIdentity | undefined {
-	const close = statLine.lastIndexOf(")");
-	const fields = statLine
-		.slice(close + 2)
-		.trim()
-		.split(/\s+/);
-	const ppid = Number(fields[1]); // field 4 after removing pid/comm
-	const pgid = Number(fields[2]); // field 5 after removing pid/comm
-	const start = Number(fields[19]); // field 22 after removing pid/comm
-	if (![ppid, pgid, start].every(Number.isSafeInteger)) return undefined;
-	return { pid, ppid, pgid, start };
-}
-
-async function procIdentity(pid: number): Promise<ProcessIdentity | undefined> {
+async function procIdentity(pid: number): Promise<ProcessStat | undefined> {
 	try {
-		return parseProcessIdentity(pid, await readFile(`/proc/${pid}/stat`, "utf8"));
+		return parseProcessStat(pid, await readFile(`/proc/${pid}/stat`, "utf8"));
 	} catch {
 		return undefined;
 	}
 }
 
-async function procRecordForIdentity(identity: ProcessIdentity): Promise<ProcessRecord | undefined> {
+async function procRecordForIdentity(identity: ProcessStat): Promise<ProcessRecord | undefined> {
 	try {
-		const status = await readFile(`/proc/${identity.pid}/status`, "utf8");
-		const rss = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status)?.[1];
-		return rss === undefined ? undefined : { ...identity, rssKiB: Number(rss) };
+		return processRecordFromStatus(identity, await readFile(`/proc/${identity.pid}/status`, "utf8"));
 	} catch {
 		return undefined;
 	}
@@ -255,12 +226,12 @@ async function groupSnapshot(pgid: number, injectFailure = false): Promise<Group
 	} catch {
 		return { kind: "unavailable" };
 	}
-	const identities: ProcessIdentity[] = [];
+	const identities: ProcessStat[] = [];
 	for (const entry of entries) {
 		if (!/^\d+$/.test(entry)) continue;
 		const pid = Number(entry);
 		try {
-			const identity = parseProcessIdentity(pid, await readFile(`/proc/${pid}/stat`, "utf8"));
+			const identity = parseProcessStat(pid, await readFile(`/proc/${pid}/stat`, "utf8"));
 			if (!identity) return { kind: "unavailable" };
 			identities.push(identity);
 		} catch (error) {
@@ -273,10 +244,11 @@ async function groupSnapshot(pgid: number, injectFailure = false): Promise<Group
 	for (const identity of identities) {
 		if (identity.pgid !== pgid) continue;
 		try {
-			const status = await readFile(`/proc/${identity.pid}/status`, "utf8");
-			const rss = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status)?.[1];
-			if (rss === undefined) return { kind: "unavailable" };
-			records.push({ ...identity, rssKiB: Number(rss) });
+			const record = processRecordFromStatus(identity, await readFile(`/proc/${identity.pid}/status`, "utf8"));
+			// A zombie has no address space, so missing VmRSS is represented by its
+			// zero-RSS owned record. Any other missing VmRSS fails closed.
+			if (!record) return { kind: "unavailable" };
+			records.push(record);
 		} catch (error) {
 			// Only a confirmed disappearance is safe to omit after membership was found.
 			if (!exitedDuringScan(error)) return { kind: "unavailable" };
