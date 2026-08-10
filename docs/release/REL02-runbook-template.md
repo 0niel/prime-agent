@@ -15,37 +15,45 @@ A required check has only these decision values:
 
 Do not overwrite a completed record. A correction is a new immutable record that links the superseded record and retains its digest.
 
-## 1. Release identity, canonical immutable manifest, and source freeze
+## 1. Release identity, strict artifact manifest, and source freeze
 
-Set `<VERSION>` before any release action. REL01's canonical release manifest is the immutable versioned object:
+Set `<VERSION>` before any release action. `releases/v<VERSION>/manifest.json` is **only** REL01's canonical immutable release-artifact manifest:
 
 ```text
 releases/v<VERSION>/manifest.json
 ```
 
-The manifest is append-only/WORM after publication. It must contain the full Prime Agent and Verifiers SHAs, candidate version/channel, build command and immutable toolchain/image identities, ordered GSM8K IDs and lifecycle seeds, every distributable filename/size/SHA-256 **and immutable stored-object path/version**, and the REL01 dry-run digest. Its exact SHA-256 must be recorded as the `manifest.json` entry in the immutable versioned checksum file:
+REL01 validates this file as the strict four-artifact release manifest. Its artifact inventory is exactly the four release artifacts REL01 validates. REL01 is the sole schema authority for this artifact manifest; this runbook adds no fields to it. In particular, do **not** put paired source SHAs, evaluation inputs or results, toolchain/image identities, canary observations, freeze records, or other release evidence in `manifest.json`.
+
+The artifact manifest is append-only/WORM after publication. Its exact SHA-256 must be recorded as the `manifest.json` entry in the immutable versioned checksum file:
 
 ```text
 releases/v<VERSION>/SHA256SUMS
 ```
 
-For example, the required checksum entry is `<MANIFEST_SHA256>  manifest.json`. Store each subsequent freeze, build, publication, and verification record in the immutable evidence index; do not mutate the frozen manifest to add later evidence.
+For example, the required checksum entry is `<MANIFEST_SHA256>  manifest.json`.
+
+All non-artifact release facts belong in the separate immutable, versioned release-evidence record/index:
+
+```text
+releases/v<VERSION>/evidence/release-evidence-index.json
+releases/v<VERSION>/evidence/release-evidence-index.json.sha256
+```
+
+The index's detached digest is its own object and contains `<EVIDENCE_INDEX_SHA256>  release-evidence-index.json`; it is not the artifact manifest, its schema, or its `SHA256SUMS` entry. The evidence index must reference the artifact manifest by both path and SHA-256. It must record the paired Prime Agent and Verifiers SHAs; release channel and candidate version; source-freeze path and digest; build command; immutable toolchain/image identities; ordered evaluation IDs and lifecycle seeds; evaluation configuration, raw results, and decision; canary start/end times and raw evidence; and every indexed evidence object's purpose, immutable path or URL, SHA-256, UTC observation time, and operator/workflow run ID. Store each freeze, build, publication, and verification record in this index or in immutable objects it indexes; do not mutate the frozen artifact manifest to add later evidence.
 
 | Field | Required recorded value |
 | --- | --- |
-| Release channel and candidate version | `<stable-or-beta> / <VERSION>` |
-| Prime Agent selected commit | `<PA_SHA: exactly 40 lowercase hex>` |
-| Verifiers selected commit | `<VERIFIERS_SHA: exactly 40 lowercase hex>` |
-| Canonical immutable manifest path | `releases/v<VERSION>/manifest.json` |
-| Manifest SHA-256 | `<MANIFEST_SHA256: 64 lowercase hex>` |
-| Immutable checksum path and manifest entry | `releases/v<VERSION>/SHA256SUMS / <MANIFEST_SHA256  manifest.json>` |
+| Canonical strict artifact-manifest path | `releases/v<VERSION>/manifest.json` |
+| Artifact-manifest SHA-256 | `<MANIFEST_SHA256: 64 lowercase hex>` |
+| Artifact-manifest checksum path and entry | `releases/v<VERSION>/SHA256SUMS / <MANIFEST_SHA256  manifest.json>` |
+| Immutable release-evidence-index path | `releases/v<VERSION>/evidence/release-evidence-index.json` |
+| Release-evidence-index detached-digest path and entry | `releases/v<VERSION>/evidence/release-evidence-index.json.sha256 / <EVIDENCE_INDEX_SHA256  release-evidence-index.json>` |
 | Root pointer binding | `<ROOT_POINTER_PATH> / {"manifest":"releases/v<VERSION>/manifest.json","sha256":"<MANIFEST_SHA256>"}` |
-| Freeze record path and SHA-256 | `releases/v<VERSION>/freeze/source-freeze.json / <FREEZE_RECORD_SHA256>` |
-| Exact REL01 dry-run output path and SHA-256 | `<IMMUTABLE_PATH> / <REL01_DRY_RUN_SHA256>` |
 
 ### Paired SHA, freeze, and rebuild checks
 
-The Prime Agent and Verifiers SHAs are a pair. Never replace one SHA while retaining the other side's freeze, manifest, build, or approval evidence.
+Record the paired Prime Agent and Verifiers SHAs in the release-evidence index. Never replace one SHA while retaining the other side's freeze, build, or approval evidence.
 
 | Required check | Required method and immutable evidence | Result (`PASS` / `HOLD`) |
 | --- | --- | --- |
@@ -132,14 +140,14 @@ Do not infer approval from completed rows. The designated release approver must 
 | --- | --- |
 | Final REL02 decision | `<PASS / HOLD>` |
 | Release candidate identity | `<VERSION> / <PA_SHA> / <VERIFIERS_SHA> / <MANIFEST_SHA256>` |
-| Required evidence index path + SHA-256 | `<IMMUTABLE_PATH> / <EVIDENCE_INDEX_SHA256>` |
+| Required release-evidence-index path + SHA-256 | `releases/v<VERSION>/evidence/release-evidence-index.json / <EVIDENCE_INDEX_SHA256>` |
 | Tag, publication, and final pointer read-back evidence paths + SHA-256 | `<PATH_AND_DIGESTS>` |
 | Approver identity and UTC timestamp | `<NAME_AND_TIME>` |
 | Explicit approval rationale, or HOLD blockers and remediation owner | `<RATIONALE_OR_DISCREPANCY_AND_OWNER>` |
 
-### Raw evidence index
+### Immutable release-evidence index
 
-Create an immutable evidence index for this attempt before final approval. It must enumerate every raw resolver, freeze create/read-back, primary and independent clean-room build/hash report, artifact create/read-back, tag, publication, distribution, S01, pointer, and rollback transcript/object; for each entry record its purpose, immutable path or URL (including object version when applicable), SHA-256, UTC observation time, and operator/workflow run ID. The final-approval table records the index path and digest; because the manifest is frozen before these later observations, do not mutate it to add the index. Missing raw evidence is **HOLD**.
+Before final approval, create the immutable versioned release-evidence index at `releases/v<VERSION>/evidence/release-evidence-index.json` and its distinct detached digest at `releases/v<VERSION>/evidence/release-evidence-index.json.sha256`. The index must bind `releases/v<VERSION>/manifest.json` and `<MANIFEST_SHA256>` and enumerate every raw resolver, freeze create/read-back, primary and independent clean-room build/hash report, artifact create/read-back, tag, publication, distribution, S01, pointer, and rollback transcript/object. For each indexed object, record its purpose, immutable path or URL (including object version when applicable), SHA-256, UTC observation time, and operator/workflow run ID. The index also records the paired source SHAs, evaluation inputs/results, toolchain/image identities, canary observations, and the approval decision. The final-approval table records this index path and `<EVIDENCE_INDEX_SHA256>`; because the artifact manifest is frozen before these later observations, do not mutate `manifest.json` to add them. Missing raw evidence is **HOLD**.
 
 ## 6. Rollback plan
 
@@ -158,6 +166,6 @@ Create an immutable evidence index for this attempt before final approval. It mu
 - [ ] Protected tag and tagged publication PASS before the final pointer action.
 - [ ] Fresh distribution retrieval, clean install, identity, smoke, and independent repeat all PASS; the distribution decision is explicit.
 - [ ] Depth-1 S01 decision is explicit and PASS.
-- [ ] The immutable raw-evidence index is complete and its path and digest are recorded in final approval without mutating the frozen manifest.
+- [ ] The immutable `release-evidence-index.json` and its distinct detached digest are complete, bind the artifact-manifest path and digest, and are recorded in final approval without mutating `manifest.json`.
 - [ ] An explicit final REL02 PASS/HOLD approval with approver and UTC timestamp is recorded after the final pointer read-back.
 - [ ] Rollback reference and verification are ready.
