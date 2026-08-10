@@ -2103,6 +2103,20 @@ export class DaemonSupervisor {
 			command.launchEnv &&
 			(!worker.client || worker.descriptor.lifecycle !== "ready")
 		) {
+			// The first fresh resume owns the one-shot recovery environment. Later
+			// resumes join that recovery instead of replacing its credentials; their
+			// defined result is the same recovered worker, or its recorded failure.
+			const inFlightRecovery = worker.recovery;
+			if (inFlightRecovery) {
+				await inFlightRecovery;
+				if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+					throw new Error(
+						worker.descriptor.lastError ??
+						`Session worker ${worker.descriptor.workerId} did not recover for the first fresh resume`,
+					);
+				}
+				return worker;
+			}
 			worker.recoveryLaunchEnv = command.launchEnv;
 			worker.intentionalStop = false;
 			worker.descriptor.stopRequestedAt = undefined;
@@ -2111,6 +2125,12 @@ export class DaemonSupervisor {
 			worker.descriptor.consecutiveFailures = 0;
 			this.persistWorker(worker);
 			await this.recoverWorker(worker);
+			if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+				throw new Error(
+					worker.descriptor.lastError ??
+						`Session worker ${worker.descriptor.workerId} did not recover with its fresh environment`,
+				);
+			}
 		}
 		return worker;
 	}
@@ -2850,6 +2870,10 @@ export class DaemonSupervisor {
 
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
 		if (this.isWorkerRecoveryCancelled(worker)) {
+			// A client-provided recovery environment is a one-shot capability. A
+			// cancelled recovery has completed without consuming it, so never leave it
+			// available for a later automatic recovery.
+			worker.recoveryLaunchEnv = undefined;
 			return;
 		}
 		if (
@@ -2972,6 +2996,10 @@ export class DaemonSupervisor {
 			await this.syncAgentPeers().catch(() => undefined);
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
 		})().finally(() => {
+			// The fresh client environment is recovery-owned, never retry-owned. This
+			// also covers reconnecting to a still-alive worker, cancellation, and every
+			// launch/connect failure path.
+			worker.recoveryLaunchEnv = undefined;
 			worker.recovery = undefined;
 		});
 		return worker.recovery;
