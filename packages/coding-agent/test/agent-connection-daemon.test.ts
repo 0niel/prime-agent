@@ -52,6 +52,8 @@ class FakeDaemonClient {
 	promptGate: Promise<void> | undefined;
 	promptError: Error | undefined;
 	promptResponseError: string | undefined;
+	promptResponseErrors: string[] = [];
+	createActiveSessionId = "active-revived";
 	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	serverCapabilities = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
@@ -75,22 +77,43 @@ class FakeDaemonClient {
 		this.requestTimeouts.push(timeoutMs);
 		switch (command.type) {
 			case "prompt":
+			case "prompt_and_wait": {
 				if (this.promptGate) await this.promptGate;
 				if (this.promptError) throw this.promptError;
-				if (this.promptResponseError) {
-					return { type: "response", command: command.type, success: false, error: this.promptResponseError };
+				const responseError = this.promptResponseErrors.shift() ?? this.promptResponseError;
+				if (responseError) {
+					return { type: "response", command: command.type, success: false, error: responseError };
 				}
 				return { type: "response", command: command.type, success: true };
-			case "prompt_and_wait":
-				if (this.promptGate) await this.promptGate;
-				if (this.promptError) throw this.promptError;
-				return { type: "response", command: command.type, success: true };
+			}
 			case "cancel_prompt_admission":
 				return {
 					type: "response",
 					command: command.type,
 					success: true,
 					data: { status: this.cancelPromptAdmissionStatus },
+				};
+			case "create": {
+				const state = createConnectionState(this.createActiveSessionId, "session-current");
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						id: this.createActiveSessionId,
+						activeSessionId: this.createActiveSessionId,
+						sessionId: state.sessionId,
+						sessionFile: state.sessionFile,
+						cwd: state.cwd,
+					},
+				};
+			}
+			case "reattach":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: createAttachResult(command.targetActiveSessionId, command.clientId, command.capabilities, 20),
 				};
 			case "list":
 				return {
@@ -709,6 +732,75 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			telemetryDisabled: true,
 		});
+	});
+
+	it.each(["prompt", "promptAndWait"] as const)(
+		"revives an archived saved session before retrying %s",
+		async (method) => {
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.promptResponseErrors.push("Unknown active session: active-1");
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+				sendClientEnv: true,
+				reviveConfig: { cwd: "/tmp/project", telemetryDisabled: true },
+			});
+			const replacements: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				if (event.type === "session_replaced") replacements.push(event);
+			});
+			await connection.attach();
+
+			await connection[method]("resume work");
+
+			expect(fakeClient.requests.map((request) => request.type)).toEqual([
+				"attach",
+				method === "prompt" ? "prompt" : "prompt_and_wait",
+				"create",
+				"reattach",
+				method === "prompt" ? "prompt" : "prompt_and_wait",
+			]);
+			expect(fakeClient.requests[2]).toMatchObject({
+				type: "create",
+				sessionPath: "/tmp/session-current.jsonl",
+				config: { cwd: "/tmp/project", telemetryDisabled: true },
+				lifecycle: "resident",
+			});
+			expect(fakeClient.requests.at(-1)).toMatchObject({
+				activeSessionId: "active-revived",
+				message: "resume work",
+			});
+			expect(replacements).toHaveLength(1);
+		},
+	);
+
+	it("shares one archived-session revival across concurrent prompts", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.promptResponseErrors.push("Unknown active session: active-1", "Unknown active session: active-1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			reviveConfig: { cwd: "/tmp/project" },
+		});
+		await connection.attach();
+
+		await Promise.all([connection.prompt("first"), connection.prompt("second")]);
+
+		expect(fakeClient.requests.filter((request) => request.type === "create")).toHaveLength(1);
+		expect(fakeClient.requests.filter((request) => request.type === "reattach")).toHaveLength(1);
+		const delivered = fakeClient.requests.filter(
+			(request): request is Extract<DaemonCommand, { type: "prompt" }> =>
+				request.type === "prompt" && request.activeSessionId === "active-revived",
+		);
+		expect(delivered.map((request) => request.message).sort()).toEqual(["first", "second"]);
+	});
+
+	it("does not revive for an inexact unknown-session rejection", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.promptResponseErrors.push("Unknown active session: active-10");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			reviveConfig: { cwd: "/tmp/project" },
+		});
+		await connection.attach();
+
+		await expect(connection.prompt("do not redirect")).rejects.toThrow("Unknown active session: active-10");
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach", "prompt"]);
 	});
 
 	it("forwards queueIfBusy for prompt admission", async () => {

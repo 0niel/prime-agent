@@ -4,6 +4,7 @@ import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai
 import { appendRotatingLog, getAgentLogPath, getDaemonLogPath } from "../../config.js";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
+import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -169,6 +170,8 @@ export interface DaemonAgentConnectionOptions {
 	ownedSession?: boolean;
 	/** Require the target worker to have been created with telemetry disabled. */
 	telemetryDisabled?: true;
+	/** Runtime config used to recreate this saved transcript if its worker was archived. */
+	reviveConfig?: AgentSessionRuntimeConfig;
 }
 
 /**
@@ -228,6 +231,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly ignoredSnapshotIds = new Set<string>();
 	private reconnectPromise?: Promise<void>;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
+	private revival: { sourceActiveSessionId: string; sessionFile: string; promise: Promise<void> } | undefined;
 	private disposing = false;
 	private disposed = false;
 
@@ -744,6 +748,91 @@ export class DaemonAgentConnection implements AgentConnection {
 		message: string,
 		options?: AgentConnectionPromptOptions,
 	): Promise<void> {
+		const pendingRevival = this.revival;
+		if (pendingRevival) await pendingRevival.promise.catch(() => undefined);
+		const sourceActiveSessionId = this.activeSessionId;
+		const sourceSessionFile = this.attachedSessionFile;
+		try {
+			await this.promptOnce(sourceActiveSessionId, type, message, options);
+			return;
+		} catch (error) {
+			if (!this.canRevivePrompt(error, sourceActiveSessionId, sourceSessionFile, options?.signal)) {
+				throw error;
+			}
+			try {
+				await this.reviveArchivedSession(sourceActiveSessionId, sourceSessionFile!);
+			} catch {
+				// The unknown-session response is the actionable failure. A create or
+				// attach detail is implementation noise and a later prompt may retry.
+				throw error;
+			}
+			if (options?.signal?.aborted) {
+				throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
+			}
+			await this.promptOnce(this.activeSessionId, type, message, options);
+		}
+	}
+
+	private canRevivePrompt(
+		error: unknown,
+		sourceActiveSessionId: string,
+		sourceSessionFile: string | undefined,
+		signal: AbortSignal | undefined,
+	): boolean {
+		return (
+			error instanceof Error &&
+			this.definitiveRequestErrors.has(error) &&
+			error.message.trim() === `Unknown active session: ${sourceActiveSessionId}` &&
+			Boolean(sourceSessionFile) &&
+			Boolean(this.options.reviveConfig) &&
+			!this.options.ownedSession &&
+			!this.disposed &&
+			!this.disposing &&
+			!signal?.aborted
+		);
+	}
+
+	private reviveArchivedSession(sourceActiveSessionId: string, sessionFile: string): Promise<void> {
+		const existing = this.revival;
+		if (
+			existing &&
+			existing.sourceActiveSessionId === sourceActiveSessionId &&
+			existing.sessionFile === sessionFile
+		) {
+			return existing.promise;
+		}
+		const promise = (async () => {
+			const summary = await this.requestData<SessionSummary>({
+				type: "create",
+				sessionPath: sessionFile,
+				config: this.options.reviveConfig,
+				lifecycle: "resident",
+				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+			});
+			if (
+				this.disposed ||
+				this.disposing ||
+				this.activeSessionId !== sourceActiveSessionId ||
+				this.attachedSessionFile !== sessionFile
+			) {
+				throw new Error("Archived-session revival was superseded");
+			}
+			const targetActiveSessionId = summary.activeSessionId ?? summary.id;
+			await this.reattachSession(sourceActiveSessionId, targetActiveSessionId);
+			this.terminalCloseEmitted = false;
+		})().finally(() => {
+			if (this.revival?.promise === promise) this.revival = undefined;
+		});
+		this.revival = { sourceActiveSessionId, sessionFile, promise };
+		return promise;
+	}
+
+	private async promptOnce(
+		targetActiveSessionId: string,
+		type: "prompt" | "prompt_and_wait",
+		message: string,
+		options?: AgentConnectionPromptOptions,
+	): Promise<void> {
 		const signal = options?.signal;
 		if (signal?.aborted) {
 			throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
@@ -752,7 +841,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.requestData<unknown>(
 				{
 					type,
-					activeSessionId: this.activeSessionId,
+					activeSessionId: targetActiveSessionId,
 					message,
 					images: options?.images,
 					streamingBehavior: options?.streamingBehavior,
@@ -777,7 +866,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		const command = {
 			type,
-			activeSessionId: this.activeSessionId,
+			activeSessionId: targetActiveSessionId,
 			message,
 			images: options.images,
 			streamingBehavior: options.streamingBehavior,
@@ -811,7 +900,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			try {
 				const result = await this.requestData<{ status: "cancelled" | "owned" | "unknown" }>({
 					type: "cancel_prompt_admission",
-					activeSessionId: this.activeSessionId,
+					activeSessionId: targetActiveSessionId,
 					admissionId,
 				});
 				status = result.status;

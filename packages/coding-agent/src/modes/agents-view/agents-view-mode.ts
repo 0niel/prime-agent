@@ -337,6 +337,7 @@ async function openAgentsViewSession(
 				recoverDaemon: options.recoverDaemon,
 				reconnectTimeoutMs: options.reconnectTimeoutMs,
 				telemetryDisabled: options.config.telemetryDisabled,
+				reviveConfig: options.config,
 			});
 			return { connection, summary };
 		} catch (error) {
@@ -360,6 +361,7 @@ async function openAgentsViewSession(
 			recoverDaemon: options.recoverDaemon,
 			reconnectTimeoutMs: options.reconnectTimeoutMs,
 			telemetryDisabled: options.config.telemetryDisabled,
+			reviveConfig: options.config,
 		});
 		return { connection, summary: resumed.summary, cwdFallbackNotice: resumed.cwdFallbackNotice };
 	} catch (error) {
@@ -2067,6 +2069,7 @@ export class AgentsViewMode implements Component, Focusable {
 				recoverDaemon: this.options.recoverDaemon,
 				reconnectTimeoutMs: this.options.reconnectTimeoutMs,
 				telemetryDisabled: true,
+				reviveConfig: this.options.config,
 			});
 			try {
 				await connection.prompt(message, streamingBehavior === undefined ? undefined : { streamingBehavior });
