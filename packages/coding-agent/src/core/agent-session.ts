@@ -4640,6 +4640,11 @@ export class AgentSession {
 		// sendCustomMessage's no-turn branch is the normal transcript append seam.
 		// It writes an ordinary custom message, emits normal events, and cannot prompt.
 		await this.sendCustomMessage({ ...message, details: { ...message.details, id } }, { triggerTurn: false });
+		// A terminal notice is deliberately a no-turn custom message, so it may be
+		// the first transcript content and bypass SessionManager's assistant-driven
+		// persistence heuristic. Its durable-delivery acknowledgement must not outrun
+		// the actual parent transcript across a daemon restart.
+		this.sessionManager.flushNow();
 		return true;
 	}
 
