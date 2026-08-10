@@ -1080,7 +1080,7 @@ export function rlmChildLabel(prompt: string): string {
 /** C04 terminal bytes are accepted exactly at the producer event boundary. This
  * queue never consults a completed AssistantMessage, transcript, or prompt
  * result; backpressure is the C04 artifact writer's bounded chunk contract. */
-class C04ProducerSink implements AsyncIterable<Uint8Array> {
+export class C04ProducerSink implements AsyncIterable<Uint8Array> {
 	private static readonly MAX_BUFFERED_BYTES = 2 * 64 * 1024;
 	private readonly chunks: Uint8Array[] = [];
 	private readonly waiters: Array<() => void> = [];
@@ -10101,6 +10101,9 @@ export class AgentSession {
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
 		let answerPreview: string | undefined;
+		// This atomically materializes the parent-bound C04 recovery authority
+		// before a child can stream. Its key bytes never leave SessionManager.
+		const parentRecoveryAuthority = this.sessionManager.getC04ParentRecoveryAuthority();
 		let terminalOutputSink: C04ProducerSink | undefined;
 		let terminalOutputCommit: Promise<C04ChildResultReference> | undefined;
 		let durationMs: number | undefined;
@@ -10218,7 +10221,13 @@ export class AgentSession {
 				this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
 				this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId &&
 				childSession?.sessionManager.getSessionFile?.() !== undefined;
-			if (!this._subagentRuntimeHost?.assignmentIdentityFenced || !childSession || !isCurrent()) return undefined;
+			if (
+				!this._subagentRuntimeHost?.assignmentIdentityFenced ||
+				!parentRecoveryAuthority ||
+				!childSession ||
+				!isCurrent()
+			)
+				return undefined;
 			const childFile = childSession.sessionManager.getSessionFile?.();
 			const childArtifactDir = childSession.sessionManager.getSessionArtifactDir?.();
 			if (!childFile || !childArtifactDir) return undefined;
@@ -10238,6 +10247,7 @@ export class AgentSession {
 								deliveryId: run.deliveryId,
 							},
 							childArtifactRoot: childArtifactDir,
+							parentRecoveryAuthority,
 							isCurrent,
 							candidate: {
 								status,
@@ -10447,7 +10457,12 @@ export class AgentSession {
 									terminalOutputSink = new C04ProducerSink();
 									const childFile = child.sessionManager.getSessionFile?.();
 									const childArtifactDir = child.sessionManager.getSessionArtifactDir?.();
-									if (this._subagentRuntimeHost?.assignmentIdentityFenced && childFile && childArtifactDir) {
+									if (
+										this._subagentRuntimeHost?.assignmentIdentityFenced &&
+										parentRecoveryAuthority &&
+										childFile &&
+										childArtifactDir
+									) {
 										const sink = terminalOutputSink;
 										terminalOutputCommit = createOrGetTerminalChildResult({
 											owner: {
@@ -10459,6 +10474,7 @@ export class AgentSession {
 												deliveryId: run.deliveryId,
 											},
 											childArtifactRoot: childArtifactDir,
+											parentRecoveryAuthority,
 											isCurrent: () =>
 												this._activeRlmChildRuns.get(run.id) === run &&
 												this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&

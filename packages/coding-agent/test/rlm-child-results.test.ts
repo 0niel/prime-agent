@@ -1,6 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	canonicalChildResultBytes,
@@ -10,6 +11,7 @@ import {
 	readOwnedArtifact,
 	recordChildResultDisposition,
 	resolveOwnedChildResult,
+	setC04ProcessIdentitySeamForTest,
 } from "../src/core/rlm-child-results.js";
 import { createRlmSafeTerminalResultTerminalMessage } from "../src/core/rlm-durable-operations.js";
 import { SessionManager } from "../src/core/session-manager.js";
@@ -31,6 +33,28 @@ function owner(file: string) {
 		deliveryId: ids[4],
 	};
 }
+function canonical(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+	const object = value as Record<string, unknown>;
+	return `{${Object.keys(object)
+		.sort()
+		.filter((key) => object[key] !== undefined)
+		.map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`)
+		.join(",")}}`;
+}
+
+function authority(file: string) {
+	const state = dirname(dirname(file));
+	const parentFile = join(state, "sessions", `${ids[0]}.jsonl`);
+	const parentArtifacts = join(state, "session-artifacts", ids[0]);
+	mkdirSync(parentArtifacts, { recursive: true, mode: 0o700 });
+	writeFileSync(parentFile, `${JSON.stringify({ type: "session", id: ids[0] })}\n`, { mode: 0o600 });
+	const recoveryKeyPath = join(parentArtifacts, ".c04-recovery-key");
+	writeFileSync(recoveryKeyPath, Buffer.alloc(32, 7), { mode: 0o600 });
+	chmodSync(recoveryKeyPath, 0o600);
+	return { parentSessionFile: parentFile, parentArtifactRoot: parentArtifacts, recoveryKeyPath };
+}
 
 describe("C04 bounded child results", () => {
 	it("commits an opaque streamed result idempotently and denies cross-owner bytes", async () => {
@@ -45,6 +69,7 @@ describe("C04 bounded child results", () => {
 			const input = {
 				owner: owner(file),
 				childArtifactRoot: artifacts,
+				parentRecoveryAuthority: authority(file),
 				candidate: {
 					status: "completed" as const,
 					summary: "done",
@@ -112,6 +137,7 @@ describe("C04 bounded child results", () => {
 			const input = {
 				owner: owner(file),
 				childArtifactRoot: artifacts,
+				parentRecoveryAuthority: authority(file),
 				candidate: {
 					status: "completed" as const,
 					summary: "done",
@@ -153,6 +179,7 @@ describe("C04 bounded child results", () => {
 		const base = {
 			owner: owner(file),
 			childArtifactRoot: artifacts,
+			parentRecoveryAuthority: authority(file),
 			candidate: { status: "completed" as const, summary: "done", preview: "safe" },
 		};
 		try {
@@ -198,6 +225,7 @@ describe("C04 bounded child results", () => {
 		const input = {
 			owner: owner(file),
 			childArtifactRoot: artifacts,
+			parentRecoveryAuthority: authority(file),
 			candidate: {
 				status: "completed" as const,
 				summary: "done",
@@ -234,9 +262,20 @@ describe("C04 bounded child results", () => {
 		const file = join(sessions, `${childV7}.jsonl`);
 		writeFileSync(file, `${JSON.stringify({ type: "session", id: childV7 })}\n`);
 		try {
+			const parentSessionId = "019a8f42-1234-7000-8000-123456789abd";
+			const parentArtifacts = join(root, "session-artifacts", parentSessionId);
+			mkdirSync(parentArtifacts, { recursive: true });
+			const parentFile = join(sessions, `${parentSessionId}.jsonl`);
+			writeFileSync(parentFile, `${JSON.stringify({ type: "session", id: parentSessionId })}\n`);
+			const parentRecoveryAuthority = {
+				parentSessionFile: parentFile,
+				parentArtifactRoot: parentArtifacts,
+				recoveryKeyPath: join(parentArtifacts, ".c04-recovery-key"),
+			};
+			writeFileSync(parentRecoveryAuthority.recoveryKeyPath, Buffer.alloc(32, 7), { mode: 0o600 });
 			const result = await createOrGetTerminalChildResult({
 				owner: {
-					parentSessionId: "019a8f42-1234-7000-8000-123456789abd",
+					parentSessionId,
 					childSessionId: childV7,
 					childSessionFile: file,
 					assignmentId: "019a8f42-1234-7000-8000-123456789abe",
@@ -244,6 +283,7 @@ describe("C04 bounded child results", () => {
 					deliveryId: "019a8f42-1234-7000-8000-123456789ac0",
 				},
 				childArtifactRoot: artifacts,
+				parentRecoveryAuthority,
 				candidate: { status: "completed", summary: "done", preview: "safe" },
 			});
 			expect(result.resultId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4/);
@@ -263,6 +303,7 @@ describe("C04 bounded child results", () => {
 			const result = await createOrGetTerminalChildResult({
 				owner: owner(file),
 				childArtifactRoot: artifacts,
+				parentRecoveryAuthority: authority(file),
 				candidate: {
 					status: "completed",
 					summary: '\\"'.repeat(2_048),
@@ -293,6 +334,7 @@ describe("C04 bounded child results", () => {
 			const result = await createOrGetTerminalChildResult({
 				owner: { ...owner(file), childSessionId: manager.getSessionId() },
 				childArtifactRoot: artifacts,
+				parentRecoveryAuthority: authority(file),
 				candidate: { status: "completed", summary: "done", preview: "safe" },
 			});
 			expect(
@@ -318,6 +360,7 @@ describe("C04 bounded child results", () => {
 		const base = {
 			owner: owner(file),
 			childArtifactRoot: artifacts,
+			parentRecoveryAuthority: authority(file),
 			candidate: { status: "completed" as const, summary: "done", preview: "safe" },
 		};
 		try {
@@ -326,22 +369,136 @@ describe("C04 bounded child results", () => {
 			const index = join(resultRoot, "operation-index", `${ids[3]}.json`);
 			const reservation = join(resultRoot, "operation-index", `.${ids[3]}.reserve`);
 			const quota = join(resultRoot, "operation-index", `.quota.${ids[1]}.${ids[2]}.reserve`);
-			const journal = {
+			const payload = {
 				version: 1,
 				owner: base.owner,
 				indexPath: index,
 				nonce: ids[4],
 				pid: 999999,
-				startedAt: new Date().toISOString(),
+				processStartId: "dead-start",
 				progress: "reserved",
 				resultId: result.resultId,
 			};
+			const key = readFileSync(base.parentRecoveryAuthority.recoveryKeyPath);
+			const journal = { ...payload, mac: createHmac("sha256", key).update(canonical(payload)).digest("hex") };
 			writeFileSync(reservation, JSON.stringify(journal));
 			writeFileSync(quota, JSON.stringify(journal));
 			rmSync(index);
+			const restoreIdentity = setC04ProcessIdentitySeamForTest({
+				captureCurrent: () => ({ pid: process.pid, processStartId: "current" }),
+				observe: () => "dead",
+			});
 			const again = await createOrGetTerminalChildResult({ ...base, candidate: { ...base.candidate } });
+			restoreIdentity();
 			expect(again).toEqual(result);
 			expect(getChildResultProjection(base.owner, result.resultId, artifacts)).toEqual(result);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed for live, unreadable, malformed, or MAC-tampered reservations without deleting them", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-reservation-fail-closed-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
+		const base = {
+			owner: owner(file),
+			childArtifactRoot: artifacts,
+			parentRecoveryAuthority: authority(file),
+			candidate: { status: "completed" as const, summary: "done", preview: "safe" },
+		};
+		try {
+			const result = await createOrGetTerminalChildResult(base);
+			const resultRoot = join(artifacts, "rlm-child-results");
+			const index = join(resultRoot, "operation-index", `${ids[3]}.json`);
+			const reservation = join(resultRoot, "operation-index", `.${ids[3]}.reserve`);
+			const quota = join(resultRoot, "operation-index", `.quota.${ids[1]}.${ids[2]}.reserve`);
+			const payload = {
+				version: 1,
+				owner: base.owner,
+				indexPath: index,
+				nonce: ids[4],
+				pid: 999999,
+				processStartId: "owner-start",
+				progress: "reserved",
+				resultId: result.resultId,
+			};
+			const key = readFileSync(base.parentRecoveryAuthority.recoveryKeyPath);
+			const valid = { ...payload, mac: createHmac("sha256", key).update(canonical(payload)).digest("hex") };
+			for (const [journal, identity] of [
+				[valid, "live"],
+				[valid, "unreadable"],
+				[{ ...valid, mac: "00".repeat(32) }, "dead"],
+				[{ nope: true }, "dead"],
+			] as const) {
+				rmSync(index, { force: true });
+				writeFileSync(reservation, JSON.stringify(journal));
+				writeFileSync(quota, JSON.stringify(journal));
+				const restore = setC04ProcessIdentitySeamForTest({
+					captureCurrent: () => ({ pid: process.pid, processStartId: "current" }),
+					observe: () => identity,
+				});
+				await expect(createOrGetTerminalChildResult({ ...base, candidate: { ...base.candidate } })).rejects.toThrow(
+					"immutable operation conflict",
+				);
+				restore();
+				expect(readFileSync(reservation, "utf8")).toBe(JSON.stringify(journal));
+				expect(getChildResultProjection(base.owner, result.resultId, artifacts)).toEqual(result);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reclaims a PID-recycled start-token mismatch but never by wall clock", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-reservation-recycled-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, `${JSON.stringify({ type: "session", id: ids[1] })}\n`);
+		const base = {
+			owner: owner(file),
+			childArtifactRoot: artifacts,
+			parentRecoveryAuthority: authority(file),
+			candidate: { status: "completed" as const, summary: "done", preview: "safe" },
+		};
+		try {
+			const result = await createOrGetTerminalChildResult(base);
+			const resultRoot = join(artifacts, "rlm-child-results");
+			const index = join(resultRoot, "operation-index", `${ids[3]}.json`);
+			const reservation = join(resultRoot, "operation-index", `.${ids[3]}.reserve`);
+			const quota = join(resultRoot, "operation-index", `.quota.${ids[1]}.${ids[2]}.reserve`);
+			const payload = {
+				version: 1,
+				owner: base.owner,
+				indexPath: index,
+				nonce: ids[4],
+				pid: process.pid,
+				processStartId: "old-incarnation",
+				progress: "reserved" as const,
+				resultId: result.resultId,
+			};
+			const mac = createHmac("sha256", readFileSync(base.parentRecoveryAuthority.recoveryKeyPath))
+				.update(canonical(payload))
+				.digest("hex");
+			writeFileSync(reservation, JSON.stringify({ ...payload, mac }));
+			writeFileSync(quota, JSON.stringify({ ...payload, mac }));
+			rmSync(index);
+			const restore = setC04ProcessIdentitySeamForTest({
+				captureCurrent: () => ({ pid: process.pid, processStartId: "current" }),
+				observe: () => "mismatch",
+			});
+			await expect(createOrGetTerminalChildResult({ ...base, candidate: { ...base.candidate } })).resolves.toEqual(
+				result,
+			);
+			restore();
+			expect(() => readFileSync(reservation)).toThrow();
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

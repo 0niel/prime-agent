@@ -2,7 +2,7 @@
  * C04's sole authority for bounded terminal child results and opaque, owner-local
  * artifacts.  This module deliberately has no daemon/protocol dependency.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
@@ -26,6 +26,7 @@ import {
 	createRlmSafeTerminalResultTerminalMessage,
 	MAX_RLM_SAFE_TERMINAL_MESSAGE_BYTES,
 } from "./rlm-durable-operations.js";
+import { getProcessStartId } from "./session-lease.js";
 
 export const CHILD_RESULT_SCHEMA_VERSION = 1 as const;
 /** C04's opaque projection must still fit C03's 64 KiB full envelope.
@@ -148,11 +149,20 @@ export interface C04ArtifactInput {
 	 * rejected so a terminal can never accidentally retain an unbounded reply. */
 	data: AsyncIterable<Uint8Array>;
 }
+/** SessionManager issues this private authority for a parent before C04 can write.
+ * It deliberately names no key bytes, so it can never enter a C04 projection. */
+export interface C04ParentRecoveryAuthority {
+	parentSessionFile: string;
+	parentArtifactRoot: string;
+	recoveryKeyPath: string;
+}
 export interface C04CreateTerminalChildResultInput {
 	owner: C04ChildResultOwner;
 	candidate: C04TerminalCandidate;
 	/** Trusted SessionManager child artifact directory; callers never pass a relative object path. */
 	childArtifactRoot: string;
+	/** SessionManager-owned, parent-bound private recovery authority. */
+	parentRecoveryAuthority: C04ParentRecoveryAuthority;
 	/** Captured runtime/assignment capability, rechecked before durable publication. */
 	isCurrent?: () => boolean;
 	now?: () => Date;
@@ -186,12 +196,13 @@ export async function createOrGetTerminalChildResult(
 	// Bind before creating C04 state: an untrusted sibling/renamed root never gets
 	// a durable directory merely because it was supplied by a caller.
 	validateChildBinding(owner, input.childArtifactRoot);
+	const recoveryKey = readParentRecoveryKey(owner, input.childArtifactRoot, input.parentRecoveryAuthority);
 	const root = prepareBoundRoot(owner, input.childArtifactRoot);
 	const now = input.now?.() ?? new Date();
 	if (!Number.isFinite(now.getTime())) throw new Error("C04 time is invalid");
 	const candidate = validateCandidate(input.candidate);
 	const indexPath = safePath(root, "operation-index", `${owner.operationId}.json`);
-	reconcileAbandonedReservation(root, owner, indexPath);
+	reconcileAbandonedReservation(root, owner, indexPath, recoveryKey);
 	const existing = readIndex(indexPath);
 	// A committed operation is immutable.  We do not touch a retry stream until its
 	// operation identity has been resolved, avoiding a concurrent writer consuming it.
@@ -203,7 +214,7 @@ export async function createOrGetTerminalChildResult(
 			throw immutableConflict(root, owner.operationId);
 		return projection(readStored(root, existing.resultId));
 	}
-	const reservation = reserveOperationAndQuota(root, owner, indexPath);
+	const reservation = reserveOperationAndQuota(root, owner, indexPath, recoveryKey);
 	const release = reservation.release;
 	const resultId = reservation.resultId;
 	const artifacts: C04OpaqueArtifactReference[] = [];
@@ -265,6 +276,10 @@ export async function createOrGetTerminalChildResult(
 		// projection. Check the actual C03 constructor before publishing any C04
 		// authority record; escaped quotes/backslashes are therefore charged.
 		assertC03EnvelopeFits(projection(stored));
+		// Fence both sides of the durable publication cuts. A stream await may have
+		// handed the assignment to a newer owner; neither an old result nor its
+		// operation index may become authoritative afterwards.
+		if (input.isCurrent && !input.isCurrent()) throw new Error("stale C04 child result capability");
 		// Initial result publication is immutable: a final name is never rename-overwritten.
 		atomicExclusiveJson(safePath(root, "results", `${resultId}.json`), stored);
 		for (const artifact of artifacts)
@@ -275,6 +290,7 @@ export async function createOrGetTerminalChildResult(
 				handleId: artifact.handleId,
 			});
 		const index = { version: 1, resultId, owner, requestDigest };
+		if (input.isCurrent && !input.isCurrent()) throw new Error("stale C04 child result capability");
 		try {
 			atomicExclusiveJson(indexPath, index);
 		} catch (error) {
@@ -705,20 +721,56 @@ const operationReservations = new Set<string>();
 /** A reservation is a durable, authenticated ownership journal. Its nonce, PID
  * and start time make restart reconciliation distinguish a live writer from a
  * dead attempt; its result ID makes every publish cut recoverable. */
-interface ReservationJournal {
+interface ReservationJournalPayload {
 	version: 1;
 	owner: C04ChildResultOwner;
 	indexPath: string;
 	nonce: string;
 	pid: number;
-	startedAt: string;
+	/** Exact PID incarnation captured at reservation creation. */
+	processStartId: string;
 	progress: "reserved" | "publishing";
 	resultId: string;
+}
+interface ReservationJournal extends ReservationJournalPayload {
+	/** HMAC-SHA256 over the canonical payload. Never project this or the key. */
+	mac: string;
+}
+export interface C04ProcessIdentitySeam {
+	captureCurrent(): { pid: number; processStartId: string } | undefined;
+	observe(identity: { pid: number; processStartId: string }): "live" | "dead" | "mismatch" | "unreadable";
+}
+const productionProcessIdentitySeam: C04ProcessIdentitySeam = {
+	captureCurrent() {
+		const processStartId = getProcessStartId(process.pid);
+		return processStartId ? { pid: process.pid, processStartId } : undefined;
+	},
+	observe(identity) {
+		try {
+			process.kill(identity.pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return "dead";
+			return "unreadable";
+		}
+		const observed = getProcessStartId(identity.pid);
+		if (!observed) return "unreadable";
+		return observed === identity.processStartId ? "live" : "mismatch";
+	},
+};
+let processIdentitySeam = productionProcessIdentitySeam;
+/** Test-only identity seam. Production always captures PID plus its start token. */
+export function setC04ProcessIdentitySeamForTest(seam: C04ProcessIdentitySeam): () => void {
+	const previous = processIdentitySeam;
+	processIdentitySeam = seam;
+	return () => {
+		processIdentitySeam = previous;
+	};
 }
 function reserveOperationAndQuota(
 	root: string,
 	owner: C04ChildResultOwner,
 	indexPath: string,
+	recoveryKey: Buffer,
 ): { release: () => void; resultId: string } {
 	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}:${owner.assignmentId}`;
 	if (operationReservations.has(key)) throw immutableConflict(root, owner.operationId);
@@ -728,16 +780,20 @@ function reserveOperationAndQuota(
 		"operation-index",
 		`.quota.${owner.childSessionId}.${owner.assignmentId}.reserve`,
 	);
-	const journal: ReservationJournal = {
+	const identity = processIdentitySeam.captureCurrent();
+	if (!identity || !Number.isSafeInteger(identity.pid) || identity.pid < 1 || !identity.processStartId)
+		throw new Error("C04 exact process identity is unavailable");
+	const payload: ReservationJournalPayload = {
 		version: 1,
 		owner,
 		indexPath,
 		nonce: randomUuid(),
-		pid: process.pid,
-		startedAt: new Date().toISOString(),
+		pid: identity.pid,
+		processStartId: identity.processStartId,
 		progress: "reserved",
 		resultId: randomUuid(),
 	};
+	const journal: ReservationJournal = { ...payload, mac: reservationMac(recoveryKey, payload) };
 	const token = canonicalJson(journal);
 	let operationFd: number | undefined;
 	let quotaFd: number | undefined;
@@ -773,40 +829,35 @@ function reserveOperationAndQuota(
 /** Restart recovery never deletes a competing result. A dead attempt is either
  * completed from its exact durable cross-indexes or tombstoned after removing
  * only names authenticated by that attempt's random result/handle identities. */
-function reconcileAbandonedReservation(root: string, owner: C04ChildResultOwner, indexPath: string): void {
+function reconcileAbandonedReservation(
+	root: string,
+	owner: C04ChildResultOwner,
+	indexPath: string,
+	recoveryKey: Buffer,
+): void {
 	const path = safePath(root, "operation-index", `.${owner.operationId}.reserve`);
-	let journal: ReservationJournal | undefined;
-	let token = "";
+	let journal: ReservationJournal;
+	let token: string;
 	try {
 		const stat = lstatSync(path);
-		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8192) return;
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8192) throw immutableConflict(root, owner.operationId);
 		token = readFileSync(path, "utf8");
-		const value = JSON.parse(token) as ReservationJournal;
+		journal = parseAuthenticatedReservation(token, recoveryKey);
 		if (
-			value.version !== 1 ||
-			!sameOwner(validateOwner(value.owner), owner) ||
-			realpathSync(dirname(value.indexPath)) !== realpathSync(dirname(indexPath)) ||
-			basename(value.indexPath) !== basename(indexPath) ||
-			!isUuid(value.nonce) ||
-			!isUuid(value.resultId) ||
-			!Number.isSafeInteger(value.pid) ||
-			value.pid < 1 ||
-			Number.isNaN(Date.parse(value.startedAt)) ||
-			value.progress !== "reserved"
+			!sameOwner(journal.owner, owner) ||
+			realpathSync(dirname(journal.indexPath)) !== realpathSync(dirname(indexPath)) ||
+			basename(journal.indexPath) !== basename(indexPath)
 		)
-			return;
-		journal = value;
-	} catch {
-		return;
-	}
-	let live = false;
-	try {
-		process.kill(journal.pid, 0);
-		live = true;
+			throw immutableConflict(root, owner.operationId);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw immutableConflict(root, owner.operationId);
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		if (error instanceof Error && error.message === "C04 immutable operation conflict") throw error;
+		// Missing/corrupt/foreign journals are live uncertainty, never stale cleanup.
+		throw immutableConflict(root, owner.operationId);
 	}
-	if (live) throw immutableConflict(root, owner.operationId);
+	const identity = processIdentitySeam.observe(journal);
+	if (identity === "live" || identity === "unreadable") throw immutableConflict(root, owner.operationId);
+	// Only a proven dead PID or a same-PID different-start-token can be reclaimed.
 	try {
 		const result = readStored(root, journal.resultId);
 		if (!sameOwner(result.owner, owner)) throw new Error("foreign result");
@@ -838,6 +889,55 @@ function reconcileAbandonedReservation(root: string, owner: C04ChildResultOwner,
 	);
 	fsyncDirectory(dirname(path));
 }
+function reservationMac(key: Buffer, payload: ReservationJournalPayload): string {
+	return createHmac("sha256", key).update(canonicalJson(payload)).digest("hex");
+}
+function parseAuthenticatedReservation(token: string, key: Buffer): ReservationJournal {
+	const value: unknown = JSON.parse(token);
+	if (
+		!isObject(value) ||
+		!exactKeys(value, [
+			"version",
+			"owner",
+			"indexPath",
+			"nonce",
+			"pid",
+			"processStartId",
+			"progress",
+			"resultId",
+			"mac",
+		]) ||
+		value.version !== 1 ||
+		!isUuid(value.nonce) ||
+		!isUuid(value.resultId) ||
+		!Number.isSafeInteger(value.pid) ||
+		value.pid < 1 ||
+		typeof value.processStartId !== "string" ||
+		!value.processStartId ||
+		value.progress !== "reserved" ||
+		typeof value.mac !== "string" ||
+		!SHA256.test(value.mac)
+	)
+		throw new Error("invalid C04 reservation journal");
+	// Do not validate/normalize owner, result, index, or nonce until the MAC
+	// authenticates the exact canonical disk payload.
+	const payload: ReservationJournalPayload = {
+		version: value.version,
+		owner: value.owner as C04ChildResultOwner,
+		indexPath: value.indexPath as string,
+		nonce: value.nonce,
+		pid: value.pid,
+		processStartId: value.processStartId,
+		progress: value.progress,
+		resultId: value.resultId,
+	};
+	if (typeof payload.indexPath !== "string") throw new Error("invalid C04 reservation journal");
+	const expected = Buffer.from(reservationMac(key, payload), "hex");
+	const actual = Buffer.from(value.mac, "hex");
+	if (expected.length !== actual.length || !timingSafeEqual(expected, actual))
+		throw new Error("invalid C04 reservation MAC");
+	return { ...payload, owner: validateOwner(payload.owner), mac: value.mac };
+}
 function readHandleIndexIfMatching(
 	root: string,
 	handleId: string,
@@ -861,6 +961,62 @@ function unlinkReservationIfOwned(path: string, token: string): void {
 function immutableConflict(root: string, operationId: string): Error {
 	appendAudit(root, "uncertain", "immutable_conflict", operationId);
 	return new Error("C04 immutable operation conflict");
+}
+/** Reads a SessionManager-owned recovery key only after proving it belongs to
+ * the parent whose ID is in the C04 owner. Missing, corrupt or redirected keys
+ * are fail-closed: recovery must not trust an unauthenticated journal. */
+function readParentRecoveryKey(
+	owner: C04ChildResultOwner,
+	childArtifactRoot: string,
+	authority: C04ParentRecoveryAuthority,
+): Buffer {
+	if (
+		!isObject(authority) ||
+		typeof authority.parentSessionFile !== "string" ||
+		typeof authority.parentArtifactRoot !== "string" ||
+		typeof authority.recoveryKeyPath !== "string"
+	)
+		throw new Error("invalid C04 parent recovery authority");
+	const parentFile = canonicalExistingRegularFile(authority.parentSessionFile);
+	if (!parentFile) throw new Error("C04 parent recovery authority is unavailable");
+	let header: unknown;
+	try {
+		header = JSON.parse(readFileSync(parentFile, "utf8").split(/\r?\n/, 1)[0] ?? "");
+	} catch {
+		throw new Error("C04 parent recovery authority is corrupt");
+	}
+	if (!isObject(header) || header.type !== "session" || header.id !== owner.parentSessionId)
+		throw new Error("C04 parent recovery authority does not match owner");
+	const parentRoot = canonicalDirectoryNoSymlinks(authority.parentArtifactRoot);
+	const expectedParentRoot = join(dirname(dirname(parentFile)), "session-artifacts", owner.parentSessionId);
+	if (parentRoot !== expectedParentRoot) throw new Error("C04 parent recovery artifact binding is invalid");
+	// Child and parent must remain within the same SessionManager state authority.
+	const childRoot = canonicalDirectoryNoSymlinks(childArtifactRoot);
+	if (dirname(parentRoot) !== dirname(childRoot)) throw new Error("C04 parent recovery authority is foreign");
+	let keyPath = resolve(authority.recoveryKeyPath);
+	try {
+		if (basename(keyPath) !== ".c04-recovery-key" || realpathSync(dirname(keyPath)) !== parentRoot)
+			throw new Error("C04 recovery key path is invalid");
+		keyPath = join(parentRoot, ".c04-recovery-key");
+	} catch {
+		throw new Error("C04 recovery key path is invalid");
+	}
+	let fd: number | undefined;
+	try {
+		const st = lstatSync(keyPath);
+		if (!st.isFile() || st.isSymbolicLink() || st.size !== 32 || (st.mode & 0o777) !== 0o600)
+			throw new Error("C04 recovery key is invalid");
+		fd = openSyncNoFollow(keyPath, "r");
+		const bytes = Buffer.alloc(32);
+		if (readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length || readSync(fd, Buffer.alloc(1), 0, 1, 32) !== 0)
+			throw new Error("C04 recovery key is truncated");
+		const after = fstatSync(fd);
+		if (after.dev !== st.dev || after.ino !== st.ino || after.size !== 32)
+			throw new Error("C04 recovery key changed");
+		return bytes;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
 }
 /** The C04 root belongs below, not beside, the validated child artifact dir. */
 function validateChildBinding(owner: C04ChildResultOwner, childArtifactRoot: string): void {
