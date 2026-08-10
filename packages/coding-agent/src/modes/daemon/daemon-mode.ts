@@ -922,6 +922,31 @@ export class AgentDaemon {
 		return `${entry.childId}\u0000${entry.assignmentId ?? "legacy"}`;
 	}
 
+	/**
+	 * Registry entries retain one terminal state per durable assignment, ordered
+	 * by the assignment's first durable publication. A later terminal update for
+	 * old A must not make A the public incarnation after B reuses its childId.
+	 */
+	private currentRlmSubagentRegistryEntry(
+		entries: readonly PersistedRlmSubagentRegistryEntry[],
+		childId: string,
+	): PersistedRlmSubagentRegistryEntry | undefined {
+		for (let index = entries.length - 1; index >= 0; index--) {
+			const entry = entries[index];
+			if (entry?.childId === childId) return entry;
+		}
+		return undefined;
+	}
+
+	/** The sole public/passive row for each reused child selector. */
+	private currentLiveRlmSubagentRegistryEntries(
+		entries: readonly PersistedRlmSubagentRegistryEntry[],
+	): PersistedRlmSubagentRegistryEntry[] {
+		const currentByChildId = new Map<string, PersistedRlmSubagentRegistryEntry>();
+		for (const entry of entries) currentByChildId.set(entry.childId, entry);
+		return [...currentByChildId.values()].filter((entry) => entry.status !== "deleted");
+	}
+
 	private appendRlmSubagentRegistryEntry(
 		parentState: ActiveSessionState,
 		entry: PersistedRlmSubagentRegistryEntry,
@@ -1089,6 +1114,26 @@ export class AgentDaemon {
 		);
 	}
 
+	/** Read only selectable catalog incarnations; exact lifecycle operations use the full reader above. */
+	private async readCurrentLiveRlmSubagentRegistryPath(
+		path: string | undefined,
+		throwOnReadError = false,
+	): Promise<PersistedRlmSubagentRegistryEntry[]> {
+		return this.currentLiveRlmSubagentRegistryEntries(
+			await this.readLatestRlmSubagentRegistryPath(path, throwOnReadError),
+		);
+	}
+
+	private async readCurrentLiveRlmSubagentRegistry(
+		parentState: ActiveSessionState,
+		throwOnReadError = false,
+	): Promise<PersistedRlmSubagentRegistryEntry[]> {
+		return this.readCurrentLiveRlmSubagentRegistryPath(
+			this.rlmSubagentRegistryPath(parentState.runtime.session),
+			throwOnReadError,
+		);
+	}
+
 	private rlmSubagentRegistryPathForEntry(entry: PersistedRlmSubagentRegistryEntry, info: SessionInfo): string {
 		return join(dirname(entry.sessionDir), "session-artifacts", info.id, RLM_SUBAGENT_REGISTRY_FILE);
 	}
@@ -1122,7 +1167,7 @@ export class AgentDaemon {
 				passive.push({ ...root, entry, info, chain });
 				await visit(
 					root,
-					await this.readLatestRlmSubagentRegistryPath(this.rlmSubagentRegistryPathForEntry(entry, info)),
+					await this.readCurrentLiveRlmSubagentRegistryPath(this.rlmSubagentRegistryPathForEntry(entry, info)),
 					chain,
 					visited,
 				);
@@ -1137,7 +1182,7 @@ export class AgentDaemon {
 			residentRootPaths.add(parentPath);
 			await visit(
 				{ rootParentState: parentState },
-				await this.readLatestRlmSubagentRegistry(parentState),
+				await this.readCurrentLiveRlmSubagentRegistry(parentState),
 				[],
 				new Set([parentPath]),
 			);
@@ -1147,7 +1192,12 @@ export class AgentDaemon {
 			if (inactiveLifecycleForSession(rootInfo) !== "live" || residentRootPaths.has(rootPath)) continue;
 			const registryPath = this.rlmSubagentRegistryPathForInfo(rootInfo);
 			if (!existsSync(registryPath)) continue;
-			await visit({ rootInfo }, await this.readLatestRlmSubagentRegistryPath(registryPath), [], new Set([rootPath]));
+			await visit(
+				{ rootInfo },
+				await this.readCurrentLiveRlmSubagentRegistryPath(registryPath),
+				[],
+				new Set([rootPath]),
+			);
 		}
 		return passive;
 	}
@@ -2352,7 +2402,10 @@ export class AgentDaemon {
 				}
 				let persisted = assignmentId
 					? persistedEntries.find((entry) => entry.childId === childId && entry.assignmentId === assignmentId)
-					: persistedEntries.find((entry) => entry.childId === childId && entry.status !== "deleted");
+					: this.currentRlmSubagentRegistryEntry(persistedEntries, childId);
+				// Legacy catalog deletion resolves the newest durable incarnation, even
+				// if an older reused childId remains completed on disk. Explicit IDs
+				// above deliberately retain exact-assignment authority.
 				if (!assignmentId && persisted) {
 					if (!persisted.assignmentId) {
 						assignmentId = randomUUID();

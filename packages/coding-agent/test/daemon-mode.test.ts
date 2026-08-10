@@ -1345,6 +1345,129 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("selects only B's latest durable reuse for legacy delete and passive catalog traversal", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-reused-durable-registry-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const rows = readFileSync(registryPath, "utf8")
+				.trim()
+				.split(/\r?\n/)
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			const a = rows[0]!;
+			const childBSessionDir = join(fixture.parentArtifactDir, "sub-reused-b");
+			const childBManager = SessionManager.create(tempDir, childBSessionDir);
+			childBManager.newSession({ parentSession: fixture.parentSessionFile });
+			childBManager.appendSessionInfo("reused-B");
+			childBManager.appendMessage({ role: "user", content: "B's distinct session file", timestamp: 3 });
+			childBManager.flushNow();
+			const childBSessionFile = childBManager.getSessionFile();
+			if (!childBSessionFile) throw new Error("Missing B session file");
+			const assignmentB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+			writeFileSync(
+				registryPath,
+				`${JSON.stringify(a)}\n${JSON.stringify({
+					...a,
+					assignmentId: assignmentB,
+					sessionName: "reused-B",
+					sessionDir: childBSessionDir,
+					sessionFile: childBSessionFile,
+					parentSessionId: childBManager.getSessionId(),
+					status: "completed",
+					createdAt: 3,
+					updatedAt: "2026-01-01T00:00:03.000Z",
+				})}\n`,
+			);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				listPassiveRlmSubagents(): Promise<
+					Array<{ entry: { childId: string; sessionFile: string; assignmentId?: string } }>
+				>;
+				findPassiveRlmSubagent(
+					target: string,
+				): Promise<{ entry: { sessionFile: string; assignmentId?: string } } | undefined>;
+				buildSessionListWithPassiveRlmSubagents(
+					active: ActiveSessionState[],
+					saved: Awaited<ReturnType<typeof SessionManager.listAll>>,
+					jobs: AgentCronJob[],
+				): Promise<Array<{ sessionFile?: string; rlmChildId?: string }>>;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+
+			// All passive selectors traverse the one current B incarnation, not A.
+			const passive = await internals.listPassiveRlmSubagents();
+			expect(passive.filter(({ entry }) => entry.childId === fixture.childId)).toEqual([
+				expect.objectContaining({
+					entry: expect.objectContaining({ sessionFile: childBSessionFile, assignmentId: assignmentB }),
+				}),
+			]);
+			expect(await internals.findPassiveRlmSubagent(fixture.childId)).toEqual(
+				expect.objectContaining({ entry: expect.objectContaining({ sessionFile: childBSessionFile }) }),
+			);
+			const listed = await internals.buildSessionListWithPassiveRlmSubagents(
+				[],
+				await SessionManager.listAll(undefined, join(tempDir, "sessions")),
+				[],
+			);
+			expect(
+				listed.filter((entry) => entry.rlmChildId === fixture.childId).map((entry) => entry.sessionFile),
+			).toEqual([childBSessionFile]);
+
+			const host = internals.createSubagentRuntimeHost(parent);
+			// An explicit old assignment remains exact, and does not select B.
+			await host.deleteRlmSubagentRuntime(fixture.childId, undefined, a.assignmentId as string);
+			let afterDelete = readFileSync(registryPath, "utf8")
+				.trim()
+				.split(/\r?\n/)
+				.map((line) => JSON.parse(line) as { assignmentId?: string; status: string });
+			expect(afterDelete.at(-1)).toMatchObject({ assignmentId: a.assignmentId, status: "deleted" });
+
+			// The ABI's assignment-less delete resolves current B, never the old A.
+			await host.deleteRlmSubagentRuntime(fixture.childId);
+			afterDelete = readFileSync(registryPath, "utf8")
+				.trim()
+				.split(/\r?\n/)
+				.map((line) => JSON.parse(line) as { assignmentId?: string; status: string });
+			expect(afterDelete.at(-1)).toMatchObject({ assignmentId: assignmentB, status: "deleted" });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps exact stale A callbacks fenced after durable B reuse", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-durable-reuse-stale-callback.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeState("parent");
+		const childB = makeState("child-b", parent.activeSessionId);
+		const assignmentA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+		const assignmentB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+		Object.assign(childB.runtime.metadata, {
+			kind: "subagent",
+			parentActiveSessionId: parent.activeSessionId,
+			rlmChildId: "reused-child",
+			assignmentId: assignmentB,
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closeSession: ReturnType<typeof vi.fn>;
+			readLatestRlmSubagentRegistry: ReturnType<typeof vi.fn>;
+		};
+		internals.readLatestRlmSubagentRegistry = vi.fn(async () => []);
+		internals.sessions.set(parent.activeSessionId, parent);
+		internals.sessions.set(childB.activeSessionId, childB);
+		internals.closeSession = vi.fn(async () => undefined);
+		const host = (
+			daemon as unknown as { createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost }
+		).createSubagentRuntimeHost(parent);
+		expect(host.completeRlmSubagentRuntime?.("reused-child", childB.runtime.session, assignmentA)).toBe(false);
+		await host.deleteRlmSubagentRuntime?.("reused-child", childB.runtime.session, assignmentA);
+		expect(internals.closeSession).not.toHaveBeenCalled();
+		expect(internals.sessions.get(childB.activeSessionId)).toBe(childB);
+	});
+
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-real-completion-"));
 		try {
