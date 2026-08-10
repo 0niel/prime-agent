@@ -15,9 +15,11 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { basename, dirname, join } from "path";
+import { basename, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir, getSessionsDir } from "./config.js";
+import { FileAuthStorageBackend } from "./core/auth-storage.js";
 import { migrateKeybindingsConfig } from "./core/keybindings.js";
+import { FileSettingsStorage } from "./core/settings-manager.js";
 import { readFirstLineSync } from "./utils/file-lines.js";
 
 const MIGRATION_GUIDE_URL =
@@ -34,51 +36,109 @@ export function migrateAuthToAuthJson(): string[] {
 	const agentDir = getAgentDir();
 	const authPath = join(agentDir, "auth.json");
 	const oauthPath = join(agentDir, "oauth.json");
-	const settingsPath = join(agentDir, "settings.json");
+	const migratedOauthPath = `${oauthPath}.migrated`;
+	let oauthSourcePath: string | undefined;
+	let providers: string[] = [];
+	let authCommitted = false;
 
-	// Skip if auth.json already exists
-	if (existsSync(authPath)) return [];
-
-	const migrated: Record<string, unknown> = {};
-	const providers: string[] = [];
-
-	// Migrate oauth.json
-	if (existsSync(oauthPath)) {
-		try {
-			const oauth = JSON.parse(readFileSync(oauthPath, "utf-8"));
-			for (const [provider, cred] of Object.entries(oauth)) {
-				migrated[provider] = { type: "oauth", ...(cred as object) };
-				providers.push(provider);
-			}
-			renameSync(oauthPath, `${oauthPath}.migrated`);
-		} catch {
-			// Skip on error
-		}
-	}
-
-	// Migrate settings.json apiKeys
-	if (existsSync(settingsPath)) {
-		try {
-			const content = readFileSync(settingsPath, "utf-8");
-			const settings = JSON.parse(content);
-			if (settings.apiKeys && typeof settings.apiKeys === "object") {
-				for (const [provider, key] of Object.entries(settings.apiKeys)) {
-					if (!migrated[provider] && typeof key === "string") {
-						migrated[provider] = { type: "api_key", key };
-						providers.push(provider);
+	try {
+		const settingsStorage = new FileSettingsStorage(agentDir, agentDir);
+		settingsStorage.withLock(
+			"global",
+			(currentSettings) => {
+				let settings: { apiKeys?: unknown } | undefined;
+				const settingsApiKeys: Record<string, string> = {};
+				if (currentSettings) {
+					try {
+						settings = JSON.parse(currentSettings) as { apiKeys?: unknown };
+						if (
+							typeof settings.apiKeys === "object" &&
+							settings.apiKeys !== null &&
+							!Array.isArray(settings.apiKeys)
+						) {
+							for (const [provider, key] of Object.entries(settings.apiKeys)) {
+								if (typeof key === "string") {
+									settingsApiKeys[provider] = key;
+								}
+							}
+						}
+					} catch {
+						// Leave unreadable settings untouched.
 					}
 				}
-				delete settings.apiKeys;
-				writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-			}
-		} catch {
-			// Skip on error
-		}
+
+				providers = new FileAuthStorageBackend(authPath).withLock((currentAuth) => {
+					if (currentAuth !== undefined) {
+						return { result: [] };
+					}
+
+					const migrated: Record<string, unknown> = {};
+					const nextProviders: string[] = [];
+					oauthSourcePath = existsSync(oauthPath)
+						? oauthPath
+						: existsSync(migratedOauthPath)
+							? migratedOauthPath
+							: undefined;
+					if (oauthSourcePath) {
+						try {
+							const oauth = JSON.parse(readFileSync(oauthSourcePath, "utf-8")) as unknown;
+							if (typeof oauth === "object" && oauth !== null && !Array.isArray(oauth)) {
+								for (const [provider, credential] of Object.entries(oauth)) {
+									migrated[provider] = { type: "oauth", ...(credential as object) };
+									nextProviders.push(provider);
+								}
+							}
+						} catch {
+							// Leave an unreadable legacy file untouched.
+						}
+					}
+
+					for (const [provider, key] of Object.entries(settingsApiKeys)) {
+						if (!(provider in migrated)) {
+							migrated[provider] = { type: "api_key", key };
+							nextProviders.push(provider);
+						}
+					}
+
+					if (nextProviders.length === 0) {
+						return { result: [] };
+					}
+					return {
+						result: nextProviders,
+						next: JSON.stringify(migrated, null, 2),
+					};
+				});
+				authCommitted = providers.length > 0;
+
+				if (!authCommitted || !settings || Object.keys(settingsApiKeys).length === 0) {
+					return undefined;
+				}
+				const currentApiKeys = settings.apiKeys as Record<string, unknown>;
+				for (const [provider, migratedKey] of Object.entries(settingsApiKeys)) {
+					if (currentApiKeys[provider] === migratedKey) {
+						delete currentApiKeys[provider];
+					}
+				}
+				if (Object.keys(currentApiKeys).length === 0) {
+					delete settings.apiKeys;
+				}
+				return JSON.stringify(settings, null, 2);
+			},
+			{ lockIfMissing: true },
+		);
+	} catch (error) {
+		if (!authCommitted) throw error;
+		// The committed auth file is authoritative; legacy cleanup is best-effort.
 	}
 
-	if (Object.keys(migrated).length > 0) {
-		mkdirSync(dirname(authPath), { recursive: true });
-		writeFileSync(authPath, JSON.stringify(migrated, null, 2), { mode: 0o600 });
+	if (providers.length === 0) return providers;
+
+	if (oauthSourcePath === oauthPath && !existsSync(migratedOauthPath)) {
+		try {
+			renameSync(oauthPath, migratedOauthPath);
+		} catch {
+			// The committed auth file is authoritative; legacy cleanup is best-effort.
+		}
 	}
 
 	return providers;

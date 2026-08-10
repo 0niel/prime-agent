@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { AuthStorage } from "../src/core/auth-storage.js";
+import { AuthStorage, FileAuthStorageBackend } from "../src/core/auth-storage.js";
 import { clearConfigValueCache } from "../src/core/resolve-config-value.js";
 
 describe("AuthStorage", () => {
@@ -984,6 +984,56 @@ describe("AuthStorage", () => {
 	});
 
 	describe("persistence semantics", () => {
+		test("locks a missing auth file before the first synchronous write", () => {
+			const realLock = lockfile.lockSync.bind(lockfile);
+			const lockSpy = vi.spyOn(lockfile, "lockSync");
+			lockSpy.mockImplementationOnce((file, options) => {
+				expect(file).toBe(authJsonPath);
+				expect(existsSync(authJsonPath)).toBe(false);
+				expect(options?.realpath).toBe(false);
+				return realLock(file, options);
+			});
+
+			const backend = new FileAuthStorageBackend(authJsonPath);
+			backend.withLock(() => ({ result: undefined, next: JSON.stringify({ anthropic: { key: "secret" } }) }));
+
+			expect(JSON.parse(readFileSync(authJsonPath, "utf-8"))).toEqual({ anthropic: { key: "secret" } });
+		});
+
+		test("locks a missing auth file before the first asynchronous write", async () => {
+			const realLock = lockfile.lock.bind(lockfile);
+			const lockSpy = vi.spyOn(lockfile, "lock");
+			lockSpy.mockImplementationOnce(async (file, options) => {
+				expect(file).toBe(authJsonPath);
+				expect(existsSync(authJsonPath)).toBe(false);
+				expect(options?.realpath).toBe(false);
+				return realLock(file, options);
+			});
+
+			const backend = new FileAuthStorageBackend(authJsonPath);
+			await backend.withLockAsync(async () => ({
+				result: undefined,
+				next: JSON.stringify({ openai: { key: "secret" } }),
+			}));
+
+			expect(JSON.parse(readFileSync(authJsonPath, "utf-8"))).toEqual({ openai: { key: "secret" } });
+		});
+
+		test.runIf(process.platform !== "win32")("atomically replaces auth data with owner-only permissions", () => {
+			writeAuthJson({ anthropic: { type: "api_key", key: "old" } });
+			const previous = statSync(authJsonPath);
+			authStorage = AuthStorage.create(authJsonPath);
+
+			authStorage.set("anthropic", { type: "api_key", key: "new" });
+
+			const current = statSync(authJsonPath);
+			expect(current.ino).not.toBe(previous.ino);
+			expect(current.mode & 0o777).toBe(0o600);
+			expect(JSON.parse(readFileSync(authJsonPath, "utf-8"))).toEqual({
+				anthropic: { type: "api_key", key: "new" },
+			});
+		});
+
 		test("set preserves unrelated external edits", () => {
 			writeAuthJson({
 				anthropic: { type: "api_key", key: "old-anthropic" },

@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { FileSettingsStorage, SettingsManager } from "../src/core/settings-manager.js";
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -25,6 +25,54 @@ describe("SettingsManager", () => {
 	});
 
 	describe("preserves externally added settings", () => {
+		it("re-reads a concurrently created settings file under the first-write lock", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const storage = new FileSettingsStorage(projectDir, agentDir);
+			let calls = 0;
+
+			storage.withLock("global", (current) => {
+				calls += 1;
+				const settings = current ? JSON.parse(current) : {};
+				if (calls === 1) {
+					writeFileSync(settingsPath, JSON.stringify({ enabledModels: ["external/model"] }));
+				}
+				settings.theme = "light";
+				return JSON.stringify(settings);
+			});
+
+			expect(calls).toBe(2);
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual({
+				enabledModels: ["external/model"],
+				theme: "light",
+			});
+		});
+
+		it.runIf(process.platform !== "win32")("applies the process umask to newly created settings", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const storage = new FileSettingsStorage(projectDir, agentDir);
+			const previousUmask = process.umask(0o077);
+			try {
+				storage.withLock("global", () => JSON.stringify({ theme: "light" }));
+				expect(statSync(settingsPath).mode & 0o777).toBe(0o600);
+			} finally {
+				process.umask(previousUmask);
+			}
+		});
+
+		it.runIf(process.platform !== "win32")("atomically replaces settings while preserving file mode", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }), { mode: 0o640 });
+			const previous = statSync(settingsPath);
+			const storage = new FileSettingsStorage(projectDir, agentDir);
+
+			storage.withLock("global", () => JSON.stringify({ theme: "light" }));
+
+			const current = statSync(settingsPath);
+			expect(current.ino).not.toBe(previous.ino);
+			expect(current.mode & 0o777).toBe(0o640);
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual({ theme: "light" });
+		});
+
 		it("should preserve enabledModels when changing thinking level", async () => {
 			// Create initial settings file
 			const settingsPath = join(agentDir, "settings.json");

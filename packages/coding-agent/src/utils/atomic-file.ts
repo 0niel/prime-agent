@@ -61,15 +61,17 @@ export function replaceFileAtomicallySync(
 	const targetPath = realpathIfPresent(path);
 	const directory = dirname(targetPath);
 	const metadata = options.preserveExistingMetadata === false ? undefined : metadataIfPresent(targetPath);
-	const mode = options.mode ?? metadata?.mode ?? 0o666;
+	const mode = options.mode ?? metadata?.mode;
 	const tempPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
-	let fd: number | undefined = openSync(tempPath, "wx", mode);
+	let fd: number | undefined = openSync(tempPath, "wx", mode ?? 0o666);
 	try {
 		write(fd, targetPath);
 		if (metadata !== undefined && process.platform !== "win32") {
 			fchownSync(fd, metadata.uid, metadata.gid);
 		}
-		fchmodSync(fd, mode);
+		if (mode !== undefined) {
+			fchmodSync(fd, mode);
+		}
 		fsyncSync(fd);
 		closeSync(fd);
 		fd = undefined;

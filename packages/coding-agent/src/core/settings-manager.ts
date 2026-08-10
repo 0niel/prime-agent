@@ -1,9 +1,10 @@
 import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import { writeFileAtomicallySync } from "../utils/atomic-file.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -208,8 +209,16 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 
 export type SettingsScope = "global" | "project";
 
+export interface SettingsLockOptions {
+	lockIfMissing?: boolean;
+}
+
 export interface SettingsStorage {
-	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
+	withLock(
+		scope: SettingsScope,
+		fn: (current: string | undefined) => string | undefined,
+		options?: SettingsLockOptions,
+	): void;
 }
 
 export interface SettingsError {
@@ -253,28 +262,40 @@ export class FileSettingsStorage implements SettingsStorage {
 		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
 	}
 
-	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
+	withLock(
+		scope: SettingsScope,
+		fn: (current: string | undefined) => string | undefined,
+		options: SettingsLockOptions = {},
+	): void {
 		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
 		const dir = dirname(path);
 
 		let release: (() => void) | undefined;
 		try {
-			// Only create directory and lock if file exists or we need to write
 			const fileExists = existsSync(path);
-			if (fileExists) {
-				release = this.acquireLockSyncWithRetry(path);
-			}
-			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
-			const next = fn(current);
-			if (next !== undefined) {
-				// Only create directory when we actually need to write
+			if (fileExists || options.lockIfMissing) {
 				if (!existsSync(dir)) {
 					mkdirSync(dir, { recursive: true });
 				}
-				if (!release) {
-					release = this.acquireLockSyncWithRetry(path);
+				release = this.acquireLockSyncWithRetry(path);
+			}
+			let current = existsSync(path) ? readFileSync(path, "utf-8") : undefined;
+			let next = fn(current);
+			if (next === undefined) return;
+
+			if (!existsSync(dir)) {
+				mkdirSync(dir, { recursive: true });
+			}
+			if (!release) {
+				release = this.acquireLockSyncWithRetry(path);
+				const lockedCurrent = existsSync(path) ? readFileSync(path, "utf-8") : undefined;
+				if (lockedCurrent !== current) {
+					current = lockedCurrent;
+					next = fn(current);
 				}
-				writeFileSync(path, next, "utf-8");
+			}
+			if (next !== undefined) {
+				writeFileAtomicallySync(path, next);
 			}
 		} finally {
 			if (release) {
@@ -288,7 +309,11 @@ export class InMemorySettingsStorage implements SettingsStorage {
 	private global: string | undefined;
 	private project: string | undefined;
 
-	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
+	withLock(
+		scope: SettingsScope,
+		fn: (current: string | undefined) => string | undefined,
+		_options: SettingsLockOptions = {},
+	): void {
 		const current = scope === "global" ? this.global : this.project;
 		const next = fn(current);
 		if (next !== undefined) {

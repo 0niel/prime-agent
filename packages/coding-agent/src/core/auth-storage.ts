@@ -15,10 +15,11 @@ import {
 	type OAuthProviderId,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { join } from "path";
+import { existsSync } from "fs";
+import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
-import { ensurePrivateFile, readPrivateFile, writePrivateFileAtomic } from "../utils/private-files.js";
+import { ensurePrivateDirectory, readPrivateFile, writePrivateFileAtomic } from "../utils/private-files.js";
 import {
 	clearPrimeCliCredentials,
 	getPrimeCliConfigPath,
@@ -108,8 +109,9 @@ export interface AuthStorageBackend {
 export class FileAuthStorageBackend implements AuthStorageBackend {
 	constructor(private authPath: string = join(getAgentDir(), "auth.json")) {}
 
-	private ensureFileExists(): void {
-		ensurePrivateFile(this.authPath, "{}");
+	private ensureParentDir(): void {
+		ensurePrivateDirectory(dirname(this.authPath));
+	}
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -140,12 +142,12 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	}
 
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T {
-		this.ensureFileExists();
+		this.ensureParentDir();
 
 		let release: (() => void) | undefined;
 		try {
 			release = this.acquireLockSyncWithRetry(this.authPath);
-			const current = readPrivateFile(this.authPath, "utf-8");
+			const current = existsSync(this.authPath) ? readPrivateFile(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
 				writePrivateFileAtomic(this.authPath, next);
@@ -159,7 +161,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	}
 
 	async withLockAsync<T>(fn: (current: string | undefined) => Promise<LockResult<T>>): Promise<T> {
-		this.ensureFileExists();
+		this.ensureParentDir();
 
 		let release: (() => Promise<void>) | undefined;
 		let lockCompromised = false;
@@ -172,6 +174,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 
 		try {
 			release = await lockfile.lock(this.authPath, {
+				realpath: false,
 				retries: {
 					retries: 10,
 					factor: 2,
@@ -187,7 +190,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			});
 
 			throwIfCompromised();
-			const current = readPrivateFile(this.authPath, "utf-8");
+			const current = existsSync(this.authPath) ? readPrivateFile(this.authPath, "utf-8") : undefined;
 			const { result, next } = await fn(current);
 			throwIfCompromised();
 			if (next !== undefined) {
