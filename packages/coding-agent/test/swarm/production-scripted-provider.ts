@@ -222,14 +222,15 @@ export function createBarrier(expected: readonly string[], timeoutMs: number) {
 	const wait = (id: string, signal: AbortSignal | undefined) =>
 		new Promise<"released" | "aborted">((resolve) => {
 			let done = false;
+			let onAbort: (() => void) | undefined;
 			const settle = (result: "released" | "aborted") => {
 				if (done) return;
 				done = true;
-				signal?.removeEventListener("abort", onAbort);
+				if (onAbort) signal?.removeEventListener("abort", onAbort);
 				waiters.delete(id);
 				resolve(result);
 			};
-			const onAbort = () => settle("aborted");
+			onAbort = () => settle("aborted");
 			if (closed || signal?.aborted) return settle("aborted");
 			if (released.has(id)) return settle("released");
 			waiters.set(id, settle);

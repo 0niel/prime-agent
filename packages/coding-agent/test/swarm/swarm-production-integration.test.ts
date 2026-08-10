@@ -221,6 +221,23 @@ describe("B00B production scripted provider", () => {
 		first.abort();
 		second.abort();
 	});
+	test("settles wait calls made after release, close, or pre-abort without throwing", async () => {
+		const barrier = createBarrier(["request-0095", "request-0096"], 10_000);
+		const rejectedOpen = expect(barrier.open).rejects.toThrow("B00B_BARRIER_CLOSED");
+		barrier.release(["request-0095"]);
+		await expect(barrier.wait("request-0095", undefined)).resolves.toBe("released");
+		barrier.close();
+		await rejectedOpen;
+		await expect(barrier.wait("request-0096", undefined)).resolves.toBe("aborted");
+
+		const preAborted = createBarrier(["request-0097"], 10_000);
+		const preAbortedOpen = expect(preAborted.open).rejects.toThrow("B00B_BARRIER_CLOSED");
+		const controller = new AbortController();
+		controller.abort();
+		await expect(preAborted.wait("request-0097", controller.signal)).resolves.toBe("aborted");
+		preAborted.close();
+		await preAbortedOpen;
+	});
 	test("registers through the real AI registry and holds a 1/4 fanout only as an observation barrier", async () => {
 		const ids = ["request-0001", "request-0002", "request-0003", "request-0004"] as const;
 		const fixture = provider(Object.fromEntries(ids.map((id) => [id, [simple(id, { waitForRelease: true })]])), ids);
