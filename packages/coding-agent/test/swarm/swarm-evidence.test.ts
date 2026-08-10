@@ -127,6 +127,10 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 			),
 		).toBe(true);
 		expect(evidence.summary).toMatchObject({ completed: 3, failed: 1, delivered: 3, cleanedUp: 4 });
+		expect(evidence.manifest.faultSchedule.map((schedule) => schedule.actions.map((action) => action.type))).toEqual([
+			["progress", "delay", "restart", "completion"],
+			["failure"],
+		]);
 		expect(evidence.processSamples.every((sample) => sample.totalRssBytes === 350)).toBe(true);
 		const lead = evidence.costAttribution.find((cost) => cost.id === "role-0001");
 		const run = evidence.costAttribution.find((cost) => cost.id === "run");

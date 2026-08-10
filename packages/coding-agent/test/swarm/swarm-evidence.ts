@@ -34,6 +34,7 @@ const EVENT_TYPES = [
 	"delivery_completed",
 	"cleanup_completed",
 ] as const;
+const FAULT_ACTION_TYPES = ["delay", "progress", "failure", "restart", "completion"] as const;
 
 type EventType = (typeof EVENT_TYPES)[number];
 export type FakeProviderAction =
@@ -292,7 +293,9 @@ function safeEvidenceString(value: string, key?: string): boolean {
 			(value === "run" || /^worker-\d{4}$/.test(value) || /^role-\d{4}$/.test(value))) ||
 		(key === "kind" && ["node", "role", "run"].includes(value)) ||
 		(key === "phase" && ["before_dispatch", "after_admission", "after_terminal", "after_cleanup"].includes(value)) ||
-		(key === "type" && (EVENT_TYPES as readonly string[]).includes(value)) ||
+		(key === "type" &&
+			((EVENT_TYPES as readonly string[]).includes(value) ||
+				(FAULT_ACTION_TYPES as readonly string[]).includes(value))) ||
 		(key === "schemaVersion" && value === SWARM_EVIDENCE_SCHEMA_VERSION) ||
 		(key === "benchmarkVersion" && value === "b00a") ||
 		((key === "fingerprint" || key === "deterministicBundleId" || key === "artifactBundleId" || key === "sha256") &&
