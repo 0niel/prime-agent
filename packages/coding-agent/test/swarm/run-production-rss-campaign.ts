@@ -244,8 +244,8 @@ async function groupSnapshot(pgid: number, injectFailure = false): Promise<Group
 		if (identity.pgid !== pgid) continue;
 		try {
 			const record = processRecordFromStatus(identity, await readFile(`/proc/${identity.pid}/status`, "utf8"));
-			// A zombie has no address space, so missing VmRSS is represented by its
-			// zero-RSS owned record. Any other missing VmRSS fails closed.
+			// A coherently read status without any Vm* fields denotes a process
+			// without an mm and is retained as a zero-RSS owned record.
 			if (!record) return { kind: "unavailable" };
 			records.push(record);
 		} catch (error) {

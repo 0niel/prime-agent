@@ -34,17 +34,25 @@ export function parseProcessStat(pid: number, statLine: string): ProcessStat | u
 }
 
 /**
- * A zombie has no address space, so Linux omits VmRSS from its status file.
- * Retaining it at zero keeps ownership/reaping conservative until it vanishes.
+ * A process without an mm has no Vm* fields. Linux exposes this both for
+ * zombies and briefly for fork/exec children, which are conservatively kept
+ * as zero-RSS records after the status state confirms the stat identity.
  */
 export function processRecordFromStatus(stat: ProcessStat, status: string): ProcessRecord | undefined {
-	const rss = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status)?.[1];
-	if (rss === undefined && stat.state !== "Z") return undefined;
-	return {
-		pid: stat.pid,
-		ppid: stat.ppid,
-		pgid: stat.pgid,
-		start: stat.start,
-		rssKiB: rss === undefined ? 0 : Number(rss),
-	};
+	const lines = status.split(/\r?\n/);
+	const stateLines = lines.filter((line) => line.startsWith("State:"));
+	const state = stateLines.length === 1 ? /^State:\s+(\S)(?:\s+\([^()]*\))?\s*$/.exec(stateLines[0])?.[1] : undefined;
+	if (state !== stat.state) return undefined;
+
+	const vmLines = lines.filter((line) => line.startsWith("Vm"));
+	const rssLines = vmLines.filter((line) => line.startsWith("VmRSS:"));
+	if (rssLines.length === 0) {
+		return vmLines.length === 0
+			? { pid: stat.pid, ppid: stat.ppid, pgid: stat.pgid, start: stat.start, rssKiB: 0 }
+			: undefined;
+	}
+	if (rssLines.length !== 1) return undefined;
+	const rss = /^VmRSS:\s+(\d+)\s+kB\s*$/.exec(rssLines[0])?.[1];
+	if (rss === undefined) return undefined;
+	return { pid: stat.pid, ppid: stat.ppid, pgid: stat.pgid, start: stat.start, rssKiB: Number(rss) };
 }

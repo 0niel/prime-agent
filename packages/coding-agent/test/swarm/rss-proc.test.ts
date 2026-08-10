@@ -10,17 +10,40 @@ function stat(state: string): string {
 	return `123 (worker name) ${fields.join(" ")}`;
 }
 
+function processStat(state: string) {
+	const parsed = parseProcessStat(123, stat(state));
+	expect(parsed).toEqual({ pid: 123, ppid: 17, pgid: 23, start: 456, state });
+	return parsed!;
+}
+
 describe("Linux proc RSS records", () => {
-	it("parses the stat state field and keeps a zombie without VmRSS at zero RSS", () => {
-		const zombie = parseProcessStat(123, stat("Z"));
-		expect(zombie).toEqual({ pid: 123, ppid: 17, pgid: 23, start: 456, state: "Z" });
-		const record = processRecordFromStatus(zombie!, "Name:\tworker\nState:\tZ (zombie)\n");
+	it.each(["S", "R"])("keeps a %s process with no mm at zero RSS", (state) => {
+		const record = processRecordFromStatus(processStat(state), `Name:\tworker\nState:\t${state} (running)\n`);
 		expect(record).toEqual({ pid: 123, ppid: 17, pgid: 23, start: 456, rssKiB: 0 });
 		expect(record).not.toHaveProperty("state");
 	});
 
-	it("fails closed when a non-zombie lacks VmRSS", () => {
-		const running = parseProcessStat(123, stat("S"));
-		expect(processRecordFromStatus(running!, "Name:\tworker\nState:\tS (sleeping)\n")).toBeUndefined();
+	it("keeps a zombie without an mm at zero RSS", () => {
+		expect(processRecordFromStatus(processStat("Z"), "Name:\tworker\nState:\tZ (zombie)\n")).toMatchObject({
+			rssKiB: 0,
+		});
+	});
+
+	it.each([
+		["missing", "Name:\tworker\n"],
+		["mismatched", "Name:\tworker\nState:\tR (running)\n"],
+		["malformed", "Name:\tworker\nState:\tS not-a-linux-state\n"],
+	])("fails closed for %s status state", (_case, status) => {
+		expect(processRecordFromStatus(processStat("S"), status)).toBeUndefined();
+	});
+
+	it("fails closed when an mm field exists but VmRSS is absent", () => {
+		const status = "Name:\tworker\nState:\tS (sleeping)\nVmSize:\t1024 kB\n";
+		expect(processRecordFromStatus(processStat("S"), status)).toBeUndefined();
+	});
+
+	it("parses VmRSS from a state-validated status file", () => {
+		const status = "Name:\tworker\nState:\tS (sleeping)\nVmSize:\t1024 kB\nVmRSS:\t512 kB\n";
+		expect(processRecordFromStatus(processStat("S"), status)).toMatchObject({ rssKiB: 512 });
 	});
 });
