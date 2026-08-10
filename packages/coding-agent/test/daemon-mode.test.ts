@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -15,7 +15,11 @@ import type { AgentObserveController } from "../src/core/agent-observe.js";
 import type { SessionActionRecoverySnapshot } from "../src/core/agent-session.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
-import { readRlmDurableOperationRegistry } from "../src/core/rlm-durable-operations.js";
+import {
+	openRlmDurableOperationStore,
+	type RlmTerminalMessage,
+	readRlmDurableOperationRegistry,
+} from "../src/core/rlm-durable-operations.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -10762,6 +10766,7 @@ function makeRuntimeSession(
 			return sessionManager.getSessionName();
 		},
 		setSubagentRuntimeHost: vi.fn(),
+		appendDurableRlmTerminalMessage: vi.fn(async () => true),
 		getRlmChildRunStatus: vi.fn(() => "running"),
 		registerRlmChildSession: vi.fn(() => true),
 		releaseRlmChildSession: vi.fn(() => vi.fn()),
@@ -10982,6 +10987,171 @@ describe("C03 durable daemon publication", () => {
 			expect(readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")).not.toContain(
 				b.operationId,
 			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rehydrates one pending normal durable terminal through manager-owned passive wake without replay", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-c03-restart-import-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				createRlmSubagentRuntime(
+					parent: ActiveSessionState,
+					options: CreateRlmSubagentRuntimeOptions,
+				): Promise<ActiveSessionState["runtime"]>;
+				closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void>;
+				sessions: Map<string, ActiveSessionState>;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const host = internals.createSubagentRuntimeHost(parent);
+			const assignmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+			const operationId = "aaaaaaaa-aaaa-4aaa-8aaa-000000000010";
+			const deliveryId = "aaaaaaaa-aaaa-4aaa-8aaa-000000000020";
+			const childDir = join(fixture.parentArtifactDir, "c03-restart-child");
+			mkdirSync(childDir, { recursive: true });
+			const options: CreateRlmSubagentRuntimeOptions = {
+				parentSession: parent.runtime.session,
+				id: "restart-worker",
+				assignmentId,
+				operationId,
+				deliveryId,
+				prompt: "normal production seam task",
+				sessionName: "restart-worker",
+				sessionDir: childDir,
+				model: { provider: "test", id: "durable-model" } as Model<Api>,
+				thinkingLevel: "off",
+				serviceTier: null,
+				scopedModels: [],
+				activeToolNames: [],
+				customTools: [],
+				includeGoals: false,
+				includeCompactSkill: false,
+				rlmDepth: 1,
+				rlmMaxDepth: 4,
+				rlmParentNodeId: "restart-worker",
+			};
+			host.admitRlmSubagentOperation?.(options);
+			const runtime = await internals.createRlmSubagentRuntime(parent, options);
+			expect(host.completeRlmSubagentRuntime?.("restart-worker", runtime.session, assignmentId, operationId)).toBe(
+				true,
+			);
+
+			// This is the real durable terminal path up to the crash boundary: the
+			// manager-created child is materialized and registered, then its fsynced
+			// outbox and parent terminal fact exist while no importer is running.
+			const parentFile = parent.runtime.session.sessionManager.getSessionFile();
+			const childFile = runtime.session.sessionManager.getSessionFile();
+			const childArtifacts = runtime.session.sessionManager.getSessionArtifactDir();
+			if (!parentFile || !childFile || !childArtifacts) throw new Error("Missing materialized C03 paths");
+			const store = openRlmDurableOperationStore(fixture.parentArtifactDir, {
+				trustedChildRecoveryRoots: (operation) =>
+					operation.assignmentId === assignmentId && operation.operationId === operationId
+						? {
+								childSessionId: runtime.session.sessionId,
+								childSessionFile: childFile,
+								childSessionRoot: dirname(childFile),
+								childArtifactDir: childArtifacts,
+								childArtifactRoot: dirname(childArtifacts),
+							}
+						: undefined,
+			});
+			const message: RlmTerminalMessage = {
+				role: "custom",
+				customType: "rlm_child_terminal_notice",
+				content: "restart-worker completed without sending a reply",
+				display: true,
+				details: { kind: "completed_without_reply", childId: "restart-worker", sessionName: "restart-worker" },
+				timestamp: 1,
+			};
+			store.appendOutbox({
+				parentSessionId: parent.runtime.session.sessionId,
+				parentSessionFile: parentFile,
+				parentSessionRoot: dirname(parentFile),
+				parentArtifactRoot: dirname(fixture.parentArtifactDir),
+				childSessionId: runtime.session.sessionId,
+				childSessionFile: childFile,
+				childSessionRoot: dirname(childFile),
+				childArtifactDir: childArtifacts,
+				childArtifactRoot: dirname(childArtifacts),
+				childId: "restart-worker",
+				assignmentId,
+				operationId,
+				deliveryId,
+				terminal: "done",
+				message,
+			});
+			expect(
+				store.recordTerminal({
+					parentSessionId: parent.runtime.session.sessionId,
+					assignmentId,
+					operationId,
+					deliveryId,
+					terminal: "done",
+				}),
+			).toBe(true);
+			const childState = [...internals.sessions.values()].find((state) => state.runtime.session === runtime.session);
+			if (!childState) throw new Error("Missing running materialized child");
+			await internals.closeSession(childState, "shutdown");
+			await internals.closeSession(parent, "shutdown");
+
+			// A new daemon has only saved session managers and the durable registry.
+			// Concurrent legitimate selector wakes join that normal hydration path.
+			const restarted = new AgentDaemon(join(tempDir, "restarted.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: join(tempDir, "sessions") },
+				createRuntime: fixture.createRuntime,
+			});
+			const restartedInternals = restarted as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				getOrHydrateBoundSessionState(selector: string): Promise<ActiveSessionState>;
+				sessions: Map<string, ActiveSessionState>;
+				closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void>;
+			};
+			const restartedParent = await restartedInternals.createRuntime({
+				type: "create",
+				sessionPath: fixture.parentSessionFile,
+			});
+			const factoryCallsBeforeWake = fixture.createRuntime.mock.calls.length;
+			const [firstWake, secondWake] = await Promise.all([
+				restartedInternals.getOrHydrateBoundSessionState("restart-worker"),
+				restartedInternals.getOrHydrateBoundSessionState("restart-worker"),
+			]);
+			expect(firstWake).toBe(secondWake);
+			expect(fixture.createRuntime).toHaveBeenCalledTimes(factoryCallsBeforeWake + 1);
+			const append = restartedParent.runtime.session.appendDurableRlmTerminalMessage as ReturnType<typeof vi.fn>;
+			expect(append).toHaveBeenCalledTimes(1);
+			expect(append).toHaveBeenCalledWith(message, deliveryId);
+			expect(
+				store
+					.rebuild()
+					.deliveries.get(
+						JSON.stringify([
+							JSON.stringify([restartedParent.runtime.session.sessionId, assignmentId, operationId]),
+							deliveryId,
+						]),
+					)?.consumed,
+			).toBe("materialized");
+
+			// A later daemon restart sees consumed durable state: importing it creates
+			// neither a second normal transcript append nor child prompt/provider work.
+			await restartedInternals.closeSession(restartedParent, "shutdown");
+			const secondRestart = new AgentDaemon(join(tempDir, "second-restarted.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: join(tempDir, "sessions") },
+				createRuntime: fixture.createRuntime,
+			});
+			const secondInternals = secondRestart as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				getOrHydrateBoundSessionState(selector: string): Promise<ActiveSessionState>;
+			};
+			const secondParent = await secondInternals.createRuntime({
+				type: "create",
+				sessionPath: fixture.parentSessionFile,
+			});
+			await secondInternals.getOrHydrateBoundSessionState("restart-worker");
+			expect(secondParent.runtime.session.appendDurableRlmTerminalMessage).not.toHaveBeenCalled();
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

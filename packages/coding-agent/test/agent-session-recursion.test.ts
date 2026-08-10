@@ -1206,6 +1206,52 @@ describe("AgentSession rlm recursion", () => {
 		expect(resumed.repliedToParentSinceTask).toBeUndefined();
 	});
 
+	it("fails a real public spawn before child construction when daemon durable admission cannot fsync", async () => {
+		const root = createSession();
+		const parentArtifactDir = root.sessionManager.getSessionArtifactDir();
+		if (!parentArtifactDir) throw new Error("Missing persisted parent artifact dir");
+		let childFactoryCalls = 0;
+		const daemon = new AgentDaemon(join(tempDir, "admission-failure.sock"), {
+			defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: join(tempDir, "daemon-sessions") },
+			createRuntime: async () => {
+				childFactoryCalls += 1;
+				throw new Error("child factory must not run before durable admission");
+			},
+		});
+		const parentState = {
+			activeSessionId: "real-parent",
+			eventGeneration: "admission-failure-generation",
+			runtime: {
+				session: root,
+				services: { agentDir: tempDir },
+				metadata: { kind: "top-level", createdAt: 0 },
+			},
+		} as unknown as ActiveSessionState;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+		};
+		internals.sessions.set(parentState.activeSessionId, parentState);
+		root.setSubagentRuntimeHost(internals.createSubagentRuntimeHost(parentState));
+
+		// A non-directory artifact path is a deterministic durable append/fsync failure.
+		// The normal public runRlmChild boundary must reject before it publishes a run
+		// or asks the daemon to construct a child runtime/provider task.
+		rmSync(parentArtifactDir, { recursive: true, force: true });
+		writeFileSync(parentArtifactDir, "injected admission append failure");
+		await expect(root.runRlmChild("must not start", { name: "durable-failure-worker" })).rejects.toThrow();
+
+		expect(childFactoryCalls).toBe(0);
+		expect((root as unknown as InspectableRlmSession)._activeRlmChildRuns).toHaveLength(0);
+		expect(root.getRlmChildSession("durable-failure-worker")).toBeUndefined();
+		expect(root.messages).not.toContainEqual(
+			expect.objectContaining({
+				customType: "rlm_child_failure",
+				content: expect.stringContaining("must not start"),
+			}),
+		);
+	});
+
 	it("surfaces post-admission startup failure in the parent transcript and subagent registry", async () => {
 		const root = createSession({
 			subagentRuntimeHost: {
