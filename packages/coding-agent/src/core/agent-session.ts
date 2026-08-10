@@ -937,6 +937,14 @@ interface PendingRlmChildUpdate {
 	isCurrent: () => boolean;
 }
 
+/**
+ * Session directories are immutable per RLM child and globally unique for the
+ * lifetime of an event stream. Keep this internal key out of UI/log output.
+ */
+function rlmChildUpdateKey(child: RlmChildAgentSnapshot): string {
+	return JSON.stringify([child.sessionDir, child.id]);
+}
+
 interface RlmChildRun {
 	id: string;
 	prompt: string;
@@ -1536,13 +1544,13 @@ export class AgentSession {
 		if (publishSynchronously) {
 			// A lifecycle or structural edge supersedes only its own replaceable
 			// snapshot, while retaining order with activity for other children.
-			this._pendingRlmChildUpdates.delete(child.id);
+			this._pendingRlmChildUpdates.delete(rlmChildUpdateKey(child));
 			this._flushRlmChildUpdates();
 			if (!this._disposed && isCurrent()) this._emit(event);
 			return;
 		}
 
-		this._pendingRlmChildUpdates.set(child.id, { event, isCurrent });
+		this._pendingRlmChildUpdates.set(rlmChildUpdateKey(child), { event, isCurrent });
 		if (this._rlmChildUpdateFlushTimer !== undefined) return;
 		const generation = this._rlmChildUpdateGeneration;
 		this._rlmChildUpdateFlushTimer = setTimeout(() => {

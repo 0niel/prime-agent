@@ -219,6 +219,44 @@ describe("AgentSession RLM child update ownership", () => {
 		expect(observed.some((entry) => entry.id === "teardown")).toBe(false);
 	});
 
+	it("keeps same child ids from different parents scoped, with activity before each terminal", async () => {
+		vi.useFakeTimers();
+		const session = await createSession();
+		const observed: string[] = [];
+		session.subscribe((event: any) => {
+			if (event.type === "rlm_child_update") {
+				observed.push(`${event.child.label}:${event.child.status}:${event.child.answerPreview ?? ""}`);
+			}
+		});
+		const sameChildUnder = (parent: string, status: "running" | "done", preview?: string) => ({
+			type: "rlm_child_update" as const,
+			child: {
+				id: "same-child-id",
+				parentId: "same-parent-local-id",
+				label: "same child",
+				status,
+				sessionDir: `/private/internal/${parent}/sub-same-child-id`,
+				answerPreview: preview,
+			},
+		});
+
+		// These simulate sibling/nested parent sessions reusing the same local id.
+		// Session paths remain internal map keys; assertions use UI-safe labels only.
+		session._queueRlmChildUpdate(sameChildUnder("parent-a", "running", "A activity"), () => true, false);
+		session._queueRlmChildUpdate(sameChildUnder("parent-b", "running", "B activity"), () => true, false);
+		expect(session._pendingRlmChildUpdates.size).toBe(2);
+		session._queueRlmChildUpdate(sameChildUnder("parent-a", "done"), () => true, true);
+		session._queueRlmChildUpdate(sameChildUnder("parent-b", "done"), () => true, true);
+
+		expect(observed).toEqual([
+			"same child:running:A activity",
+			"same child:running:B activity",
+			"same child:done:",
+			"same child:done:",
+		]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
 	it("rechecks the ownership fence at enqueue and flush, so stale A cannot publish over B", async () => {
 		vi.useFakeTimers();
 		const session = await createSession();

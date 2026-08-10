@@ -6490,9 +6490,12 @@ export class AgentDaemon {
 		) {
 			return;
 		}
-		const childId = message.event.child.id;
+		const { id: childId, sessionDir } = message.event.child;
 		for (const candidate of this.sessions.values()) {
-			if (candidate.runtime.metadata.rlmChildId === childId) {
+			const metadata = candidate.runtime.metadata;
+			// Child ids are parent-local. The event's immutable child sessionDir
+			// identifies the exact daemon child without exposing it to the UI.
+			if (metadata.rlmChildId === childId && metadata.sessionDir === sessionDir) {
 				message.event.child.activeSessionId = candidate.activeSessionId;
 				return;
 			}

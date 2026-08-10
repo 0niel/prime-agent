@@ -1720,6 +1720,72 @@ describe("InteractiveMode connection events", () => {
 		}
 	});
 
+	test("scopes same child ids by session identity so nested parents retain both activity and terminals", async () => {
+		vi.useFakeTimers();
+		try {
+			type Event = { type: "session_event"; event: AgentConnectionSessionEvent };
+			let listener: ((event: Event) => Promise<void>) | undefined;
+			const handled: string[] = [];
+			const fakeThis = {
+				agentConnection: {
+					subscribe: (callback: (event: Event) => Promise<void>) => {
+						listener = callback;
+						return vi.fn();
+					},
+				},
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				progressFlushGeneration: 0,
+				progressFlushStopped: false,
+				handleEvent: vi.fn(async (event: any) => {
+					handled.push(`${event.child.label}:${event.child.status}:${event.child.answerPreview ?? ""}`);
+				}),
+				showError: vi.fn(),
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
+				fakeThis,
+			);
+			const child = (scope: string, label: string, status: "running" | "done", answerPreview?: string) =>
+				listener?.({
+					type: "session_event",
+					event: {
+						type: "rlm_child_update",
+						child: {
+							id: "same-child-id",
+							parentId: "same-parent-local-id",
+							sessionDir: `internal-child-${scope}`,
+							label,
+							status,
+							answerPreview,
+						},
+					},
+				} as unknown as Event);
+
+			// First state edges are structural. Subsequent activity is coalesced,
+			// independently, despite the intentionally identical child-local id.
+			await child("a", "child A", "running", "A first");
+			await child("b", "child B", "running", "B first");
+			child("a", "child A", "running", "A activity");
+			child("b", "child B", "running", "B activity");
+			expect((fakeThis as any).pendingProgressEvents.size).toBe(2);
+			await child("a", "child A", "done");
+			await child("b", "child B", "done");
+
+			expect(handled).toEqual([
+				"child A:running:A first",
+				"child B:running:B first",
+				"child A:running:A activity",
+				"child B:running:B activity",
+				"child A:done:",
+				"child B:done:",
+			]);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("bounds distinct progress coalescing without dropping ordered newest updates", async () => {
 		vi.useFakeTimers();
 		try {

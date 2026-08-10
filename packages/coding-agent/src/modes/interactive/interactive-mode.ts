@@ -347,6 +347,21 @@ export function formatSplashCwd(cwd: string): string {
 	return normalized;
 }
 
+/**
+ * A child id is allocated by its parent, so it is not globally unique. Session
+ * storage identity is stable on every child event and deliberately remains an
+ * internal map key rather than UI/log output.
+ */
+function subagentSnapshotKey(child: AgentConnectionRlmChildAgentSnapshot): string {
+	return JSON.stringify([child.sessionDir, child.id]);
+}
+
+function subagentParentSnapshotKey(child: AgentConnectionRlmChildAgentSnapshot): string | undefined {
+	// Children are stored immediately below their parent's RLM session directory.
+	// Derive the parent scope locally instead of putting an internal path on events.
+	return child.parentId === undefined ? undefined : JSON.stringify([path.dirname(child.sessionDir), child.parentId]);
+}
+
 function mergeSubagentSnapshot(
 	previous: AgentConnectionRlmChildAgentSnapshot,
 	incoming: AgentConnectionRlmChildAgentSnapshot,
@@ -5048,13 +5063,14 @@ export class InteractiveMode {
 		if (event.type === "tool_execution_update") return true;
 		if (event.type !== "rlm_child_update") return false;
 
-		const { id, status } = event.child;
-		const previous = this.progressChildStatuses.get(id);
+		const { status } = event.child;
+		const key = subagentSnapshotKey(event.child);
+		const previous = this.progressChildStatuses.get(key);
 		if (status !== "queued" && status !== "running") {
-			this.progressChildStatuses.delete(id);
+			this.progressChildStatuses.delete(key);
 			return false;
 		}
-		this.progressChildStatuses.set(id, status);
+		this.progressChildStatuses.set(key, status);
 		// The first observation and queued/running edge affect the child summary;
 		// preserve them, and coalesce only later snapshots in the same state.
 		return previous === status;
@@ -5068,7 +5084,7 @@ export class InteractiveMode {
 			return `assistant:${event.message.responseId ?? "active"}`;
 		}
 		if (event.type === "tool_execution_update") return `tool:${event.toolCallId}`;
-		if (event.type === "rlm_child_update") return `rlm-child:${event.child.id}`;
+		if (event.type === "rlm_child_update") return `rlm-child:${subagentSnapshotKey(event.child)}`;
 		return undefined;
 	}
 
@@ -6004,8 +6020,9 @@ export class InteractiveMode {
 		for (const child of children ?? []) {
 			// Live updates can arrive before the initial snapshot; do not replace them
 			// with the snapshot's older state.
-			if (!this.subagentSnapshots.has(child.id) && child.status !== "cancelled") {
-				this.subagentSnapshots.set(child.id, child);
+			const key = subagentSnapshotKey(child);
+			if (!this.subagentSnapshots.has(key) && child.status !== "cancelled") {
+				this.subagentSnapshots.set(key, child);
 			}
 		}
 		this.refreshSubagentSummary();
@@ -6015,19 +6032,21 @@ export class InteractiveMode {
 		const next = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 		for (const child of children ?? []) {
 			if (child.status === "cancelled") continue;
-			const previous = this.subagentSnapshots.get(child.id);
-			next.set(child.id, previous ? mergeSubagentSnapshot(previous, child) : child);
+			const key = subagentSnapshotKey(child);
+			const previous = this.subagentSnapshots.get(key);
+			next.set(key, previous ? mergeSubagentSnapshot(previous, child) : child);
 		}
 		this.subagentSnapshots = next;
 		this.refreshSubagentSummary();
 	}
 
 	private updateSubagentSummary(child: AgentConnectionRlmChildAgentSnapshot): void {
+		const key = subagentSnapshotKey(child);
 		if (child.status === "cancelled") {
-			this.removeSubagentSnapshot(child.id);
+			this.removeSubagentSnapshot(key);
 		} else {
-			const previous = this.subagentSnapshots.get(child.id);
-			this.subagentSnapshots.set(child.id, previous ? mergeSubagentSnapshot(previous, child) : child);
+			const previous = this.subagentSnapshots.get(key);
+			this.subagentSnapshots.set(key, previous ? mergeSubagentSnapshot(previous, child) : child);
 		}
 		this.refreshSubagentSummary();
 	}
@@ -6053,10 +6072,10 @@ export class InteractiveMode {
 		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
 	}
 
-	private removeSubagentSnapshot(id: string): void {
-		this.subagentSnapshots.delete(id);
-		for (const child of [...this.subagentSnapshots.values()]) {
-			if (child.parentId === id) this.removeSubagentSnapshot(child.id);
+	private removeSubagentSnapshot(key: string): void {
+		this.subagentSnapshots.delete(key);
+		for (const [childKey, child] of [...this.subagentSnapshots.entries()]) {
+			if (subagentParentSnapshotKey(child) === key) this.removeSubagentSnapshot(childKey);
 		}
 	}
 
