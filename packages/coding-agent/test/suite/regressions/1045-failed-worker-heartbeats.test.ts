@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getWindowsProcessStartId, runProcessQuery } from "../../../src/core/session-lease.js";
+import { getProcessQueryOptions, getWindowsProcessStartId, runProcessQuery } from "../../../src/core/session-lease.js";
 import type { DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { type DaemonCommand, type DaemonResponse, success } from "../../../src/modes/daemon/daemon-protocol.js";
 import { createWorkerProcessIdentityProbe, DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js";
@@ -58,15 +58,31 @@ function createSupervisorHarness(): SupervisorHarness {
 }
 
 describe("#1045 failed worker isolation", () => {
-	it("bounds a timed-out process start-id query and maps it to unknown", () => {
+	it("force-kills a SIGTERM-ignoring process query within the hard bound", () => {
 		const startedAt = performance.now();
 		const processStartId = getWindowsProcessStartId(42, () =>
-			runProcessQuery(process.execPath, ["--eval", "setTimeout(() => {}, 5000)"]),
+			runProcessQuery(process.execPath, [
+				"--eval",
+				'process.on("SIGTERM", () => {}); setTimeout(() => process.exit(0), 3000)',
+			]),
 		);
 		const elapsedMs = performance.now() - startedAt;
 
 		expect(processStartId).toBeUndefined();
 		expect(elapsedMs).toBeLessThan(1500);
+	});
+
+	it("allows a bounded cold PowerShell window while keeping ps probes short", () => {
+		expect(getProcessQueryOptions("win32")).toEqual({
+			timeout: 1000,
+			maxBuffer: 64 * 1024,
+			killSignal: "SIGKILL",
+		});
+		expect(getProcessQueryOptions("darwin")).toEqual({
+			timeout: 250,
+			maxBuffer: 64 * 1024,
+			killSignal: "SIGKILL",
+		});
 	});
 	it("classifies mismatched and unknown process identities without authorizing a signal", () => {
 		vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {

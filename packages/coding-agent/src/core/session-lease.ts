@@ -110,19 +110,25 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
-interface ProcessQueryOptions {
+export interface ProcessQueryOptions {
 	timeout: number;
 	maxBuffer: number;
+	killSignal: "SIGKILL";
 }
 
 type ProcessQuery = (command: string, args: string[], options: ProcessQueryOptions) => string;
 
-const PROCESS_QUERY_OPTIONS: ProcessQueryOptions = {
-	timeout: 250,
-	maxBuffer: 64 * 1024,
-};
+export function getProcessQueryOptions(platform: NodeJS.Platform = process.platform): ProcessQueryOptions {
+	return {
+		// PowerShell cold starts are materially slower than ps; both remain bounded
+		// below the normal graceful-stop window. SIGKILL maps to TerminateProcess on Windows.
+		timeout: platform === "win32" ? 1000 : 250,
+		maxBuffer: 64 * 1024,
+		killSignal: "SIGKILL",
+	};
+}
 
-export function runProcessQuery(command: string, args: string[], options = PROCESS_QUERY_OPTIONS): string {
+export function runProcessQuery(command: string, args: string[], options = getProcessQueryOptions()): string {
 	return execFileSync(command, args, {
 		...options,
 		encoding: "utf8",
@@ -144,7 +150,7 @@ export function getWindowsProcessStartId(pid: number, query: ProcessQuery = runP
 				"-Command",
 				`([System.Diagnostics.Process]::GetProcessById(${pid})).StartTime.ToUniversalTime().Ticks`,
 			],
-			PROCESS_QUERY_OPTIONS,
+			getProcessQueryOptions("win32"),
 		).trim();
 		return /^\d+$/.test(startTicks) ? `win:${startTicks}` : undefined;
 	} catch {
@@ -171,7 +177,11 @@ export function getProcessStartId(pid: number): string | undefined {
 		// Fall through to the portable process listing used on macOS and BSD.
 	}
 	try {
-		const startTime = runProcessQuery("ps", ["-p", String(pid), "-o", "lstart="], PROCESS_QUERY_OPTIONS).trim();
+		const startTime = runProcessQuery(
+			"ps",
+			["-p", String(pid), "-o", "lstart="],
+			getProcessQueryOptions(process.platform),
+		).trim();
 		return startTime ? `ps:${startTime}` : undefined;
 	} catch {
 		return undefined;
