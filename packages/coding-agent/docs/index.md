@@ -71,5 +71,6 @@ Public releases are currently installed from versioned release artifacts. The in
 - [Development](development.md) - local setup, configuration, debugging, and validation.
 - [Architecture overview](architecture.md) - system topology and end-to-end prompt flow.
 - [Daemon Architecture](daemon.md) - supervisor, catalog, worker, lifecycle, and recovery details.
+- [Worker Lifecycle Concurrency Contract](worker-lifecycle-concurrency.md) - authority, cancellation, stop, retry, and reclaim invariants.
 - [Agent Connection Architecture](agent-connection.md) - client/runtime connection boundary.
 - [RLM Runtime Architecture](rlm-runtime.md) - ZeroMQ kernel transport and recursive subagent execution.

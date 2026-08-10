@@ -112,6 +112,8 @@ interface InspectableRlmRun {
 	id: string;
 	sessionDir: string;
 	abort: () => void;
+	publication: { reject(error: Error): void };
+	emitUpdate?: () => void;
 	status: string;
 	settled: boolean;
 	error?: string;
@@ -1218,6 +1220,50 @@ describe("AgentSession rlm recursion", () => {
 				details: { kind: "cancelled", reason: "Cancelled by user" },
 			});
 		});
+	});
+
+	it("accepts scheduled interleaved double cancellation with one abort, rejection, and terminal emission", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				childStarted = true;
+				void release.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("late child answer") });
+				});
+				return stream;
+			},
+		});
+		const spawned = await root.runRlmChild("slow child", { name: "interleaved-cancel-worker" });
+		await waitFor(() => childStarted);
+		const run = (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(spawned.rlm_child_id);
+		if (!run) throw new Error("Missing tracked child run");
+		const abort = vi.fn(run.abort);
+		run.abort = abort;
+		const reject = vi.spyOn(run.publication, "reject");
+		const emitCancellationUpdate = vi.fn(run.emitUpdate);
+		run.emitUpdate = emitCancellationUpdate;
+
+		// Queue both independent callers before either gets a scheduling turn. The
+		// synchronous state transition makes both accepted, but only its winner may
+		// perform the irreversible abort/reject/update effects.
+		const first = Promise.resolve().then(() => root.cancelRlmChildRun(spawned.rlm_child_id));
+		const second = Promise.resolve().then(() => root.cancelRlmChildRun(spawned.rlm_child_id));
+		await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+		expect(abort).toHaveBeenCalledTimes(1);
+		expect(reject).toHaveBeenCalledTimes(1);
+		expect(emitCancellationUpdate).toHaveBeenCalledTimes(1);
+
+		releaseChild();
+		await waitFor(() => !(root as unknown as InspectableRlmSession)._activeRlmChildRuns.has(spawned.rlm_child_id));
+		const notices = root.messages.filter(
+			(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
+		);
+		expect(notices).toHaveLength(1);
 	});
 
 	it("injects exactly one notice with a preview when a child completes without replying", async () => {

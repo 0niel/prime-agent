@@ -5573,33 +5573,48 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("quarantines malformed registry rows without losing slash-bearing model IDs on a later complete replay", async () => {
+	it("quarantines only the malformed registry selector until a full row deliberately republishes it", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-registry-replay-model-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir, { modelId: "org/scripted" });
 			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
-			const valid = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
-			valid.model = { provider: "test", modelId: "org/scripted" };
-			const malformed = { ...valid, status: "interrupted" };
-			writeFileSync(registryPath, `${JSON.stringify(valid)}\n${JSON.stringify(malformed)}\n`);
+			const validA = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			validA.model = { provider: "test", modelId: "org/scripted" };
+			const validB = {
+				...validA,
+				childId: "child-b",
+				sessionName: "valid-worker-b",
+				sessionDir: join(tempDir, "child-b"),
+				sessionFile: join(tempDir, "child-b", "session.jsonl"),
+			};
+			const malformedA = { ...validA, status: "interrupted" };
+			writeFileSync(
+				registryPath,
+				`${JSON.stringify(validA)}\n${JSON.stringify(validB)}\n${JSON.stringify(malformedA)}\n`,
+			);
 			const internals = fixture.daemon as unknown as {
 				readLatestRlmSubagentRegistryPath(
 					path: string,
 				): Promise<Array<{ childId: string; model?: { provider: string; modelId: string } }>>;
 			};
 
-			// A corrupt later row fences the prior incarnation rather than reviving it.
-			expect(await internals.readLatestRlmSubagentRegistryPath(registryPath)).toEqual([]);
-
-			// A complete later replay deliberately republishes the child and preserves
-			// model IDs whose provider/model boundary is the first slash only.
-			writeFileSync(registryPath, `${readFileSync(registryPath, "utf8")}${JSON.stringify(valid)}\n`);
+			// A malformed A row is a selector-local tombstone: valid B remains addressable.
 			expect(await internals.readLatestRlmSubagentRegistryPath(registryPath)).toEqual([
-				expect.objectContaining({
-					childId: fixture.childId,
-					model: { provider: "test", modelId: "org/scripted" },
-				}),
+				expect.objectContaining({ childId: "child-b" }),
 			]);
+
+			// Only a complete A row deliberately recovers A; it also preserves model IDs
+			// whose provider/model boundary is the first slash only.
+			writeFileSync(registryPath, `${readFileSync(registryPath, "utf8")}${JSON.stringify(validA)}\n`);
+			expect(await internals.readLatestRlmSubagentRegistryPath(registryPath)).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						childId: fixture.childId,
+						model: { provider: "test", modelId: "org/scripted" },
+					}),
+					expect.objectContaining({ childId: "child-b" }),
+				]),
+			);
 			const parentState = await (
 				fixture.daemon as unknown as {
 					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;

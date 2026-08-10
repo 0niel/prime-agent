@@ -22,6 +22,8 @@ flowchart TD
 
 The supervisor owns public sockets, client attachments, routing, global agent-message delivery, worker health, command journals, and coordinated updates. It does not execute providers, tools, compaction, bash, kernels, schedules, or transcript scans.
 
+Lifecycle races, identity authority, cancellation, reclaim, and background finalization are governed by the [Worker Lifecycle Concurrency Contract](worker-lifecycle-concurrency.md).
+
 The catalog subprocess owns saved-session scans and inactive-session file operations. A catalog failure can fail a catalog request without interrupting active workers.
 
 Each worker owns one root `AgentSessionRuntime`, its root `AgentSession`, scheduler, kernels, and every RLM descendant below that root. New, switch, fork, and import operations replace the root runtime inside the worker while preserving the public active-session ID.
