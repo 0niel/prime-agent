@@ -87,6 +87,44 @@ describe("B00B RSS campaign", () => {
 	);
 
 	it.skipIf(process.platform !== "linux")(
+		"fails closed when the final scan is unavailable after a TERM-ignoring descendant",
+		async () => {
+			const root = await directory("final-scan-failure");
+			const output = join(root, "output");
+			const pidFile = join(root, "fixture.pid");
+			const fixture = join(root, "ignore-term.cjs");
+			await writeFile(
+				fixture,
+				"require('fs').writeFileSync(process.argv[2],String(process.pid));process.on('SIGTERM',()=>{});setInterval(()=>{},1000);",
+				{ mode: 0o700 },
+			);
+			await campaign(output, [
+				"--fanout",
+				"1",
+				"--repetitions",
+				"1",
+				"--timeout-ms",
+				"500",
+				"--test-fail-final-scan",
+				"--fixture-command",
+				process.execPath,
+				"--fixture-arg",
+				fixture,
+				"--fixture-arg",
+				pidFile,
+			]);
+			const pid = Number(await readFile(pidFile, "utf8"));
+			const result = await run(output, 1, 1);
+			expect(result.status).toBe("failed");
+			expect(result.reasonCode).toBe(5);
+			expect(result.finalRssKiB).toBeNull();
+			expect((result.samples as { phase: string }[]).some((sample) => sample.phase === "final")).toBe(false);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(() => process.kill(pid, 0)).toThrow();
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")(
 		"does not arm timeout or release descendants before exact ownership capture",
 		async () => {
 			const root = await directory("delayed-ownership");

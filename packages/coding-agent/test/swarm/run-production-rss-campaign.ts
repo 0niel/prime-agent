@@ -98,6 +98,8 @@ interface Config {
 	// Test-only delay which makes the pre-release ownership window deterministic.
 	identityCaptureDelayMs: number;
 	testIgnoreTerm: boolean;
+	// Test-only deterministic final-observation fault injection.
+	testFailFinalScan: boolean;
 }
 
 interface GroupOwnership {
@@ -149,6 +151,7 @@ function config(): Config {
 		allocationMiB: safeInteger("--allocation-mib", 1, 1),
 		identityCaptureDelayMs: safeInteger("--test-identity-capture-delay-ms", 0, 0),
 		testIgnoreTerm: process.argv.includes("--test-ignore-term"),
+		testFailFinalScan: process.argv.includes("--test-fail-final-scan"),
 	};
 }
 
@@ -218,23 +221,64 @@ async function procRecord(pid: number): Promise<ProcessRecord | undefined> {
 	return identity ? procRecordForIdentity(identity) : undefined;
 }
 
-async function groupSnapshot(pgid: number): Promise<readonly ProcessRecord[]> {
+type GroupSnapshot =
+	| { kind: "empty" }
+	| { kind: "records"; records: readonly ProcessRecord[] }
+	| { kind: "unavailable" };
+
+function snapshotRecords(snapshot: GroupSnapshot): readonly ProcessRecord[] | undefined {
+	if (snapshot.kind === "unavailable") return undefined;
+	return snapshot.kind === "empty" ? [] : snapshot.records;
+}
+
+function exitedDuringScan(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException).code;
+	return code === "ENOENT" || code === "ESRCH";
+}
+
+/**
+ * Collect a complete group view. An empty records result is a positive claim:
+ * every numeric /proc entry was read and no member of this PGID remained.
+ * Any non-disappearance read or parse failure makes the entire scan unusable;
+ * collapsing it to [] could authorize a signal or a false zero-RSS result.
+ */
+async function groupSnapshot(pgid: number, injectFailure = false): Promise<GroupSnapshot> {
+	if (injectFailure) return { kind: "unavailable" };
 	let entries: string[];
 	try {
 		entries = await readdir("/proc");
 	} catch {
-		return [];
+		return { kind: "unavailable" };
 	}
-	// Scanning all /proc stat files identifies the process group without reading
-	// every status file; VmRSS is read only for members of this measured group.
-	const identities = await Promise.all(
-		entries.filter((entry) => /^\d+$/.test(entry)).map((entry) => procIdentity(Number(entry))),
-	);
-	const members = identities.filter((identity): identity is ProcessIdentity => identity?.pgid === pgid);
-	const records = await Promise.all(members.map(procRecordForIdentity));
-	return records
-		.filter((record): record is ProcessRecord => record !== undefined)
-		.sort((left, right) => left.pid - right.pid);
+	const identities: ProcessIdentity[] = [];
+	for (const entry of entries) {
+		if (!/^\d+$/.test(entry)) continue;
+		const pid = Number(entry);
+		try {
+			const identity = parseProcessIdentity(pid, await readFile(`/proc/${pid}/stat`, "utf8"));
+			if (!identity) return { kind: "unavailable" };
+			identities.push(identity);
+		} catch (error) {
+			// A process which vanished between readdir and stat cannot be a live,
+			// unobserved group member. Every other unreadable numeric entry fails closed.
+			if (!exitedDuringScan(error)) return { kind: "unavailable" };
+		}
+	}
+	const records: ProcessRecord[] = [];
+	for (const identity of identities) {
+		if (identity.pgid !== pgid) continue;
+		try {
+			const status = await readFile(`/proc/${identity.pid}/status`, "utf8");
+			const rss = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status)?.[1];
+			if (rss === undefined) return { kind: "unavailable" };
+			records.push({ ...identity, rssKiB: Number(rss) });
+		} catch (error) {
+			// Only a confirmed disappearance is safe to omit after membership was found.
+			if (!exitedDuringScan(error)) return { kind: "unavailable" };
+		}
+	}
+	const sorted = records.sort((left, right) => left.pid - right.pid);
+	return sorted.length === 0 ? { kind: "empty" } : { kind: "records", records: sorted };
 }
 
 async function collectorAvailable(): Promise<boolean> {
@@ -270,10 +314,21 @@ function pause(milliseconds: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function reapOwnGroup(ownership?: GroupOwnership): Promise<boolean> {
-	if (!ownership) return true;
+interface ReapResult {
+	reaped: boolean;
+	collectionFailed: boolean;
+}
+
+async function reapOwnGroup(ownership?: GroupOwnership): Promise<ReapResult> {
+	if (!ownership) return { reaped: true, collectionFailed: false };
+	let collectionFailed = false;
 	const signalOwnedGroup = async (signal: NodeJS.Signals): Promise<boolean> => {
-		const records = await groupSnapshot(ownership.pgid);
+		const snapshot = await groupSnapshot(ownership.pgid);
+		const records = snapshotRecords(snapshot);
+		if (!records) {
+			collectionFailed = true;
+			return false;
+		}
 		// A negative PID can affect a reused PGID. Signal only when a process whose
 		// PID, start tick, and PGID we captured is still anchoring this exact group.
 		if (!hasOwnedAnchor(ownership, records)) return records.length === 0;
@@ -285,17 +340,21 @@ async function reapOwnGroup(ownership?: GroupOwnership): Promise<boolean> {
 			return false;
 		}
 	};
-	if (!(await signalOwnedGroup("SIGTERM"))) return false;
+	if (!(await signalOwnedGroup("SIGTERM"))) return { reaped: false, collectionFailed };
 	await pause(REAP_GRACE_MS);
-	let records = await groupSnapshot(ownership.pgid);
-	if (records.length === 0) return true;
-	if (!(await signalOwnedGroup("SIGKILL"))) return false;
+	let snapshot = await groupSnapshot(ownership.pgid);
+	let records = snapshotRecords(snapshot);
+	if (!records) return { reaped: false, collectionFailed: true };
+	if (records.length === 0) return { reaped: true, collectionFailed };
+	if (!(await signalOwnedGroup("SIGKILL"))) return { reaped: false, collectionFailed };
 	const deadline = monotonicMs() + REAP_VERIFY_MS;
 	do {
 		await pause(10);
-		records = await groupSnapshot(ownership.pgid);
+		snapshot = await groupSnapshot(ownership.pgid);
+		records = snapshotRecords(snapshot);
+		if (!records) return { reaped: false, collectionFailed: true };
 	} while (records.length > 0 && monotonicMs() < deadline);
-	return records.length === 0;
+	return { reaped: records.length === 0, collectionFailed };
 }
 
 function workerArguments(settings: Config, fanout: number, scratch: string): string[] {
@@ -353,6 +412,7 @@ async function runCell(
 	let completed = 0;
 	let failed = fanout;
 	let allocatedBytes = 0;
+	let collectorFailed = false;
 	let queue = Promise.resolve();
 	const pendingMemberPids = new Set<number>();
 	const enqueue = (phase: Phase, memberPids: readonly number[] = []): Promise<void> => {
@@ -367,7 +427,12 @@ async function runCell(
 				currentOwnership,
 				announced.filter((record): record is ProcessRecord => record?.pgid === currentOwnership.pgid),
 			);
-			const records = await groupSnapshot(currentOwnership.pgid);
+			const snapshot = await groupSnapshot(currentOwnership.pgid);
+			const records = snapshotRecords(snapshot);
+			if (!records) {
+				collectorFailed = true;
+				return;
+			}
 			remember(currentOwnership, records);
 			samples.push(sample(phase, records));
 		});
@@ -448,10 +513,13 @@ async function runCell(
 				return;
 			}
 
-			const reaped = await reapOwnGroup(ownership);
-			const finalRecords = await groupSnapshot(ownership.pgid);
-			samples.push(sample("final", finalRecords));
-			const emptyOwnedGroup = reaped && finalRecords.length === 0;
+			const reap = await reapOwnGroup(ownership);
+			const finalSnapshot = await groupSnapshot(ownership.pgid, settings.testFailFinalScan);
+			const finalRecords = snapshotRecords(finalSnapshot);
+			const finalCollectionFailed = finalRecords === undefined;
+			if (finalRecords) samples.push(sample("final", finalRecords));
+			const collectionFailure = collectorFailed || reap.collectionFailed || finalCollectionFailed;
+			const emptyOwnedGroup = !collectionFailure && reap.reaped && finalRecords?.length === 0;
 			const status =
 				requested === "complete" && emptyOwnedGroup && !cadenceFailed
 					? "complete"
@@ -474,11 +542,11 @@ async function runCell(
 					maxObservedGapMs: cadence.maxObservedGapMs,
 					sharedPages: "summed-per-process",
 				},
-				reasonCode: status === "complete" ? null : timedOut ? 1 : cadenceFailed ? 4 : 2,
+				reasonCode: status === "complete" ? null : collectionFailure ? 5 : timedOut ? 1 : cadenceFailed ? 4 : 2,
 				baselineRssKiB: 0,
 				peakRssKiB: active.length ? Math.max(...active.map((entry) => entry.totalRssKiB)) : null,
 				terminalRssKiB: byPhase("terminals"),
-				finalRssKiB: total(finalRecords),
+				finalRssKiB: collectionFailure ? null : total(finalRecords ?? []),
 				allocatedBytes,
 				completed,
 				failed,
