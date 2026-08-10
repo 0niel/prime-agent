@@ -2644,6 +2644,37 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual(["queued before abort", "wake after abort"]);
 	});
 
+	it("delivers programmatic agent mail to an idle session without a typed prompt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("mail handled")]);
+		const prompt = agentPromptText("agentmsg_idle_delivery", "background result");
+
+		await expect(harness.session.queueAgentMessagePrompt(prompt, "followUp")).resolves.toBe(true);
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual([prompt]);
+		expect(getAssistantTexts(harness)).toEqual(["mail handled"]);
+	});
+
+	it("wakes an idle suspended pump when a resumeIfIdle follow-up coalesces", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("owner delivered")]);
+		await harness.session.followUp("queued owner", undefined, { queueKey: "scheduled:owner" });
+		harness.session.requestAbort();
+
+		await expect(
+			harness.session.followUp("coalesced re-fire", undefined, {
+				queueKey: "scheduled:owner",
+				resumeIfIdle: true,
+			}),
+		).resolves.toBe(false);
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["queued owner"]);
+	});
+
 	it("waitForIdle resolves when the queue is cleared while the pump is suspended", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

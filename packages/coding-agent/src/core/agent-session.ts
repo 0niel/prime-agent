@@ -4497,6 +4497,7 @@ export class AgentSession {
 			await this._queuePreparedPrompt("steer", text, undefined, {
 				agentMessageId,
 				message: customMessage,
+				resumeIfIdle: true,
 			});
 			if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 			return true;
@@ -4504,6 +4505,7 @@ export class AgentSession {
 		const queued = await this._queuePreparedPrompt("followUp", text, undefined, {
 			agentMessageId,
 			message: customMessage,
+			resumeIfIdle: true,
 		});
 		if (queued && customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
 		return queued;
@@ -5302,8 +5304,14 @@ export class AgentSession {
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
+		const wakesIdleTurn =
+			!options.restore && options.wake !== false && action.payload.kind === "turn" && action.wake === "immediate";
+		if (wakesIdleTurn) this._sessionInputPumpSuspended = false;
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
+			// No new action will reach the normal scheduling path below, so wake
+			// the already-queued owner before this coalesced early return.
+			if (wakesIdleTurn) this._scheduleSessionInputPump();
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
 				this._rejectAgentMessage(
 					action.agentMessageId,
