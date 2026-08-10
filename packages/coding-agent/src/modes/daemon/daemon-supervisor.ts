@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -2907,8 +2907,12 @@ export class DaemonSupervisor {
 		) {
 			// Never infer an owner environment or relaunch an owner-owned worker from
 			// persisted state. This includes processless/passivated descriptors, whose
-			// missing PID must not bypass the owner/no-env guard.
+			// missing PID must not bypass the owner/no-env guard. A dead PID is not a
+			// processless descriptor until its identity is removed: otherwise a later
+			// recovery could probe or signal stale/recycled process metadata.
 			worker.descriptor.lifecycle = "passivated";
+			delete worker.descriptor.pid;
+			delete worker.descriptor.processStartId;
 			worker.descriptor.lastError = "Waiting for the owning client to reconnect";
 			this.persistWorker(worker);
 			return;
@@ -4856,9 +4860,12 @@ export class DaemonSupervisor {
 		if (worker.stopFinalized) {
 			if (removeDescriptor && archiveSession) {
 				// A prior non-removing stop retains a recovering descriptor for hand-off.
-				// A later explicit archive/delete stop must durably tombstone it before
-				// archiving, then remove it so restart cannot recover stale work.
-				this.persistWorkerStopTombstone(worker, true);
+				// Tombstone only that retained durable record. If a concurrent final stop
+				// already deleted it, writing here would recreate a crash-window tombstone
+				// after finalization. Archiving remains idempotent and is still attempted.
+				if (existsSync(worker.descriptorPath)) {
+					this.persistWorkerStopTombstone(worker, true);
+				}
 				await this.finalizeArchivedWorkerStopOnce(worker);
 				this.workers.delete(worker.descriptor.workerId);
 				this.deleteWorkerDescriptor(worker);

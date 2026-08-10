@@ -250,9 +250,29 @@ export class AgentCronJobStore {
 		if ((file.dispatches ?? []).some((dispatch) => !isAgentCronDispatchRecord(dispatch))) {
 			return true;
 		}
-		return ((file.jobs as AgentCronJob[] | undefined) ?? []).some(
-			(job) => job.status === "active" || (isHeartbeatCronJob(job) && job.status === "paused"),
-		);
+		const jobs = (file.jobs as AgentCronJob[] | undefined) ?? [];
+		const jobsById = new Map<string, AgentCronJob>();
+		for (const job of jobs) {
+			// A duplicate ID makes a dispatch ambiguous: we cannot prove which durable
+			// schedule claimed it, so recovery is safer than passivation.
+			if (jobsById.has(job.id)) return true;
+			jobsById.set(job.id, job);
+		}
+		for (const dispatch of (file.dispatches as AgentCronDispatchRecord[] | undefined) ?? []) {
+			const job = jobsById.get(dispatch.jobId);
+			// Dispatches are not independently meaningful. An orphan, cross-session,
+			// or terminal-state mismatch may represent work whose result was lost. A
+			// completed one-shot dispatch is safe: its durable terminal job proves there
+			// is no schedule left to revive.
+			if (
+				!job ||
+				job.sessionId !== sessionId ||
+				(job.status !== "active" && job.status !== "completed")
+			) {
+				return true;
+			}
+		}
+		return jobs.some((job) => job.status === "active" || (isHeartbeatCronJob(job) && job.status === "paused"));
 	}
 
 	create(input: CreateAgentCronJobInput): AgentCronJob {
