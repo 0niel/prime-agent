@@ -109,7 +109,7 @@ async function verifyCatalogAfterStartupDeadline(socketPath: string, cwd: string
 	const client = new DaemonClient(socketPath);
 	try {
 		await client.connect(2000);
-		const response = await client.request({ type: "list", cwd }, 10_000);
+		const response = await client.request({ type: "list", all: true, cwd }, 10_000);
 		expect(response.success, response.success ? undefined : response.error).toBe(true);
 	} finally {
 		client.close();
