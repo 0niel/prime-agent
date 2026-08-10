@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added source-line coordinates to editor layout lines and `styleDisplayText()` so subclasses can style wrapped or scrolled text against exact source offsets.
+
 ## [0.7.1] - 2026-08-07
 
 ## [0.7.0] - 2026-08-05
