@@ -1,11 +1,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import { isClientOwnedDaemonSession } from "../src/main.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
@@ -275,26 +276,14 @@ function launchAcp(agentDir: string, projectDir: string, daemonSocket: string, r
 }
 
 describe("ACP daemon lifecycle negotiation", () => {
-	it("uses resident lifecycle only for ACP sessions that can be reattached", () => {
-		const source = readFileSync(resolve(__dirname, "../src/main.ts"), "utf8");
-		// ACP with a session file stays resident; --no-session remains client-owned
-		// so disconnect completes the worker instead of leaking it.
-		expect(source).toContain('clientOwned: appMode !== "acp" || parsed.noSession');
-		expect(source).toContain("sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile()");
-
-		const clientOwned = (appMode: "acp" | "rpc", noSession: boolean) => appMode !== "acp" || noSession;
-		expect(clientOwned("acp", false)).toBe(false);
-		expect(clientOwned("acp", true)).toBe(true);
-	});
-
-	it("forwards the caller environment for resident sessions too", () => {
-		// A resident worker is still launched by the daemon, so it needs the
-		// caller's env. An embedder (the verifiers ACP harness) passes the model
-		// endpoint, bearer token, and proxy settings that way; gating launchEnv on
-		// clientOwned would start the worker unable to reach the model at all.
-		const source = readFileSync(resolve(__dirname, "../src/main.ts"), "utf8");
-		expect(source).toContain("launchEnv: collectDaemonLaunchEnv(),");
-		expect(source).not.toContain("launchEnv: clientOwned ? collectDaemonLaunchEnv() : undefined");
+	it("keeps only reattachable ACP sessions resident", () => {
+		// Resident workers survive ACP stdio disconnect only when a later
+		// --continue can find their session file. All ephemeral or non-ACP modes
+		// are completed by their creating client.
+		expect(isClientOwnedDaemonSession("acp", false)).toBe(false);
+		expect(isClientOwnedDaemonSession("acp", true)).toBe(true);
+		expect(isClientOwnedDaemonSession("rpc", false)).toBe(true);
+		expect(isClientOwnedDaemonSession("print", false)).toBe(true);
 	});
 
 	it(
