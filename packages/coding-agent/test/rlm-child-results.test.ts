@@ -27,6 +27,8 @@ const ids = [
 	"77777777-7777-4777-8777-777777777777",
 	"88888888-8888-4888-8888-888888888888",
 	"99999999-9999-4999-8999-999999999999",
+	"0196f4a0-9abc-7000-8000-aaaaaaaaaaaa",
+	"0196f4a0-def0-7000-8000-bbbbbbbbbbbb",
 ];
 function owner(file: string) {
 	return {
@@ -275,8 +277,8 @@ describe("C04 bounded child results", () => {
 					status: "completed",
 					summary: "😀".repeat(4096),
 					preview: "😀".repeat(2048),
-					facts: [{ claim: "f".repeat(4096) }],
-					nextActions: ["n".repeat(2048)],
+					facts: [{ claim: "f".repeat(1024) }],
+					nextActions: ["n".repeat(512)],
 				},
 			});
 			const resultPath = join(artifacts, "rlm-child-results", "results", `${withinCap.resultId}.json`);
@@ -291,8 +293,8 @@ describe("C04 bounded child results", () => {
 						status: "completed",
 						summary: "😀".repeat(4096),
 						preview: "😀".repeat(2048),
-						facts: Array.from({ length: 32 }, () => ({ claim: "f".repeat(4096) })),
-						nextActions: Array.from({ length: 16 }, () => "n".repeat(2048)),
+						facts: Array.from({ length: 32 }, () => ({ claim: "f".repeat(1024) })),
+						nextActions: Array.from({ length: 16 }, () => "n".repeat(512)),
 					},
 				}),
 			).rejects.toThrow("result record too large");
@@ -345,7 +347,7 @@ describe("C04 bounded child results", () => {
 		}
 	});
 
-	it("prevalidates combined artifacts and rolls back failed publication without bypassing child-session quota", async () => {
+	it("prevalidates combined artifacts, rolls back publication, and cannot bypass child quota with another parent UUIDv7", async () => {
 		const root = mkdtempSync(join(tmpdir(), "c04-rollback-quota-"));
 		const sessions = join(root, "sessions");
 		const artifacts = join(root, "session-artifacts", ids[1]);
@@ -392,7 +394,9 @@ describe("C04 bounded child results", () => {
 			expect(readdirSync(join(c04, "handle-index"))).toEqual([]);
 
 			const quotaResultId = ids[5];
-			const quotaOwner = { ...owner(file), assignmentId: ids[6], operationId: ids[7], deliveryId: ids[8] };
+			// parentSessionId is caller correlation metadata. A record created through
+			// another valid parent must still consume this trusted child's one quota.
+			const quotaOwner = { ...owner(file), parentSessionId: ids[9], assignmentId: ids[6], operationId: ids[7], deliveryId: ids[8] };
 			const quotaArtifacts = Array.from({ length: 4 }, (_, index) => ({
 				version: 1,
 				handleId: [ids[3], ids[4], ids[7], ids[8]][index]!,
@@ -422,6 +426,44 @@ describe("C04 bounded child results", () => {
 			).rejects.toThrow("session artifact quota");
 			expect(MAX_ARTIFACT_BYTES * 4).toBe(MAX_ARTIFACT_BYTES_PER_CHILD_SESSION);
 			expect(readdirSync(join(c04, "objects"))).toEqual([]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("releases operation and child-quota reservations when corrupt stored results make aggregation fail", async () => {
+		const root = mkdtempSync(join(tmpdir(), "c04-aggregate-cleanup-"));
+		const sessions = join(root, "sessions");
+		const artifacts = join(root, "session-artifacts", ids[1]);
+		mkdirSync(sessions, { recursive: true });
+		mkdirSync(artifacts, { recursive: true });
+		const file = join(sessions, `${ids[1]}.jsonl`);
+		writeFileSync(file, "{}\n");
+		const corruptResultId = ids[3];
+		const data = () =>
+			(async function* () {
+				yield new TextEncoder().encode("retry-safe");
+			})();
+		try {
+			const c04 = join(artifacts, "rlm-child-results");
+			mkdirSync(join(c04, "results"), { recursive: true });
+			// aggregateBytes is intentionally fail-closed rather than silently
+			// ignoring a corrupt durable record. Its throw occurs after reservation.
+			writeFileSync(join(c04, "results", `${corruptResultId}.json`), "not a C04 result");
+			const input = {
+				owner: owner(file),
+				childArtifactRoot: artifacts,
+				candidate: { status: "completed" as const, summary: "retry", preview: "safe", artifacts: [{ kind: "attachment" as const, contentType: "text/plain" as const, data: data() }] },
+			};
+			await expect(createOrGetTerminalChildResult(input)).rejects.toThrow("uncertain C04 result store");
+			const reservationDir = join(c04, "operation-index");
+			expect(readdirSync(reservationDir).filter((name) => name.endsWith(".reserve"))).toEqual([]);
+			// Once the operator removes the corrupt result, the exact same operation
+			// can reserve and publish normally; no stale in-memory or on-disk lease remains.
+			rmSync(join(c04, "results", `${corruptResultId}.json`));
+			const retried = await createOrGetTerminalChildResult({ ...input, candidate: { ...input.candidate, artifacts: [{ kind: "attachment", contentType: "text/plain", data: data() }] } });
+			expect(getChildResultProjection(input.owner, retried.resultId, artifacts)).toEqual(retried);
+			expect(readdirSync(reservationDir).filter((name) => name.endsWith(".reserve"))).toEqual([]);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

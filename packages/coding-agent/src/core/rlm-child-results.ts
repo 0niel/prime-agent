@@ -203,8 +203,11 @@ export async function createOrGetTerminalChildResult(
 	const artifacts: C04OpaqueArtifactReference[] = [];
 	const publishedHandleIndexes: string[] = [];
 	let resultPublished = false;
-	let reservedBytes = aggregateBytes(root, owner);
 	try {
+		// aggregateBytes is deliberately fail-closed for a corrupt result store.
+		// It must run inside this cleanup boundary: reservation acquisition has
+		// already happened, while no terminal object has been published yet.
+		let reservedBytes = aggregateBytes(root, owner);
 		for (const artifact of artifactInputs) {
 			const written = await writeArtifact(root, owner, resultId, artifact, reservedBytes);
 			reservedBytes += written.byteLength;
@@ -691,11 +694,9 @@ function aggregateBytes(root: string, owner: C04ChildResultOwner): number {
 		if (!name.endsWith(".json")) continue;
 		try {
 			const r = readStored(root, name.slice(0, -5));
-			if (
-				r.owner.parentSessionId === owner.parentSessionId &&
-				r.owner.childSessionId === owner.childSessionId &&
-				r.owner.childSessionFile === owner.childSessionFile
-			)
+			// Quota belongs to the trusted child binding (validated root/file/ID),
+			// never to an untrusted correlation field supplied by the caller.
+			if (r.owner.childSessionId === owner.childSessionId && r.owner.childSessionFile === owner.childSessionFile)
 				total += r.artifacts.reduce((n, a) => n + (a.retentionState === "retained" ? a.byteLength : 0), 0);
 		} catch {
 			throw new Error("uncertain C04 result store");
@@ -707,13 +708,15 @@ const operationReservations = new Set<string>();
 /** Reservation ownership is a nonce-bound fact. A losing writer never unlinks
  * a name it did not create, including during the create-one/create-two cut. */
 function reserveOperationAndQuota(root: string, owner: C04ChildResultOwner, indexPath: string): () => void {
-	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}:${owner.childSessionFile}`;
+	// root, childSessionFile and childSessionId form the validated SessionManager
+	// child binding. parentSessionId is caller correlation metadata, not quota authority.
+	const key = `${root}:${owner.childSessionId}:${owner.childSessionFile}`;
 	if (operationReservations.has(key)) throw immutableConflict(root, owner.operationId);
 	const reservation = safePath(root, "operation-index", `.${owner.operationId}.reserve`);
 	const quotaReservation = safePath(
 		root,
 		"operation-index",
-		`.quota.${owner.parentSessionId}.${owner.childSessionId}.reserve`,
+		`.quota.${owner.childSessionId}.reserve`,
 	);
 	const nonce = randomUuid();
 	const token = canonicalJson({ version: 1, owner, indexPath, nonce });
