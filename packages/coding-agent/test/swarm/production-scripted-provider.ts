@@ -178,51 +178,64 @@ function assertScript(script: ProviderScript, requestId: string): void {
 }
 
 /** Abort-aware gate. It owns one promise per request, so one abort cannot release a sibling. */
-function createBarrier(expected: readonly string[], timeoutMs: number) {
+export function createBarrier(expected: readonly string[], timeoutMs: number) {
 	const expectedSet = new Set(expected);
 	if (expectedSet.size !== expected.length || expected.some((id) => !/^request-\d{4}$/.test(id))) {
 		throw new Error("B00B_BAD_BARRIER_EXPECTED");
 	}
 	let resolveOpen!: () => void;
 	let rejectOpen!: (error: Error) => void;
-	let settled = false;
+	let openSettled = false;
+	let closed = false;
 	const open = new Promise<void>((resolve, reject) => {
 		resolveOpen = resolve;
 		rejectOpen = reject;
 	});
 	const entered = new Set<string>();
 	const released = new Set<string>();
-	const waiters = new Map<string, () => void>();
+	const waiters = new Map<string, (result: "released" | "aborted") => void>();
+	const abortPendingWaiters = () => {
+		for (const waiter of waiters.values()) waiter("aborted");
+		waiters.clear();
+	};
+	const rejectPendingOpen = (error: Error) => {
+		if (openSettled) return;
+		openSettled = true;
+		rejectOpen(error);
+	};
 	const timer = setTimeout(() => {
-		if (!settled) {
-			settled = true;
-			rejectOpen(new Error("B00B_BARRIER_TIMEOUT"));
-		}
+		if (closed) return;
+		closed = true;
+		rejectPendingOpen(new Error("B00B_BARRIER_TIMEOUT"));
+		abortPendingWaiters();
 	}, timeoutMs);
 	const enteredRequest = (id: string) => {
 		if (!expectedSet.has(id)) return;
 		if (entered.has(id)) throw new Error("B00B_BARRIER_DUPLICATE");
 		entered.add(id);
-		if (entered.size === expectedSet.size && !settled) {
-			settled = true;
+		if (entered.size === expectedSet.size && !openSettled) {
+			openSettled = true;
 			clearTimeout(timer);
 			resolveOpen();
 		}
 	};
 	const wait = (id: string, signal: AbortSignal | undefined) =>
 		new Promise<"released" | "aborted">((resolve) => {
-			if (released.has(id)) return resolve("released");
-			const onAbort = () => {
+			let done = false;
+			const settle = (result: "released" | "aborted") => {
+				if (done) return;
+				done = true;
 				signal?.removeEventListener("abort", onAbort);
 				waiters.delete(id);
-				resolve("aborted");
+				resolve(result);
 			};
-			if (signal?.aborted) return onAbort();
-			waiters.set(id, () => {
-				signal?.removeEventListener("abort", onAbort);
-				resolve("released");
-			});
+			const onAbort = () => settle("aborted");
+			if (closed || signal?.aborted) return settle("aborted");
+			if (released.has(id)) return settle("released");
+			waiters.set(id, settle);
 			signal?.addEventListener("abort", onAbort, { once: true });
+			// The abort may race listener registration in an implementation-specific host.
+			if (signal?.aborted) settle("aborted");
 		});
 	return {
 		open,
@@ -231,16 +244,15 @@ function createBarrier(expected: readonly string[], timeoutMs: number) {
 		release(ids?: readonly string[]) {
 			for (const id of ids ?? expected) {
 				released.add(id);
-				waiters.get(id)?.();
-				waiters.delete(id);
+				waiters.get(id)?.("released");
 			}
 		},
 		close() {
+			if (closed) return;
+			closed = true;
 			clearTimeout(timer);
-			if (!settled) {
-				settled = true;
-				rejectOpen(new Error("B00B_BARRIER_CLOSED"));
-			}
+			rejectPendingOpen(new Error("B00B_BARRIER_CLOSED"));
+			abortPendingWaiters();
 		},
 	};
 }

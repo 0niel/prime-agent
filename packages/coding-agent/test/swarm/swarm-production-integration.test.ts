@@ -3,7 +3,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentOptions } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { AgentSession } from "../../src/core/agent-session.js";
@@ -24,7 +24,7 @@ import {
 	verifySignedProductionEvidenceFreshProcess,
 	writeSignedProductionEvidence,
 } from "./production-evidence-adapter.js";
-import { createBarrierScriptedProvider, type ProviderScript } from "./production-scripted-provider.js";
+import { createBarrier, createBarrierScriptedProvider, type ProviderScript } from "./production-scripted-provider.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
@@ -92,7 +92,7 @@ function simple(requestId: string, options: Partial<ProviderScript> = {}): Provi
 }
 function agentFor(
 	model: ReturnType<typeof provider>["models"][number],
-	tools: NonNullable<import("@earendil-works/pi-agent-core").AgentOptions["initialState"]>["tools"] = [],
+	tools: NonNullable<AgentOptions["initialState"]>["tools"] = [],
 ) {
 	return new Agent({ getApiKey: () => "fixture-key", initialState: { model, systemPrompt: canaries[0], tools } });
 }
@@ -188,6 +188,39 @@ async function waitForTerminals(fixture: ReturnType<typeof provider>, count: num
 }
 
 describe("B00B production scripted provider", () => {
+	test("settles every held waiter as aborted on barrier timeout and removes its abort listeners", async () => {
+		vi.useFakeTimers();
+		try {
+			const barrier = createBarrier(["request-0091", "request-0092"], 100);
+			const first = new AbortController();
+			const second = new AbortController();
+			const firstWait = barrier.wait("request-0091", first.signal);
+			const secondWait = barrier.wait("request-0092", second.signal);
+			const rejectedOpen = expect(barrier.open).rejects.toThrow("B00B_BARRIER_TIMEOUT");
+			await vi.advanceTimersByTimeAsync(100);
+			await expect(Promise.all([firstWait, secondWait])).resolves.toEqual(["aborted", "aborted"]);
+			await rejectedOpen;
+			// A stale abort listener would have a second settlement path after timeout.
+			first.abort();
+			second.abort();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("settles every held waiter as aborted when the provider closes", async () => {
+		const barrier = createBarrier(["request-0093", "request-0094"], 10_000);
+		const first = new AbortController();
+		const second = new AbortController();
+		const firstWait = barrier.wait("request-0093", first.signal);
+		const secondWait = barrier.wait("request-0094", second.signal);
+		const rejectedOpen = expect(barrier.open).rejects.toThrow("B00B_BARRIER_CLOSED");
+		barrier.close();
+		await expect(Promise.all([firstWait, secondWait])).resolves.toEqual(["aborted", "aborted"]);
+		await rejectedOpen;
+		first.abort();
+		second.abort();
+	});
 	test("registers through the real AI registry and holds a 1/4 fanout only as an observation barrier", async () => {
 		const ids = ["request-0001", "request-0002", "request-0003", "request-0004"] as const;
 		const fixture = provider(Object.fromEntries(ids.map((id) => [id, [simple(id, { waitForRelease: true })]])), ids);

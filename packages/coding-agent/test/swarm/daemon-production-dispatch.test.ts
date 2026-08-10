@@ -17,7 +17,7 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -270,7 +270,7 @@ async function localProvider(canary: string): Promise<LocalProvider> {
 	const releaseWaiters = new Map<string, Set<() => void>>();
 	const sockets = new Set<Socket>();
 	let closePromise: Promise<void> | undefined;
-	const waitForRelease = (id: string, response: import("node:http").ServerResponse): Promise<boolean> =>
+	const waitForRelease = (id: string, response: ServerResponse): Promise<boolean> =>
 		new Promise((resolveRelease) => {
 			const release = () => finish(true);
 			const closed = () => finish(false);

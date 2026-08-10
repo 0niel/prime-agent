@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { validateRssSampleCadence } from "./rss-campaign-cadence.js";
+import { childExecArgsWithTsxImport } from "./rss-child-exec-args.js";
 
 const execute = promisify(execFile);
 const launcher = fileURLToPath(new URL("./run-production-rss-campaign.ts", import.meta.url));
@@ -37,6 +38,13 @@ async function run(output: string, fanout: number, repetition: number): Promise<
 }
 
 describe("B00B RSS campaign", () => {
+	it("preloads tsx for a TypeScript worker exactly once unless a loader is already selected", () => {
+		expect(childExecArgsWithTsxImport([])).toEqual(["--import", "tsx"]);
+		expect(childExecArgsWithTsxImport(["--trace-warnings"])).toEqual(["--trace-warnings", "--import", "tsx"]);
+		expect(childExecArgsWithTsxImport(["--import", "tsx"])).toEqual(["--import", "tsx"]);
+		expect(childExecArgsWithTsxImport(["--import=tsx"])).toEqual(["--import=tsx"]);
+		expect(childExecArgsWithTsxImport(["--loader", "custom-ts-loader"])).toEqual(["--loader", "custom-ts-loader"]);
+	});
 	it("writes complete structured dry artifacts rather than zero-looking macOS data", async () => {
 		const output = join(await directory("dry"), "output");
 		await campaign(output, ["--fanout", "1", "--repetitions", "2"]);

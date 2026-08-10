@@ -16,6 +16,7 @@ import {
 	MAX_RSS_SAMPLE_GAP_MS,
 	validateRssSampleCadence,
 } from "./rss-campaign-cadence.js";
+import { childExecArgsWithTsxImport } from "./rss-child-exec-args.js";
 import { type ProcessRecord, type ProcessStat, parseProcessStat, processRecordFromStatus } from "./rss-proc.js";
 import { RSS_SCAN_RETRY_DELAY_MS, RSS_SCAN_RETRY_WINDOW_MS, retryUnavailableSnapshot } from "./rss-snapshot-retry.js";
 
@@ -369,7 +370,7 @@ async function reapOwnGroup(ownership?: GroupOwnership): Promise<ReapResult> {
 function workerArguments(settings: Config, fanout: number, scratch: string): string[] {
 	const args = [
 		"--expose-gc",
-		...process.execArgv,
+		...childExecArgsWithTsxImport(process.execArgv),
 		WORKER.pathname,
 		"--fanout",
 		String(fanout),
