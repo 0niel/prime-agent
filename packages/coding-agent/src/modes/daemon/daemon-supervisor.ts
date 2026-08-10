@@ -4874,11 +4874,11 @@ export class DaemonSupervisor {
 			}
 			await this.finalizeArchivedWorkerStop(worker);
 		}
-		// Leave an immutable marker for any route that captured this worker before
-		// descriptor deletion. A later create/retry must resolve a fresh route.
-		worker.stopFinalized = true;
-		this.workers.delete(worker.descriptor.workerId);
 		if (removeDescriptor) {
+			// Leave an immutable marker for any route that captured this worker before
+			// descriptor deletion. A later create/retry must resolve a fresh route.
+			worker.stopFinalized = true;
+			this.workers.delete(worker.descriptor.workerId);
 			this.deleteWorkerDescriptor(worker);
 		}
 		if (!this.shuttingDown) {
