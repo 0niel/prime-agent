@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -133,6 +134,26 @@ class HarnessStateTest(unittest.TestCase):
             self.assertIn("await rlm.list_subagents()", overview)
             self.assertIn("receiver_role='child'", overview)
             self.assertIn("refinements: 1", reloaded.overview())
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions and symlink semantics")
+    def test_private_atomic_state_rejects_symlink_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "harness"
+            state_path = root / "harness_state.json"
+            state = HarnessState(state_path, scope="global")
+            state.save()
+
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(state_path.stat().st_mode), 0o600)
+
+            outside = Path(temp_dir) / "outside.json"
+            outside.write_text("sentinel", encoding="utf-8")
+            state_path.unlink()
+            state_path.symlink_to(outside)
+
+            with self.assertRaisesRegex(OSError, "non-regular private file"):
+                state.save()
+            self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
 
     def test_load_ignores_unknown_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import stat
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,6 +92,75 @@ def _state_file(state_dir: str | Path | None = None, *, global_: bool = False) -
     return _agent_dir() / _DEFAULT_HARNESS_DIR_NAME / _DEFAULT_FILE_NAME
 
 
+def _chmod_open_file(fd: int, path: Path, mode: int) -> None:
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, mode)
+    else:
+        path.chmod(mode)
+
+
+def _ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise OSError(f"Refusing to use non-directory private path: {path}")
+    if os.name == "nt":
+        path.chmod(0o700)
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(f"Refusing to use non-directory private path: {path}")
+        _chmod_open_file(fd, path, 0o700)
+    finally:
+        os.close(fd)
+
+
+def _open_private_for_read(path: Path):
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise OSError(f"Refusing to use non-regular private file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(f"Refusing to use non-regular private file: {path}")
+        _chmod_open_file(fd, path, 0o600)
+        return os.fdopen(fd, "r", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _write_private_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    _ensure_private_directory(path.parent)
+    if os.path.lexists(path):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise OSError(f"Refusing to replace non-regular private file: {path}")
+    temp_path = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    try:
+        fd = os.open(temp_path, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @dataclass
 class HarnessEntry:
     """A reusable prompt, memory, skill, or subagent record."""
@@ -155,7 +226,7 @@ class HarnessState:
             self.file_path: Path | None = None
         else:
             self.file_path = (
-                Path(file_path).expanduser().resolve()
+                Path(file_path).expanduser().parent.resolve() / Path(file_path).expanduser().name
                 if file_path
                 else _state_file(global_=(scope == "global"))
             )
@@ -179,7 +250,10 @@ class HarnessState:
         if self.file_path is None:
             return None
         try:
-            return self.file_path.stat().st_mtime_ns
+            info = self.file_path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                return None
+            return info.st_mtime_ns
         except OSError:
             return None
 
@@ -196,12 +270,12 @@ class HarnessState:
             self.load()
 
     def load(self) -> "HarnessState":
-        if self.file_path is None or not self.file_path.exists():
+        if self.file_path is None or not os.path.lexists(self.file_path):
             self._loaded_mtime = None
             return self
         mtime = self._disk_mtime()
         try:
-            with self.file_path.open("r", encoding="utf-8") as f:
+            with _open_private_for_read(self.file_path) as f:
                 data = json.load(f)
         except (OSError, ValueError):
             # A corrupt or unreadable state file must not crash the kernel or block
@@ -285,7 +359,6 @@ class HarnessState:
         if self.file_path is None:
             # in_memory fallback: nothing to persist.
             return self
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "schema": 1,
             "entries": {
@@ -294,8 +367,7 @@ class HarnessState:
             },
             "refinements": [asdict(event) for event in self.refinements],
         }
-        with self.file_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        _write_private_json_atomic(self.file_path, data)
         self._loaded_mtime = self._disk_mtime()
         return self
 
