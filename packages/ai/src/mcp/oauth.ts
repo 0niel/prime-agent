@@ -26,6 +26,11 @@ interface AuthServerMetadata {
 	scopes_supported?: string[];
 }
 
+/** OAuth protected-resource metadata (RFC 9728). */
+interface ProtectedResourceMetadata {
+	authorization_servers?: string[];
+}
+
 export interface McpOAuthConfig {
 	/** MCP server name; provider id becomes `mcp:<server>`. */
 	server: string;
@@ -46,11 +51,18 @@ interface McpCredentials extends OAuthCredentials {
 }
 
 async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
+	const method = init?.method ?? "GET";
 	const res = await fetch(url, init);
+	const text = await res.text();
 	if (!res.ok) {
-		throw new Error(`${init?.method ?? "GET"} ${url} failed: ${res.status} ${await res.text()}`);
+		throw new Error(`${method} ${url} failed: ${res.status} ${text}`);
 	}
-	return res.json();
+	try {
+		return JSON.parse(text);
+	} catch (cause) {
+		const contentType = res.headers.get("content-type") ?? "unknown content type";
+		throw new Error(`${method} ${url} returned non-JSON (${contentType})`, { cause });
+	}
 }
 
 /** Random, URL-safe CSRF `state` value, independent of the PKCE verifier. */
@@ -63,27 +75,74 @@ function randomState(): string {
 		.replace(/=/g, "");
 }
 
-/** Try the protected-resource and auth-server well-known docs at the URL's origin. */
-async function discover(url: string): Promise<AuthServerMetadata> {
-	const origin = new URL(url).origin;
-	const candidates = [
-		`${origin}/.well-known/oauth-authorization-server`,
-		`${origin}/.well-known/openid-configuration`,
-	];
-	let lastError: unknown;
-	for (const candidate of candidates) {
-		try {
-			const meta = (await fetchJson(candidate)) as AuthServerMetadata;
-			if (meta.authorization_endpoint && meta.token_endpoint) {
-				return meta;
+function wellKnownCandidates(url: string, document: string): string[] {
+	const parsed = new URL(url);
+	const path = parsed.pathname === "/" ? "" : parsed.pathname;
+	return [...new Set([`${parsed.origin}/.well-known/${document}${path}`, `${parsed.origin}/.well-known/${document}`])];
+}
+
+function isAuthServerMetadata(value: unknown): value is AuthServerMetadata {
+	if (!value || typeof value !== "object") return false;
+	const metadata = value as Partial<AuthServerMetadata>;
+	return typeof metadata.authorization_endpoint === "string" && typeof metadata.token_endpoint === "string";
+}
+
+async function discoverAuthorizationServer(
+	issuer: string,
+	attempts: string[],
+	errors: string[],
+): Promise<AuthServerMetadata | undefined> {
+	for (const document of ["oauth-authorization-server", "openid-configuration"]) {
+		for (const candidate of wellKnownCandidates(issuer, document)) {
+			attempts.push(candidate);
+			try {
+				const metadata = await fetchJson(candidate);
+				if (isAuthServerMetadata(metadata)) return metadata;
+				errors.push(`${candidate}: missing authorization_endpoint or token_endpoint`);
+			} catch (error) {
+				errors.push(String(error));
 			}
-		} catch (error) {
-			lastError = error;
 		}
 	}
+	return undefined;
+}
+
+/** Follow RFC 9728 resource metadata, then fall back to co-located AS discovery. */
+async function discover(url: string): Promise<AuthServerMetadata> {
+	const resourceUrl = new URL(url);
+	const attempts: string[] = [];
+	const errors: string[] = [];
+
+	for (const candidate of wellKnownCandidates(url, "oauth-protected-resource")) {
+		attempts.push(candidate);
+		try {
+			const resource = (await fetchJson(candidate)) as ProtectedResourceMetadata;
+			const issuers = Array.isArray(resource?.authorization_servers)
+				? resource.authorization_servers.filter((issuer): issuer is string => typeof issuer === "string")
+				: [];
+			if (issuers.length === 0) {
+				errors.push(`${candidate}: missing authorization_servers`);
+				continue;
+			}
+			for (const issuer of issuers) {
+				try {
+					const metadata = await discoverAuthorizationServer(issuer, attempts, errors);
+					if (metadata) return metadata;
+				} catch (error) {
+					errors.push(`${issuer}: ${String(error)}`);
+				}
+			}
+		} catch (error) {
+			errors.push(String(error));
+		}
+	}
+
+	const colocated = await discoverAuthorizationServer(resourceUrl.origin, attempts, errors);
+	if (colocated) return colocated;
+
 	throw new Error(
-		`Could not discover OAuth metadata for ${origin}. ` +
-			`Tried ${candidates.join(", ")}. Last error: ${String(lastError)}`,
+		`Could not discover OAuth metadata for ${resourceUrl.origin}. ` +
+			`Tried ${attempts.join(", ")}. Errors: ${errors.join("; ")}`,
 	);
 }
 

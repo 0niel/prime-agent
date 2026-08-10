@@ -74,6 +74,101 @@ describe.sequential("MCP OAuth provider", () => {
 		expect(authParams.get("scope")).toBe("read write");
 	});
 
+	it("follows path-suffixed protected-resource metadata to an external issuer", async () => {
+		let authUrl = "";
+		const requested: string[] = [];
+		const externalMeta = {
+			...META,
+			issuer: "https://auth.test/tenant",
+			authorization_endpoint: "https://auth.test/authorize",
+			token_endpoint: "https://auth.test/token",
+		};
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown): Promise<Response> => {
+				const url = urlOf(input);
+				requested.push(url);
+				if (url === "https://resource.test/.well-known/oauth-protected-resource/mcp/v1") {
+					return jsonResponse({ authorization_servers: ["https://auth.test/tenant"] });
+				}
+				if (url === "https://auth.test/.well-known/oauth-authorization-server/tenant") {
+					return jsonResponse(externalMeta);
+				}
+				if (url === externalMeta.token_endpoint) {
+					return jsonResponse({ access_token: "external-access", expires_in: 3600 });
+				}
+				throw new Error(`unexpected fetch: ${url}`);
+			}),
+		);
+
+		const provider = createMcpOAuthProvider({
+			server: "external",
+			url: "https://resource.test/mcp/v1",
+			clientId: "configured-client",
+		});
+		const credentials = await provider.login({
+			onAuth: (info) => {
+				authUrl = info.url;
+			},
+			onPrompt: async () => "",
+			onManualCodeInput: async () => {
+				const state = new URL(authUrl).searchParams.get("state") ?? "";
+				return `${REDIRECT}?code=external-code&state=${state}`;
+			},
+		});
+
+		expect(credentials.access).toBe("external-access");
+		expect(new URL(authUrl).origin).toBe("https://auth.test");
+		expect(requested.slice(0, 2)).toEqual([
+			"https://resource.test/.well-known/oauth-protected-resource/mcp/v1",
+			"https://auth.test/.well-known/oauth-authorization-server/tenant",
+		]);
+	});
+
+	it("falls back from path-suffixed to root protected-resource metadata", async () => {
+		let authUrl = "";
+		const requested: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown): Promise<Response> => {
+				const url = urlOf(input);
+				requested.push(url);
+				if (url.endsWith("/.well-known/oauth-protected-resource/mcp")) {
+					return new Response("not found", { status: 404 });
+				}
+				if (url.endsWith("/.well-known/oauth-protected-resource")) {
+					return jsonResponse({ authorization_servers: ["https://srv.test"] });
+				}
+				if (url === "https://srv.test/.well-known/oauth-authorization-server") return jsonResponse(META);
+				if (url === META.token_endpoint) return jsonResponse({ access_token: "root-access", expires_in: 3600 });
+				throw new Error(`unexpected fetch: ${url}`);
+			}),
+		);
+
+		const provider = createMcpOAuthProvider({
+			server: "root-resource",
+			url: "https://srv.test/mcp",
+			clientId: "configured-client",
+		});
+		const credentials = await provider.login({
+			onAuth: (info) => {
+				authUrl = info.url;
+			},
+			onPrompt: async () => "",
+			onManualCodeInput: async () => {
+				const state = new URL(authUrl).searchParams.get("state") ?? "";
+				return `${REDIRECT}?code=root-code&state=${state}`;
+			},
+		});
+
+		expect(credentials.access).toBe("root-access");
+		expect(requested.slice(0, 3)).toEqual([
+			"https://srv.test/.well-known/oauth-protected-resource/mcp",
+			"https://srv.test/.well-known/oauth-protected-resource",
+			"https://srv.test/.well-known/oauth-authorization-server",
+		]);
+	});
+
 	it("falls back to the next port when the base callback port is in use", async () => {
 		const http = await import("node:http");
 		// Occupy the base callback port. If something already holds it (e.g. a stray
