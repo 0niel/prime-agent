@@ -186,7 +186,11 @@ describe("SessionManager session state", () => {
 			expect(SessionManager.open(sessionFile!, sessionDir).getSessionState()).toEqual({ status: "active" });
 
 			const sessions = await SessionManager.list(cwd, sessionDir);
-			expect(sessions[0]).toMatchObject({ id: session.getSessionId(), state: { status: "active" } });
+			expect(sessions[0]).toMatchObject({
+				id: session.getSessionId(),
+				state: { status: "active" },
+				hasInvalidDurableState: true,
+			});
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

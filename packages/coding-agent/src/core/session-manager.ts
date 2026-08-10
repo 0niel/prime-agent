@@ -1084,10 +1084,12 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			if (entry.type === "session_state") {
 				const stateEntry = entry as SessionStateEntry;
 				const status = normalizeSessionStateStatus(stateEntry.state?.status);
-				// A later corrupt lifecycle supersedes an earlier entry. Do not let an
-				// old archived state authorize passivation of an untrusted session.
-				state = status ? { status } : undefined;
-				if (!status) hasInvalidDurableState = true;
+				// Keep the last readable lifecycle for SessionManager compatibility, but
+				// mark an unrecognized later lifecycle as untrusted. C00 checks this
+				// marker before passivation, so the retained presentation state can never
+				// authorize recovery suppression.
+				if (status) state = { status };
+				else hasInvalidDurableState = true;
 			}
 			// Keep the latest recap/verdict so off-daemon sessions don't all show as
 			// unjudged in the agents view. Append-only, so last seen wins.

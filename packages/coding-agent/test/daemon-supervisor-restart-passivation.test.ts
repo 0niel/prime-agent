@@ -184,6 +184,45 @@ describe("daemon supervisor restart passivation", () => {
 		expect(worker.descriptor.lifecycle).toBe("ready");
 	});
 
+	it("rejects an incompatible telemetry attach before waking a passivated root", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals & {
+			attachClient(
+				client: object,
+				command: { type: "attach"; activeSessionId: string; telemetryDisabled: true },
+			): Promise<unknown>;
+		};
+		const worker: WorkerFixture = {
+			descriptor: { ...descriptor(fixture, "telemetry", session), lifecycle: "passivated" },
+			descriptorPath: join(fixture.descriptorDir, "telemetry.json"),
+			summaries: new Map([
+				[
+					"active-telemetry",
+					{ id: "active-telemetry", activeSessionId: "active-telemetry", sessionId: session.id },
+				],
+			]),
+		};
+		supervisor.workers.set("telemetry", worker);
+		supervisor.recoverWorker = vi.fn();
+
+		await expect(
+			supervisor.attachClient(
+				{ id: "attach-client" },
+				{
+					type: "attach",
+					activeSessionId: "active-telemetry",
+					telemetryDisabled: true,
+				},
+			),
+		).rejects.toThrow("Cannot attach to this active agent while telemetry is disabled");
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+		expect(worker.descriptor.lifecycle).toBe("passivated");
+	});
+
 	it("does not revive a passivated root for metadata reads, but wakes it for one explicit operation", async () => {
 		const fixture = fixtureRoot();
 		const session = persistSession(fixture.sessionDir, fixture.root, "completed");

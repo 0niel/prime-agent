@@ -3495,8 +3495,10 @@ export class DaemonSupervisor {
 			}
 		}
 		const match = await this.findWorkerForClient(client, command.activeSessionId);
-		await this.wakePassivatedWorker(match.worker);
+		// The descriptor retains the creation telemetry policy while passivated, so
+		// reject an incompatible attach before it can launch a worker process.
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
+		await this.wakePassivatedWorker(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
 		if (duplicateValidation) {

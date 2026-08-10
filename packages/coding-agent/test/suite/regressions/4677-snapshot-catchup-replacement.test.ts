@@ -306,7 +306,10 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			activeSessionId,
 			capabilities: ["chunked_snapshot"],
 		});
-		await Promise.resolve();
+		// C00 permits this attach to take the passivated-wake branch before issuing
+		// the request. Wait for the controllable request boundary rather than relying
+		// on a particular number of promise turns.
+		await vi.waitFor(() => expect(worker.client?.request).toHaveBeenCalledOnce());
 
 		for (const result of [firstResult, streamedResult(replacementSnapshotId, 1, 2)]) {
 			const { messages: _messages, ...snapshot } = result.snapshot;
