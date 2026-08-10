@@ -128,7 +128,13 @@ function outboxRecord(input: ReturnType<typeof outbox>): Record<string, unknown>
 }
 
 function trustedRoots(f: Fixture) {
-	return () => ({ childSessionRoot: f.root, childArtifactRoot: f.root });
+	return () => ({
+		childSessionId,
+		childSessionFile: f.childFile,
+		childSessionRoot: f.root,
+		childArtifactDir: f.childArtifacts,
+		childArtifactRoot: f.root,
+	});
 }
 function appendRecord(path: string, record: Record<string, unknown>): void {
 	appendFileSync(path, `${JSON.stringify(record)}\n`);
@@ -368,12 +374,35 @@ describe("RLM durable operation store", () => {
 			}),
 		).toBe("already_discarded");
 	});
-	it("never opens a persisted child artifact without matching session-manager roots and identity", () => {
+	it("refuses alternate contained artifacts for both outbox append and import", () => {
 		const f = fixture();
+		const alternate = join(f.root, "alternate-child-artifacts");
+		mkdirSync(alternate);
 		const store = openRlmDurableOperationStore(f.parentArtifacts);
 		store.admit(f.admission);
-		const foreign = join(f.root, "foreign-artifacts");
-		mkdirSync(foreign);
+		materialize(store, f);
+		const stranded = { ...outbox(f), childArtifactDir: alternate };
+		expect(() => store.appendOutbox(stranded)).toThrow(/conflicts/);
+		store.appendOutbox(outbox(f));
+		store.recordTerminal({
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			deliveryId: delivery,
+			terminal: "done",
+		});
+		expect(() => store.importOutbox(stranded)).toThrow(/conflicts/);
+		expect(() => readFileSync(join(alternate, "rlm-terminal-outbox.jsonl"), "utf8")).toThrow();
+	});
+
+	it("does not authorize a raw outbox stranded in an alternate contained artifact", () => {
+		const f = fixture();
+		const alternate = join(f.root, "raw-alternate-child-artifacts");
+		mkdirSync(alternate);
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		store.admit(f.admission);
+		// Simulate an old/wrong writer by placing otherwise valid production facts
+		// directly in JSONL, with the outbox under a contained but non-materialized dir.
 		appendRecord(join(f.parentArtifacts, "rlm-operation-ledger.jsonl"), {
 			version: 1,
 			type: "materialized",
@@ -383,14 +412,136 @@ describe("RLM durable operation store", () => {
 			childSessionId,
 			childSessionFile: f.childFile,
 			childSessionRoot: f.root,
-			childArtifactDir: foreign,
-			childArtifactRoot: foreign,
+			childArtifactDir: f.childArtifacts,
+			childArtifactRoot: f.root,
 			recordedAt: new Date().toISOString(),
 		});
-		appendRecord(join(foreign, "rlm-terminal-outbox.jsonl"), outboxRecord(outbox(f)));
+		appendRecord(join(f.parentArtifacts, "rlm-operation-ledger.jsonl"), {
+			version: 1,
+			type: "terminal_recorded",
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			deliveryId: delivery,
+			terminal: "done",
+			recordedAt: new Date().toISOString(),
+		});
+		appendRecord(
+			join(alternate, "rlm-terminal-outbox.jsonl"),
+			outboxRecord({ ...outbox(f), childArtifactDir: alternate }),
+		);
+		const rebuilt = readRlmDurableOperationRegistry(f.parentArtifacts, trustedRoots(f));
+		const key = JSON.stringify([parentId, assignment, operation]);
+		const rawDelivery = rebuilt.deliveries.get(JSON.stringify([key, delivery]));
+		expect(rebuilt.operations.get(key)?.uncertain).toBe(true);
+		expect(rawDelivery?.outboxed).toBe(false);
+		expect(rawDelivery?.uncertain).toBe(true);
+	});
+
+	it("does not authorize a raw sibling-session/artifact substitution under trusted broad roots", () => {
+		const f = fixture();
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		store.admit(f.admission);
+		const siblingSessionId = uuid(7);
+		const siblingFile = join(f.childSessions, "sibling.jsonl");
+		const siblingArtifacts = join(f.root, "sibling-artifacts");
+		session(siblingFile, siblingSessionId);
+		mkdirSync(siblingArtifacts);
+		// These are raw production JSONL facts, not calls to materialization helpers.
+		appendRecord(join(f.parentArtifacts, "rlm-operation-ledger.jsonl"), {
+			version: 1,
+			type: "materialized",
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			childSessionId: siblingSessionId,
+			childSessionFile: siblingFile,
+			childSessionRoot: f.root,
+			childArtifactDir: siblingArtifacts,
+			childArtifactRoot: f.root,
+			recordedAt: new Date().toISOString(),
+		});
+		appendRecord(
+			join(siblingArtifacts, "rlm-terminal-outbox.jsonl"),
+			outboxRecord({ ...outbox(f), childSessionId: siblingSessionId, childSessionFile: siblingFile }),
+		);
 		const rebuilt = readRlmDurableOperationRegistry(f.parentArtifacts, trustedRoots(f));
 		expect(rebuilt.operations.get(JSON.stringify([parentId, assignment, operation]))?.uncertain).toBe(true);
 		expect(rebuilt.deliveries.size).toBe(0);
+	});
+
+	it("marks a raw terminal ledger fact without its durable outbox uncertain after restart", () => {
+		const f = fixture();
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		store.admit(f.admission);
+		appendRecord(join(f.parentArtifacts, "rlm-operation-ledger.jsonl"), {
+			version: 1,
+			type: "materialized",
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			childSessionId,
+			childSessionFile: f.childFile,
+			childSessionRoot: f.root,
+			childArtifactDir: f.childArtifacts,
+			childArtifactRoot: f.root,
+			recordedAt: new Date().toISOString(),
+		});
+		appendRecord(join(f.parentArtifacts, "rlm-operation-ledger.jsonl"), {
+			version: 1,
+			type: "terminal_recorded",
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			deliveryId: delivery,
+			terminal: "done",
+			recordedAt: new Date().toISOString(),
+		});
+		const restarted = openRlmDurableOperationStore(f.parentArtifacts, { trustedChildRecoveryRoots: trustedRoots(f) });
+		const rebuilt = restarted.rebuild();
+		const key = JSON.stringify([parentId, assignment, operation]);
+		const deliveryKey = JSON.stringify([key, delivery]);
+		expect(rebuilt.operations.get(key)?.uncertain).toBe(true);
+		expect(rebuilt.deliveries.get(deliveryKey)?.outboxed).toBe(false);
+		expect(rebuilt.deliveries.get(deliveryKey)?.uncertain).toBe(true);
+		expect(() => restarted.importOutbox(outbox(f))).toThrow(/exact materialized/);
+	});
+
+	it("fails closed on raw deleted-then-terminal ledger ordering", () => {
+		const f = fixture();
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		store.admit(f.admission);
+		appendRecord(join(f.parentArtifacts, "rlm-operation-ledger.jsonl"), {
+			version: 1,
+			type: "materialized",
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			childSessionId,
+			childSessionFile: f.childFile,
+			childSessionRoot: f.root,
+			childArtifactDir: f.childArtifacts,
+			childArtifactRoot: f.root,
+			recordedAt: new Date().toISOString(),
+		});
+		for (const type of ["deleted", "terminal_recorded"] as const) {
+			appendRecord(join(f.parentArtifacts, "rlm-operation-ledger.jsonl"), {
+				version: 1,
+				type,
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				...(type === "terminal_recorded" ? { deliveryId: delivery, terminal: "done" } : {}),
+				recordedAt: new Date().toISOString(),
+			});
+		}
+		const rebuilt = readRlmDurableOperationRegistry(f.parentArtifacts, trustedRoots(f));
+		const key = JSON.stringify([parentId, assignment, operation]);
+		const rawDelivery = rebuilt.deliveries.get(JSON.stringify([key, delivery]));
+		expect(rebuilt.operations.get(key)?.uncertain).toBe(true);
+		expect(rebuilt.hasUncertainRecords).toBe(true);
+		expect(rawDelivery?.outboxed).toBe(false);
+		expect(rawDelivery?.uncertain).toBe(true);
 	});
 
 	it("cryptographically binds inbox immutable facts and body to the durable outbox", () => {
