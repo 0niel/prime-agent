@@ -1776,13 +1776,14 @@ export class AgentsViewMode implements Component, Focusable {
 			const client = await this.connectDedicatedClient();
 			try {
 				this.setStatusMessage("Creating session...");
+				const hello = await client.waitForHello().catch(() => undefined);
 				const scopeRoot = this.scopeRootSummary;
 				const scopeSessionFile = scopeRoot?.sessionFile;
 				const response = await client.request({
 					type: "create",
 					config: this.options.config,
 					env: collectDaemonClientEnv(),
-					...(scopeRoot && scopeSessionFile && client.supportsServerCapability("scoped_session_create")
+					...(scopeRoot && scopeSessionFile && hello && client.supportsServerCapability("scoped_session_create")
 						? { runtimeMetadata: createAgentsViewScopedRuntimeMetadata(scopeRoot, scopeSessionFile) }
 						: {}),
 				});

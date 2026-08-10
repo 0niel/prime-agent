@@ -43,7 +43,10 @@ import {
 	failure,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon mode helpers", () => {
 	it("preserves envelope client identity while registering prompt admission", () => {
@@ -960,6 +963,85 @@ describe("daemon mode helpers", () => {
 			});
 			expect(internals.isDiscardableDraft(kernelChildState)).toBe(false);
 		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("honors the worker-assigned root active session id for a scoped root create", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-worker-scoped-root-"));
+		// A test daemon has no recovery journal; keep a host worker's env from
+		// leaking one in (recordWorkerRecoveryState would touch a foreign file).
+		const previousRecoveryJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		try {
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => ({
+				session: makeRuntimeSession(options.sessionManager),
+				extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["extensionsResult"],
+				services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+					ReturnType<CreateAgentSessionRuntimeFactory>
+				>["services"],
+				diagnostics: [],
+			}));
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: join(tempDir, "sessions") },
+				createRuntime,
+				worker: { authenticationToken: "token", restoreActiveSessionId: "root-assigned" },
+			});
+			const internals = daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				addRuntime(
+					runtime: ActiveSessionState["runtime"],
+					name?: string,
+					clientEnv?: Record<string, string>,
+					onStateCreated?: (state: ActiveSessionState) => void,
+					runtimeOpenGuard?: () => boolean,
+					onStateBound?: (state: ActiveSessionState) => void,
+					restoreActiveSessionId?: string,
+				): Promise<ActiveSessionState>;
+			};
+
+			// Kernel-managed subagent runtimes pass an explicit id (e.g. rehydration):
+			// it wins over and does not consume the worker's one-shot root id.
+			const rehydratedManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+			rehydratedManager.newSession();
+			const rehydrated = await internals.addRuntime(
+				{
+					metadata: { kind: "subagent", createdAt: Date.now(), rlmChildId: "rehydrated-child" },
+					session: makeRuntimeSession(rehydratedManager),
+					setRuntimeEnvScope: vi.fn(),
+					setSubagentRuntimeHost: vi.fn(),
+					setRebindSession: vi.fn(),
+				} as unknown as ActiveSessionState["runtime"],
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				"explicit-restore",
+			);
+			expect(rehydrated.activeSessionId).toBe("explicit-restore");
+
+			// The worker's root create keeps its supervisor-assigned id even when a
+			// scoped agents-view create carries subagent metadata.
+			const scopedRoot = await internals.createRuntime({
+				type: "create",
+				runtimeMetadata: {
+					kind: "subagent",
+					createdAt: Date.now(),
+					parentSessionId: "scope-parent",
+					parentSessionFile: join(tempDir, "parent.jsonl"),
+				},
+			});
+			expect(scopedRoot.activeSessionId).toBe("root-assigned");
+
+			// One-shot: later creates mint their own ids.
+			const next = await internals.createRuntime({ type: "create" });
+			expect(next.activeSessionId).not.toBe("root-assigned");
+		} finally {
+			if (previousRecoveryJournal === undefined) delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+			else process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] = previousRecoveryJournal;
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

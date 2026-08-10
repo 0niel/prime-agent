@@ -696,11 +696,20 @@ describe("AgentsViewMode persistent catalog state", () => {
 			stopped: false,
 			scopeRootSummary: scopeRoot,
 			options: { config: {} },
-			connectDedicatedClient: async () => ({
-				request: modeMocks.clientRequest,
-				close: vi.fn(),
-				supportsServerCapability: () => true,
-			}),
+			// Model the real handshake race: the capability is unknown until the
+			// daemon_hello arrives, so the gate must wait for it.
+			connectDedicatedClient: async () => {
+				let helloResolved = false;
+				return {
+					request: modeMocks.clientRequest,
+					close: vi.fn(),
+					waitForHello: vi.fn(async () => {
+						helloResolved = true;
+						return { type: "daemon_hello", serverCapabilities: ["scoped_session_create"] };
+					}),
+					supportsServerCapability: () => helloResolved,
+				};
+			},
 			setStatusMessage: vi.fn(),
 			selectSummary: vi.fn(),
 			finish: vi.fn(),
@@ -740,11 +749,18 @@ describe("AgentsViewMode persistent catalog state", () => {
 			stopped: false,
 			scopeRootSummary: scopeRoot,
 			options: { config: {} },
-			connectDedicatedClient: async () => ({
-				request: modeMocks.clientRequest,
-				close: vi.fn(),
-				supportsServerCapability: () => true,
-			}),
+			connectDedicatedClient: async () => {
+				let helloResolved = false;
+				return {
+					request: modeMocks.clientRequest,
+					close: vi.fn(),
+					waitForHello: vi.fn(async () => {
+						helloResolved = true;
+						return { type: "daemon_hello", serverCapabilities: ["scoped_session_create"] };
+					}),
+					supportsServerCapability: () => helloResolved,
+				};
+			},
 			setStatusMessage: vi.fn(),
 			selectSummary: vi.fn(),
 			finish: vi.fn(),
@@ -778,6 +794,7 @@ describe("AgentsViewMode persistent catalog state", () => {
 			connectDedicatedClient: async () => ({
 				request: modeMocks.clientRequest,
 				close: vi.fn(),
+				waitForHello: vi.fn(async () => ({ type: "daemon_hello", serverCapabilities: [] })),
 				supportsServerCapability: () => false,
 			}),
 			setStatusMessage: vi.fn(),
@@ -810,7 +827,11 @@ describe("AgentsViewMode persistent catalog state", () => {
 			stopped: false,
 			scopeRootSummary: undefined,
 			options: { config: {} },
-			connectDedicatedClient: async () => ({ request: modeMocks.clientRequest, close: vi.fn() }),
+			connectDedicatedClient: async () => ({
+				request: modeMocks.clientRequest,
+				close: vi.fn(),
+				waitForHello: vi.fn(async () => ({ type: "daemon_hello", serverCapabilities: ["scoped_session_create"] })),
+			}),
 			setStatusMessage: vi.fn(),
 			selectSummary: vi.fn(),
 			finish: vi.fn(),

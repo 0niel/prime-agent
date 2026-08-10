@@ -1198,9 +1198,8 @@ export class AgentDaemon {
 		onStateBound?: (state: ActiveSessionState) => void,
 		restoreActiveSessionId?: string,
 	): Promise<ActiveSessionState> {
-		const desiredActiveSessionId =
-			runtime.metadata.kind === "top-level" ? this.restoreActiveSessionId : restoreActiveSessionId;
-		if (runtime.metadata.kind === "top-level" && desiredActiveSessionId) {
+		const desiredActiveSessionId = restoreActiveSessionId ?? this.restoreActiveSessionId;
+		if (!restoreActiveSessionId && desiredActiveSessionId) {
 			this.restoreActiveSessionId = undefined;
 		}
 		const state: ActiveSessionState = {
