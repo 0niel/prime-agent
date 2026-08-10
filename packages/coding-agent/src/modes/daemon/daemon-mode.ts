@@ -471,6 +471,13 @@ export function readSupervisorLaunchLockGeneration(lockDirectory: string): strin
 	return readSupervisorLaunchLock(lockDirectory)?.generation;
 }
 
+function isSupervisorLaunchLockGenerationCurrent(lockDirectory: string, generation: string): boolean {
+	return withSupervisorLaunchLockGuard(
+		lockDirectory,
+		() => readSupervisorLaunchLock(lockDirectory)?.generation === generation,
+	);
+}
+
 function withSupervisorLaunchLockGuard<T>(lockDirectory: string, action: () => T): T {
 	const release = lockfile.lockSync(dirname(lockDirectory), {
 		realpath: false,
@@ -499,6 +506,9 @@ function removeSupervisorLaunchLockGenerationUnlocked(
 	expectedGeneration: string,
 	disposition: "released" | "stale",
 ): boolean {
+	if (readSupervisorLaunchLock(lockDirectory)?.generation !== expectedGeneration) {
+		return false;
+	}
 	const quarantinedDirectory = `${lockDirectory}.${disposition}-${process.pid}-${randomUUID()}`;
 	try {
 		renameSync(lockDirectory, quarantinedDirectory);
@@ -525,17 +535,22 @@ function removeSupervisorLaunchLockGenerationUnlocked(
 }
 
 function refreshSupervisorLaunchLock(lockDirectory: string, token: string): boolean {
-	const leasePath = join(lockDirectory, supervisorLaunchLockOwnerFileName(token));
-	try {
-		const now = Date.now() / 1000;
-		utimesSync(leasePath, now, now);
-		return true;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+	return withSupervisorLaunchLockGuard(lockDirectory, () => {
+		if (readSupervisorLaunchLock(lockDirectory)?.generation !== token) {
 			return false;
 		}
-		throw error;
-	}
+		const leasePath = join(lockDirectory, supervisorLaunchLockOwnerFileName(token));
+		try {
+			const now = Date.now() / 1000;
+			utimesSync(leasePath, now, now);
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				return false;
+			}
+			throw error;
+		}
+	});
 }
 
 function isProcessIdAlive(pid: number): boolean {
@@ -957,6 +972,7 @@ export class AgentDaemon {
 		const key = createHash("sha256").update(supervisorSocketPath).digest("hex").slice(0, 12);
 		const lockDirectory = join(dirname(supervisorSocketPath), `.supervisor-launch-${key}.lock`);
 		let lockGeneration: string | undefined;
+		let lockGenerationLost = false;
 		let lockRefreshTimer: ReturnType<typeof setInterval> | undefined;
 		try {
 			for (let attempt = 0; attempt < 3 && !lockGeneration; attempt++) {
@@ -1025,19 +1041,47 @@ export class AgentDaemon {
 			if (!lockGeneration) {
 				return;
 			}
-			lockRefreshTimer = setInterval(() => {
-				if (lockGeneration && !refreshSupervisorLaunchLock(lockDirectory, lockGeneration)) {
-					if (lockRefreshTimer) {
-						clearInterval(lockRefreshTimer);
-						lockRefreshTimer = undefined;
+			const assertCurrentLockGeneration = (): boolean => {
+				if (!lockGeneration || lockGenerationLost) {
+					return false;
+				}
+				try {
+					const current = isSupervisorLaunchLockGenerationCurrent(lockDirectory, lockGeneration);
+					if (!current) {
+						lockGenerationLost = true;
 					}
+					return current;
+				} catch (error) {
+					this.log(`could not verify supervisor launch lock: ${String(error)}`);
+					return false;
+				}
+			};
+			lockRefreshTimer = setInterval(() => {
+				if (!lockGeneration || lockGenerationLost) {
+					return;
+				}
+				try {
+					if (!refreshSupervisorLaunchLock(lockDirectory, lockGeneration)) {
+						lockGenerationLost = true;
+						if (lockRefreshTimer) {
+							clearInterval(lockRefreshTimer);
+							lockRefreshTimer = undefined;
+						}
+					}
+				} catch (error) {
+					this.log(`could not refresh supervisor launch lock; retrying: ${String(error)}`);
 				}
 			}, SUPERVISOR_LAUNCH_LOCK_REFRESH_MS);
 			lockRefreshTimer.unref();
-			if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+			const supervisorConnected = await this.canConnectToSupervisor(supervisorSocketPath);
+			if (!assertCurrentLockGeneration() || supervisorConnected) {
 				return;
 			}
-			if (await isDaemonShutdownAdmissionActive()) {
+			const shutdownAdmissionActive = await isDaemonShutdownAdmissionActive();
+			if (!assertCurrentLockGeneration() || shutdownAdmissionActive) {
+				return;
+			}
+			if (!assertCurrentLockGeneration()) {
 				return;
 			}
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", supervisorSocketPath]);
@@ -1050,6 +1094,9 @@ export class AgentDaemon {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
+			if (!assertCurrentLockGeneration()) {
+				return;
+			}
 			const child = spawn(launch.command, launch.args, {
 				cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
 				detached: true,
@@ -1059,11 +1106,18 @@ export class AgentDaemon {
 			child.unref();
 			const deadline = Date.now() + 10_000;
 			while (!this.shuttingDown && Date.now() < deadline) {
-				if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+				const connected = await this.canConnectToSupervisor(supervisorSocketPath);
+				if (!assertCurrentLockGeneration()) {
+					return;
+				}
+				if (connected) {
 					this.log(`launched replacement supervisor on ${supervisorSocketPath}`);
 					return;
 				}
 				await delay(50);
+				if (!assertCurrentLockGeneration()) {
+					return;
+				}
 			}
 		} catch (error) {
 			this.log(`failed to launch replacement supervisor: ${String(error)}`);

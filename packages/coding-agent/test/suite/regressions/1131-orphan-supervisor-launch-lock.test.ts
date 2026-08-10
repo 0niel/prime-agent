@@ -3,6 +3,24 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const launchTestState = vi.hoisted(() => ({ launchSpecCalls: 0 }));
+
+interface SubprocessLaunchModule {
+	createCliSubprocessLaunchSpec(args: readonly string[]): unknown;
+}
+
+vi.mock("../../../src/cli/subprocess-launch.js", async (importOriginal) => {
+	const actual = await importOriginal<SubprocessLaunchModule>();
+	return {
+		...actual,
+		createCliSubprocessLaunchSpec(args: readonly string[]) {
+			launchTestState.launchSpecCalls++;
+			return actual.createCliSubprocessLaunchSpec(args);
+		},
+	};
+});
+
 import {
 	AgentDaemon,
 	readSupervisorLaunchLockGeneration,
@@ -13,6 +31,7 @@ interface LaunchHarness {
 	supervisorLaunchInProgress: boolean;
 	shuttingDown: boolean;
 	canConnectToSupervisor: ReturnType<typeof vi.fn>;
+	log: ReturnType<typeof vi.fn>;
 	launchReplacementSupervisor(supervisorSocketPath: string): Promise<void>;
 }
 
@@ -21,6 +40,7 @@ const tempDirs: string[] = [];
 afterEach(() => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
+	launchTestState.launchSpecCalls = 0;
 	for (const directory of tempDirs.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
 	}
@@ -36,6 +56,7 @@ function createHarness(canConnect: () => Promise<boolean> = async () => true): L
 		supervisorLaunchInProgress: false,
 		shuttingDown: false,
 		canConnectToSupervisor: vi.fn(canConnect),
+		log: vi.fn(),
 	}) as LaunchHarness;
 }
 
@@ -142,6 +163,37 @@ describe("#1131 orphan supervisor launch lock recovery", () => {
 		expect(existsSync(lockDirectory)).toBe(false);
 	});
 
+	it("catches a transient refresh guard error and retries without losing the lock", async () => {
+		vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+		const root = mkdtempSync(join(tmpdir(), "prime-regression-1131-refresh-error-"));
+		tempDirs.push(root);
+		const supervisorSocketPath = join(root, "daemon.sock");
+		const lockDirectory = launchLockPath(supervisorSocketPath);
+		const firstProbe = deferred<boolean>();
+		const first = createHarness(() => firstProbe.promise);
+		const firstLaunch = first.launchReplacementSupervisor(supervisorSocketPath);
+		await vi.advanceTimersByTimeAsync(0);
+		const generation = readSupervisorLaunchLockGeneration(lockDirectory);
+		expect(generation).toEqual(expect.any(String));
+
+		await vi.advanceTimersByTimeAsync(4000);
+		mkdirSync(`${lockDirectory}.guard`, { mode: 0o700 });
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(first.log).toHaveBeenCalledWith(expect.stringContaining("could not refresh supervisor launch lock"));
+		expect(readSupervisorLaunchLockGeneration(lockDirectory)).toBe(generation);
+
+		rmSync(`${lockDirectory}.guard`, { recursive: true, force: true });
+		await vi.advanceTimersByTimeAsync(5000);
+		const second = createHarness();
+		await second.launchReplacementSupervisor(supervisorSocketPath);
+		expect(second.canConnectToSupervisor).not.toHaveBeenCalled();
+		expect(readSupervisorLaunchLockGeneration(lockDirectory)).toBe(generation);
+
+		firstProbe.resolve(true);
+		await firstLaunch;
+		expect(existsSync(lockDirectory)).toBe(false);
+	});
+
 	it("a stalled old launcher cannot delete its successor lock when it resumes", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-regression-1131-successor-"));
 		tempDirs.push(root);
@@ -165,8 +217,9 @@ describe("#1131 orphan supervisor launch lock recovery", () => {
 		expect(secondGeneration).toEqual(expect.any(String));
 		expect(secondGeneration).not.toBe(firstGeneration);
 
-		firstProbe.resolve(true);
+		firstProbe.resolve(false);
 		await firstLaunch;
+		expect(launchTestState.launchSpecCalls).toBe(0);
 		expect(readSupervisorLaunchLockGeneration(lockDirectory)).toBe(secondGeneration);
 		secondProbe.resolve(true);
 		await secondLaunch;
