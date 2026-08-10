@@ -99,12 +99,22 @@ def _prime_agent_snapshot_state():
         payload[name] = blob
         total += _b.len(blob)
 
-    os.makedirs(os.path.dirname(${pyStr(outPath)}), exist_ok=True)
-    tmp = ${pyStr(outPath)} + ".tmp"
+    out_dir = os.path.dirname(${pyStr(outPath)})
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
     try:
-        with _b.open(tmp, "wb") as fh:
+        os.chmod(out_dir, 0o700)
+    except _b.Exception:
+        pass
+    tmp = ${pyStr(outPath)} + ".tmp." + _b.str(os.getpid()) + "." + os.urandom(8).hex()
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _b.getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o600)
+        with os.fdopen(fd, "wb") as fh:
             dill.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, ${pyStr(outPath)})
+        os.chmod(${pyStr(outPath)}, 0o600)
     except _b.Exception as _err:
         try:
             os.remove(tmp)
@@ -124,10 +134,20 @@ def _prime_agent_snapshot_state():
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     try:
-        with _b.open(${pyStr(manifestPath)}, "w") as fh:
+        manifest_tmp = ${pyStr(manifestPath)} + ".tmp." + _b.str(os.getpid()) + "." + os.urandom(8).hex()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _b.getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(manifest_tmp, flags, 0o600)
+        with os.fdopen(fd, "w") as fh:
             json.dump(manifest, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(manifest_tmp, ${pyStr(manifestPath)})
+        os.chmod(${pyStr(manifestPath)}, 0o600)
     except _b.Exception:
-        pass
+        try:
+            os.remove(manifest_tmp)
+        except _b.Exception:
+            pass
     _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"saved": saved, "skipped": skipped, "bytes": bytes_written}))
 
 
@@ -159,7 +179,14 @@ def _prime_agent_restore_state():
         return
 
     try:
-        with _b.open(${pyStr(inPath)}, "rb") as fh:
+        import stat as _stat
+        snapshot_stat = os.lstat(${pyStr(inPath)})
+        if not _stat.S_ISREG(snapshot_stat.st_mode):
+            _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": [], "error": "load failed: snapshot is not a regular file"}))
+            return
+        flags = os.O_RDONLY | _b.getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(${pyStr(inPath)}, flags)
+        with os.fdopen(fd, "rb") as fh:
             payload = dill.load(fh)
     except _b.Exception as _err:
         _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": [], "error": "load failed: " + _b.str(_err)}))
