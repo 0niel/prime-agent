@@ -9661,6 +9661,7 @@ export class AgentSession {
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
 		let childSession: AgentSession | undefined;
+		let flushChildUsageAttribution = () => {};
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -9764,6 +9765,23 @@ export class AgentSession {
 				throwIfCancelled();
 				run.status = "running";
 				emitChildUpdate();
+				const parentUsageEntry = parentAssistantForUsage
+					? this._findAssistantEntryForMessage(parentAssistantForUsage)
+					: undefined;
+				const pendingChildUsage = new Map<"spawn_task" | "agent_message" | "direct_user", Usage>();
+				flushChildUsageAttribution = () => {
+					if (!parentAssistantForUsage || !parentUsageEntry || pendingChildUsage.size === 0) return;
+					const batches = [...pendingChildUsage];
+					pendingChildUsage.clear();
+					for (const [origin, childUsage] of batches) {
+						this.sessionManager.appendChildUsageAttribution(
+							parentUsageEntry.id,
+							childUsage,
+							parentAssistantForUsage.usage,
+							origin,
+						);
+					}
+				};
 				const unsubscribeChildEvents = child.subscribe((event) => {
 					if (event.type === "rlm_child_update") {
 						this._emit(event);
@@ -9773,34 +9791,29 @@ export class AgentSession {
 						activity = { kind: "waiting" };
 						emitChildUpdate();
 					} else if (event.type === "agent_end") {
+						flushChildUsageAttribution();
 						activity = undefined;
 						emitChildUpdate();
 					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
-							if (parentAssistantForUsage) {
-								const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
-								if (parentEntry) {
-									const messages = child.messages;
-									const assistantIndex = messages.lastIndexOf(assistant);
-									const precedingPrompt = messages
-										.slice(0, assistantIndex)
-										.reverse()
-										.find((message) => message.role === "user" || message.role === "custom");
-									const origin =
-										precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
-											? precedingPrompt.details.id.startsWith("spawn:")
-												? "spawn_task"
-												: "agent_message"
-											: "direct_user";
-									this.sessionManager.appendChildUsageAttribution(
-										parentEntry.id,
-										assistant.usage,
-										parentAssistantForUsage.usage,
-										origin,
-									);
-								}
+							if (parentAssistantForUsage && parentUsageEntry) {
+								const messages = child.messages;
+								const assistantIndex = messages.lastIndexOf(assistant);
+								const precedingPrompt = messages
+									.slice(0, assistantIndex)
+									.reverse()
+									.find((message) => message.role === "user" || message.role === "custom");
+								const origin =
+									precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
+										? precedingPrompt.details.id.startsWith("spawn:")
+											? "spawn_task"
+											: "agent_message"
+										: "direct_user";
+								const batch = pendingChildUsage.get(origin) ?? emptyUsage();
+								addAssistantUsage(batch, assistant.usage);
+								pendingChildUsage.set(origin, batch);
 							}
 						}
 						const text = compactRlmText(readAssistantText(assistant));
@@ -9939,6 +9952,11 @@ export class AgentSession {
 				}
 			} finally {
 				signal?.removeEventListener("abort", abortFromHost);
+				try {
+					flushChildUsageAttribution();
+				} catch {
+					// Attribution persistence must not prevent terminal child cleanup.
+				}
 				if (run.detachedDeletion && childRuntime) {
 					try {
 						await this._deleteRlmSubagentSession(run.id, childRuntime.session);

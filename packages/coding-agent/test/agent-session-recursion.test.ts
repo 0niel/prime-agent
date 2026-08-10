@@ -1815,7 +1815,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(attribution.aggregateUsage.cost.total).toBe(10);
 	});
 
-	it("attributes every tool-loop turn in the admitted task to spawn usage", async () => {
+	it("batches every tool-loop turn into one spawn usage attribution", async () => {
 		const tool = {
 			name: "echo",
 			description: "Echo a value",
@@ -1860,8 +1860,12 @@ describe("AgentSession rlm recursion", () => {
 			const attributions = root.sessionManager
 				.getEntries()
 				.filter((entry) => entry.type === "child_usage_attributed");
-			expect(attributions).toHaveLength(2);
-			expect(attributions.map((entry) => entry.origin)).toEqual(["spawn_task", "spawn_task"]);
+			expect(attributions).toHaveLength(1);
+			expect(attributions[0]).toMatchObject({
+				origin: "spawn_task",
+				childUsage: { input: 3, output: 3 },
+				aggregateUsage: { input: 3, output: 3 },
+			});
 		});
 	});
 
