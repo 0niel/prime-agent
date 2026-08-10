@@ -1531,11 +1531,14 @@ describe("daemon mode helpers", () => {
 				});
 			expect(fixture.createRuntime).toHaveBeenCalledTimes(2);
 			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions).toMatchObject({
+				model: fixture.policyModel,
 				thinkingLevel: "low",
 				serviceTier: "flex",
 				initialActiveToolNames: ["agent_message"],
 				allowedToolNames: ["agent_message"],
 			});
+			expect(fixture.modelRegistry.find).toHaveBeenCalledWith("test", "scripted");
+			expect(fixture.modelRegistry.canUseModel).toHaveBeenCalledWith(fixture.policyModel);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -1652,9 +1655,9 @@ describe("daemon mode helpers", () => {
 				listPassiveRlmSubagents(): Promise<Array<{ entry: { childId: string } }>>;
 			};
 			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
-			expect(await internals.listPassiveRlmSubagents()).toEqual([
-				expect.objectContaining({ entry: expect.objectContaining({ childId: fixture.childId }) }),
-			]);
+			expect(
+				(await internals.listPassiveRlmSubagents()).filter(({ entry }) => entry.childId === fixture.childId),
+			).toEqual([expect.objectContaining({ entry: expect.objectContaining({ childId: fixture.childId }) })]);
 			// Listing is passive catalog projection: no child runtime is created.
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 			await internals
@@ -1664,15 +1667,86 @@ describe("daemon mode helpers", () => {
 					message: "explicit hydrate",
 				});
 			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions).toMatchObject({
+				model: fixture.policyModel,
+				thinkingLevel: "low",
+				serviceTier: "flex",
 				initialActiveToolNames: ["agent_message"],
 				allowedToolNames: ["agent_message"],
 			});
+			expect(fixture.modelRegistry.find).toHaveBeenCalledWith("test", "scripted");
+			expect(fixture.modelRegistry.canUseModel).toHaveBeenCalledWith(fixture.policyModel);
 			const corrupt = {
 				...row,
 				swarmRoleAssignment: { ...persistedSwarmAssignment(String(row.assignmentId)), assignmentId: "wrong" },
 			};
 			writeFileSync(registryPath, `${JSON.stringify(corrupt)}\n`);
-			expect(await internals.listPassiveRlmSubagents()).toEqual([]);
+			expect(
+				(await internals.listPassiveRlmSubagents()).filter(({ entry }) => entry.childId === fixture.childId),
+			).toEqual([]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a persisted policy registry model mismatch before it can hydrate or escalate providers", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-policy-model-mismatch-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const row = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			writeFileSync(
+				registryPath,
+				`${JSON.stringify({
+					...row,
+					// This untrusted legacy display snapshot must not override the role assignment.
+					model: { provider: "escalated-provider", modelId: "escalated-model" },
+					swarmRoleAssignment: persistedSwarmAssignment(String(row.assignmentId)),
+				})}\n`,
+			);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createAgentMessageController(
+					getCurrentState: () => ActiveSessionState | undefined,
+				): AgentSessionMessageController;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await expect(
+				internals
+					.createAgentMessageController(() => parent)
+					.sendAgentMessage({ target: "renamed-worker", message: "must not hydrate mismatched policy child" }),
+			).rejects.toThrow();
+			// No child runtime means the forged provider/model was never handed to a runtime.
+			expect(fixture.createRuntime).toHaveBeenCalledOnce();
+			expect(fixture.modelRegistry.find).not.toHaveBeenCalled();
+			expect(fixture.modelRegistry.canUseModel).not.toHaveBeenCalled();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not hydrate a persisted policy child when its assignment model is unavailable", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-policy-model-unavailable-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir, { canUsePolicyModel: false });
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const row = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			row.swarmRoleAssignment = persistedSwarmAssignment(String(row.assignmentId));
+			writeFileSync(registryPath, `${JSON.stringify(row)}\n`);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createAgentMessageController(
+					getCurrentState: () => ActiveSessionState | undefined,
+				): AgentSessionMessageController;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			await expect(
+				internals
+					.createAgentMessageController(() => parent)
+					.sendAgentMessage({ target: "renamed-worker", message: "must not hydrate unavailable policy child" }),
+			).rejects.toThrow("persisted policy swarm assignment model is unavailable in the authenticated catalog");
+			expect(fixture.createRuntime).toHaveBeenCalledOnce();
+			expect(fixture.modelRegistry.find).toHaveBeenCalledWith("test", "scripted");
+			expect(fixture.modelRegistry.canUseModel).toHaveBeenCalledWith(fixture.policyModel);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -10776,6 +10850,7 @@ function makePersistedRlmDaemonFixture(
 		childDisposeGate?: Promise<void>;
 		childAdmissionStarted?: () => void;
 		childAdmissionGate?: Promise<void>;
+		canUsePolicyModel?: boolean;
 	} = {},
 ) {
 	const sessionDir = join(tempDir, "sessions");
@@ -10853,6 +10928,13 @@ function makePersistedRlmDaemonFixture(
 `,
 	);
 
+	const policyModel = { provider: "test", id: "scripted" } as Model<Api>;
+	const modelRegistry = {
+		find: vi.fn((provider: string, modelId: string) =>
+			provider === policyModel.provider && modelId === policyModel.id ? policyModel : undefined,
+		),
+		canUseModel: vi.fn(async (model: Model<Api>) => model === policyModel && options.canUsePolicyModel !== false),
+	};
 	const acceptAgentMessagePrompt = vi.fn(
 		async (_message: string, promptOptions?: { preflightResult?: (didSucceed: boolean) => void }) => {
 			if (options.childAdmissionGate) {
@@ -10905,7 +10987,7 @@ function makePersistedRlmDaemonFixture(
 			extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
 				ReturnType<CreateAgentSessionRuntimeFactory>
 			>["extensionsResult"],
-			services: { cwd: runtimeOptions.cwd, agentDir: runtimeOptions.agentDir } as Awaited<
+			services: { cwd: runtimeOptions.cwd, agentDir: runtimeOptions.agentDir, modelRegistry } as unknown as Awaited<
 				ReturnType<CreateAgentSessionRuntimeFactory>
 			>["services"],
 			diagnostics: [],
@@ -10920,6 +11002,8 @@ function makePersistedRlmDaemonFixture(
 		createRuntime,
 		runtimeSessions,
 		acceptAgentMessagePrompt,
+		modelRegistry,
+		policyModel,
 		parentSessionFile,
 		parentArtifactDir,
 		parentSessionId: parentManager.getSessionId(),

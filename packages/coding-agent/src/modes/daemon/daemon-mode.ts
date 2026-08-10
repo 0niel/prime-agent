@@ -445,6 +445,14 @@ function persistedSwarmToolArray(value: unknown): string[] {
 	if (new Set(result).size !== result.length) throw new Error("invalid persisted swarm assignment allowedToolNames");
 	return result;
 }
+function assertPersistedPolicyRegistryModelMatches(value: unknown, assignment: Readonly<SwarmRoleAssignment>): void {
+	if (value === undefined) return;
+	if (!isPersistedSwarmRecord(value) || typeof value.provider !== "string" || typeof value.modelId !== "string")
+		throw new Error("invalid persisted policy registry model");
+	const [provider, modelId] = assignment.model.split("/");
+	if (value.provider !== provider || value.modelId !== modelId)
+		throw new Error("persisted policy swarm assignment model does not match registry model");
+}
 function freezePersistedSwarmAssignment(value: SwarmRoleAssignment): Readonly<SwarmRoleAssignment> {
 	const sharedContext: SwarmRoleAssignment["sharedContext"] = {
 		maxItems: value.sharedContext.maxItems,
@@ -1268,10 +1276,14 @@ export class AgentDaemon {
 						? rawEntry
 						: {
 								...rawEntry,
-								swarmRoleAssignment: decodePersistedSwarmRoleAssignment(
-									rawEntry.swarmRoleAssignment,
-									rawEntry.assignmentId,
-								),
+								swarmRoleAssignment: (() => {
+									const assignment = decodePersistedSwarmRoleAssignment(
+										rawEntry.swarmRoleAssignment,
+										rawEntry.assignmentId,
+									);
+									assertPersistedPolicyRegistryModelMatches(rawEntry.model, assignment);
+									return assignment;
+								})(),
 							};
 				if (
 					entry.type !== "rlm_subagent" ||
@@ -3168,7 +3180,22 @@ export class AgentDaemon {
 			const sessionManager = await SessionManager.openAsync(entry.sessionFile, entry.sessionDir);
 			const modelRegistry = parentState.runtime.services.modelRegistry;
 			let rehydratedModel: Model<Api> | undefined;
-			if (entry.model) {
+			if (entry.swarmRoleAssignment) {
+				// A policy assignment is the immutable authority for a restored child.
+				// The registry model is only a legacy spawn display snapshot and must
+				// never select a policy child's provider or model.
+				const [provider, modelId] = entry.swarmRoleAssignment.model.split("/");
+				if (entry.model && (entry.model.provider !== provider || entry.model.modelId !== modelId)) {
+					throw new Error("persisted policy swarm assignment model does not match registry model");
+				}
+				const resolved = modelRegistry.find(provider!, modelId!);
+				if (!resolved || !(await modelRegistry.canUseModel(resolved))) {
+					throw new Error("persisted policy swarm assignment model is unavailable in the authenticated catalog");
+				}
+				rehydratedModel = resolved;
+			} else if (entry.model) {
+				// Assignment-less registry rows predate policy authority and retain
+				// their historical best-effort registry model restoration behavior.
 				const resolved = modelRegistry.find(entry.model.provider, entry.model.modelId);
 				if (resolved && (await modelRegistry.canUseModel(resolved))) {
 					rehydratedModel = resolved;
