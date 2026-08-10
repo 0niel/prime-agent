@@ -65,7 +65,9 @@ afterEach(async () => {
 	}
 	workerPids.clear();
 	for (const directory of tempDirs.splice(0)) {
-		rmSync(directory, { recursive: true, force: true });
+		// Detached workers can release kernel/snapshot files just after their
+		// process group exits on macOS.
+		rmSync(directory, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 });
 	}
 });
 
@@ -398,6 +400,108 @@ describe("daemon supervisor resident workers", () => {
 		client.close();
 		await waitForSocketGone(socketPath);
 	}, 60_000);
+
+	it("persists only safe resident launch settings", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-resident-env-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		const extensionPath = join(projectDir, "resident-env-extension.ts");
+		const markerPath = join(projectDir, "resident-env-marker");
+		mkdirSync(projectDir, { recursive: true });
+		writeFileSync(
+			extensionPath,
+			[
+				"import { appendFileSync } from 'node:fs';",
+				"export default function() { appendFileSync('resident-env-marker', process.pid + ':' + process.env.PRIME_AGENT_TRACES_BASE_URL + ':' + (process.env.PRIME_AGENT_TEST_CREDENTIAL ?? '') + '\\n'); }",
+				"",
+			].join("\n"),
+		);
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, supervisor);
+		const launchEnvSentinel = `resident-env-${randomUUID()}`;
+		const created = await client.request({
+			type: "create",
+			lifecycle: "resident",
+			launchEnv: {
+				PRIME_AGENT_TRACES_BASE_URL: launchEnvSentinel,
+				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				PRIME_AGENT_TEST_CREDENTIAL: "must-not-be-persisted",
+				OPENAI_API_KEY: "must-not-be-persisted",
+				AWS_SECRET_ACCESS_KEY: "must-not-be-persisted",
+				GH_TOKEN: "must-not-be-persisted",
+				SSH_AUTH_SOCK: "/tmp/must-not-be-persisted.sock",
+			},
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, extensions: [extensionPath] },
+		});
+		expect(created.success).toBe(true);
+		const summary = requireSummary(created.success ? created.data : undefined);
+		if (summary.workerPid) workerPids.add(summary.workerPid);
+		const initialMarkerLines = readFileSync(markerPath, "utf8").trim().split("\n");
+		expect(initialMarkerLines).toHaveLength(1);
+		// The initial spawn receives the complete transient caller environment.
+		expect(initialMarkerLines[0]).toMatch(
+			new RegExp(`^${summary.workerPid}:${launchEnvSentinel}:must-not-be-persisted$`),
+		);
+		const descriptor = readWorkerDescriptor(agentDir);
+		// The endpoint survives restart, but credentials never enter the descriptor.
+		expect(descriptor.launchEnv).toEqual({
+			PRIME_AGENT_TRACES_BASE_URL: launchEnvSentinel,
+			TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+		});
+		expect(JSON.stringify(descriptor)).not.toContain("must-not-be-persisted");
+		expect(JSON.stringify(descriptor)).not.toContain("AWS_SECRET_ACCESS_KEY");
+		expect(JSON.stringify(descriptor)).not.toContain("GH_TOKEN");
+		expect(JSON.stringify(descriptor)).not.toContain("SSH_AUTH_SOCK");
+
+		supervisor.kill("SIGTERM");
+		await waitForExit(supervisor);
+		children.delete(supervisor);
+		client.close();
+
+		const replacementClient = await connectEventually(socketPath);
+		const adopted = await replacementClient.request({ type: "list" });
+		const adoptedSummary = requireSessionList(adopted.success ? adopted.data : undefined)[0];
+		expect(adoptedSummary.workerPid).toBe(summary.workerPid);
+		if (!adoptedSummary.workerPid) throw new Error("Adopted resident worker did not expose its pid");
+		process.kill(-adoptedSummary.workerPid, "SIGKILL");
+		await waitForProcessGone(adoptedSummary.workerPid);
+		let recoveredSummary: SessionSummary | undefined;
+		const recoveryDeadline = Date.now() + 15_000;
+		while (!recoveredSummary && Date.now() < recoveryDeadline) {
+			const listed = await replacementClient.request({ type: "list" });
+			recoveredSummary = requireSessionList(listed.success ? listed.data : undefined).find(
+				(session) => session.workerPid !== adoptedSummary.workerPid,
+			);
+			if (!recoveredSummary) await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+		}
+		expect(recoveredSummary).toBeDefined();
+		let markerLines: string[] = [];
+		const markerDeadline = Date.now() + 15_000;
+		while (Date.now() < markerDeadline) {
+			try {
+				markerLines = readFileSync(markerPath, "utf8").trim().split("\n");
+				if (markerLines.length === 2) break;
+			} catch {
+				// The replacement process has not run its extension yet.
+			}
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+		}
+		expect(markerLines).toHaveLength(2);
+		// Recovery retains the descriptor's allowlisted endpoint. Credential
+		// exclusion is asserted against the durable descriptor above; a process
+		// may also inherit credentials from the supervisor's own environment.
+		expect(markerLines[1]).toMatch(new RegExp(`^${recoveredSummary?.workerPid}:${launchEnvSentinel}:`));
+		expect(recoveredSummary?.workerPid).not.toBe(adoptedSummary.workerPid);
+
+		await replacementClient.request({ type: "shutdown" });
+		replacementClient.close();
+	});
 
 	it("keeps client-owned workers hidden and removes them without archiving", async () => {
 		const root = tempDir();
