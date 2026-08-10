@@ -4,6 +4,11 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import {
+	parseMcpDeclarationDocument,
+	type McpDeclarationDocument,
+	type McpDeclarationScope,
+} from "./mcp/mcp-declarations.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -144,7 +149,9 @@ export interface Settings {
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
-	mcpServers?: Record<string, McpServerConfig>; // User-declared MCP servers (name → config); built-ins are in the ai/mcp catalog
+	mcpServers?: Record<string, McpServerConfig>; // Legacy runtime-owned MCP integrations; M01 does not read or write this field.
+	/** M01 credential-free MCP declarations. Project declarations remain inert without C05 trust. */
+	mcpDeclarations?: McpDeclarationDocument;
 	packages?: PackageSource[]; // Array of npm/git package sources (string or object with filtering)
 	extensions?: string[]; // Array of local extension file paths or directories
 	skills?: string[]; // Array of local skill file paths or directories
@@ -1211,6 +1218,30 @@ export class SettingsManager {
 
 	getMcpServers(): Record<string, McpServerConfig> | undefined {
 		return this.settings.mcpServers;
+	}
+
+	/** Read one M01 declaration document without merging user and project scope. */
+	getMcpDeclarationDocument(scope: McpDeclarationScope): McpDeclarationDocument {
+		const settings = scope === "user" ? this.globalSettings : this.projectSettings;
+		return parseMcpDeclarationDocument(settings.mcpDeclarations);
+	}
+
+	/**
+	 * Persist a parsed M01 declaration document in exactly one settings scope.
+	 * This never writes mcpServers, auth storage, or any credential-shaped value.
+	 */
+	setMcpDeclarationDocument(scope: McpDeclarationScope, document: McpDeclarationDocument): void {
+		const parsed = parseMcpDeclarationDocument(document);
+		if (scope === "user") {
+			this.globalSettings.mcpDeclarations = structuredClone(parsed);
+			this.markModified("mcpDeclarations");
+			this.save();
+			return;
+		}
+		const projectSettings = structuredClone(this.projectSettings);
+		projectSettings.mcpDeclarations = structuredClone(parsed);
+		this.markProjectModified("mcpDeclarations");
+		this.saveProjectSettings(projectSettings);
 	}
 
 	setEnabledModels(patterns: string[] | undefined): void {

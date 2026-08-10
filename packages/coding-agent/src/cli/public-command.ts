@@ -1,5 +1,7 @@
 import chalk from "chalk";
 import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
+import { executeMcpDeclarationCommand, parseMcpDeclarationCommand } from "../core/mcp/mcp-declaration-command.js";
+import { SettingsManager } from "../core/settings-manager.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
 import {
@@ -140,9 +142,21 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		case "config":
 			if (!requireArgumentCount(args.slice(1), 0, "config")) return HANDLED;
 			return continueWith(args);
+		case "mcp":
+			return runMcpDeclarationCommand(args.slice(1));
 		default:
 			return continueWith(args);
 	}
+}
+
+
+async function runMcpDeclarationCommand(args: string[]): Promise<PublicCommandResult> {
+	const command = parseMcpDeclarationCommand(args);
+	const settings = SettingsManager.create(process.cwd());
+	const result = executeMcpDeclarationCommand(command, settings, process.cwd());
+	await settings.flush();
+	console.log(JSON.stringify(result, null, 2));
+	return HANDLED;
 }
 
 function normalizeLeadingDaemonSocketOption(args: string[]): string[] {
