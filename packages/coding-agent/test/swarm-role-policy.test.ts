@@ -38,6 +38,28 @@ describe("swarm role policy", () => {
 		).not.toBe(first.digest);
 	});
 
+	it("fails closed for __proto__ and preserves prototype-named profile identifiers", () => {
+		const protoProfiles = JSON.parse(
+			'{"__proto__":{"model":"neutral/provider-model","thinkingLevel":"high"}}',
+		) as Record<string, unknown>;
+		expect(() => parseSwarmRolePolicy({ ...policy, modelProfiles: protoProfiles })).toThrow("model profile ID");
+		for (const profileId of ["constructor", "prototype"]) {
+			const snapshot = parseSwarmRolePolicy({
+				...policy,
+				modelProfiles: { [profileId]: { model: "neutral/provider-model", thinkingLevel: "high" } },
+				roles: { reviewer_1: { ...policy.roles.reviewer_1, modelProfile: profileId } },
+			});
+			expect(Object.hasOwn(snapshot.policy.modelProfiles, profileId)).toBe(true);
+			expect(snapshot.policy.modelProfiles[profileId]?.model).toBe("neutral/provider-model");
+		}
+		const ordinary = parseSwarmRolePolicy(policy);
+		const cloned = parseSwarmRolePolicy({
+			...policy,
+			modelProfiles: JSON.parse(JSON.stringify(policy.modelProfiles)) as Record<string, unknown>,
+		});
+		expect(cloned.digest).toBe(ordinary.digest);
+	});
+
 	it("resolves only an exact authenticated selector and parent tool intersection", () => {
 		const snapshot = parseSwarmRolePolicy(policy);
 		const assignment = resolveSwarmRoleAssignment({

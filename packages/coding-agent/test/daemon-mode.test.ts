@@ -1691,6 +1691,49 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("fences a selector after a malformed valid-ID B update until complete republish", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-valid-id-malformed-replay-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const a = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			const assignmentB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+			const b = { ...a, assignmentId: assignmentB, sessionName: "republished-B" };
+			const unrelatedAssignment = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+			const unrelated = {
+				...a,
+				childId: "unrelated-child-C",
+				assignmentId: unrelatedAssignment,
+				sessionName: "unrelated-C",
+			};
+			// B's ID is valid but its row is not. Neither B nor older A may be
+			// selectable, while C remains independently available.
+			writeFileSync(
+				registryPath,
+				`${JSON.stringify(a)}\n${JSON.stringify(b)}\n${JSON.stringify({ ...b, status: "invalid" })}\n${JSON.stringify(unrelated)}\n`,
+			);
+			const internals = fixture.daemon as unknown as {
+				readLatestRlmSubagentRegistryPath(path: string): Promise<Array<{ childId: string; assignmentId?: string }>>;
+				readCurrentLiveRlmSubagentRegistryPath(
+					path: string,
+				): Promise<Array<{ childId: string; assignmentId?: string }>>;
+			};
+			expect(await internals.readLatestRlmSubagentRegistryPath(registryPath)).toEqual([
+				expect.objectContaining({ childId: unrelated.childId, assignmentId: unrelatedAssignment }),
+			]);
+			// A later complete immutable B publication is the only recovery event.
+			writeFileSync(registryPath, `${readFileSync(registryPath, "utf8")}${JSON.stringify(b)}\n`);
+			expect(await internals.readCurrentLiveRlmSubagentRegistryPath(registryPath)).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ childId: a.childId, assignmentId: assignmentB }),
+					expect.objectContaining({ childId: unrelated.childId, assignmentId: unrelatedAssignment }),
+				]),
+			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("allows a later complete B publication to clear A's selector quarantine", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-c03-quarantine-republish-"));
 		try {

@@ -1274,9 +1274,13 @@ export class AgentDaemon {
 				// unrelated valid assignment sharing another selector.
 				quarantinedSelectors.add(rawEntry.childId);
 			} else {
-				// A well-formed C03 ID names exactly one assignment, even when some
-				// other field in this update is corrupt.
+				// The selector and immutable ID are both syntactically meaningful, but
+				// the rest of this append-only update is corrupt. Fencing just that ID
+				// would allow an older assignment for this selector to become current
+				// after replay. Quarantine the entire selector until a later complete
+				// C03 publication explicitly repopulates it.
 				latest.delete(this.rlmAssignmentKey({ childId: rawEntry.childId, assignmentId }));
+				quarantinedSelectors.add(rawEntry.childId);
 			}
 		};
 		let lines: string[];

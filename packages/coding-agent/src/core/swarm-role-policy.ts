@@ -232,7 +232,11 @@ export function parseSwarmRolePolicy(value: unknown): SwarmRolePolicySnapshot {
 	if (!rawProfiles.length) fail("modelProfiles must not be empty");
 	if (new Set(rawProfiles.map(([id]) => id)).size !== rawProfiles.length)
 		fail("modelProfiles contains duplicate normalized IDs");
-	const modelProfiles: Record<string, SwarmModelProfile> = {};
+	// Profiles are addressed by externally supplied, closed identifiers. Use a
+	// null-prototype record so `__proto__` cannot invoke Object.prototype's legacy
+	// setter if this grammar evolves; every accepted identifier remains an ordinary
+	// own property and therefore participates in canonical authority/digests.
+	const modelProfiles: Record<string, SwarmModelProfile> = Object.create(null) as Record<string, SwarmModelProfile>;
 	for (const [id, profile] of rawProfiles) modelProfiles[id] = parseProfile(profile, id);
 	const rawRoles = Object.entries(value.roles).map(
 		([rawId, role]) => [normalizedIdentifier(rawId, "role ID", true), role] as const,
