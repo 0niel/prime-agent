@@ -631,6 +631,92 @@ describe("RLM durable operation store", () => {
 		).toBe(false);
 	});
 
+	it("does not install a live child binding when materialization fsync is cut", () => {
+		const f = fixture();
+		let cutNow = false;
+		const cut = {
+			...fs,
+			fsyncSync: (fd: number) => {
+				if (cutNow) throw new Error("materialization fsync cut");
+				return fs.fsyncSync(fd);
+			},
+		} as unknown as RlmDurableIo;
+		const store = openRlmDurableOperationStore(f.parentArtifacts, { io: cut });
+		store.admit(f.admission);
+		cutNow = true;
+		expect(() => materialize(store, f)).toThrow(/materialization fsync cut/);
+		// The failed call may have reached the kernel, but cannot install a live
+		// authority binding that would permit an undurably reported operation.
+		expect(() => store.appendOutbox(outbox(f))).toThrow(/exact materialized operation/);
+	});
+
+	it("does not assign a valid B outbox planted under A's authorized artifact to B", () => {
+		const f = fixture();
+		const bAssignment = uuid(12);
+		const bOperation = uuid(13);
+		const bDelivery = uuid(14);
+		const bChildId = uuid(15);
+		const bSessionId = uuid(16);
+		const bFile = join(f.childSessions, "b-child.jsonl");
+		const bArtifacts = join(f.root, "b-child-artifacts");
+		session(bFile, bSessionId);
+		mkdirSync(bArtifacts);
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		store.admit(f.admission);
+		materialize(store, f);
+		store.admit({
+			...f.admission,
+			childId: bChildId,
+			assignmentId: bAssignment,
+			operationId: bOperation,
+			deliveryId: bDelivery,
+		});
+		expect(
+			store.markMaterialized({
+				parentSessionId: parentId,
+				assignmentId: bAssignment,
+				operationId: bOperation,
+				childSessionId: bSessionId,
+				childSessionFile: bFile,
+				childSessionRoot: f.root,
+				childArtifactDir: bArtifacts,
+				childArtifactRoot: f.root,
+			}),
+		).toBe(true);
+		// This record is individually valid for B, but its physical source is A's
+		// artifact. Recovery must bind source artifact + expected operation.
+		appendRecord(
+			join(f.childArtifacts, "rlm-terminal-outbox.jsonl"),
+			outboxRecord({
+				...outbox(f),
+				childSessionId: bSessionId,
+				childSessionFile: bFile,
+				childArtifactDir: bArtifacts,
+				childId: bChildId,
+				assignmentId: bAssignment,
+				operationId: bOperation,
+				deliveryId: bDelivery,
+			}),
+		);
+		const aKey = JSON.stringify([parentId, assignment, operation]);
+		const bKey = JSON.stringify([parentId, bAssignment, bOperation]);
+		const rebuilt = readRlmDurableOperationRegistry(f.parentArtifacts, (candidate) =>
+			candidate.key === aKey
+				? trustedRoots(f)()
+				: candidate.key === bKey
+					? {
+						childSessionId: bSessionId,
+						childSessionFile: bFile,
+						childSessionRoot: f.root,
+						childArtifactDir: bArtifacts,
+						childArtifactRoot: f.root,
+					}
+					: undefined,
+		);
+		expect(rebuilt.operations.get(aKey)?.uncertain).toBe(true);
+		expect(rebuilt.deliveries.get(JSON.stringify([bKey, bDelivery]))?.outboxed).not.toBe(true);
+	});
+
 	it("does not advance terminal/import authority across outbox or inbox fsync cuts", () => {
 		const f = fixture();
 		let cutNow = false;

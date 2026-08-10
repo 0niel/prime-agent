@@ -403,6 +403,10 @@ class Store implements RlmDurableOperationStore {
 				return true;
 			return false;
 		}
+		// This live binding is authority for the same process, so it must never
+		// precede the fsynced materialization fact. If append/fsync throws, the
+		// binding remains absent and a later outbox attempt fail-closes.
+		this.append(this.path(LEDGER), record);
 		this.inProcessChildBindings.set(operation.key, {
 			childSessionId: record.childSessionId,
 			childSessionFile: record.childSessionFile,
@@ -410,7 +414,6 @@ class Store implements RlmDurableOperationStore {
 			childArtifactDir: record.childArtifactDir,
 			childArtifactRoot: record.childArtifactRoot,
 		});
-		this.append(this.path(LEDGER), record);
 		this.afterAppend();
 		return true;
 	}
@@ -697,7 +700,7 @@ function reduceArtifact(
 			)
 				throw new Error("persisted child binding does not match session-manager authority");
 			for (const parsed of readJsonl(joinArtifact(trustedArtifact, OUTBOX, io), io, registry, "outbox"))
-				reduceOutbox(parsed, registry);
+				reduceOutbox(parsed, registry, operation);
 		} catch {
 			markOperationUncertain(operation, registry, "untrusted or unreadable child recovery binding");
 		}
@@ -842,29 +845,47 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 	markOperationUncertain(operation, registry, "unknown ledger event");
 }
 
-function reduceOutbox(raw: unknown, registry: RlmDurableOperationRegistry): void {
+function reduceOutbox(
+	raw: unknown,
+	registry: RlmDurableOperationRegistry,
+	sourceOperation: RlmDurableOperation,
+): void {
 	if (!validOutbox(raw, "terminal")) {
-		globalUncertain(registry, "invalid outbox record");
+		markOperationUncertain(sourceOperation, registry, "invalid outbox record");
 		return;
 	}
 	const record = raw as RlmTerminalOutboxRecord;
-	const operation = registry.operations.get(
-		operationKey(record.parentSessionId, record.assignmentId, record.operationId),
-	);
+	// An outbox is authorized by the artifact from which it was read, not just
+	// by fields it claims. A valid record for B planted in A's authorized
+	// artifact must therefore not become B's delivery authority.
+	if (
+		operationKey(record.parentSessionId, record.assignmentId, record.operationId) !== sourceOperation.key ||
+		record.parentSessionFile !== sourceOperation.parentSessionFile ||
+		record.childSessionId !== sourceOperation.childSessionId ||
+		record.childSessionFile !== sourceOperation.childSessionFile ||
+		record.childId !== sourceOperation.childId ||
+		record.deliveryId !== sourceOperation.deliveryId
+	) {
+		markOperationUncertain(sourceOperation, registry, "outbox does not match its authorized artifact binding");
+		return;
+	}
+	const operation = registry.operations.get(sourceOperation.key);
 	if (!operation) {
-		globalUncertain(registry, "outbox without operation");
+		// Defensive: sourceOperation is from this registry, but do not ever infer
+		// an operation from an outbox record if that invariant changes.
+		globalUncertain(registry, "outbox without source operation");
 		return;
 	}
 	const delivery = deliveryFor(operation, record.deliveryId, registry);
 	if (
 		operation.uncertain ||
-		record.deliveryId !== operation.deliveryId ||
-		operation.parentSessionFile !== record.parentSessionFile ||
-		operation.childSessionId !== record.childSessionId ||
-		operation.childSessionFile !== record.childSessionFile ||
-		operation.childId !== record.childId
+		!operation.childSessionFile ||
+		operation.childSessionId !== sourceOperation.childSessionId ||
+		operation.childSessionFile !== sourceOperation.childSessionFile ||
+		operation.childArtifactDir !== sourceOperation.childArtifactDir ||
+		operation.childArtifactRoot !== sourceOperation.childArtifactRoot
 	) {
-		markDeliveryUncertain(delivery, operation, registry, "outbox identity mismatch");
+		markDeliveryUncertain(delivery, operation, registry, "outbox source binding mismatch");
 		return;
 	}
 	if (!delivery.outboxed) {
@@ -878,7 +899,6 @@ function reduceOutbox(raw: unknown, registry: RlmDurableOperationRegistry): void
 		markDeliveryUncertain(delivery, operation, registry, "conflicting outbox");
 	else defineDeliveryDigest(delivery, record);
 }
-
 function reconcileTerminalOutboxes(registry: RlmDurableOperationRegistry): void {
 	for (const operation of registry.operations.values()) {
 		if (!operation.terminal) continue;
