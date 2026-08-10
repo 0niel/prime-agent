@@ -518,6 +518,19 @@ function isProcessAlive(pid: number): boolean {
 	}
 }
 
+export function isWorkerDescriptorProcessAlive(
+	descriptor: Pick<DaemonWorkerDescriptor, "pid" | "processStartId">,
+): boolean {
+	if (!isProcessAlive(descriptor.pid)) {
+		return false;
+	}
+	if (!descriptor.processStartId) {
+		return true;
+	}
+	const observedProcessStartId = getProcessStartId(descriptor.pid);
+	return observedProcessStartId === undefined || observedProcessStartId === descriptor.processStartId;
+}
+
 function isFinalizedTranscriptEvent(eventType: string | undefined): boolean {
 	return (
 		eventType === "message_end" ||
@@ -1630,7 +1643,9 @@ export class DaemonSupervisor {
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
 					return this.forwardToWorker(match.worker, command);
 				}
-				const workers = [...this.workers.values()].filter((worker) => this.isVisibleWorker(worker));
+				const workers = [...this.workers.values()].filter(
+					(worker) => this.isVisibleWorker(worker) && worker.descriptor.lifecycle !== "failed",
+				);
 				const heartbeats = new Map<string, AgentConnectionHeartbeat>();
 				const snapshots: Array<{ heartbeats?: AgentConnectionHeartbeat[]; response?: DaemonResponse }> =
 					await Promise.all(
@@ -4563,13 +4578,13 @@ export class DaemonSupervisor {
 			worker.client = undefined;
 		} else if (directChild) {
 			directChild.child.kill("SIGTERM");
-		} else if (isProcessAlive(worker.descriptor.pid)) {
+		} else if (isWorkerDescriptorProcessAlive(worker.descriptor)) {
 			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGTERM");
 		}
 		const isWorkerProcessAlive = () =>
 			directChild
 				? directChild.child.exitCode === null && directChild.child.signalCode === null
-				: isProcessAlive(worker.descriptor.pid);
+				: isWorkerDescriptorProcessAlive(worker.descriptor);
 		const gracefulDeadline = Date.now() + (force ? 500 : 2000);
 		while (isWorkerProcessAlive() && Date.now() < gracefulDeadline) {
 			await delay(25);
