@@ -1,13 +1,72 @@
-import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
+import {
+	appendFileSync,
+	chmodSync,
+	closeSync,
+	fsyncSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+	writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
+import {
+	WorkerRecoveryJournal,
+	type WorkerRecoveryJournalFileSystem,
+} from "../src/modes/daemon/worker-recovery-journal.js";
 
 const generationA = "11111111-1111-4111-8111-111111111111";
 const generationB = "22222222-2222-4222-8222-222222222222";
 const operationA = "33333333-3333-4333-8333-333333333333";
 const operationB = "44444444-4444-4444-8444-444444444444";
+
+function recordingFileSystem(events: string[], failTempFsync = false): WorkerRecoveryJournalFileSystem {
+	const descriptors = new Map<number, string>();
+	return {
+		mkdirSync,
+		readFileSync,
+		openSync(path, flags, mode) {
+			const fd = mode === undefined ? openSync(path, flags) : openSync(path, flags, mode);
+			descriptors.set(
+				fd,
+				path.endsWith(".tmp") ? "temp" : path.includes("worker.recovery") ? "journal" : "directory",
+			);
+			events.push(`open:${flags}:${descriptors.get(fd)}:${mode?.toString(8) ?? ""}`);
+			return fd;
+		},
+		writeSync(fd, data) {
+			events.push(`write:${descriptors.get(fd)}`);
+			return writeSync(fd, data);
+		},
+		fsyncSync(fd) {
+			events.push(`fsync:${descriptors.get(fd)}`);
+			if (failTempFsync && descriptors.get(fd) === "temp") {
+				const error = new Error("injected temporary-file fsync failure") as NodeJS.ErrnoException;
+				error.code = "EIO";
+				throw error;
+			}
+			fsyncSync(fd);
+		},
+		closeSync(fd) {
+			events.push(`close:${descriptors.get(fd)}`);
+			closeSync(fd);
+		},
+		chmodSync,
+		renameSync(oldPath, newPath) {
+			events.push("rename");
+			renameSync(oldPath, newPath);
+		},
+		unlinkSync(path) {
+			events.push("unlink");
+			unlinkSync(path);
+		},
+	};
+}
 
 describe("WorkerRecoveryJournal C01 identities", () => {
 	const roots: string[] = [];
@@ -131,5 +190,54 @@ describe("WorkerRecoveryJournal C01 identities", () => {
 			]),
 		);
 		expect(restarted.getLatest()).toHaveLength(2);
+	});
+	it("fsyncs a restrictive replacement before rename and its parent directory after rename", () => {
+		const file = path();
+		const tempPath = `${file}.fixed.tmp`;
+		const events: string[] = [];
+		const journal = new WorkerRecoveryJournal(file, {
+			fileSystem: recordingFileSystem(events),
+			makeTempPath: () => tempPath,
+		});
+		journal.record({ ...base, busy: true });
+		events.splice(0);
+		journal.record({ ...base, busy: false });
+		expect(events).toEqual([
+			"open:a:journal:600",
+			"write:journal",
+			"fsync:journal",
+			"close:journal",
+			"open:wx:temp:600",
+			"write:temp",
+			"fsync:temp",
+			"close:temp",
+			"rename",
+			"open:r:directory:",
+			"fsync:directory",
+			"close:directory",
+		]);
+	});
+
+	it("fails closed on replacement sync failure without removing a busy sibling journal record", () => {
+		const file = path();
+		const tempPath = `${file}.fixed.tmp`;
+		const events: string[] = [];
+		const journal = new WorkerRecoveryJournal(file, {
+			fileSystem: recordingFileSystem(events, true),
+			makeTempPath: () => tempPath,
+		});
+		journal.record({ ...base, busy: true });
+		journal.record({ ...base, busy: true, operationId: operationB });
+		expect(() => journal.record({ ...base, busy: false })).toThrow("injected temporary-file fsync failure");
+		expect(events).toContain("unlink");
+		expect(events).not.toContain("rename");
+		expect(() => readFileSync(tempPath, "utf8")).toThrow();
+		expect(WorkerRecoveryJournal.readLatest(file)).toEqual(
+			expect.arrayContaining([expect.objectContaining({ busy: true, operationId: operationB })]),
+		);
+		// The failed compaction also keeps the live instance conservative.
+		expect(journal.getLatest()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ busy: true, operationId: operationB })]),
+		);
 	});
 });

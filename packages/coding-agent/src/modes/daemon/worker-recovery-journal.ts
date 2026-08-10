@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
@@ -6,7 +7,7 @@ import {
 	openSync,
 	readFileSync,
 	renameSync,
-	writeFileSync,
+	unlinkSync,
 	writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
@@ -81,6 +82,37 @@ interface ParsedRecords {
 	hasInvalidRecords: boolean;
 }
 
+/** Narrow filesystem boundary so durability order and failure behavior are testable. */
+export interface WorkerRecoveryJournalFileSystem {
+	mkdirSync(path: string, options: { recursive: true; mode: number }): string | undefined;
+	readFileSync(path: string, encoding: "utf8"): string;
+	openSync(path: string, flags: string, mode?: number): number;
+	writeSync(fd: number, data: string): number;
+	fsyncSync(fd: number): void;
+	closeSync(fd: number): void;
+	chmodSync(path: string, mode: number): void;
+	renameSync(oldPath: string, newPath: string): void;
+	unlinkSync(path: string): void;
+}
+
+export interface WorkerRecoveryJournalOptions {
+	fileSystem?: WorkerRecoveryJournalFileSystem;
+	makeTempPath?: (journalPath: string) => string;
+	platform?: NodeJS.Platform;
+}
+
+const nativeFileSystem: WorkerRecoveryJournalFileSystem = {
+	mkdirSync,
+	readFileSync,
+	openSync,
+	writeSync,
+	fsyncSync,
+	closeSync,
+	chmodSync,
+	renameSync,
+	unlinkSync,
+};
+
 const v2Key = (record: Pick<WorkerRecoveryRecord, "activeSessionId" | "generation" | "operationId">) =>
 	`${record.activeSessionId}\u0000${record.generation}\u0000${record.operationId}`;
 const legacyKey = (record: Pick<LegacyWorkerRecoveryRecord, "activeSessionId">) =>
@@ -117,11 +149,14 @@ function isV1(value: unknown): value is LegacyWorkerRecoveryRecord {
 	);
 }
 
-function parseRecords(path: string): ParsedRecords {
+function parseRecords(
+	path: string,
+	fileSystem: Pick<WorkerRecoveryJournalFileSystem, "readFileSync"> = nativeFileSystem,
+): ParsedRecords {
 	const latest = new Map<string, ReadWorkerRecoveryRecord>();
 	let contents: string;
 	try {
-		contents = readFileSync(path, "utf8");
+		contents = fileSystem.readFileSync(path, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { latest, hasInvalidRecords: false };
 		throw error;
@@ -146,10 +181,23 @@ function parseRecords(path: string): ParsedRecords {
 export class WorkerRecoveryJournal {
 	private readonly latest: Map<string, ReadWorkerRecoveryRecord>;
 	private readonly hasInvalidRecords: boolean;
+	private readonly fileSystem: WorkerRecoveryJournalFileSystem;
+	private readonly makeTempPath: (journalPath: string) => string;
+	private readonly platform: NodeJS.Platform;
 
-	constructor(private readonly path: string) {
-		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-		const parsed = parseRecords(path);
+	constructor(
+		private readonly path: string,
+		{
+			fileSystem = nativeFileSystem,
+			makeTempPath = (journalPath) => `${journalPath}.${process.pid}.${randomUUID()}.tmp`,
+			platform = process.platform,
+		}: WorkerRecoveryJournalOptions = {},
+	) {
+		this.fileSystem = fileSystem;
+		this.makeTempPath = makeTempPath;
+		this.platform = platform;
+		this.fileSystem.mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		const parsed = parseRecords(path, this.fileSystem);
 		this.latest = parsed.latest;
 		this.hasInvalidRecords = parsed.hasInvalidRecords;
 		// Upgrade journals written before completed v2 identities were pruned.
@@ -191,7 +239,18 @@ export class WorkerRecoveryJournal {
 		// operationId cardinality cannot turn completed work into unbounded journal
 		// or getLatest history. v1 remains conservative uncertainty; every busy v2
 		// identity remains exact crash evidence.
-		if (!record.busy) this.compact();
+		if (!record.busy) {
+			try {
+				this.compact();
+			} catch (error) {
+				// The append is durable, but a failed replacement must not make this
+				// process forget any retained sibling evidence before the caller decides
+				// how to recover.
+				if (previous) this.latest.set(key, previous);
+				else this.latest.delete(key);
+				throw error;
+			}
+		}
 	}
 
 	getLatest(): ReadWorkerRecoveryRecord[] {
@@ -207,14 +266,14 @@ export class WorkerRecoveryJournal {
 	}
 
 	private append(record: WorkerRecoveryRecord): void {
-		const fd = openSync(this.path, "a", 0o600);
+		const fd = this.fileSystem.openSync(this.path, "a", 0o600);
 		try {
-			writeSync(fd, `${JSON.stringify(record)}\n`);
-			fsyncSync(fd);
+			this.fileSystem.writeSync(fd, `${JSON.stringify(record)}\n`);
+			this.fileSystem.fsyncSync(fd);
 		} finally {
-			closeSync(fd);
+			this.fileSystem.closeSync(fd);
 		}
-		chmodSync(this.path, 0o600);
+		this.fileSystem.chmodSync(this.path, 0o600);
 	}
 
 	private compact(): void {
@@ -223,12 +282,66 @@ export class WorkerRecoveryJournal {
 		// historical operation. v1 has no identity fence and is therefore preserved
 		// verbatim as uncertain legacy recovery evidence.
 		const retained = [...this.latest.entries()].filter(([, record]) => !isV2(record) || record.busy);
+		const contents = retained.map(([, record]) => JSON.stringify(record)).join("\n");
+		this.replaceAtomically(contents ? `${contents}\n` : "");
+		// Do not alter in-memory recovery evidence until its replacement is durable.
 		this.latest.clear();
 		for (const [key, record] of retained) this.latest.set(key, record);
-		const tempPath = `${this.path}.${process.pid}.tmp`;
-		const contents = retained.map(([, record]) => JSON.stringify(record)).join("\n");
-		writeFileSync(tempPath, contents ? `${contents}\n` : "", { mode: 0o600 });
-		chmodSync(tempPath, 0o600);
-		renameSync(tempPath, this.path);
+	}
+
+	private replaceAtomically(contents: string): void {
+		const tempPath = this.makeTempPath(this.path);
+		let tempFd: number | undefined;
+		let renamed = false;
+		try {
+			// Exclusive creation makes cleanup safe: this invocation owns this temp file.
+			tempFd = this.fileSystem.openSync(tempPath, "wx", 0o600);
+			this.fileSystem.chmodSync(tempPath, 0o600);
+			this.fileSystem.writeSync(tempFd, contents);
+			this.fileSystem.fsyncSync(tempFd);
+			this.fileSystem.closeSync(tempFd);
+			tempFd = undefined;
+			this.fileSystem.renameSync(tempPath, this.path);
+			renamed = true;
+			this.fsyncParentDirectory();
+		} catch (error) {
+			if (tempFd !== undefined) {
+				try {
+					this.fileSystem.closeSync(tempFd);
+				} catch {
+					// The original write/sync/rename failure is the actionable failure.
+				}
+			}
+			if (!renamed) {
+				try {
+					this.fileSystem.unlinkSync(tempPath);
+				} catch {
+					// A unique, restrictive temp can be cleaned by a later operator; never touch the journal.
+				}
+			}
+			throw error;
+		}
+	}
+
+	private fsyncParentDirectory(): void {
+		let directoryFd: number | undefined;
+		try {
+			directoryFd = this.fileSystem.openSync(dirname(this.path), "r");
+			this.fileSystem.fsyncSync(directoryFd);
+		} catch (error) {
+			if (!this.isDirectoryFsyncUnsupported(error)) throw error;
+		} finally {
+			if (directoryFd !== undefined) this.fileSystem.closeSync(directoryFd);
+		}
+	}
+
+	private isDirectoryFsyncUnsupported(error: unknown): boolean {
+		const code = (error as NodeJS.ErrnoException).code;
+		return (
+			code === "ENOTSUP" ||
+			code === "EOPNOTSUPP" ||
+			code === "EINVAL" ||
+			(this.platform === "win32" && (code === "EPERM" || code === "EISDIR"))
+		);
 	}
 }
