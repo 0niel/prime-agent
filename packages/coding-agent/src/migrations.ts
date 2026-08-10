@@ -4,6 +4,7 @@
 
 import chalk from "chalk";
 import {
+	chmodSync,
 	type Dirent,
 	existsSync,
 	mkdirSync,
@@ -20,12 +21,92 @@ import { CONFIG_DIR_NAME, getAgentDir, getBinDir, getSessionsDir } from "./confi
 import { FileAuthStorageBackend } from "./core/auth-storage.js";
 import { migrateKeybindingsConfig } from "./core/keybindings.js";
 import { FileSettingsStorage } from "./core/settings-manager.js";
+import { resolveManagedFilePathSync, writeFileAtomicallySync } from "./utils/atomic-file.js";
 import { readFirstLineSync } from "./utils/file-lines.js";
 
 const MIGRATION_GUIDE_URL =
 	"https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
 const EXTENSIONS_DOC_URL =
 	"https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/extensions.md";
+
+function stableJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+	if (typeof value === "object" && value !== null) {
+		return `{${Object.entries(value)
+			.sort(([a], [b]) => a.localeCompare(b))
+			.map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+			.join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "undefined";
+}
+
+function isLockContention(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "ELOCKED";
+}
+
+function cleanupCommittedLegacyAuth(
+	agentDir: string,
+	authPath: string,
+	oauthPath: string,
+	migratedOauthPath: string,
+): void {
+	let auth: Record<string, unknown>;
+	try {
+		const parsed = JSON.parse(readFileSync(authPath, "utf-8")) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+		auth = parsed as Record<string, unknown>;
+	} catch {
+		return;
+	}
+
+	try {
+		new FileSettingsStorage(agentDir, agentDir).withLock("global", (current) => {
+			if (!current) return undefined;
+			const settings = JSON.parse(current) as { apiKeys?: unknown };
+			if (typeof settings.apiKeys !== "object" || settings.apiKeys === null || Array.isArray(settings.apiKeys)) {
+				return undefined;
+			}
+			const keys = settings.apiKeys as Record<string, unknown>;
+			let changed = false;
+			for (const [provider, key] of Object.entries(keys)) {
+				const credential = auth[provider] as { type?: unknown; key?: unknown } | undefined;
+				if (credential?.type === "api_key" && credential.key === key) {
+					delete keys[provider];
+					changed = true;
+				}
+			}
+			if (!changed) return undefined;
+			if (Object.keys(keys).length === 0) delete settings.apiKeys;
+			return JSON.stringify(settings, null, 2);
+		});
+	} catch {
+		// Authoritative auth exists; contended or invalid legacy settings are best-effort cleanup only.
+	}
+
+	if (!existsSync(oauthPath)) return;
+	try {
+		const parsed = JSON.parse(readFileSync(oauthPath, "utf-8")) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+		const remaining = { ...(parsed as Record<string, unknown>) };
+		let changed = false;
+		for (const [provider, credential] of Object.entries(remaining)) {
+			if (stableJson(auth[provider]) === stableJson({ type: "oauth", ...(credential as object) })) {
+				delete remaining[provider];
+				changed = true;
+			}
+		}
+		if (!changed) return;
+		if (Object.keys(remaining).length > 0) {
+			writeFileAtomicallySync(oauthPath, JSON.stringify(remaining, null, 2), { mode: 0o600 });
+		} else if (!existsSync(migratedOauthPath)) {
+			renameSync(oauthPath, migratedOauthPath);
+		} else {
+			rmSync(oauthPath, { force: true });
+		}
+	} catch {
+		// Leave newer or unreadable legacy OAuth data untouched.
+	}
+}
 
 /**
  * Migrate legacy oauth.json and settings.json apiKeys to auth.json.
@@ -34,9 +115,17 @@ const EXTENSIONS_DOC_URL =
  */
 export function migrateAuthToAuthJson(): string[] {
 	const agentDir = getAgentDir();
-	const authPath = join(agentDir, "auth.json");
+	if (!existsSync(agentDir)) mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+	chmodSync(agentDir, 0o700);
+	const configuredAuthPath = join(agentDir, "auth.json");
+	const authPath = resolveManagedFilePathSync(configuredAuthPath, "auth");
 	const oauthPath = join(agentDir, "oauth.json");
 	const migratedOauthPath = `${oauthPath}.migrated`;
+	if (existsSync(authPath)) {
+		chmodSync(authPath, 0o600);
+		cleanupCommittedLegacyAuth(agentDir, authPath, oauthPath, migratedOauthPath);
+		return [];
+	}
 	let oauthSourcePath: string | undefined;
 	let providers: string[] = [];
 	let authCommitted = false;
@@ -127,8 +216,16 @@ export function migrateAuthToAuthJson(): string[] {
 			{ lockIfMissing: true },
 		);
 	} catch (error) {
-		if (!authCommitted) throw error;
-		// The committed auth file is authoritative; legacy cleanup is best-effort.
+		let authoritativeAuth = authCommitted;
+		try {
+			const committedPath = resolveManagedFilePathSync(configuredAuthPath, "auth");
+			authoritativeAuth ||= existsSync(committedPath);
+			if (authoritativeAuth) cleanupCommittedLegacyAuth(agentDir, committedPath, oauthPath, migratedOauthPath);
+		} catch {
+			// Preserve the original failure when no authoritative regular auth file can be verified.
+		}
+		if (!authoritativeAuth && !isLockContention(error)) throw error;
+		// Live lock contention and post-commit legacy cleanup are best-effort during startup.
 	}
 
 	if (providers.length === 0) return providers;

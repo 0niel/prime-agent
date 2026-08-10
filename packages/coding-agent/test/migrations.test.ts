@@ -1,18 +1,10 @@
-import {
-	chmodSync,
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	rmSync,
-	statSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import lockfile from "proper-lockfile";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import { FileAuthStorageBackend } from "../src/core/auth-storage.js";
 import {
 	migrateAuthToAuthJson,
 	migrateLegacySessionDirsToSessionRoot,
@@ -32,6 +24,7 @@ describe("session migrations", () => {
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
+		vi.restoreAllMocks();
 	});
 
 	it("moves legacy per-cwd session files into the flat session root", () => {
@@ -133,6 +126,7 @@ describe("auth migration", () => {
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
+		vi.restoreAllMocks();
 	});
 
 	function createAgentDir(): string {
@@ -160,27 +154,46 @@ describe("auth migration", () => {
 		expect(existsSync(oauthPath)).toBe(false);
 		expect(existsSync(`${oauthPath}.migrated`)).toBe(true);
 		expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual({ theme: "dark" });
+		expect(migrateAuthToAuthJson()).toEqual([]);
+		expect(existsSync(oauthPath)).toBe(false);
+		expect(existsSync(`${oauthPath}.migrated`)).toBe(true);
 	});
 
-	it.runIf(process.platform !== "win32")("keeps committed auth when legacy settings cleanup cannot be written", () => {
+	it("treats auth as authoritative when commit succeeds before a reported backend failure", () => {
 		const agentDir = createAgentDir();
-		const protectedDir = join(agentDir, "protected");
-		const settingsTarget = join(protectedDir, "settings.json");
-		mkdirSync(protectedDir);
-		writeFileSync(settingsTarget, JSON.stringify({ apiKeys: { openai: "openai-key" } }));
-		symlinkSync(settingsTarget, join(agentDir, "settings.json"));
-		chmodSync(protectedDir, 0o500);
+		const authPath = join(agentDir, "auth.json");
+		const settingsPath = join(agentDir, "settings.json");
+		writeFileSync(settingsPath, JSON.stringify({ apiKeys: { openai: "openai-key" } }));
+		vi.spyOn(FileAuthStorageBackend.prototype, "withLock").mockImplementationOnce(() => {
+			writeFileSync(authPath, JSON.stringify({ openai: { type: "api_key", key: "openai-key" } }), { mode: 0o600 });
+			throw new Error("directory sync failed after rename");
+		});
+
+		expect(migrateAuthToAuthJson()).toEqual([]);
+		expect(JSON.parse(readFileSync(authPath, "utf-8"))).toEqual({
+			openai: { type: "api_key", key: "openai-key" },
+		});
+		expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual({});
+	});
+
+	it("does not abort startup when authoritative auth has a contended settings lock", () => {
+		const agentDir = createAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		const settingsPath = join(agentDir, "settings.json");
+		writeFileSync(authPath, JSON.stringify({ openai: { type: "api_key", key: "openai-key" } }));
+		writeFileSync(settingsPath, JSON.stringify({ apiKeys: { openai: "openai-key" } }));
+		const release = lockfile.lockSync(settingsPath, { realpath: false });
 		try {
-			expect(migrateAuthToAuthJson()).toEqual(["openai"]);
-			expect(JSON.parse(readFileSync(join(agentDir, "auth.json"), "utf-8"))).toEqual({
+			expect(migrateAuthToAuthJson()).toEqual([]);
+			expect(JSON.parse(readFileSync(authPath, "utf-8"))).toEqual({
 				openai: { type: "api_key", key: "openai-key" },
 			});
-			expect(JSON.parse(readFileSync(settingsTarget, "utf-8"))).toEqual({
-				apiKeys: { openai: "openai-key" },
-			});
 		} finally {
-			chmodSync(protectedDir, 0o700);
+			release();
 		}
+
+		expect(migrateAuthToAuthJson()).toEqual([]);
+		expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual({});
 	});
 
 	it("recovers OAuth credentials from a legacy backup left by an interrupted migration", () => {
@@ -197,6 +210,58 @@ describe("auth migration", () => {
 		});
 		expect(existsSync(migratedOauthPath)).toBe(true);
 		expect(existsSync(join(agentDir, "settings.json"))).toBe(false);
+	});
+
+	it("does not wait for a held auth lock when auth.json is already authoritative", () => {
+		const agentDir = createAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		writeFileSync(authPath, JSON.stringify({ existing: { type: "api_key", key: "existing-key" } }));
+		const release = lockfile.lockSync(authPath, { realpath: false });
+		try {
+			expect(migrateAuthToAuthJson()).toEqual([]);
+		} finally {
+			release();
+		}
+	});
+
+	it("restarts legacy cleanup idempotently and preserves newer credentials", () => {
+		const agentDir = createAgentDir();
+		const authPath = join(agentDir, "auth.json");
+		const oauthPath = join(agentDir, "oauth.json");
+		const settingsPath = join(agentDir, "settings.json");
+		writeFileSync(
+			authPath,
+			JSON.stringify({
+				openai: { type: "api_key", key: "migrated-key" },
+				google: { type: "oauth", access: "migrated-access", refresh: "refresh", expires: 100 },
+				newer: { type: "oauth", access: "auth-access", refresh: "refresh", expires: 200 },
+			}),
+		);
+		writeFileSync(
+			settingsPath,
+			JSON.stringify({ apiKeys: { openai: "migrated-key", anthropic: "newer-settings-key" } }),
+		);
+		writeFileSync(
+			oauthPath,
+			JSON.stringify({
+				google: { access: "migrated-access", refresh: "refresh", expires: 100 },
+				newer: { access: "newer-legacy-access", refresh: "refresh", expires: 200 },
+			}),
+		);
+
+		expect(migrateAuthToAuthJson()).toEqual([]);
+		const afterFirst = {
+			settings: readFileSync(settingsPath, "utf-8"),
+			oauth: readFileSync(oauthPath, "utf-8"),
+		};
+		expect(JSON.parse(afterFirst.settings)).toEqual({ apiKeys: { anthropic: "newer-settings-key" } });
+		expect(JSON.parse(afterFirst.oauth)).toEqual({
+			newer: { access: "newer-legacy-access", refresh: "refresh", expires: 200 },
+		});
+
+		expect(migrateAuthToAuthJson()).toEqual([]);
+		expect(readFileSync(settingsPath, "utf-8")).toBe(afterFirst.settings);
+		expect(readFileSync(oauthPath, "utf-8")).toBe(afterFirst.oauth);
 	});
 
 	it("leaves legacy sources untouched when auth.json is already authoritative", () => {

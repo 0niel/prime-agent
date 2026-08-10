@@ -1,8 +1,9 @@
 import {
 	appendFileSync,
 	chmodSync,
-	type chownSync,
 	existsSync,
+	type fchmodSync,
+	type fchownSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -18,29 +19,29 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-type ChmodSync = typeof chmodSync;
-type ChownSync = typeof chownSync;
+type FchmodSync = typeof fchmodSync;
+type FchownSync = typeof fchownSync;
 type RenameSync = typeof renameSync;
 type WriteFileSync = typeof writeFileSync;
 
 const fsMocks = vi.hoisted(() => ({
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
-	chmodSync: vi.fn<ChmodSync>(),
-	chownSync: vi.fn<ChownSync>(),
+	fchmodSync: vi.fn<FchmodSync>(),
+	fchownSync: vi.fn<FchownSync>(),
 	renameSync: vi.fn<RenameSync>(),
 	writeFileSync: vi.fn<WriteFileSync>(),
 }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
-	fsMocks.chmodSync.mockImplementation(actual.chmodSync);
-	fsMocks.chownSync.mockImplementation(actual.chownSync);
+	fsMocks.fchmodSync.mockImplementation(actual.fchmodSync);
+	fsMocks.fchownSync.mockImplementation(actual.fchownSync);
 	fsMocks.renameSync.mockImplementation(actual.renameSync);
 	fsMocks.writeFileSync.mockImplementation(actual.writeFileSync);
 	return {
 		...actual,
-		chmodSync: fsMocks.chmodSync,
-		chownSync: fsMocks.chownSync,
+		fchmodSync: fsMocks.fchmodSync,
+		fchownSync: fsMocks.fchownSync,
 		renameSync: fsMocks.renameSync,
 		writeFileSync: fsMocks.writeFileSync,
 	};
@@ -123,23 +124,25 @@ describe("SessionManager.flushNow", () => {
 		const file = mgr.getSessionFile()!;
 		chmodSync(file, 0o660);
 		const before = statSync(file);
-		fsMocks.chownSync.mockClear();
-		fsMocks.chownSync.mockImplementationOnce(() => undefined);
-		fsMocks.chmodSync.mockClear();
+		fsMocks.fchownSync.mockClear();
+		fsMocks.fchownSync.mockImplementationOnce(() => undefined);
+		fsMocks.fchmodSync.mockClear();
 		fsMocks.renameSync.mockClear();
 
 		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
 		mgr.flushNow();
 
-		const tempPath = fsMocks.chownSync.mock.calls[0]?.[0];
+		const tempFd = fsMocks.fchownSync.mock.calls[0]?.[0];
+		const tempPath = fsMocks.renameSync.mock.calls[0]?.[0];
+		expect(tempFd).toEqual(expect.any(Number));
 		expect(tempPath).toEqual(expect.any(String));
-		expect(fsMocks.chownSync).toHaveBeenCalledWith(tempPath, before.uid, before.gid);
-		expect(fsMocks.chmodSync).toHaveBeenCalledWith(tempPath, before.mode & 0o777);
+		expect(fsMocks.fchownSync).toHaveBeenCalledWith(tempFd, before.uid, before.gid);
+		expect(fsMocks.fchmodSync).toHaveBeenCalledWith(tempFd, before.mode & 0o777);
 		expect(fsMocks.renameSync).toHaveBeenCalledWith(tempPath, join(dirname(tempPath as string), basename(file)));
-		expect(fsMocks.chownSync.mock.invocationCallOrder[0]!).toBeLessThan(
-			fsMocks.chmodSync.mock.invocationCallOrder[0]!,
+		expect(fsMocks.fchownSync.mock.invocationCallOrder[0]!).toBeLessThan(
+			fsMocks.fchmodSync.mock.invocationCallOrder[0]!,
 		);
-		expect(fsMocks.chmodSync.mock.invocationCallOrder[0]!).toBeLessThan(
+		expect(fsMocks.fchmodSync.mock.invocationCallOrder[0]!).toBeLessThan(
 			fsMocks.renameSync.mock.invocationCallOrder[0]!,
 		);
 		const after = statSync(file);
@@ -159,7 +162,7 @@ describe("SessionManager.flushNow", () => {
 		const before = readFileSync(file);
 		const tempPrefix = `.${basename(file)}.`;
 		const permissionError = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
-		fsMocks.chownSync.mockImplementationOnce(() => {
+		fsMocks.fchownSync.mockImplementationOnce(() => {
 			throw permissionError;
 		});
 		fsMocks.renameSync.mockClear();
@@ -342,10 +345,21 @@ function createPersistedSessionForRollbackTest(): { mgr: SessionManager; file: s
 	return { mgr, file, before: readFileSync(file) };
 }
 
+function recordObservedRevision(mgr: SessionManager, file: string): void {
+	const stats = statSync(file);
+	(mgr as unknown as { fileRevision: { dev: number; ino: number; size: number; mtimeMs: number } }).fileRevision = {
+		dev: stats.dev,
+		ino: stats.ino,
+		size: stats.size,
+		mtimeMs: stats.mtimeMs,
+	};
+}
+
 function failNextOutcomeAppend(mgr: SessionManager, file: string): void {
 	const internals = mgr as unknown as { _persist(entry: unknown): void };
 	internals._persist = () => {
 		appendFileSync(file, '{"type":"custom_message","truncat');
+		recordObservedRevision(mgr, file);
 		throw new Error("append failed");
 	};
 }
@@ -408,6 +422,7 @@ describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 		const originalPersist = internals._persist.bind(mgr);
 		internals._persist = () => {
 			appendFileSync(file, '{"type":"custom_message","truncat');
+			recordObservedRevision(mgr, file);
 			throw new Error("disk full");
 		};
 		expect(() => mgr.appendCustomMessageEntryWithRollback("test.outcome", "details", false)).toThrow("disk full");

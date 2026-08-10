@@ -6,6 +6,9 @@ import {
 	appendFileSync,
 	closeSync,
 	existsSync,
+	fstatSync,
+	fsyncSync,
+	ftruncateSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -17,17 +20,13 @@ import {
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "path";
+import lockfile from "proper-lockfile";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
-import { replaceFileAtomicallySync, writeFileAtomicallySync } from "../utils/atomic-file.js";
+import { resolveFileTargetSync, writeFileAtomicallySync } from "../utils/atomic-file.js";
 import { readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
-import {
-	appendPrivateFile,
-	assertRegularFileNoSymlink,
-	ensurePrivateDirectory,
-	writePrivateFileAtomic,
-} from "../utils/private-files.js";
+import { assertRegularFileNoSymlink, ensurePrivateDirectory } from "../utils/private-files.js";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -43,6 +42,8 @@ const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 const SESSION_STREAMING_LOAD_THRESHOLD_BYTES = 128 * 1024 * 1024;
 const SESSION_ASYNC_PARSE_YIELD_BYTES = 4 * 1024 * 1024;
+const SESSION_TAIL_INSPECTION_MAX_BYTES = 8 * 1024 * 1024;
+const SESSION_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 
 // Entry types that can represent user intent (vs. daemon bookkeeping like
 // session_state/agent_status/git_state/child_usage_attributed). Used by
@@ -82,10 +83,11 @@ export interface NewSessionOptions {
 export type SessionPersistListener = (sessionFile: string) => void;
 
 export interface SessionFileRecovery {
-	action: "append-newline" | "truncate";
+	action: "append-newline" | "truncate" | "manual-recovery";
 	originalSize: number;
 	repairedSize: number;
 	discardedBytes: number;
+	reason?: string;
 }
 
 export interface SessionEntryBase {
@@ -1205,10 +1207,64 @@ async function listSessionsFromDir(
 	return sessions;
 }
 
+let sessionTailInspectionHook: ((path: string) => void) | undefined;
+
+/** Test-only hook for deterministic interprocess persistence races. */
+export function setSessionTailInspectionHookForTest(hook: ((path: string) => void) | undefined): void {
+	sessionTailInspectionHook = hook;
+}
+
 interface UnterminatedSessionTail {
 	action: SessionFileRecovery["action"];
 	originalSize: number;
 	repairedSize: number;
+	reason?: string;
+}
+
+interface SessionFileRevision {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+}
+
+function getSessionFileRevision(path: string): SessionFileRevision | undefined {
+	try {
+		const stats = statSync(path);
+		return { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeMs: stats.mtimeMs };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+function sessionFileRevisionsEqual(a: SessionFileRevision | undefined, b: SessionFileRevision | undefined): boolean {
+	return a?.dev === b?.dev && a?.ino === b?.ino && a?.size === b?.size && a?.mtimeMs === b?.mtimeMs;
+}
+
+function acquireSessionFileLock(path: string): () => void {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 250; attempt++) {
+		try {
+			return lockfile.lockSync(path, { realpath: false, stale: 5 * 60_000 });
+		} catch (error) {
+			lastError = error;
+			if ((error as NodeJS.ErrnoException).code !== "ELOCKED") throw error;
+			Atomics.wait(SESSION_LOCK_WAIT, 0, 0, 20);
+		}
+	}
+	throw (lastError as Error) ?? new Error(`Could not lock session file: ${path}`);
+}
+
+function withSessionFileLockSync<T>(path: string, action: (targetPath: string) => T): T {
+	mkdirSync(dirname(path), { recursive: true });
+	const targetPath = resolveFileTargetSync(path);
+	const release = acquireSessionFileLock(targetPath);
+	try {
+		return action(targetPath);
+	} finally {
+		release();
+	}
 }
 
 function readExactly(fd: number, buffer: Buffer, position: number): void {
@@ -1222,68 +1278,64 @@ function readExactly(fd: number, buffer: Buffer, position: number): void {
 	}
 }
 
-function inspectUnterminatedSessionTail(path: string): UnterminatedSessionTail | undefined {
-	const originalSize = statSync(path).size;
+function inspectUnterminatedSessionTailFd(fd: number): UnterminatedSessionTail | undefined {
+	const originalSize = fstatSync(fd).size;
 	if (originalSize === 0) return undefined;
 
-	const fd = openSync(path, "r");
-	try {
-		const lastByte = Buffer.allocUnsafe(1);
-		readExactly(fd, lastByte, originalSize - 1);
-		if (lastByte[0] === 0x0a) return undefined;
+	const lastByte = Buffer.allocUnsafe(1);
+	readExactly(fd, lastByte, originalSize - 1);
+	if (lastByte[0] === 0x0a) return undefined;
 
-		let tailStart = 0;
-		let cursor = originalSize;
-		const scanBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, originalSize));
-		while (cursor > 0) {
-			const length = Math.min(scanBuffer.length, cursor);
-			const position = cursor - length;
-			const chunk = scanBuffer.subarray(0, length);
-			readExactly(fd, chunk, position);
-			const newline = chunk.lastIndexOf(0x0a);
-			if (newline !== -1) {
-				tailStart = position + newline + 1;
-				break;
-			}
-			cursor = position;
+	let tailStart: number | undefined;
+	let cursor = originalSize;
+	const scanStart = Math.max(0, originalSize - SESSION_TAIL_INSPECTION_MAX_BYTES - 1);
+	const scanBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, originalSize));
+	while (cursor > scanStart) {
+		const length = Math.min(scanBuffer.length, cursor - scanStart);
+		const position = cursor - length;
+		const chunk = scanBuffer.subarray(0, length);
+		readExactly(fd, chunk, position);
+		const newline = chunk.lastIndexOf(0x0a);
+		if (newline !== -1) {
+			tailStart = position + newline + 1;
+			break;
 		}
-
-		const tail = Buffer.allocUnsafe(originalSize - tailStart);
-		readExactly(fd, tail, tailStart);
-		let isCompleteRecord = false;
-		if (isUtf8(tail)) {
-			try {
-				JSON.parse(tail.toString("utf8"));
-				isCompleteRecord = true;
-			} catch {
-				// An invalid unterminated record is a torn append.
-			}
-		}
-
-		return isCompleteRecord
-			? { action: "append-newline", originalSize, repairedSize: originalSize + 1 }
-			: { action: "truncate", originalSize, repairedSize: tailStart };
-	} finally {
-		closeSync(fd);
+		cursor = position;
 	}
+
+	if (tailStart === undefined && scanStart > 0) {
+		return {
+			action: "manual-recovery",
+			originalSize,
+			repairedSize: originalSize,
+			reason: `Unterminated session record exceeds ${SESSION_TAIL_INSPECTION_MAX_BYTES} bytes`,
+		};
+	}
+
+	tailStart ??= 0;
+	const tail = Buffer.allocUnsafe(originalSize - tailStart);
+	readExactly(fd, tail, tailStart);
+	let isCompleteRecord = false;
+	if (isUtf8(tail)) {
+		try {
+			JSON.parse(tail.toString("utf8"));
+			isCompleteRecord = true;
+		} catch {
+			// An invalid unterminated record is a torn append.
+		}
+	}
+
+	return isCompleteRecord
+		? { action: "append-newline", originalSize, repairedSize: originalSize + 1 }
+		: { action: "truncate", originalSize, repairedSize: tailStart };
 }
 
-function copyFilePrefix(sourcePath: string, targetFd: number, length: number): void {
-	const sourceFd = openSync(sourcePath, "r");
+function inspectUnterminatedSessionTail(path: string): UnterminatedSessionTail | undefined {
+	const fd = openSync(path, "r");
 	try {
-		const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, length)));
-		let position = 0;
-		while (position < length) {
-			const chunk = buffer.subarray(0, Math.min(buffer.length, length - position));
-			readExactly(sourceFd, chunk, position);
-			let written = 0;
-			while (written < chunk.length) {
-				written += writeSync(targetFd, chunk, written, chunk.length - written);
-			}
-			position += chunk.length;
-		}
+		return inspectUnterminatedSessionTailFd(fd);
 	} finally {
-		closeSync(sourceFd);
+		closeSync(fd);
 	}
 }
 
@@ -1311,8 +1363,8 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
-	private needsTailRepair = false;
 	private fileRecovery: SessionFileRecovery | undefined;
+	private fileRevision: SessionFileRevision | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1320,6 +1372,7 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		preloadedEntries?: FileEntry[],
+		preloadedRevision?: SessionFileRevision,
 	) {
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
@@ -1329,7 +1382,7 @@ export class SessionManager {
 		}
 
 		if (sessionFile) {
-			this.setSessionFile(sessionFile, preloadedEntries);
+			this.setSessionFile(sessionFile, preloadedEntries, preloadedRevision);
 		} else {
 			this.newSession();
 		}
@@ -1340,24 +1393,37 @@ export class SessionManager {
 	 * preloadedEntries must be loadEntriesFromFile(sessionFile) for the same path; it
 	 * lets the async daemon path skip the synchronous re-read.
 	 */
-	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
+	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[], preloadedRevision?: SessionFileRevision): void {
 		this.sessionFile = resolve(sessionFile);
 		this.fileRecovery = undefined;
-		this.needsTailRepair = false;
+		this.fileRevision = undefined;
 		if (existsSync(this.sessionFile)) {
-			const firstHeader = readSessionHeader(this.sessionFile);
-			if (firstHeader?.type === "session" && typeof firstHeader.id === "string") {
-				assertValidSessionId(firstHeader.id);
-			}
-			this.needsTailRepair = inspectUnterminatedSessionTail(this.sessionFile) !== undefined;
-			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
+			withSessionFileLockSync(this.sessionFile, (targetPath) => {
+				const firstHeader = readSessionHeader(targetPath);
+				if (firstHeader?.type === "session" && typeof firstHeader.id === "string") {
+					assertValidSessionId(firstHeader.id);
+				}
+				const pendingRecovery = inspectUnterminatedSessionTail(targetPath);
+				if (pendingRecovery?.action === "manual-recovery") {
+					this.fileRecovery = { ...pendingRecovery, discardedBytes: 0 };
+				}
+				const currentRevision = getSessionFileRevision(targetPath);
+				if (preloadedEntries && sessionFileRevisionsEqual(preloadedRevision, currentRevision)) {
+					this.fileEntries = preloadedEntries;
+				} else {
+					this.fileEntries = loadEntriesFromFile(targetPath);
+				}
+				this.fileRevision = currentRevision;
+			});
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
 			// to avoid appending messages without a session header (which breaks the session)
 			if (this.fileEntries.length === 0) {
 				const explicitPath = this.sessionFile;
+				const observedRevision = this.fileRevision;
 				this.newSession();
 				this.sessionFile = explicitPath;
+				this.fileRevision = observedRevision;
 				this._rewriteFile();
 				this.flushed = true;
 				return;
@@ -1438,8 +1504,8 @@ export class SessionManager {
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		this.flushed = false;
-		this.needsTailRepair = false;
 		this.fileRecovery = undefined;
+		this.fileRevision = undefined;
 
 		if (this.persist) {
 			this.sessionFile = sessionFile;
@@ -1468,33 +1534,54 @@ export class SessionManager {
 		}
 	}
 
+	private _rewriteFileLocked(targetPath: string, content: string): void {
+		const currentRevision = getSessionFileRevision(targetPath);
+		if (currentRevision !== undefined) {
+			const pendingRecovery = inspectUnterminatedSessionTail(targetPath);
+			if (pendingRecovery?.action === "manual-recovery") {
+				this.fileRecovery = { ...pendingRecovery, discardedBytes: 0 };
+				throw new Error(`${pendingRecovery.reason}; manual session recovery is required: ${targetPath}`);
+			}
+		}
+		if (currentRevision !== undefined && !sessionFileRevisionsEqual(currentRevision, this.fileRevision)) {
+			throw new Error(`Session file changed before rewrite: ${targetPath}`);
+		}
+		writeFileAtomicallySync(targetPath, content, { createMode: 0o600 });
+		this.fileRevision = getSessionFileRevision(targetPath);
+	}
+
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		writePrivateFileAtomic(this.sessionFile, content);
-		this.needsTailRepair = false;
+		withSessionFileLockSync(this.sessionFile, (targetPath) => this._rewriteFileLocked(targetPath, content));
 		this._notifyPersistListeners();
 	}
 
-	private _repairUnterminatedTail(): void {
-		if (!this.needsTailRepair || !this.sessionFile || !existsSync(this.sessionFile)) return;
-		const recovery = inspectUnterminatedSessionTail(this.sessionFile);
-		if (!recovery) {
-			this.needsTailRepair = false;
-			return;
-		}
+	private _repairUnterminatedTail(targetPath: string): void {
+		if (!existsSync(targetPath)) return;
+		const fd = openSync(targetPath, "r+");
+		let recovery: UnterminatedSessionTail | undefined;
+		try {
+			recovery = inspectUnterminatedSessionTailFd(fd);
+			if (recovery) sessionTailInspectionHook?.(targetPath);
+			if (!recovery) {
+				return;
+			}
+			if (recovery.action === "manual-recovery") {
+				this.fileRecovery = { ...recovery, discardedBytes: 0 };
+				throw new Error(`${recovery.reason}; manual session recovery is required: ${targetPath}`);
+			}
 
-		replaceFileAtomicallySync(this.sessionFile, (fd, currentPath) => {
-			if (statSync(currentPath).size !== recovery.originalSize) {
-				throw new Error("Session file changed while repairing its JSONL tail");
+			if (recovery.action === "truncate") {
+				ftruncateSync(fd, recovery.repairedSize);
+			} else {
+				const newline = Buffer.from("\n");
+				writeSync(fd, newline, 0, newline.length, recovery.originalSize);
 			}
-			const bytesToCopy = recovery.action === "truncate" ? recovery.repairedSize : recovery.originalSize;
-			copyFilePrefix(currentPath, fd, bytesToCopy);
-			if (recovery.action === "append-newline") {
-				writeSync(fd, "\n");
-			}
-		});
-		this.needsTailRepair = false;
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
 		this.fileRecovery = {
 			...recovery,
 			discardedBytes: recovery.originalSize - Math.min(recovery.originalSize, recovery.repairedSize),
@@ -1604,18 +1691,25 @@ export class SessionManager {
 			return;
 		}
 
-		if (!this.flushed || !existsSync(this.sessionFile)) {
+		if (!this.flushed) {
 			this._rewriteFile();
 			this.flushed = true;
 		} else {
-			this._repairUnterminatedTail();
-			try {
-				appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}
-`);
-			} catch (error) {
-				this.needsTailRepair = true;
-				throw error;
-			}
+			withSessionFileLockSync(this.sessionFile, (targetPath) => {
+				if (!existsSync(targetPath)) {
+					const content = `${this.fileEntries.map((item) => JSON.stringify(item)).join("\n")}\n`;
+					this._rewriteFileLocked(targetPath, content);
+					return;
+				}
+				this._repairUnterminatedTail(targetPath);
+				try {
+					appendFileSync(targetPath, `${JSON.stringify(entry)}\n`);
+				} catch (error) {
+					this.fileRevision = getSessionFileRevision(targetPath);
+					throw error;
+				}
+				this.fileRevision = getSessionFileRevision(targetPath);
+			});
 			this._notifyPersistListeners();
 		}
 	}
@@ -2246,6 +2340,7 @@ export class SessionManager {
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
+			this.fileRevision = undefined;
 			this._buildIndex();
 
 			// Only write the file now if it contains an assistant message.
@@ -2338,14 +2433,16 @@ export class SessionManager {
 		if (!existsSync(path)) {
 			return SessionManager.open(path, sessionDir, cwdOverride);
 		}
+		const beforeRevision = getSessionFileRevision(path);
 		const entries = await loadEntriesFromFileAsync(path);
-		// empty/corrupt: defer to open() (finalizeLoadedEntries guarantees entries[0] is a valid header otherwise)
-		if (entries.length === 0) {
+		const afterRevision = getSessionFileRevision(path);
+		// Empty, corrupt, or concurrently modified files defer to the locked synchronous path.
+		if (entries.length === 0 || !sessionFileRevisionsEqual(beforeRevision, afterRevision)) {
 			return SessionManager.open(path, sessionDir, cwdOverride);
 		}
 		const cwd = cwdOverride ?? (entries[0] as SessionHeader).cwd;
 		const dir = sessionDir ?? resolve(path, "..");
-		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries);
+		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries, afterRevision);
 	}
 
 	/**
@@ -2425,7 +2522,11 @@ export class SessionManager {
 			const out = parentId === entry.parentId ? entry : { ...entry, parentId };
 			forkedEntries.push(out);
 		}
-		writePrivateFileAtomic(newSessionFile, `${forkedEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		withSessionFileLockSync(newSessionFile, (targetPath) => {
+			writeFileAtomicallySync(targetPath, `${forkedEntries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
+				createMode: 0o600,
+			});
+		});
 
 		return new SessionManager(targetCwd, dir, newSessionFile, true);
 	}

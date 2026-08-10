@@ -1,10 +1,10 @@
 import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
-import { writeFileAtomicallySync } from "../utils/atomic-file.js";
+import { resolveManagedFilePathSync, writeFileAtomicallySync } from "../utils/atomic-file.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -226,6 +226,11 @@ export interface SettingsError {
 	error: Error;
 }
 
+function ensurePrivateDirectory(path: string): void {
+	if (!existsSync(path)) mkdirSync(path, { recursive: true, mode: 0o700 });
+	chmodSync(path, 0o700);
+}
+
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
 	private projectSettingsPath: string;
@@ -267,25 +272,28 @@ export class FileSettingsStorage implements SettingsStorage {
 		fn: (current: string | undefined) => string | undefined,
 		options: SettingsLockOptions = {},
 	): void {
-		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
-		const dir = dirname(path);
+		const configuredPath = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+		const dir = dirname(configuredPath);
+		let path = configuredPath;
 
 		let release: (() => void) | undefined;
 		try {
-			const fileExists = existsSync(path);
+			const fileExists = existsSync(configuredPath);
+			if (fileExists || existsSync(dir)) {
+				path = resolveManagedFilePathSync(configuredPath, `${scope} settings`);
+			}
 			if (fileExists || options.lockIfMissing) {
-				if (!existsSync(dir)) {
-					mkdirSync(dir, { recursive: true });
-				}
+				ensurePrivateDirectory(dir);
+				path = resolveManagedFilePathSync(configuredPath, `${scope} settings`);
 				release = this.acquireLockSyncWithRetry(path);
 			}
+			if (release && existsSync(path)) chmodSync(path, 0o600);
 			let current = existsSync(path) ? readFileSync(path, "utf-8") : undefined;
 			let next = fn(current);
 			if (next === undefined) return;
 
-			if (!existsSync(dir)) {
-				mkdirSync(dir, { recursive: true });
-			}
+			ensurePrivateDirectory(dir);
+			path = resolveManagedFilePathSync(configuredPath, `${scope} settings`);
 			if (!release) {
 				release = this.acquireLockSyncWithRetry(path);
 				const lockedCurrent = existsSync(path) ? readFileSync(path, "utf-8") : undefined;
@@ -295,7 +303,7 @@ export class FileSettingsStorage implements SettingsStorage {
 				}
 			}
 			if (next !== undefined) {
-				writeFileAtomicallySync(path, next);
+				writeFileAtomicallySync(path, next, { mode: 0o600 });
 			}
 		} finally {
 			if (release) {

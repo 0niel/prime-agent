@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -59,7 +59,7 @@ describe("SettingsManager", () => {
 			}
 		});
 
-		it.runIf(process.platform !== "win32")("atomically replaces settings while preserving file mode", () => {
+		it.runIf(process.platform !== "win32")("atomically replaces settings and repairs private file mode", () => {
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }), { mode: 0o640 });
 			const previous = statSync(settingsPath);
@@ -69,8 +69,51 @@ describe("SettingsManager", () => {
 
 			const current = statSync(settingsPath);
 			expect(current.ino).not.toBe(previous.ino);
-			expect(current.mode & 0o777).toBe(0o640);
+			expect(current.mode & 0o777).toBe(0o600);
 			expect(JSON.parse(readFileSync(settingsPath, "utf-8"))).toEqual({ theme: "light" });
+		});
+
+		it.runIf(process.platform !== "win32")(
+			"creates fresh global and project settings directories and files privately under umask 000",
+			async () => {
+				rmSync(agentDir, { recursive: true, force: true });
+				rmSync(join(projectDir, ".prime"), { recursive: true, force: true });
+				const previousUmask = process.umask(0);
+				try {
+					const manager = SettingsManager.create(projectDir, agentDir);
+					manager.setTheme("private");
+					manager.setProjectPackages(["private-package"]);
+					await manager.flush();
+					for (const path of [agentDir, join(projectDir, ".prime", "agent")]) {
+						expect(statSync(path).mode & 0o777).toBe(0o700);
+						expect(statSync(join(path, "settings.json")).mode & 0o777).toBe(0o600);
+					}
+				} finally {
+					process.umask(previousUmask);
+				}
+			},
+		);
+
+		it.runIf(process.platform !== "win32")("rejects existing and dangling settings symlinks", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const targetPath = join(testDir, "settings-target.json");
+			writeFileSync(targetPath, JSON.stringify({ theme: "target" }));
+			symlinkSync(targetPath, settingsPath);
+			const storage = new FileSettingsStorage(projectDir, agentDir);
+
+			expect(() => storage.withLock("global", () => JSON.stringify({ theme: "changed" }))).toThrow(
+				/Refusing global settings symlink/,
+			);
+			expect(lstatSync(settingsPath).isSymbolicLink()).toBe(true);
+			expect(JSON.parse(readFileSync(targetPath, "utf-8"))).toEqual({ theme: "target" });
+
+			rmSync(settingsPath);
+			symlinkSync(join(testDir, "missing-target.json"), settingsPath);
+			expect(() => storage.withLock("global", () => JSON.stringify({ theme: "changed" }))).toThrow(
+				/Refusing global settings symlink/,
+			);
+			expect(lstatSync(settingsPath).isSymbolicLink()).toBe(true);
+			expect(existsSync(join(testDir, "missing-target.json"))).toBe(false);
 		});
 
 		it("should preserve enabledModels when changing thinking level", async () => {

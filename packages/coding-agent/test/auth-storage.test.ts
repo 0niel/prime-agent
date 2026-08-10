@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
@@ -988,7 +998,7 @@ describe("AuthStorage", () => {
 			const realLock = lockfile.lockSync.bind(lockfile);
 			const lockSpy = vi.spyOn(lockfile, "lockSync");
 			lockSpy.mockImplementationOnce((file, options) => {
-				expect(file).toBe(authJsonPath);
+				expect(file).toBe(join(realpathSync(tempDir), "auth.json"));
 				expect(existsSync(authJsonPath)).toBe(false);
 				expect(options?.realpath).toBe(false);
 				return realLock(file, options);
@@ -1004,7 +1014,7 @@ describe("AuthStorage", () => {
 			const realLock = lockfile.lock.bind(lockfile);
 			const lockSpy = vi.spyOn(lockfile, "lock");
 			lockSpy.mockImplementationOnce(async (file, options) => {
-				expect(file).toBe(authJsonPath);
+				expect(file).toBe(join(realpathSync(tempDir), "auth.json"));
 				expect(existsSync(authJsonPath)).toBe(false);
 				expect(options?.realpath).toBe(false);
 				return realLock(file, options);
@@ -1032,6 +1042,45 @@ describe("AuthStorage", () => {
 			expect(JSON.parse(readFileSync(authJsonPath, "utf-8"))).toEqual({
 				anthropic: { type: "api_key", key: "new" },
 			});
+		});
+
+		test.runIf(process.platform !== "win32")(
+			"creates fresh auth directories and sync/async files privately under umask 000",
+			async () => {
+				rmSync(tempDir, { recursive: true, force: true });
+				const previousUmask = process.umask(0);
+				try {
+					const syncBackend = new FileAuthStorageBackend(authJsonPath);
+					syncBackend.withLock(() => ({ result: undefined, next: "{}" }));
+					expect(statSync(tempDir).mode & 0o777).toBe(0o700);
+					expect(statSync(authJsonPath).mode & 0o777).toBe(0o600);
+
+					rmSync(authJsonPath);
+					const asyncBackend = new FileAuthStorageBackend(authJsonPath);
+					await asyncBackend.withLockAsync(async () => ({ result: undefined, next: "{}" }));
+					expect(statSync(tempDir).mode & 0o777).toBe(0o700);
+					expect(statSync(authJsonPath).mode & 0o777).toBe(0o600);
+				} finally {
+					process.umask(previousUmask);
+				}
+			},
+		);
+
+		test.runIf(process.platform !== "win32")("rejects existing and dangling auth symlinks", () => {
+			const targetPath = join(tempDir, "auth-target.json");
+			writeFileSync(targetPath, JSON.stringify({ existing: true }));
+			symlinkSync(targetPath, authJsonPath);
+			const backend = new FileAuthStorageBackend(authJsonPath);
+
+			expect(() => backend.withLock(() => ({ result: undefined, next: "{}" }))).toThrow(/Refusing auth symlink/);
+			expect(lstatSync(authJsonPath).isSymbolicLink()).toBe(true);
+			expect(JSON.parse(readFileSync(targetPath, "utf-8"))).toEqual({ existing: true });
+
+			rmSync(authJsonPath);
+			symlinkSync(join(tempDir, "missing-auth-target.json"), authJsonPath);
+			expect(() => backend.withLock(() => ({ result: undefined, next: "{}" }))).toThrow(/Refusing auth symlink/);
+			expect(lstatSync(authJsonPath).isSymbolicLink()).toBe(true);
+			expect(existsSync(join(tempDir, "missing-auth-target.json"))).toBe(false);
 		});
 
 		test("set preserves unrelated external edits", () => {

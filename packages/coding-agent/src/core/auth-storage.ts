@@ -19,7 +19,8 @@ import { existsSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
-import { ensurePrivateDirectory, readPrivateFile, writePrivateFileAtomic } from "../utils/private-files.js";
+import { resolveManagedFilePathSync, writeFileAtomicallySync } from "../utils/atomic-file.js";
+import { ensurePrivateDirectory, readPrivateFile } from "../utils/private-files.js";
 import {
 	clearPrimeCliCredentials,
 	getPrimeCliConfigPath,
@@ -112,7 +113,6 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	private ensureParentDir(): void {
 		ensurePrivateDirectory(dirname(this.authPath));
 	}
-	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
 		const maxAttempts = 10;
@@ -144,13 +144,14 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T {
 		this.ensureParentDir();
 
+		const path = resolveManagedFilePathSync(this.authPath, "auth");
 		let release: (() => void) | undefined;
 		try {
-			release = this.acquireLockSyncWithRetry(this.authPath);
-			const current = existsSync(this.authPath) ? readPrivateFile(this.authPath, "utf-8") : undefined;
+			release = this.acquireLockSyncWithRetry(path);
+			const current = existsSync(path) ? readPrivateFile(path, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
-				writePrivateFileAtomic(this.authPath, next);
+				writeFileAtomicallySync(path, next, { mode: 0o600 });
 			}
 			return result;
 		} finally {
@@ -163,6 +164,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	async withLockAsync<T>(fn: (current: string | undefined) => Promise<LockResult<T>>): Promise<T> {
 		this.ensureParentDir();
 
+		const path = resolveManagedFilePathSync(this.authPath, "auth");
 		let release: (() => Promise<void>) | undefined;
 		let lockCompromised = false;
 		let lockCompromisedError: Error | undefined;
@@ -173,7 +175,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		};
 
 		try {
-			release = await lockfile.lock(this.authPath, {
+			release = await lockfile.lock(path, {
 				realpath: false,
 				retries: {
 					retries: 10,
@@ -190,11 +192,11 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			});
 
 			throwIfCompromised();
-			const current = existsSync(this.authPath) ? readPrivateFile(this.authPath, "utf-8") : undefined;
+			const current = existsSync(path) ? readPrivateFile(path, "utf-8") : undefined;
 			const { result, next } = await fn(current);
 			throwIfCompromised();
 			if (next !== undefined) {
-				writePrivateFileAtomic(this.authPath, next);
+				writeFileAtomicallySync(path, next, { mode: 0o600 });
 			}
 			throwIfCompromised();
 			return result;

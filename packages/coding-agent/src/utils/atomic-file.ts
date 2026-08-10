@@ -4,6 +4,7 @@ import {
 	fchmodSync,
 	fchownSync,
 	fsyncSync,
+	lstatSync,
 	openSync,
 	realpathSync,
 	renameSync,
@@ -15,6 +16,7 @@ import { basename, dirname, join } from "node:path";
 
 export interface AtomicReplaceOptions {
 	mode?: number;
+	createMode?: number;
 	preserveExistingMetadata?: boolean;
 }
 
@@ -24,12 +26,31 @@ interface FileMetadata {
 	gid: number;
 }
 
-function realpathIfPresent(path: string): string {
+export function resolveManagedFilePathSync(path: string, label: string): string {
+	try {
+		const stats = lstatSync(path);
+		if (stats.isSymbolicLink()) throw new Error(`Refusing ${label} symlink: ${path}`);
+		if (!stats.isFile()) throw new Error(`Refusing non-file ${label} path: ${path}`);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	return join(realpathSync(dirname(path)), basename(path));
+}
+
+export function resolveFileTargetSync(path: string): string {
 	try {
 		return realpathSync(path);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return path;
-		throw error;
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		try {
+			if (lstatSync(path).isSymbolicLink()) {
+				throw new Error(`Refusing to replace dangling symlink: ${path}`);
+			}
+		} catch (lstatError) {
+			if ((lstatError as NodeJS.ErrnoException).code !== "ENOENT") throw lstatError;
+		}
+		const directory = realpathSync(dirname(path));
+		return join(directory, basename(path));
 	}
 }
 
@@ -58,10 +79,10 @@ export function replaceFileAtomicallySync(
 	write: (fd: number, currentPath: string) => void,
 	options: AtomicReplaceOptions = {},
 ): void {
-	const targetPath = realpathIfPresent(path);
+	const targetPath = resolveFileTargetSync(path);
 	const directory = dirname(targetPath);
 	const metadata = options.preserveExistingMetadata === false ? undefined : metadataIfPresent(targetPath);
-	const mode = options.mode ?? metadata?.mode;
+	const mode = options.mode ?? metadata?.mode ?? (metadata === undefined ? options.createMode : undefined);
 	const tempPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
 	let fd: number | undefined = openSync(tempPath, "wx", mode ?? 0o666);
 	try {
@@ -78,10 +99,11 @@ export function replaceFileAtomicallySync(
 		renameSync(tempPath, targetPath);
 		syncDirectory(directory);
 	} finally {
-		if (fd !== undefined) {
-			closeSync(fd);
+		try {
+			if (fd !== undefined) closeSync(fd);
+		} finally {
+			rmSync(tempPath, { force: true });
 		}
-		rmSync(tempPath, { force: true });
 	}
 }
 
