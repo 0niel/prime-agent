@@ -15,3 +15,7 @@ For most users, [Git for Windows](https://git-scm.com/download/win) is sufficien
   "shellPath": "C:\\cygwin64\\bin\\bash.exe"
 }
 ```
+
+## Native Verification
+
+Before a Windows release, verify from a clean PowerShell session with no `uv` on `PATH` that `PRIME_AGENT_INSTALL_UV=1` installs `uv`, creates `~\.prime\agent\kernel-venv\Scripts\python.exe`, and starts an IPython cell. Also repeat with an existing populated venv to confirm startup reuses it rather than rebuilding it. These process and installer checks require native Windows; the interpreter-layout and installer-selection unit tests run on every platform.
