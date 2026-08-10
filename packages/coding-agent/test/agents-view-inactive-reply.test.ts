@@ -410,7 +410,7 @@ describe("agents view reply on inactive sessions", () => {
 		const self: Record<string, unknown> = {
 			creatingNewSession: false,
 			options: { config: { cwd: process.cwd() } },
-			connectDedicatedClient: vi.fn(async () => ({ request, close })),
+			connectDedicatedClient: vi.fn(async () => ({ request, close, waitForHello: vi.fn(async () => ({})) })),
 			setStatusMessage: vi.fn(),
 			selectSummary: vi.fn(),
 			finish,
@@ -433,6 +433,7 @@ describe("agents view reply on inactive sessions", () => {
 			options: { config: {} },
 			connectDedicatedClient: vi.fn(async () => ({
 				close: vi.fn(),
+				waitForHello: vi.fn(async () => ({})),
 				request: vi.fn(async (command: { type: string }) => {
 					requests.push(command);
 					// The view finishes while create is in flight.
@@ -464,6 +465,7 @@ describe("agents view reply on inactive sessions", () => {
 					throw new Error("daemon busy");
 				}),
 				close: vi.fn(),
+				waitForHello: vi.fn(async () => ({})),
 			})),
 			setStatusMessage,
 			selectSummary: vi.fn(),
