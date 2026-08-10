@@ -14,6 +14,7 @@ interface WorkerOptions {
 	scratch: string;
 	fixtureCommand?: string;
 	fixtureArgs: readonly string[];
+	testIgnoreTerm: boolean;
 }
 
 type WorkerMessage =
@@ -51,7 +52,14 @@ function options(): WorkerOptions {
 			index += 1;
 		}
 	}
-	return { fanout, allocationMiB, scratch, fixtureCommand, fixtureArgs };
+	return {
+		fanout,
+		allocationMiB,
+		scratch,
+		fixtureCommand,
+		fixtureArgs,
+		testIgnoreTerm: process.argv.includes("--test-ignore-term"),
+	};
 }
 
 function safeEnvironment(worker: number, fanout: number, allocationBytes: number): NodeJS.ProcessEnv {
@@ -111,8 +119,20 @@ function pause(milliseconds: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function awaitRelease(): Promise<void> {
+	return new Promise((resolve) => {
+		process.once("message", (message: unknown) => {
+			if ((message as { type?: unknown })?.type === "release") resolve();
+		});
+	});
+}
+
 async function main(): Promise<void> {
 	const config = options();
+	// No allocation, fixture, or descendant may exist before the parent has
+	// authenticated this leader's PID/start/PGID and explicitly releases us.
+	await awaitRelease();
+	if (config.testIgnoreTerm) process.on("SIGTERM", () => {});
 	const allocationBytes = config.allocationMiB * 1024 * 1024;
 	let allocation = Buffer.allocUnsafe(allocationBytes);
 	for (let index = 0; index < allocation.length; index += 4096) allocation[index] = 1;

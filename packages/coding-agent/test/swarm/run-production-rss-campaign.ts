@@ -95,6 +95,9 @@ interface Config {
 	fixtureCommand?: string;
 	fixtureArgs: readonly string[];
 	allocationMiB: number;
+	// Test-only delay which makes the pre-release ownership window deterministic.
+	identityCaptureDelayMs: number;
+	testIgnoreTerm: boolean;
 }
 
 interface GroupOwnership {
@@ -144,6 +147,8 @@ function config(): Config {
 		fixtureCommand: option("--fixture-command"),
 		fixtureArgs,
 		allocationMiB: safeInteger("--allocation-mib", 1, 1),
+		identityCaptureDelayMs: safeInteger("--test-identity-capture-delay-ms", 0, 0),
+		testIgnoreTerm: process.argv.includes("--test-ignore-term"),
 	};
 }
 
@@ -307,6 +312,7 @@ function workerArguments(settings: Config, fanout: number, scratch: string): str
 	];
 	if (settings.fixtureCommand) args.push("--fixture-command", settings.fixtureCommand);
 	for (const fixtureArg of settings.fixtureArgs) args.push("--fixture-arg", fixtureArg);
+	if (settings.testIgnoreTerm) args.push("--test-ignore-term");
 	return args;
 }
 
@@ -363,15 +369,43 @@ async function runCell(
 			);
 			const records = await groupSnapshot(currentOwnership.pgid);
 			remember(currentOwnership, records);
-			const entry = sample(phase, records);
-			samples.push(entry);
+			samples.push(sample(phase, records));
 		});
 		return queue;
+	};
+	const reapDirectChild = async (): Promise<void> => {
+		// Before release the worker protocol has not allocated or spawned anything.
+		// Never use a negative PGID without an authenticated /proc identity anchor.
+		const direct = child;
+		if (!direct || direct.exitCode !== null || direct.signalCode !== null) return;
+		try {
+			direct.kill("SIGKILL");
+		} catch {
+			return;
+		}
+		await new Promise<void>((resolve) => {
+			if (direct.exitCode !== null || direct.signalCode !== null) resolve();
+			else direct.once("exit", () => resolve());
+		});
 	};
 	return new Promise<Repetition>((resolve) => {
 		let timer: NodeJS.Timeout | undefined;
 		let timeout: NodeJS.Timeout | undefined;
-		const settle = async (requested: Status): Promise<void> => {
+		let executionStarted = false;
+		let settle: (requested: Status) => Promise<void>;
+		const startExecution = (): void => {
+			if (executionStarted || stopped) return;
+			executionStarted = true;
+			void enqueue("started");
+			timer = setInterval(() => {
+				if (!stopped) void enqueue("started");
+			}, settings.requestedPeriodMs);
+			timeout = setTimeout(() => {
+				timedOut = true;
+				void settle("timed_out");
+			}, settings.timeoutMs);
+		};
+		settle = async (requested: Status): Promise<void> => {
 			if (stopped) return;
 			stopped = true;
 			if (timer) clearInterval(timer);
@@ -381,10 +415,49 @@ async function runCell(
 				samples.filter((entry) => entry.phase === "started").map((entry) => entry.monotonicMs),
 			);
 			const cadenceFailed = !cadence.valid;
+
+			// A failed startup is deliberately not represented as an empty owned
+			// group: no exact PID/start/PGID anchor was ever authenticated.
+			if (!ownership) {
+				await reapDirectChild();
+				resolve({
+					schemaVersion: SCHEMA_VERSION,
+					kind: "b00b-rss-repetition",
+					status: "failed",
+					fanout,
+					repetition,
+					warmup,
+					sampler: {
+						source: "proc-status",
+						requestedPeriodMs: settings.requestedPeriodMs,
+						maxGapMs: MAX_RSS_SAMPLE_GAP_MS,
+						maxObservedGapMs: cadence.maxObservedGapMs,
+						sharedPages: "summed-per-process",
+					},
+					reasonCode: 2,
+					baselineRssKiB: 0,
+					peakRssKiB: null,
+					terminalRssKiB: null,
+					finalRssKiB: null,
+					allocatedBytes: 0,
+					completed: 0,
+					failed: fanout,
+					timedOut: false,
+					samples,
+				});
+				return;
+			}
+
 			const reaped = await reapOwnGroup(ownership);
-			const finalRecords = ownership ? await groupSnapshot(ownership.pgid) : [];
+			const finalRecords = await groupSnapshot(ownership.pgid);
 			samples.push(sample("final", finalRecords));
-			const status = requested === "complete" && (!reaped || cadenceFailed) ? "failed" : requested;
+			const emptyOwnedGroup = reaped && finalRecords.length === 0;
+			const status =
+				requested === "complete" && emptyOwnedGroup && !cadenceFailed
+					? "complete"
+					: requested === "timed_out" && emptyOwnedGroup && !cadenceFailed
+						? "timed_out"
+						: "failed";
 			const byPhase = (phase: Phase) => samples.filter((entry) => entry.phase === phase).at(-1)?.totalRssKiB ?? null;
 			const active = samples.filter((entry) => entry.phase !== "baseline" && entry.phase !== "final");
 			resolve({
@@ -430,23 +503,9 @@ async function runCell(
 			void settle("failed");
 			return;
 		}
-		void procRecord(pid).then((leader) => {
-			if (!leader || leader.pgid !== pid || stopped) {
-				void settle("failed");
-				return;
-			}
-			ownership = { pgid: leader.pgid, leader, members: new Map([[leader.pid, leader]]) };
-			void enqueue("started");
-			timer = setInterval(() => {
-				if (!stopped) void enqueue("started");
-			}, settings.requestedPeriodMs);
-		});
-		timeout = setTimeout(() => {
-			timedOut = true;
-			void settle("timed_out");
-		}, settings.timeoutMs);
 		child.once("error", () => void settle("failed"));
 		child.on("message", (message: WorkerMessage) => {
+			if (message.type === "boundary") startExecution();
 			if (message.type === "result") {
 				completed = message.completed;
 				failed = message.failed;
@@ -460,6 +519,24 @@ async function runCell(
 			"exit",
 			(code, signal) => void settle(code === 0 && signal === null && completed === fanout ? "complete" : "failed"),
 		);
+		void (async () => {
+			if (settings.identityCaptureDelayMs) await pause(settings.identityCaptureDelayMs);
+			const leader = await procRecord(pid);
+			if (!leader || leader.pgid !== pid || stopped) {
+				void settle("failed");
+				return;
+			}
+			ownership = { pgid: leader.pgid, leader, members: new Map([[leader.pid, leader]]) };
+			// The worker remains gated until this release. Its first boundary proves
+			// execution began, at which point startExecution arms the timeout.
+			try {
+				child?.send({ type: "release" }, (error) => {
+					if (error && !stopped) void settle("failed");
+				});
+			} catch {
+				void settle("failed");
+			}
+		})();
 	});
 }
 

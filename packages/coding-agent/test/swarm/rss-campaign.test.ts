@@ -86,6 +86,45 @@ describe("B00B RSS campaign", () => {
 		},
 	);
 
+	it.skipIf(process.platform !== "linux")(
+		"does not arm timeout or release descendants before exact ownership capture",
+		async () => {
+			const root = await directory("delayed-ownership");
+			const output = join(root, "output");
+			const pidFile = join(root, "fixture.pid");
+			const fixture = join(root, "ignore-term.cjs");
+			await writeFile(
+				fixture,
+				"require('fs').writeFileSync(process.argv[2],String(process.pid));process.on('SIGTERM',()=>{});setInterval(()=>{},1000);",
+				{ mode: 0o700 },
+			);
+			await campaign(output, [
+				"--fanout",
+				"1",
+				"--repetitions",
+				"1",
+				"--timeout-ms",
+				"1",
+				"--test-identity-capture-delay-ms",
+				"25",
+				"--test-ignore-term",
+				"--fixture-command",
+				process.execPath,
+				"--fixture-arg",
+				fixture,
+				"--fixture-arg",
+				pidFile,
+			]);
+			const pid = Number(await readFile(pidFile, "utf8"));
+			const result = await run(output, 1, 1);
+			expect(result.status).toBe("timed_out");
+			expect(result.timedOut).toBe(true);
+			expect(result.finalRssKiB).toBe(0);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(() => process.kill(pid, 0)).toThrow();
+		},
+	);
+
 	it("validates unchanged sample timestamps at the 50 ms max-gap contract", () => {
 		expect(validateRssSampleCadence([0, 50, 100]).valid).toBe(true);
 		expect(validateRssSampleCadence([0, 25, 76])).toEqual({ maxObservedGapMs: 51, valid: false });
