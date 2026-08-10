@@ -1737,16 +1737,38 @@ describe("daemon mode helpers", () => {
 				createAgentMessageController(
 					getCurrentState: () => ActiveSessionState | undefined,
 				): AgentSessionMessageController;
+				listPassiveRlmSubagents(): Promise<Array<{ entry: { childId: string } }>>;
 			};
 			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const messages = internals.createAgentMessageController(() => parent);
 			await expect(
-				internals
-					.createAgentMessageController(() => parent)
-					.sendAgentMessage({ target: "renamed-worker", message: "must not hydrate unavailable policy child" }),
+				messages.sendAgentMessage({
+					target: "renamed-worker",
+					message: "must not hydrate unavailable policy child",
+				}),
 			).rejects.toThrow("persisted policy swarm assignment model is unavailable in the authenticated catalog");
+			// Quarantine is a durable, exact-assignment tombstone: the first failed
+			// explicit hydrate created no child runtime and cannot remain selectable.
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
+			expect(
+				(await internals.listPassiveRlmSubagents()).filter(({ entry }) => entry.childId === fixture.childId),
+			).toEqual([]);
+			const rows = readFileSync(registryPath, "utf8")
+				.trim()
+				.split(/\r?\n/)
+				.map((line) => JSON.parse(line) as { assignmentId?: string; status: string });
+			expect(rows.at(-1)).toMatchObject({ assignmentId: row.assignmentId, status: "deleted" });
+			expect(fixture.modelRegistry.find).toHaveBeenCalledTimes(1);
 			expect(fixture.modelRegistry.find).toHaveBeenCalledWith("test", "scripted");
+			expect(fixture.modelRegistry.canUseModel).toHaveBeenCalledTimes(1);
 			expect(fixture.modelRegistry.canUseModel).toHaveBeenCalledWith(fixture.policyModel);
+			await expect(
+				messages.sendAgentMessage({ target: "renamed-worker", message: "must not retry quarantined policy child" }),
+			).rejects.toThrow();
+			// The second lookup stays in the passive catalog, which no longer contains
+			// the tombstoned assignment, so it cannot query the model registry again.
+			expect(fixture.modelRegistry.find).toHaveBeenCalledTimes(1);
+			expect(fixture.modelRegistry.canUseModel).toHaveBeenCalledTimes(1);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

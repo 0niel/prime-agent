@@ -3189,10 +3189,22 @@ export class AgentDaemon {
 					throw new Error("persisted policy swarm assignment model does not match registry model");
 				}
 				const resolved = modelRegistry.find(provider!, modelId!);
-				if (!resolved || !(await modelRegistry.canUseModel(resolved))) {
+				let available = false;
+				try {
+					available = resolved !== undefined && (await modelRegistry.canUseModel(resolved));
+				} catch {
+					// Authorization checks can fail rather than return false. A valid persisted
+					// policy assignment that cannot be authorized is just as unsafe to retry.
+					available = false;
+				}
+				if (!available) {
+					// Tombstone precisely this immutable assignment. The append-only registry
+					// reader will then omit it from every passive catalog traversal, while
+					// rows for legacy incarnations and other assignments remain untouched.
+					await this.recordRlmSubagentDeletion(parentState, entry.childId, entry.assignmentId!);
 					throw new Error("persisted policy swarm assignment model is unavailable in the authenticated catalog");
 				}
-				rehydratedModel = resolved;
+				rehydratedModel = resolved!;
 			} else if (entry.model) {
 				// Assignment-less registry rows predate policy authority and retain
 				// their historical best-effort registry model restoration behavior.
