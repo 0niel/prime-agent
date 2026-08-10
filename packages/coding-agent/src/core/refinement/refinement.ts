@@ -1,13 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
 	existsSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	renameSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
+	fsyncSync,
+	closeSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -58,6 +61,7 @@ export interface HarnessRefinementEvent {
 
 export interface HarnessState {
 	schema: number;
+	generation: number;
 	entries: Record<RefinementKind, Record<string, HarnessEntry>>;
 	refinements: HarnessRefinementEvent[];
 }
@@ -210,7 +214,8 @@ function now(): string {
 
 function emptyHarnessState(): HarnessState {
 	return {
-		schema: 1,
+		schema: 2,
+		generation: 0,
 		entries: {
 			prompt: {},
 			memory: {},
@@ -278,50 +283,124 @@ export function getHarnessStatePath(harnessStateDir: string = getGlobalHarnessSt
 	return join(harnessStateDir, "harness_state.json");
 }
 
-export function loadHarnessState(
-	harnessStateDir: string = getGlobalHarnessStateDir(),
-	scope: HarnessScope = "global",
-): HarnessState {
-	const statePath = getHarnessStatePath(harnessStateDir);
-	if (!existsSync(statePath)) {
-		return emptyHarnessState();
+export interface HarnessSnapshot {
+	generation: number;
+	sha256: string;
+}
+
+export class HarnessGenerationConflict extends Error {
+	constructor(public readonly expected: HarnessSnapshot, public readonly actual: HarnessSnapshot) {
+		super("harness state changed while this operation was in progress");
 	}
-	let parsed: Partial<HarnessState>;
-	try {
-		const raw = JSON.parse(readFileSync(statePath, "utf8"));
-		// loadHarnessState runs on every system-prompt build and before each /refine, so
-		// a corrupt or unreadable (or non-object) state file must degrade to empty rather
-		// than throw and break the session. The next saveHarnessState rewrites it cleanly.
-		if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-			return emptyHarnessState();
-		}
-		parsed = raw as Partial<HarnessState>;
-	} catch {
-		return emptyHarnessState();
+}
+export class HarnessLockBusy extends Error {}
+export class HarnessAtomicWriteUnsupported extends Error {}
+export class HarnessRecoveryRequired extends Error {}
+
+function canonicalize(value: unknown): unknown {
+	if (typeof value === "string") return value.normalize("NFC");
+	if (Array.isArray(value)) return value.map(canonicalize);
+	if (value && typeof value === "object") {
+		const result: Record<string, unknown> = {};
+		for (const key of Object.keys(value as Record<string, unknown>).sort()) result[key.normalize("NFC")] = canonicalize((value as Record<string, unknown>)[key]);
+		return result;
 	}
-	const state = emptyHarnessState();
-	state.schema = typeof parsed.schema === "number" ? parsed.schema : 1;
+	if (typeof value === "number" && (!Number.isSafeInteger(value) || Object.is(value, -0))) throw new Error("invalid numeric value");
+	if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+	throw new Error("invalid JSON value");
+}
+function canonicalBytes(state: HarnessState): Buffer {
+	return Buffer.from(`${JSON.stringify(canonicalize(state))}\n`, "utf8");
+}
+function snapshotFor(state: HarnessState): HarnessSnapshot {
+	const bytes = canonicalBytes(state);
+	return { generation: state.generation, sha256: createHash("sha256").update(bytes).digest("hex") };
+}
+function validV2(state: unknown): state is HarnessState {
+	if (!state || typeof state !== "object" || Array.isArray(state)) return false;
+	const record = state as Record<string, unknown>;
+	if (Object.keys(record).sort().join(",") !== "entries,generation,refinements,schema" || record.schema !== 2 || !Number.isSafeInteger(record.generation) || (record.generation as number) < 0 || !record.entries || typeof record.entries !== "object" || Array.isArray(record.entries) || !Array.isArray(record.refinements)) return false;
+	const entries = record.entries as Record<string, unknown>;
+	return Object.keys(entries).sort().join(",") === "memory,prompt,skill,subagent" && Object.values(entries).every((x) => x && typeof x === "object" && !Array.isArray(x));
+}
+function legacyState(raw: unknown, scope: HarnessScope): HarnessState | undefined {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw) || ((raw as { schema?: unknown }).schema !== undefined && (raw as { schema?: unknown }).schema !== 1)) return undefined;
+	const legacy = raw as Partial<HarnessState>; const state = emptyHarnessState(); state.schema = 1; state.generation = 0;
 	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
-		const records = parsed.entries?.[kind];
-		if (records && typeof records === "object") {
-			for (const [id, rawEntry] of Object.entries(records)) {
-				const entry = objectRecord(rawEntry);
-				if (!entry) continue;
-				state.entries[kind][id] = {
-					...(entry as unknown as HarnessEntry),
-					scope: normalizeHarnessScope(entry.scope, scope),
-					reference: objectRecord(entry.reference) ?? {},
-					arguments: objectRecord(entry.arguments) ?? {},
-					metadata: objectRecord(entry.metadata) ?? {},
-				};
-			}
+		const records = legacy.entries?.[kind];
+		if (records && typeof records === "object") for (const [id, entry] of Object.entries(records)) {
+			const value = objectRecord(entry); if (!value || typeof value.title !== "string" || typeof value.content !== "string") continue;
+			state.entries[kind][id] = { id, kind, title: value.title, content: value.content, path: typeof value.path === "string" ? value.path : "general", scope: normalizeHarnessScope(value.scope, scope), reference: objectRecord(value.reference) ?? {}, arguments: objectRecord(value.arguments) ?? {}, metadata: objectRecord(value.metadata) ?? {}, source: typeof value.source === "string" ? value.source : "agent", created_at: typeof value.created_at === "string" ? value.created_at : now(), updated_at: typeof value.updated_at === "string" ? value.updated_at : now(), version: typeof value.version === "number" && Number.isSafeInteger(value.version) && value.version > 0 ? value.version : 1 };
 		}
 	}
-	if (Array.isArray(parsed.refinements)) {
-		state.refinements = parsed.refinements;
-	}
+	state.refinements = Array.isArray(legacy.refinements) ? legacy.refinements as HarnessRefinementEvent[] : [];
 	return state;
 }
+function readState(path: string, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot; legacy: boolean } {
+	if (!existsSync(path)) { const state = emptyHarnessState(); return { state, snapshot: snapshotFor(state), legacy: false }; }
+	const bytes = readFileSync(path); let raw: unknown;
+	try { raw = JSON.parse(bytes.toString("utf8")); } catch { throw new HarnessRecoveryRequired("invalid harness state requires recovery"); }
+	if (validV2(raw)) { const state = raw; if (!bytes.equals(canonicalBytes(state))) throw new HarnessRecoveryRequired("noncanonical harness state requires recovery"); return { state, snapshot: snapshotFor(state), legacy: false }; }
+	const legacy = legacyState(raw, scope); if (legacy) return { state: legacy, snapshot: { generation: 0, sha256: createHash("sha256").update(bytes).digest("hex") }, legacy: true };
+	throw new HarnessRecoveryRequired("invalid harness state requires recovery");
+}
+
+function recoverState(path: string, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot } {
+	try { return readState(path, scope); } catch (error) {
+		if (!existsSync(path)) throw error;
+		const raw = readFileSync(path); const dir = join(path, "..");
+		const recovery = join(dir, `harness_state.corrupt.${Date.now()}.${randomUUID()}.${error instanceof HarnessRecoveryRequired && raw.toString("utf8").includes("�") ? "bin" : "json"}`);
+		try { writeFileSync(recovery, raw, { mode: 0o600 }); const fd = openSync(recovery, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } } catch { throw new HarnessRecoveryRequired("unable to preserve corrupt harness state"); }
+		const state = emptyHarnessState(); state.generation = 1; const bytes = canonicalBytes(state); const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+		try { const fd = openSync(temp, "wx", 0o600); try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); } renameSync(temp, path); return { state, snapshot: snapshotFor(state) }; }
+		finally { if (existsSync(temp)) unlinkSync(temp); }
+	}
+}
+
+/** Read canonical v2 state (or the one legacy schema-1 compatibility input). */
+export function loadHarnessState(harnessStateDir: string = getGlobalHarnessStateDir(), scope: HarnessScope = "global"): HarnessState {
+	return recoverState(getHarnessStatePath(harnessStateDir), scope).state;
+}
+
+function withHarnessLease<T>(path: string, operation: () => T): T {
+	const lock = `${path}.lock`;
+	const nonce = randomUUID();
+	const deadline = Date.now() + 2_000;
+	while (true) {
+		try {
+			const fd = openSync(lock, "wx", 0o600);
+			try { writeFileSync(fd, JSON.stringify({ nonce, pid: process.pid, created_at: now() })); fsyncSync(fd); } finally { closeSync(fd); }
+			break;
+		} catch (error) {
+			if (Date.now() >= deadline) throw new HarnessLockBusy("harness state lease is busy");
+			// The portable cross-runtime protocol never steals an owner whose liveness
+			// cannot be proven. Yielding here is strictly per-state-file persistence.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+		}
+	}
+	try { return operation(); }
+	finally {
+		try { if (readFileSync(lock, "utf8").includes(nonce)) unlinkSync(lock); } catch { /* leave unowned evidence */ }
+	}
+}
+
+export function saveHarnessState(harnessStateDir: string, state: HarnessState, expected?: HarnessSnapshot): string {
+	const path = getHarnessStatePath(harnessStateDir);
+	return withHarnessLease(path, () => {
+	mkdirSync(harnessStateDir, { recursive: true, mode: 0o700 });
+	const actual = recoverState(path, "global").snapshot; const baseline = expected ?? actual;
+	if (actual.generation !== baseline.generation || actual.sha256 !== baseline.sha256) throw new HarnessGenerationConflict(baseline, actual);
+	const candidate = { ...state, schema: 2, generation: actual.generation + 1 }; const bytes = canonicalBytes(candidate); const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		const fd = openSync(temp, "wx", 0o600); try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+		renameSync(temp, path);
+		try { const dirFd = openSync(harnessStateDir, "r"); try { fsyncSync(dirFd); } finally { closeSync(dirFd); } } catch { /* unsupported directory fsync is platform-qualified */ }
+		const verified = readState(path, "global"); if (!Buffer.from(verified.snapshot.sha256).equals(Buffer.from(snapshotFor(candidate).sha256))) throw new HarnessAtomicWriteUnsupported("post-rename verification failed");
+		state.schema = 2; state.generation = candidate.generation; return path;
+	} catch (error) { if (error instanceof HarnessGenerationConflict || error instanceof HarnessAtomicWriteUnsupported) throw error; throw new HarnessAtomicWriteUnsupported("atomic harness-state write unavailable");
+	} finally { if (existsSync(temp)) unlinkSync(temp); }
+
+	});}
 
 export function mergeHarnessStates(globalState: HarnessState, localState?: HarnessState): HarnessState {
 	const merged = emptyHarnessState();
@@ -342,21 +421,6 @@ export function mergeHarnessStates(globalState: HarnessState, localState?: Harne
 	return merged;
 }
 
-export function saveHarnessState(harnessStateDir: string, state: HarnessState): string {
-	const statePath = getHarnessStatePath(harnessStateDir);
-	const tempPath = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
-	mkdirSync(harnessStateDir, { recursive: true });
-	try {
-		const mode = existsSync(statePath) ? statSync(statePath).mode & 0o777 : 0o600;
-		writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode });
-		renameSync(tempPath, statePath);
-	} finally {
-		if (existsSync(tempPath)) {
-			unlinkSync(tempPath);
-		}
-	}
-	return statePath;
-}
 
 export function getRefinementHistoryPath(harnessStateDir: string = getGlobalHarnessStateDir()): string {
 	return join(harnessStateDir, REFINEMENT_HISTORY_FILE_NAME);

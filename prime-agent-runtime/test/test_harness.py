@@ -10,7 +10,7 @@ from pathlib import Path
 
 from rlm import harness as package_harness
 from rlm import rlm as callable_rlm
-from rlm.harness import HarnessState, get_harness_state
+from rlm.harness import HarnessEntry, HarnessState, get_harness_state
 
 PYTHON_REFERENCE = {
     "type": "python",
@@ -929,6 +929,47 @@ class HarnessStateTest(unittest.TestCase):
                 state.delete("tool", "tool")
             with self.assertRaisesRegex(ValueError, "unknown harness kind"):
                 state.list("tool")
+
+    def test_schema2_cas_is_digest_fenced_and_atomic(self) -> None:
+        from rlm.harness import HarnessGenerationConflict
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "harness_state.json"
+            first = HarnessState(path)
+            second = HarnessState(path)
+            first.create_memory("First", "winner", id="first")
+            # Raw save is deliberately CAS-fenced even if mtimes are equal. CRUD
+            # may refresh before an operation for legacy source compatibility.
+            candidate = second._candidate()
+            candidate.entries["memory"]["second"] = HarnessEntry(
+                id="second", kind="memory", title="Second", content="loser", scope="local"
+            )
+            with self.assertRaises(HarnessGenerationConflict):
+                candidate.save(expected=second._snapshot)
+            self.assertIsNone(second.entries["memory"].get("second"))
+            loaded = HarnessState(path)
+            self.assertEqual(loaded.snapshot().generation, 1)
+            self.assertEqual(loaded.get("memory", "first").content, "winner")
+            self.assertIsNone(loaded.get("memory", "second"))
+            self.assertFalse((Path(f"{path}.lock")).exists())
+            self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+            raw = path.read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertEqual(json.loads(raw)["schema"], 2)
+
+    def test_corruption_is_preserved_before_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "harness_state.json"
+            damaged = b'{"schema":2,'
+            path.write_bytes(damaged)
+            recovered = HarnessState(path)
+            self.assertTrue(recovered.recovered)
+            self.assertEqual(recovered.recovery, "invalid_json")
+            copies = list(path.parent.glob("harness_state.corrupt.*.json"))
+            self.assertEqual(len(copies), 1)
+            self.assertEqual(copies[0].read_bytes(), damaged)
+            self.assertEqual(json.loads(path.read_bytes())["generation"], 1)
+            recovered.create_memory("after", "recovery", id="after")
+            self.assertEqual(HarnessState(path).get("memory", "after").content, "recovery")
 
 
 if __name__ == "__main__":
