@@ -263,7 +263,8 @@ def _validate_json(value: Any) -> None:
 
 
 def _nfc_text(value: Any) -> bool:
-    return isinstance(value, str) and value == unicodedata.normalize("NFC", value)
+    return (isinstance(value, str) and value == unicodedata.normalize("NFC", value)
+            and not any(0xD800 <= ord(ch) <= 0xDFFF for ch in value))
 
 
 def _validate_v2(data: Any, scope: HarnessScope) -> None:
@@ -274,14 +275,16 @@ def _validate_v2(data: Any, scope: HarnessScope) -> None:
     entries = data["entries"]
     if not _plain_object(entries) or set(entries) != set(_KINDS) or not isinstance(data["refinements"], list):
         raise ValueError("invalid_shape")
+    seen_ids: set[str] = set()
     seen_events: set[str] = set()
     for kind in _KINDS:
         records = entries[kind]
         if not _plain_object(records):
             raise ValueError("invalid_shape")
         for entry_id, entry in records.items():
-            if not isinstance(entry_id, str) or not _plain_object(entry):
-                raise ValueError("invalid_shape")
+            if not _nfc_text(entry_id) or not entry_id or entry_id in seen_ids or not _plain_object(entry):
+                raise ValueError("invalid_entry")
+            seen_ids.add(entry_id)
             required = {"id", "kind", "title", "content", "path", "scope", "reference", "arguments", "metadata", "source", "created_at", "updated_at", "version"}
             if set(entry) != required or entry.get("id") != entry_id or entry.get("kind") != kind:
                 raise ValueError("invalid_shape")
@@ -300,7 +303,7 @@ def _validate_v2(data: Any, scope: HarnessScope) -> None:
     for event in data["refinements"]:
         if not _plain_object(event) or set(event) != {"id", "trigger", "changes", "evidence", "outcome", "created_at"}:
             raise ValueError("invalid_shape")
-        if any(not _nfc_text(event[field]) for field in ("id", "trigger", "evidence", "outcome", "created_at")) or not _RFC3339_MILLIS_Z.fullmatch(event["created_at"]) or not isinstance(event["changes"], list) or not all(_nfc_text(x) for x in event["changes"]) or event["id"] in seen_events:
+        if not event["id"] or any(not _nfc_text(event[field]) for field in ("id", "trigger", "evidence", "outcome", "created_at")) or not _RFC3339_MILLIS_Z.fullmatch(event["created_at"]) or not isinstance(event["changes"], list) or not all(_nfc_text(x) for x in event["changes"]) or event["id"] in seen_events:
             raise ValueError("invalid_shape")
         seen_events.add(event["id"])
 
@@ -333,8 +336,9 @@ def _legacy_data(raw: bytes, scope: HarnessScope) -> dict[str, Any]:
         raise ValueError("invalid_utf8") from exc
     except ValueError as exc:
         raise ValueError("invalid_json") from exc
-    if not isinstance(data, dict) or data.get("schema", 1) != 1:
-        raise ValueError("unsupported_schema" if isinstance(data, dict) and isinstance(data.get("schema"), int) and data["schema"] > 2 else "invalid_shape")
+    schema = data.get("schema", 1) if isinstance(data, dict) else None
+    if not isinstance(data, dict) or isinstance(schema, bool) or not isinstance(schema, int) or schema != 1:
+        raise ValueError("unsupported_schema" if isinstance(data, dict) and isinstance(schema, int) and not isinstance(schema, bool) and schema > 2 else "invalid_shape")
     entries = {kind: {} for kind in _KINDS}
     for kind in _KINDS:
         records = data.get("entries", {}).get(kind, {}) if isinstance(data.get("entries"), dict) else {}
@@ -343,13 +347,15 @@ def _legacy_data(raw: bytes, scope: HarnessScope) -> dict[str, Any]:
         for entry_id, raw_entry in records.items():
             if not isinstance(raw_entry, dict) or not isinstance(raw_entry.get("title"), str) or not isinstance(raw_entry.get("content"), str):
                 continue
-            entries[kind][str(entry_id)] = {"id": str(entry_id), "kind": kind, "title": raw_entry["title"], "content": raw_entry["content"], "path": raw_entry.get("path") if isinstance(raw_entry.get("path"), str) else "general", "scope": raw_entry.get("scope") if raw_entry.get("scope") in ("local", "global") else scope, "reference": raw_entry.get("reference") if isinstance(raw_entry.get("reference"), dict) else {}, "arguments": raw_entry.get("arguments") if isinstance(raw_entry.get("arguments"), dict) else {}, "metadata": raw_entry.get("metadata") if isinstance(raw_entry.get("metadata"), dict) else {}, "source": raw_entry.get("source") if isinstance(raw_entry.get("source"), str) else "agent", "created_at": raw_entry.get("created_at") if isinstance(raw_entry.get("created_at"), str) else _now(), "updated_at": raw_entry.get("updated_at") if isinstance(raw_entry.get("updated_at"), str) else _now(), "version": int(raw_entry.get("version", 1)) if str(raw_entry.get("version", 1)).lstrip("-").isdigit() else 1}
+            entries[kind][str(entry_id)] = {"id": str(entry_id), "kind": kind, "title": raw_entry["title"], "content": raw_entry["content"], "path": raw_entry.get("path") if isinstance(raw_entry.get("path"), str) else "general", "scope": raw_entry.get("scope") if raw_entry.get("scope") in ("local", "global") else scope, "reference": raw_entry.get("reference") if isinstance(raw_entry.get("reference"), dict) else {}, "arguments": raw_entry.get("arguments") if isinstance(raw_entry.get("arguments"), dict) else {}, "metadata": raw_entry.get("metadata") if isinstance(raw_entry.get("metadata"), dict) else {}, "source": raw_entry.get("source") if isinstance(raw_entry.get("source"), str) else "agent", "created_at": raw_entry.get("created_at") if isinstance(raw_entry.get("created_at"), str) else _now(), "updated_at": raw_entry.get("updated_at") if isinstance(raw_entry.get("updated_at"), str) else _now(), "version": int(raw_entry.get("version", 1)) if isinstance(raw_entry.get("version", 1), (int, str)) and str(raw_entry.get("version", 1)).isdigit() and _safe_integer(int(raw_entry.get("version", 1)), positive=True) else 1}
     refinements = []
     for event in data.get("refinements", []) if isinstance(data.get("refinements"), list) else []:
         if isinstance(event, dict) and isinstance(event.get("id"), str) and isinstance(event.get("trigger"), str):
             changes = event.get("changes")
-            if isinstance(changes, str): changes = [changes]
-            if isinstance(changes, list): refinements.append({"id": event["id"], "trigger": event["trigger"], "changes": [str(x) for x in changes], "evidence": event.get("evidence") if isinstance(event.get("evidence"), str) else "", "outcome": event.get("outcome") if isinstance(event.get("outcome"), str) else "", "created_at": event.get("created_at") if isinstance(event.get("created_at"), str) else _now()})
+            if isinstance(changes, str):
+                changes = [changes]
+            if isinstance(changes, list):
+                refinements.append({"id": event["id"], "trigger": event["trigger"], "changes": [str(change) for change in changes], "evidence": event.get("evidence") if isinstance(event.get("evidence"), str) else "", "outcome": event.get("outcome") if isinstance(event.get("outcome"), str) else "", "created_at": event.get("created_at") if isinstance(event.get("created_at"), str) else _now()})
     return {"schema": 1, "entries": entries, "refinements": refinements}
 
 
@@ -379,7 +385,12 @@ def _lock_owner(raw: bytes) -> dict[str, Any] | None:
         return None
     if not isinstance(value["nonce"], str) or len(value["nonce"]) != 32 or any(ch not in "0123456789abcdef" for ch in value["nonce"]):
         return None
-    if not _safe_integer(value["pid"], positive=True) or not isinstance(value["process_start"], str) or not value["process_start"] or not isinstance(value["created_at"], str):
+    if (not _safe_integer(value["pid"], positive=True) or not _nfc_text(value["process_start"]) or not value["process_start"]
+            or not _nfc_text(value["created_at"]) or not _RFC3339_MILLIS_Z.fullmatch(value["created_at"])):
+        return None
+    # Lock records are a wire protocol, not merely equivalent JSON. Reject
+    # duplicate, reordered, or whitespace-padded owners before stale-lock logic.
+    if raw != _canonical_lock_bytes(value):
         return None
     return value
 
@@ -461,8 +472,8 @@ class _Lease:
 
 
 def _canonical_lock_bytes(owner: dict[str, Any]) -> bytes:
-    # Same parsed wire fields and compact UTF-8 representation as Node.
-    return json.dumps(owner, ensure_ascii=False, separators=(",", ":"), sort_keys=False).encode("utf-8") + b"\n"
+    # Fixed field order is part of the shared Node/Python lock wire protocol.
+    return json.dumps({"nonce": owner["nonce"], "pid": owner["pid"], "process_start": owner["process_start"], "created_at": owner["created_at"]}, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
 def _write_all(fd: int, raw: bytes) -> None:
@@ -559,13 +570,15 @@ class HarnessState:
                 view = view[written:]
             os.fsync(fd)
             os.close(fd); fd = None
+            if (temp.stat().st_mode & 0o777) != 0o600:
+                raise HarnessAtomicWriteUnsupported("owner-only temp unavailable")
             os.replace(temp, self.file_path)
             self._fsync_directory()
             verified, snapshot = _decode_v2(self.file_path.read_bytes(), self.scope)
-            if verified != data:
+            if verified != data or (self.file_path.stat().st_mode & 0o777) != 0o600:
                 raise HarnessAtomicWriteUnsupported("atomic harness-state verification failed")
             return snapshot
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise HarnessAtomicWriteUnsupported("atomic harness-state write unavailable") from exc
         finally:
             if fd is not None:

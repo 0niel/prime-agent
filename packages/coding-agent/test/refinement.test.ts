@@ -1,4 +1,13 @@
-import { appendFileSync, chmodSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	chmodSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -214,12 +223,14 @@ describe("harness refinement", () => {
 		const state = loadHarnessState(harnessStateDir);
 		seedEntry(state, "memory");
 
-		const statePath = saveHarnessState(harnessStateDir, state);
+		saveHarnessState(harnessStateDir, state);
+		const statePath = getHarnessStatePath(harnessStateDir);
 
 		expect(loadHarnessState(harnessStateDir).entries.memory.memory_entry).toBeDefined();
 		expect(readdirSync(harnessStateDir)).toEqual([statePath.split("/").at(-1)]);
 		chmodSync(statePath, 0o600);
-		saveHarnessState(harnessStateDir, state);
+		// Re-load after the first commit so this second write carries the current CAS fence.
+		saveHarnessState(harnessStateDir, loadHarnessState(harnessStateDir));
 		expect(statSync(statePath).mode & 0o777).toBe(0o600);
 	});
 
@@ -654,7 +665,8 @@ describe("harness refinement", () => {
 			{ id: "refine_1" },
 		);
 
-		const statePath = saveHarnessState(dir, state);
+		saveHarnessState(dir, state);
+		const statePath = getHarnessStatePath(dir);
 		const reloaded = loadHarnessState(dir, "local");
 
 		expect(statePath.endsWith("harness_state.json")).toBe(true);
@@ -1194,6 +1206,43 @@ describe("harness refinement", () => {
 			refineHarness([], state, [], {} as never, "api-key", { rollbackId: "missing_refinement" }),
 		).rejects.toThrow("Refinement missing_refinement not found");
 	});
+	it("rejects duplicate entry ids across kinds during schema-2 load", () => {
+		const dir = makeTempDir();
+		const state = loadHarnessState(dir, "local");
+		seedEntry(state, "memory", "shared");
+		saveHarnessState(dir, state);
+		const path = getHarnessStatePath(dir);
+		const raw = JSON.parse(readFileSync(path, "utf8"));
+		raw.entries.prompt.shared = { ...raw.entries.memory.shared, kind: "prompt" };
+		writeFileSync(path, JSON.stringify(raw), "utf8");
+		const recovered = loadHarnessState(dir, "local");
+		expect(recovered.recovered).toBe(true);
+		expect(recovered.recovery).toBe("invalid_entry");
+	});
+
+	it("migrates the shared normalized legacy fixture on mutation", () => {
+		const dir = makeTempDir();
+		writeFileSync(
+			getHarnessStatePath(dir),
+			readFileSync(new URL("./fixtures/harness-state/legacy-v1-normalized.json", import.meta.url)),
+		);
+		const state = loadHarnessState(dir, "local");
+		expect(state.entries.memory.legacy_nfc.version).toBe(2);
+		expect(state.refinements[0].changes).toEqual(["migration"]);
+		seedEntry(state, "memory", "new");
+		saveHarnessState(dir, state);
+		expect(JSON.parse(readFileSync(getHarnessStatePath(dir), "utf8")).schema).toBe(2);
+	});
+
+	it("fails closed on duplicate-key or noncanonical lock owners", () => {
+		const dir = makeTempDir();
+		const state = loadHarnessState(dir, "local");
+		const path = getHarnessStatePath(dir);
+		const lock = `${path}.lock`;
+		writeFileSync(lock, readFileSync(new URL("./fixtures/harness-state/lock-duplicate-key.json", import.meta.url)));
+		expect(() => saveHarnessState(dir, state)).toThrow(/lease is busy/);
+		rmSync(lock, { force: true });
+	});
 });
 
 describe("global refinement history", () => {
@@ -1432,7 +1481,8 @@ describe("global refinement history", () => {
 			]),
 			{ id: "refine_session_a" },
 		);
-		applied.harnessStatePath = saveHarnessState(dir, sessionAState);
+		saveHarnessState(dir, sessionAState);
+		applied.harnessStatePath = getHarnessStatePath(dir);
 		appendGlobalRefinement(dir, applied);
 
 		// A fresh session loads the global state and the global history (its own session

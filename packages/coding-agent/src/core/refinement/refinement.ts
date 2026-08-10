@@ -408,15 +408,71 @@ function parseV2(raw: Buffer): { state: HarnessState; snapshot: HarnessSnapshot 
 	if (!raw.equals(canonicalBytes(parsed))) throw new Error("noncanonical_v2");
 	return { state: parsed, snapshot: { generation: parsed.generation, sha256: createHash("sha256").update(raw).digest("hex") } };
 }
+function legacyVersion(value: unknown): number {
+	if (safeInteger(value, true)) return value;
+	return typeof value === "string" && /^\d+$/.test(value) && safeInteger(Number(value), true) ? Number(value) : 1;
+}
 function legacyState(raw: Buffer, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot } | undefined {
-	let parsed: any; try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)); } catch { return undefined; }
-	if (!isRecord(parsed) || (parsed.schema !== undefined && parsed.schema !== 1)) return undefined;
-	const state = emptyHarnessState(); state.schema = 1; state.generation = 0;
+	// Schema 1 is deliberately permissive only where both runtimes can perform
+	// the same deterministic migration. Invalid retained values are rejected by
+	// schema-2 validation on the first mutation rather than silently coerced.
+	let parsed: any;
+	try {
+		parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+	} catch {
+		return undefined;
+	}
+	if (
+		!isRecord(parsed) ||
+		(parsed.schema !== undefined &&
+			(typeof parsed.schema !== "number" || !Number.isInteger(parsed.schema) || parsed.schema !== 1))
+	)
+		return undefined;
+	const state = emptyHarnessState();
+	state.schema = 1;
+	state.generation = 0;
 	for (const kind of ["prompt", "memory", "skill", "subagent"] as RefinementKind[]) {
 		const records = isRecord(parsed.entries) && isRecord(parsed.entries[kind]) ? parsed.entries[kind] : {};
-		for (const [id, value] of Object.entries(records)) if (isRecord(value) && typeof value.title === "string" && typeof value.content === "string") state.entries[kind][id] = { id, kind, title: value.title, content: value.content, path: typeof value.path === "string" ? value.path : "general", scope: value.scope === "global" ? "global" : scope, reference: isRecord(value.reference) ? value.reference : {}, arguments: isRecord(value.arguments) ? value.arguments : {}, metadata: isRecord(value.metadata) ? value.metadata : {}, source: typeof value.source === "string" ? value.source : "agent", created_at: typeof value.created_at === "string" ? value.created_at : now(), updated_at: typeof value.updated_at === "string" ? value.updated_at : now(), version: safeInteger(value.version, true) ? value.version : 1 };
+		for (const [id, value] of Object.entries(records))
+			if (isRecord(value) && typeof value.title === "string" && typeof value.content === "string")
+				state.entries[kind][id] = {
+					id,
+					kind,
+					title: value.title,
+					content: value.content,
+					path: typeof value.path === "string" ? value.path : "general",
+					scope: value.scope === "global" || value.scope === "local" ? value.scope : scope,
+					reference: isRecord(value.reference) ? value.reference : {},
+					arguments: isRecord(value.arguments) ? value.arguments : {},
+					metadata: isRecord(value.metadata) ? value.metadata : {},
+					source: typeof value.source === "string" ? value.source : "agent",
+					created_at: typeof value.created_at === "string" ? value.created_at : now(),
+					updated_at: typeof value.updated_at === "string" ? value.updated_at : now(),
+					version: legacyVersion(value.version),
+				};
 	}
-	state.refinements = Array.isArray(parsed.refinements) ? parsed.refinements.filter(isRecord).map((event: any) => ({ id: typeof event.id === "string" ? event.id : randomUUID(), trigger: typeof event.trigger === "string" ? event.trigger : "", changes: Array.isArray(event.changes) ? event.changes.filter((item: unknown): item is string => typeof item === "string") : [], evidence: typeof event.evidence === "string" ? event.evidence : "", outcome: typeof event.outcome === "string" ? event.outcome : "", created_at: typeof event.created_at === "string" ? event.created_at : now() })) : [];
+	state.refinements = Array.isArray(parsed.refinements)
+		? parsed.refinements.filter(isRecord).flatMap((event: any) => {
+				if (typeof event.id !== "string" || typeof event.trigger !== "string") return [];
+				const changes =
+					typeof event.changes === "string"
+						? [event.changes]
+						: Array.isArray(event.changes)
+							? event.changes.map(String)
+							: undefined;
+				if (!changes) return [];
+				return [
+					{
+						id: event.id,
+						trigger: event.trigger,
+						changes,
+						evidence: typeof event.evidence === "string" ? event.evidence : "",
+						outcome: typeof event.outcome === "string" ? event.outcome : "",
+						created_at: typeof event.created_at === "string" ? event.created_at : now(),
+					},
+				];
+			})
+		: [];
 	return { state, snapshot: { generation: 0, sha256: createHash("sha256").update(raw).digest("hex") } };
 }
 function readState(path: string, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot; legacy: boolean } {
@@ -432,8 +488,34 @@ function ensureRoot(dir: string): void {
 	try { mkdirSync(dir, { recursive: true, mode: 0o700 }); const mode = statSync(dir).mode & 0o777; if (mode !== 0o700) { chmodSync(dir, 0o700); if ((statSync(dir).mode & 0o777) !== 0o700) throw new Error("mode"); } } catch (error) { throw new HarnessAtomicWriteUnsupported("owner-only harness root unavailable"); }
 }
 interface LockOwner { nonce: string; pid: number; process_start: string; created_at: string; }
-function parseLock(bytes: Buffer): LockOwner | undefined { try { const raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); return isRecord(raw) && exactKeys(raw, ["nonce", "pid", "process_start", "created_at"]) && nfcString(raw.nonce) && /^[0-9a-f]{32}$/.test(raw.nonce) && safeInteger(raw.pid, true) && nfcString(raw.process_start) && timestamp(raw.created_at) ? raw as LockOwner : undefined; } catch { return undefined; } }
-function lockBytes(owner: LockOwner): Buffer { return Buffer.from(`{"nonce":"${owner.nonce}","pid":${owner.pid},"process_start":${JSON.stringify(owner.process_start)},"created_at":"${owner.created_at}"}\n`, "utf8"); }
+function parseLock(bytes: Buffer): LockOwner | undefined {
+	try {
+		const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+		rejectDuplicateKeys(text);
+		const raw = JSON.parse(text);
+		if (
+			!isRecord(raw) ||
+			!exactKeys(raw, ["nonce", "pid", "process_start", "created_at"]) ||
+			!nfcString(raw.nonce) ||
+			!/^[0-9a-f]{32}$/.test(raw.nonce) ||
+			!safeInteger(raw.pid, true) ||
+			!nfcString(raw.process_start) ||
+			!raw.process_start ||
+			!timestamp(raw.created_at)
+		)
+			return undefined;
+		const owner = raw as LockOwner;
+		return bytes.equals(lockBytes(owner)) ? owner : undefined;
+	} catch {
+		return undefined;
+	}
+}
+function lockBytes(owner: LockOwner): Buffer {
+	return Buffer.from(
+		`{"nonce":"${owner.nonce}","pid":${owner.pid},"process_start":${JSON.stringify(owner.process_start)},"created_at":"${owner.created_at}"}\n`,
+		"utf8",
+	);
+}
 function withHarnessLease<T>(path: string, operation: () => T): T {
 	const lock = `${path}.lock`; const nonce = randomUUID().replaceAll("-", ""); const start = processStart(process.pid); if (!start) throw new HarnessAtomicWriteUnsupported("process-start identity unavailable"); const owner: LockOwner = { nonce, pid: process.pid, process_start: start, created_at: now() }; const deadline = Date.now() + 2_000;
 	while (true) try { const fd = openSync(lock, "wx", 0o600); try { writeFileSync(fd, lockBytes(owner)); fsyncSync(fd); } finally { closeSync(fd); } break; } catch (error: any) {

@@ -974,5 +974,48 @@ class HarnessStateTest(unittest.TestCase):
             self.assertEqual(HarnessState(path).get("memory", "after").content, "recovery")
 
 
+    def test_schema2_rejects_entry_ids_duplicated_across_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(path)
+            state.create_memory("One", "one", id="shared")
+            raw = json.loads(path.read_text())
+            raw["entries"]["prompt"]["shared"] = {**raw["entries"]["memory"]["shared"], "kind": "prompt"}
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            recovered = HarnessState(path)
+            self.assertTrue(recovered.recovered)
+            self.assertEqual(recovered.recovery, "invalid_entry")
+
+    def test_lock_owner_requires_exact_canonical_duplicate_free_wire_bytes(self) -> None:
+        from rlm.harness import _canonical_lock_bytes, _lock_owner
+        owner = {"nonce": "a" * 32, "pid": 1, "process_start": "100", "created_at": "2026-01-01T00:00:00.000Z"}
+        canonical = _canonical_lock_bytes(owner)
+        canonical_fixture = Path(__file__).parent / "fixtures" / "harness_state" / "lock-canonical.json"
+        self.assertEqual(canonical_fixture.read_bytes(), canonical)
+        self.assertEqual(_lock_owner(canonical), owner)
+        duplicate = Path(__file__).parent / "fixtures" / "harness_state" / "lock-duplicate-key.json"
+        self.assertIsNone(_lock_owner(duplicate.read_bytes()))
+        self.assertIsNone(_lock_owner(b'{"pid":1,"nonce":"' + b"a" * 32 + b'","process_start":"100","created_at":"2026-01-01T00:00:00.000Z"}\n'))
+
+    def test_shared_legacy_fixture_migrates_to_canonical_v2(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "harness_state" / "legacy-v1-normalized.json"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "harness_state.json"
+            path.write_bytes(fixture.read_bytes())
+            state = HarnessState(path)
+            self.assertEqual(state.get("memory", "legacy_nfc").version, 2)
+            self.assertEqual(state.refinements[0].changes, ["migration"])
+            state.create_memory("New", "canonical", id="new")
+            self.assertEqual(json.loads(path.read_bytes())["schema"], 2)
+
+    def test_atomic_state_file_is_owner_only_after_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(path)
+            state.create_memory("Private", "state", id="private")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
