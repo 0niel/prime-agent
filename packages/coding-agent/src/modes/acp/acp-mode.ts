@@ -98,6 +98,8 @@ export interface AcpModeOptions {
 	stream?: ReturnType<typeof acp.ndJsonStream>;
 	/** Skip claiming stdout when the caller supplies its own transport. */
 	ownStdout?: boolean;
+	/** Test seam for deterministically gating a serialized outbound update. */
+	beforeAcpUpdatePublish?: (update: Record<string, unknown>) => Promise<void> | void;
 }
 
 interface AcpSessionEntry {
@@ -127,6 +129,7 @@ class AcpUpdateProducer {
 	constructor(
 		private readonly sessionId: string,
 		private readonly client: { notify(method: unknown, params: unknown): Promise<unknown> },
+		private readonly beforePublish?: (update: Record<string, unknown>) => Promise<void> | void,
 	) {}
 
 	beginPrompt(): number {
@@ -146,6 +149,10 @@ class AcpUpdateProducer {
 	sealTerminal(turnId: number): void {
 		this.terminalTurns.add(turnId);
 		this.finishPrompt(turnId);
+	}
+
+	isTerminalSealed(turnId: number): boolean {
+		return this.terminalTurns.has(turnId);
 	}
 
 	turnForEvent(event: AgentConnectionSessionEvent): number {
@@ -191,12 +198,13 @@ class AcpUpdateProducer {
 		};
 		// Keep the chain alive after a disconnect, while preserving the order of
 		// every later notification and allowing callers to await its drain.
-		this.tail = this.tail.then(() =>
-			this.client
+		this.tail = this.tail.then(async () => {
+			await this.beforePublish?.(correlatedUpdate);
+			await this.client
 				.notify(acp.methods.client.session.update, { sessionId: this.sessionId, update: correlatedUpdate })
 				.then(() => undefined)
-				.catch(() => undefined),
-		);
+				.catch(() => undefined);
+		});
 		return this.tail;
 	}
 
@@ -424,7 +432,7 @@ export async function runAcpModeWithConnection(
 				// Install the listener before fetching the snapshot. Child updates can arrive
 				// while the snapshot request is in flight; the connection remains the
 				// authoritative source used when quiescence is emitted below.
-				const producer = new AcpUpdateProducer(sessionId, ctx.client);
+				const producer = new AcpUpdateProducer(sessionId, ctx.client, options.beforeAcpUpdatePublish);
 				const entry: AcpSessionEntry = { id: sessionId, abort: undefined, unsubscribe: undefined, producer };
 				// Subscribe for the session lifetime, not per prompt turn: prime-agent
 				// subagents are fire-and-forget and keep reporting after the spawning turn
@@ -511,7 +519,16 @@ export async function runAcpModeWithConnection(
 					return { stopReason: "cancelled" satisfies AcpStopReason };
 				}
 				const outcome = failure ? "error" : "result";
+				const terminalQuiescence = quiescenceMeta(status, liveSnapshot.children);
+				const terminal =
+					terminalQuiescence.outstandingSubagents === 0 &&
+					terminalQuiescence.remainingAutonomousContinuations === 0;
+				// The zero-terminal completion pair linearizes here, before either
+				// notification is queued. A cancellation before this cut produces no
+				// boundary/terminal; a cancellation after it cannot relabel a durable
+				// response+terminal pair as a cancelled prompt.
 				if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
+				if (terminal) entry.producer.sealTerminal(promptTurnId);
 				await entry.producer.publish(
 					{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
 					promptTurnId,
@@ -519,20 +536,6 @@ export async function runAcpModeWithConnection(
 					outcome,
 				);
 				responseBoundaryEmitted = true;
-				if (abort.signal.aborted) {
-					await entry.producer.drain();
-					return { stopReason: "cancelled" satisfies AcpStopReason };
-				}
-				const terminalQuiescence = quiescenceMeta(status, liveSnapshot.children);
-				const terminal =
-					terminalQuiescence.outstandingSubagents === 0 &&
-					terminalQuiescence.remainingAutonomousContinuations === 0;
-				if (terminal) {
-					// Cut before queuing terminal: callbacks after the cut are turn-zero
-					// events and can never trail this scoreable terminal on its turn.
-					if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
-					entry.producer.sealTerminal(promptTurnId);
-				}
 				await entry.producer.publish(
 					{
 						sessionUpdate: "session_info_update",
@@ -544,9 +547,16 @@ export async function runAcpModeWithConnection(
 				);
 				await entry.producer.drain();
 				if (failure) throw new Error(`prime-agent turn failed: ${failure}`);
-				return { stopReason: acpStopReason({ cancelled: abort.signal.aborted, autonomous: status }) };
+				// A cancellation after the zero-terminal cut cannot relabel the durable
+				// boundary/terminal pair as cancellation.
+				return {
+					stopReason: acpStopReason({
+						cancelled: abort.signal.aborted && !entry.producer.isTerminalSealed(promptTurnId),
+						autonomous: status,
+					}),
+				};
 			} catch (error) {
-				if (abort.signal.aborted) {
+				if (abort.signal.aborted && !entry.producer.isTerminalSealed(promptTurnId)) {
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
 				}

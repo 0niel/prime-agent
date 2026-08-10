@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
@@ -91,7 +93,7 @@ function fakeAcpConnection(
 	};
 }
 
-function connectAcpClient(connection: any): ClientHarness {
+function connectAcpClient(connection: any, options: Record<string, unknown> = {}): ClientHarness {
 	// Two web streams crossed over: agent's stdout is the client's stdin.
 	const toAgent = new TransformStream<Uint8Array, Uint8Array>();
 	const toClient = new TransformStream<Uint8Array, Uint8Array>();
@@ -100,7 +102,7 @@ function connectAcpClient(connection: any): ClientHarness {
 	const clientStream = acp.ndJsonStream(toAgent.writable, toClient.readable);
 
 	const updates: any[] = [];
-	void runAcpModeWithConnection(connection, { stream: agentStream } as any);
+	void runAcpModeWithConnection(connection, { stream: agentStream, ...options } as any);
 
 	const handle = acp
 		.client({ name: "test-client" })
@@ -510,6 +512,118 @@ describe("ACP mode end to end", () => {
 			false,
 		);
 		close();
+	});
+
+	it("linearizes a cancellation during the response-boundary publish as a completed pair", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const enteredBoundary = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const releaseBoundary = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection, {
+			beforeAcpUpdatePublish: async (update: any) => {
+				if (update._meta?.[PRIME_AGENT_META_NAMESPACE]?.phase === "responseBoundary") {
+					entered();
+					await releaseBoundary;
+				}
+			},
+		});
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		const pending = client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "gate boundary" }],
+		});
+		await enteredBoundary;
+		await client.notify("session/cancel", { sessionId: session.sessionId });
+		release();
+		const result = await pending;
+		expect(result.stopReason).not.toBe("cancelled");
+		const meta = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(meta.filter((item) => item.phase === "responseBoundary")).toEqual([
+			expect.objectContaining({ outcome: "result" }),
+		]);
+		expect(meta.filter((item) => item.phase === "terminalQuiescence")).toEqual([
+			expect.objectContaining({
+				outcome: "result",
+				quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 0 },
+			}),
+		]);
+		close();
+	});
+
+	it("linearizes a cancellation during terminal publish as a completed pair", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const enteredTerminal = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const releaseTerminal = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection, {
+			beforeAcpUpdatePublish: async (update: any) => {
+				if (update._meta?.[PRIME_AGENT_META_NAMESPACE]?.phase === "terminalQuiescence") {
+					entered();
+					await releaseTerminal;
+				}
+			},
+		});
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		const pending = client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "gate terminal" }],
+		});
+		await enteredTerminal;
+		await client.notify("session/cancel", { sessionId: session.sessionId });
+		release();
+		const result = await pending;
+		expect(result.stopReason).not.toBe("cancelled");
+		const meta = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(meta.filter((item) => item.phase === "responseBoundary")).toEqual([
+			expect.objectContaining({ outcome: "result" }),
+		]);
+		expect(meta.filter((item) => item.phase === "terminalQuiescence")).toEqual([
+			expect.objectContaining({
+				outcome: "result",
+				quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 0 },
+			}),
+		]);
+		close();
+	});
+
+	it("publishes canonical offline correlation fixtures for the consumer", () => {
+		const fixture = JSON.parse(
+			readFileSync(resolve(import.meta.dirname, "../fixtures/acp-correlation-transcripts.json"), "utf8"),
+		) as { cases: Record<string, Array<Record<string, unknown>>> };
+		for (const [name, records] of Object.entries(fixture.cases)) {
+			for (let index = 1; index < records.length; index++) {
+				expect(records[index].eventSequence, `${name} sequence`).toBeGreaterThan(
+					records[index - 1].eventSequence as number,
+				);
+			}
+		}
+		for (const name of ["success_zero_terminal", "error_zero_terminal", "global_sequence_two_prompts"]) {
+			const records = fixture.cases[name];
+			for (let index = 0; index < records.length; index += 2) {
+				expect(records[index]).toMatchObject({ phase: "responseBoundary" });
+				expect(records[index + 1]).toMatchObject({
+					promptTurnId: records[index].promptTurnId,
+					phase: "terminalQuiescence",
+					outcome: records[index].outcome,
+					quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 0 },
+				});
+			}
+		}
+		expect(fixture.cases.error_incomplete).toHaveLength(1);
+		expect(fixture.cases.cancel.every((record) => record.phase === "event")).toBe(true);
+		expect(fixture.cases.late_child_after_terminal.at(-1)).toMatchObject({ promptTurnId: 0, phase: "event" });
 	});
 
 	it("correlates connection-scoped heartbeats to turn zero", async () => {

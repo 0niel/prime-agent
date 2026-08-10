@@ -1,0 +1,123 @@
+{
+  "schema": "ai.primeintellect.prime-agent/v1",
+  "notes": "Canonical offline producer transcripts. end_turn is deliberately absent: ACP transport stop reasons are never causal.",
+  "cases": {
+    "success_zero_terminal": [
+      {
+        "promptTurnId": 1,
+        "eventSequence": 1,
+        "phase": "responseBoundary",
+        "outcome": "result"
+      },
+      {
+        "promptTurnId": 1,
+        "eventSequence": 2,
+        "phase": "terminalQuiescence",
+        "outcome": "result",
+        "quiescence": {
+          "outstandingSubagents": 0,
+          "remainingAutonomousContinuations": 0
+        }
+      }
+    ],
+    "error_zero_terminal": [
+      {
+        "promptTurnId": 1,
+        "eventSequence": 1,
+        "phase": "responseBoundary",
+        "outcome": "error"
+      },
+      {
+        "promptTurnId": 1,
+        "eventSequence": 2,
+        "phase": "terminalQuiescence",
+        "outcome": "error",
+        "quiescence": {
+          "outstandingSubagents": 0,
+          "remainingAutonomousContinuations": 0
+        }
+      }
+    ],
+    "error_incomplete": [
+      {
+        "promptTurnId": 1,
+        "eventSequence": 1,
+        "phase": "responseBoundary",
+        "outcome": "error"
+      }
+    ],
+    "cancel": [
+      {
+        "promptTurnId": 1,
+        "eventSequence": 1,
+        "phase": "event",
+        "goal": {
+          "status": "active"
+        }
+      }
+    ],
+    "late_child_after_terminal": [
+      {
+        "promptTurnId": 1,
+        "eventSequence": 1,
+        "phase": "responseBoundary",
+        "outcome": "result"
+      },
+      {
+        "promptTurnId": 1,
+        "eventSequence": 2,
+        "phase": "terminalQuiescence",
+        "outcome": "result",
+        "quiescence": {
+          "outstandingSubagents": 0,
+          "remainingAutonomousContinuations": 0
+        }
+      },
+      {
+        "promptTurnId": 0,
+        "eventSequence": 3,
+        "phase": "event",
+        "subagents": [
+          {
+            "id": "child-1",
+            "status": "done"
+          }
+        ]
+      }
+    ],
+    "global_sequence_two_prompts": [
+      {
+        "promptTurnId": 1,
+        "eventSequence": 4,
+        "phase": "responseBoundary",
+        "outcome": "result"
+      },
+      {
+        "promptTurnId": 1,
+        "eventSequence": 5,
+        "phase": "terminalQuiescence",
+        "outcome": "result",
+        "quiescence": {
+          "outstandingSubagents": 0,
+          "remainingAutonomousContinuations": 0
+        }
+      },
+      {
+        "promptTurnId": 2,
+        "eventSequence": 6,
+        "phase": "responseBoundary",
+        "outcome": "error"
+      },
+      {
+        "promptTurnId": 2,
+        "eventSequence": 7,
+        "phase": "terminalQuiescence",
+        "outcome": "error",
+        "quiescence": {
+          "outstandingSubagents": 0,
+          "remainingAutonomousContinuations": 0
+        }
+      }
+    ]
+  }
+}
