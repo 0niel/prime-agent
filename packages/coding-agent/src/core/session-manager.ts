@@ -1,6 +1,7 @@
 import { isUtf8 } from "node:buffer";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
+import { execFileSync } from "child_process";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -15,7 +16,10 @@ import {
 	readFileSync,
 	readSync,
 	realpathSync,
+	renameSync,
+	rmSync,
 	statSync,
+	unlinkSync,
 	writeSync,
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
@@ -44,6 +48,23 @@ const SESSION_STREAMING_LOAD_THRESHOLD_BYTES = 128 * 1024 * 1024;
 const SESSION_ASYNC_PARSE_YIELD_BYTES = 4 * 1024 * 1024;
 const SESSION_TAIL_INSPECTION_MAX_BYTES = 8 * 1024 * 1024;
 const SESSION_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
+const SESSION_LOCK_STALE_MS = 5 * 60_000;
+const SESSION_LOCK_METADATA_GRACE_MS = 1_000;
+const SESSION_LOCK_TRANSITION_STALE_MS = 30_000;
+const SESSION_LOCK_OWNER_PREFIX = "owner-";
+const SESSION_LOCK_OWNER_SUFFIX = ".json";
+let sessionLockReclaimHookForTest: ((owner: { ownerPath: string; generation: string }) => void) | undefined;
+let sessionLockIdentitylessClaimHookForTest: ((lockPath: string) => void) | undefined;
+
+export function setSessionLockReclaimHookForTest(
+	hook: ((owner: { ownerPath: string; generation: string }) => void) | undefined,
+): void {
+	sessionLockReclaimHookForTest = hook;
+}
+
+export function setSessionLockIdentitylessClaimHookForTest(hook: ((lockPath: string) => void) | undefined): void {
+	sessionLockIdentitylessClaimHookForTest = hook;
+}
 
 // Entry types that can represent user intent (vs. daemon bookkeeping like
 // session_state/agent_status/git_state/child_usage_attributed). Used by
@@ -1242,18 +1263,281 @@ function sessionFileRevisionsEqual(a: SessionFileRevision | undefined, b: Sessio
 	return a?.dev === b?.dev && a?.ino === b?.ino && a?.size === b?.size && a?.mtimeMs === b?.mtimeMs;
 }
 
-function acquireSessionFileLock(path: string): () => void {
-	let lastError: unknown;
-	for (let attempt = 0; attempt < 250; attempt++) {
+interface SessionLockOwner {
+	generation: string;
+	pid: number;
+	processStartId?: string;
+	createdAt: number;
+}
+
+function getProcessStartId(pid: number): string | undefined {
+	try {
+		if (process.platform === "linux") {
+			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+			return fields[19]; // field 22 (starttime), after pid and the parenthesized comm field
+		}
+		if (process.platform === "darwin" || process.platform === "freebsd") {
+			const value = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+			}).trim();
+			return value || undefined;
+		}
+		if (process.platform === "win32") {
+			const value = execFileSync(
+				"powershell.exe",
+				[
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					`(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
+				],
+				{ encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+			).trim();
+			return value || undefined;
+		}
+	} catch {
+		return undefined;
+	}
+	return undefined;
+}
+
+let sessionLockProcessStartId: string | undefined;
+let sessionLockProcessStartIdResolved = false;
+
+function getCurrentProcessStartId(): string | undefined {
+	if (!sessionLockProcessStartIdResolved) {
+		sessionLockProcessStartId = getProcessStartId(process.pid);
+		sessionLockProcessStartIdResolved = true;
+	}
+	return sessionLockProcessStartId;
+}
+
+function isProcessDefinitelyDead(owner: SessionLockOwner): boolean {
+	try {
+		process.kill(owner.pid, 0);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH";
+	}
+	if (!owner.processStartId) return false;
+	const actualStartId = getProcessStartId(owner.pid);
+	return actualStartId !== undefined && actualStartId !== owner.processStartId;
+}
+
+function readSessionLockOwner(lockPath: string): { owner: SessionLockOwner; ownerPath: string } | undefined {
+	let names: string[];
+	try {
+		names = readdirSync(lockPath).filter(
+			(name) => name.startsWith(SESSION_LOCK_OWNER_PREFIX) && name.endsWith(SESSION_LOCK_OWNER_SUFFIX),
+		);
+	} catch {
+		return undefined;
+	}
+	if (names.length !== 1) return undefined;
+	const ownerPath = join(lockPath, names[0]!);
+	try {
+		const owner = JSON.parse(readFileSync(ownerPath, "utf8")) as Partial<SessionLockOwner>;
+		if (
+			typeof owner.generation !== "string" ||
+			names[0] !== `${SESSION_LOCK_OWNER_PREFIX}${owner.generation}${SESSION_LOCK_OWNER_SUFFIX}` ||
+			typeof owner.pid !== "number" ||
+			!Number.isSafeInteger(owner.pid) ||
+			owner.pid <= 0 ||
+			typeof owner.createdAt !== "number" ||
+			(owner.processStartId !== undefined && typeof owner.processStartId !== "string")
+		) {
+			return undefined;
+		}
+		return { owner: owner as SessionLockOwner, ownerPath };
+	} catch {
+		return undefined;
+	}
+}
+
+function removeQuarantinedSessionLock(quarantinePath: string): void {
+	try {
+		rmSync(quarantinePath, { recursive: true, force: true });
+	} catch {
+		// The canonical lock is already free; quarantine cleanup is best-effort.
+	}
+}
+
+function tryReclaimDeadSessionFileLock(path: string): boolean {
+	const lockPath = `${path}.lock`;
+	const observed = readSessionLockOwner(lockPath);
+	if (!observed) {
+		let lockStats: ReturnType<typeof statSync>;
 		try {
-			return lockfile.lockSync(path, { realpath: false, stale: 5 * 60_000 });
+			lockStats = statSync(lockPath);
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ENOENT";
+		}
+		const age = Date.now() - lockStats.mtimeMs;
+		if (age < SESSION_LOCK_METADATA_GRACE_MS || age < SESSION_LOCK_STALE_MS) return false;
+
+		// The caller holds the short transition guard, so cooperating acquire,
+		// release, and reclaim paths cannot replace the observed directory here.
+		sessionLockIdentitylessClaimHookForTest?.(lockPath);
+		let currentStats: ReturnType<typeof statSync>;
+		try {
+			currentStats = statSync(lockPath);
+		} catch {
+			return true;
+		}
+		if (currentStats.dev !== lockStats.dev || currentStats.ino !== lockStats.ino) return false;
+		const quarantinePath = `${lockPath}.reclaim-stale-${randomUUID()}`;
+		try {
+			renameSync(lockPath, quarantinePath);
+		} catch {
+			return false;
+		}
+		removeQuarantinedSessionLock(quarantinePath);
+		return true;
+	}
+	if (!isProcessDefinitelyDead(observed.owner)) return false;
+	sessionLockReclaimHookForTest?.({
+		ownerPath: observed.ownerPath,
+		generation: observed.owner.generation,
+	});
+
+	const claimPath = join(lockPath, `reclaim-${observed.owner.generation}.json`);
+	try {
+		// Claim the exact observed generation before touching the lock directory.
+		// If it was released/replaced, this filename no longer exists and the
+		// rename fails rather than quarantining a newer owner.
+		renameSync(observed.ownerPath, claimPath);
+	} catch {
+		return false;
+	}
+	const quarantinePath = `${lockPath}.reclaim-${observed.owner.generation}-${randomUUID()}`;
+	try {
+		renameSync(lockPath, quarantinePath);
+	} catch {
+		try {
+			renameSync(claimPath, observed.ownerPath);
+		} catch {
+			// Keep the failed claim conservative for stale-time recovery.
+		}
+		return false;
+	}
+	removeQuarantinedSessionLock(quarantinePath);
+	return true;
+}
+
+export function tryReclaimDeadSessionFileLockForTest(path: string): boolean {
+	const releaseTransition = acquireSessionLockTransition(path);
+	try {
+		return tryReclaimDeadSessionFileLock(path);
+	} finally {
+		releaseTransition();
+	}
+}
+
+function acquireSessionLockTransition(path: string): () => void {
+	let lastError: unknown;
+	const deadline = Date.now() + SESSION_LOCK_TRANSITION_STALE_MS + 1_000;
+	while (Date.now() <= deadline) {
+		try {
+			return lockfile.lockSync(`${path}.transition-target`, {
+				realpath: false,
+				lockfilePath: `${path}.transition-lock`,
+				stale: SESSION_LOCK_TRANSITION_STALE_MS,
+			});
 		} catch (error) {
 			lastError = error;
 			if ((error as NodeJS.ErrnoException).code !== "ELOCKED") throw error;
 			Atomics.wait(SESSION_LOCK_WAIT, 0, 0, 20);
 		}
 	}
+	throw (lastError as Error) ?? new Error(`Could not coordinate session lock transition: ${path}`);
+}
+
+function acquireSessionFileLock(path: string): () => void {
+	let lastError: unknown;
+	const deadline = Date.now() + SESSION_LOCK_STALE_MS + SESSION_LOCK_METADATA_GRACE_MS + 1_000;
+	while (Date.now() <= deadline) {
+		const releaseTransition = acquireSessionLockTransition(path);
+		let retryImmediately = false;
+		try {
+			const existingOwner = readSessionLockOwner(`${path}.lock`);
+			if (existingOwner) {
+				if (tryReclaimDeadSessionFileLock(path)) {
+					retryImmediately = true;
+				} else {
+					lastError = Object.assign(new Error(`Session file is locked by PID ${existingOwner.owner.pid}`), {
+						code: "ELOCKED",
+					});
+				}
+			} else {
+				try {
+					const releaseLock = lockfile.lockSync(path, { realpath: false, stale: SESSION_LOCK_STALE_MS });
+					const generation = randomUUID();
+					const ownerPath = join(
+						`${path}.lock`,
+						`${SESSION_LOCK_OWNER_PREFIX}${generation}${SESSION_LOCK_OWNER_SUFFIX}`,
+					);
+					let ownerFd: number | undefined;
+					try {
+						ownerFd = openSync(ownerPath, "wx", 0o600);
+						writeSync(
+							ownerFd,
+							JSON.stringify({
+								generation,
+								pid: process.pid,
+								processStartId: getCurrentProcessStartId(),
+								createdAt: Date.now(),
+							} satisfies SessionLockOwner),
+						);
+						fsyncSync(ownerFd);
+						closeSync(ownerFd);
+						ownerFd = undefined;
+					} catch (error) {
+						if (ownerFd !== undefined) closeSync(ownerFd);
+						try {
+							unlinkSync(ownerPath);
+						} catch {
+							// The owner file may not have been created.
+						}
+						releaseLock();
+						throw error;
+					}
+					return () => {
+						const releaseOwnerTransition = acquireSessionLockTransition(path);
+						try {
+							try {
+								unlinkSync(ownerPath);
+							} catch (error) {
+								if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+									throw Object.assign(new Error("Session lock generation was replaced before release"), {
+										code: "ECOMPROMISED",
+									});
+								}
+								throw error;
+							}
+							releaseLock();
+						} finally {
+							releaseOwnerTransition();
+						}
+					};
+				} catch (error) {
+					lastError = error;
+					const code = (error as NodeJS.ErrnoException).code;
+					if (code !== "ELOCKED" && code !== "ENOTEMPTY") throw error;
+					if (tryReclaimDeadSessionFileLock(path)) retryImmediately = true;
+				}
+			}
+		} finally {
+			releaseTransition();
+		}
+		if (retryImmediately) continue;
+		Atomics.wait(SESSION_LOCK_WAIT, 0, 0, 20);
+	}
 	throw (lastError as Error) ?? new Error(`Could not lock session file: ${path}`);
+}
+
+export function acquireSessionFileLockForTest(path: string): () => void {
+	return acquireSessionFileLock(path);
 }
 
 function withSessionFileLockSync<T>(path: string, action: (targetPath: string) => T): T {
