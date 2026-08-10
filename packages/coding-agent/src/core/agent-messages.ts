@@ -300,6 +300,9 @@ function sameAgentFamilyParent(
 }
 
 function isAgentFamilyParent(parent: AgentFamilyCatalogEntry, child: AgentFamilyCatalogEntry): boolean {
+	// A matching persisted parent identifier is necessary but not sufficient: a
+	// malformed depth must not turn a descendant into a directly reachable child.
+	if (child.depth !== parent.depth + 1) return false;
 	return (
 		(child.parentSessionPath !== undefined && child.parentSessionPath === parent.sessionPath) ||
 		(child.parentSessionId !== undefined && child.parentSessionId === parent.id)

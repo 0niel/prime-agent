@@ -292,6 +292,13 @@ describe("agent session bus", () => {
 			status: "idle" as const,
 			parentSessionPath: "/child",
 		};
+		const depthSkippingDescendant = {
+			id: "depth-skipping-descendant",
+			depth: 2,
+			status: "idle" as const,
+			parentSessionId: "root",
+			parentSessionPath: "/root",
+		};
 
 		expect(assertAgentFamilyReach(root, otherRoot)).toBe("sibling");
 		expect(() => assertAgentFamilyReach(root, { id: "orphan", depth: 3, status: "inactive" })).toThrow(
@@ -311,6 +318,9 @@ describe("agent session bus", () => {
 			"Agent reach is limited to parent, siblings, and children",
 		);
 		expect(() => assertAgentFamilyReach(sibling, grandchild)).toThrow(
+			"Agent reach is limited to parent, siblings, and children",
+		);
+		expect(() => assertAgentFamilyReach(root, depthSkippingDescendant)).toThrow(
 			"Agent reach is limited to parent, siblings, and children",
 		);
 	});
