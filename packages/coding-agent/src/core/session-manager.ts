@@ -16,7 +16,7 @@ import {
 	renameSync,
 	rmSync,
 	statSync,
-	writeSync,
+	writeFileSync,
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
@@ -90,12 +90,10 @@ type SessionDurabilityIo = {
 
 const productionSessionDurabilityIo: SessionDurabilityIo = {
 	writeAll(fd, bytes) {
-		let offset = 0;
-		while (offset < bytes.length) {
-			const written = writeSync(fd, bytes, offset, bytes.length - offset);
-			if (written <= 0) throw new Error("Session persistence made no write progress");
-			offset += written;
-		}
+		// writeFileSync(fd, ...) completes the full buffer (unlike one writeSync
+		// call) and preserves the established synchronous fs-failure contract used
+		// by flush callers. The descriptor remains open for the required fsync.
+		writeFileSync(fd, bytes);
 	},
 	fileFsync(fd) {
 		fsyncSync(fd);

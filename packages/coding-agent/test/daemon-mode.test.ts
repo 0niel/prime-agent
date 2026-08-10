@@ -1775,9 +1775,9 @@ describe("daemon mode helpers", () => {
 			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry.childId)).toContain("child-1");
 			expect((await internals.findPassiveRlmSubagent("real-worker"))?.entry.childId).toBe("child-1");
 			const roster = await internals.createAgentMessageController(() => parentState).roster?.();
-			const passiveRosterEntry = roster?.entries.find((entry) => entry.name === "real-worker");
-			expect(passiveRosterEntry).toMatchObject({ relationship: "child", status: "inactive" });
-			expect(passiveRosterEntry).not.toHaveProperty("repliedSinceTask");
+			// A nonresident authoritative C03 record stays in explicit list metadata,
+			// but is deliberately absent from the active family roster.
+			expect(roster?.entries.find((entry) => entry.name === "real-worker")).toBeUndefined();
 			const listed = await internals.buildSessionListWithPassiveRlmSubagents(
 				[parentState],
 				await SessionManager.listAll(undefined, sessionDir),
@@ -6495,10 +6495,21 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("validates a requested passive child name before hydration", async () => {
+	it("defaults a requested passive child name to depth 1 without persisted depth authority", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-name-preflight-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			// Neither registry nor header supplies depth. Do not fabricate nested authority
+			// from the artifact path: passive compatibility uses the depth-1 default.
+			const childLines = readFileSync(fixture.childSessionFile, "utf8").split("\n");
+			const childHeader = JSON.parse(childLines[0] ?? "{}") as Record<string, unknown>;
+			delete childHeader.rlmDepth;
+			childLines[0] = JSON.stringify(childHeader);
+			writeFileSync(fixture.childSessionFile, childLines.join("\n"));
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const registryEntry = JSON.parse(readFileSync(registryPath, "utf8").trim()) as Record<string, unknown>;
+			delete registryEntry.rlmDepth;
+			writeFileSync(registryPath, `${JSON.stringify(registryEntry)}\n`);
 			const internals = fixture.daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
@@ -6524,7 +6535,7 @@ describe("daemon mode helpers", () => {
 			).rejects.toBe(nameError);
 			expect(internals.assertFamilySessionNameAvailable).toHaveBeenCalledWith({
 				name: "sibling",
-				depth: 2,
+				depth: 1,
 				parentSessionId: parentState.runtime.session.sessionId,
 				parentSessionPath: fixture.parentSessionFile,
 				ignoreSessionId: expect.any(String),
@@ -6575,7 +6586,7 @@ describe("daemon mode helpers", () => {
 	});
 
 	it("rehydrates a legacy child with depth inferred from its session file path", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-legacy-rlm-depth-"));
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-c03-no-depth-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
 			const lines = readFileSync(fixture.childSessionFile, "utf8").split("\n");
@@ -6680,7 +6691,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("rehydrates a C03 passive subagent at its persisted depth", async () => {
+	it("defaults a C03 passive subagent to depth 1 without persisted depth authority", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-legacy-rlm-depth-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
@@ -6710,7 +6721,9 @@ describe("daemon mode helpers", () => {
 				.createAgentMessageController(() => parentState)
 				.sendAgentMessage({ target: "renamed-worker", message: "report progress" });
 
-			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions?.rlmDepth).toBe(2);
+			// Both sources deliberately omitted depth, so C03 does not invent depth 2
+			// from its parent/path relationship; compatibility falls back to depth 1.
+			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions?.rlmDepth).toBe(1);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

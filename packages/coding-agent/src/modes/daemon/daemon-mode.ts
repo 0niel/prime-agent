@@ -117,12 +117,7 @@ import {
 } from "../../core/session-action-store.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
-import {
-	readSessionInfo,
-	resolveSessionRlmDepth,
-	type SessionInfo,
-	SessionManager,
-} from "../../core/session-manager.js";
+import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
@@ -932,7 +927,8 @@ export class AgentDaemon {
 	}
 
 	private rlmSubagentRegistryPath(parentSession: AgentSession): string | undefined {
-		const artifactDir = parentSession.sessionManager.getSessionArtifactDir();
+		// Legacy/session-shaped hosts without artifact authority cannot read a durable registry.
+		const artifactDir = parentSession.sessionManager?.getSessionArtifactDir?.();
 		if (!artifactDir) {
 			return undefined;
 		}
@@ -1502,7 +1498,7 @@ export class AgentDaemon {
 				}
 				await this.assertFamilySessionNameAvailable({
 					name: normalizedName,
-					depth: passiveSubagent.info.rlmDepth ?? passiveSubagent.entry.rlmDepth ?? 1,
+					depth: this.passiveRlmSubagentOpenDepth(passiveSubagent),
 					parentSessionId: passiveSubagent.entry.parentSessionId,
 					parentSessionPath:
 						passiveSubagent.entry.parentSessionFile ??
@@ -3445,6 +3441,9 @@ export class AgentDaemon {
 		let runtime: AgentSessionRuntime | undefined;
 		let sessionLease: SessionLease | undefined;
 		try {
+			// Read this before SessionManager compatibility loading can derive and append
+			// a legacy path depth. Only the stored registry/header may establish depth.
+			const persistedDepth = this.persistedRlmSubagentOpenDepth(entry);
 			sessionLease = acquireSessionLease(entry.sessionFile, parentState.runtime.services.agentDir);
 			const sessionManager = await SessionManager.openAsync(entry.sessionFile, entry.sessionDir);
 			const modelRegistry = parentState.runtime.services.modelRegistry;
@@ -3494,14 +3493,9 @@ export class AgentDaemon {
 							},
 						},
 						rlmSessionDir: entry.sessionDir,
-						// Registry depth is authoritative (written at spawn); for legacy entries
-						// without it, the shared accessor resolves persisted header depth or the
-						// session file's sub- path before the depth-1 default.
-						rlmDepth:
-							entry.rlmDepth ??
-							(existsSync(entry.sessionFile)
-								? resolveSessionRlmDepth(sessionManager.getHeader() ?? {}, entry.sessionFile)
-								: 1),
+						// Registry depth is authoritative. If it is absent, only an explicit
+						// persisted header depth can establish nesting; path ancestry is not authority.
+						rlmDepth: persistedDepth,
 						rlmMaxDepth: entry.rlmMaxDepth,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
 					},
@@ -5903,10 +5897,65 @@ export class AgentDaemon {
 		};
 	}
 
+	/**
+	 * A nonresident complete C03 record is a durable passive lifecycle fact, not a
+	 * live family member. It remains in the explicit list/observe projections, but
+	 * cannot reserve a public family name, appear in the active roster, or be woken
+	 * through an agent-family operation. Match the exact catalog row by its durable
+	 * session path plus child identity so legacy rows and resident C03 runtimes keep
+	 * their established behavior.
+	 */
+	private isNonresidentAuthoritativeC03Passive(passive: PassiveRlmSubagent): boolean {
+		return (
+			this.isAuthoritativeC03RegistryEntry(passive.entry) &&
+			this.findSessionBySessionFile(passive.entry.sessionFile) === undefined
+		);
+	}
+
+	private isNonresidentAuthoritativeC03PassiveFamilyEntry(
+		agent: AgentSessionMessageAgentSummary,
+		passiveByPath: ReadonlyMap<string, PassiveRlmSubagent>,
+	): boolean {
+		if (!agent.sessionPath || !agent.rlmChildId) return false;
+		const passive = passiveByPath.get(canonicalSessionPath(agent.sessionPath));
+		return (
+			passive !== undefined &&
+			passive.info.id === agent.sessionId &&
+			passive.entry.childId === agent.rlmChildId &&
+			this.isNonresidentAuthoritativeC03Passive(passive)
+		);
+	}
+
+	/** Use only explicit depth facts when a passive C03 child is about to be re-opened. */
+	private persistedRlmSubagentOpenDepth(entry: PersistedRlmSubagentRegistryEntry): number {
+		if (entry.rlmDepth !== undefined) return entry.rlmDepth;
+		try {
+			const header = JSON.parse(readFileSync(entry.sessionFile, "utf8").split(/\r?\n/, 1)[0] ?? "{}") as {
+				rlmDepth?: unknown;
+			};
+			if (typeof header.rlmDepth === "number" && Number.isSafeInteger(header.rlmDepth) && header.rlmDepth >= 0) {
+				return header.rlmDepth;
+			}
+		} catch {
+			// The subsequent hydration reports file failures; this preflight has no depth authority.
+		}
+		return 1;
+	}
+
+	private passiveRlmSubagentOpenDepth(passive: PassiveRlmSubagent): number {
+		return this.persistedRlmSubagentOpenDepth(passive.entry);
+	}
+
 	private async createAgentFamilyCatalog(currentState?: ActiveSessionState): Promise<AgentFamilyCatalogEntry[]> {
 		const current =
 			currentState ?? [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
 		const listed = current ? await this.createAgentMessageListResult(current) : { agents: [] };
+		const passiveByPath = new Map(
+			(await this.listPassiveRlmSubagents()).map((passive) => [
+				canonicalSessionPath(passive.entry.sessionFile),
+				passive,
+			]),
+		);
 		const remotePeers = new Set(this.remoteAgentPeers.values());
 		// A live C03 deletion immediately closes its public registry row but retains
 		// the cancelled runtime until its exact terminal hand-off is durable. Exclude
@@ -5920,7 +5969,9 @@ export class AgentDaemon {
 				: [],
 		);
 		const visibleLocalAgents = listed.agents.filter((agent) => {
-			if (remotePeers.has(agent)) return false;
+			if (remotePeers.has(agent) || this.isNonresidentAuthoritativeC03PassiveFamilyEntry(agent, passiveByPath)) {
+				return false;
+			}
 			const state = this.sessions.get(agent.activeSessionId);
 			const metadata = state?.runtime.metadata;
 			return !(
@@ -5980,7 +6031,7 @@ export class AgentDaemon {
 			if (entry && state.runtime.session.sessionFile)
 				entry.sessionPath = canonicalSessionPath(state.runtime.session.sessionFile);
 		}
-		for (const passive of await this.listPassiveRlmSubagents()) {
+		for (const passive of passiveByPath.values()) {
 			const entry = byId.get(passive.info.id);
 			if (entry) entry.sessionPath = canonicalSessionPath(passive.entry.sessionFile);
 		}
