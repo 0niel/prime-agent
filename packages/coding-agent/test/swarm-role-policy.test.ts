@@ -1,5 +1,6 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
+import { createRlmRunHostHandler } from "../src/core/rlm-runtime.js";
 import {
 	parseSwarmRolePolicy,
 	projectSwarmRoleMetadata,
@@ -99,6 +100,16 @@ describe("swarm role policy", () => {
 				parentAssignment: { delegableRoleIds: [], decisionScopes: ["review"], implementationScopes: [] },
 			}),
 		).toThrow("not delegable");
+	});
+
+	it("rejects non-object bridge kwargs rather than silently treating them as legacy input", async () => {
+		const handler = createRlmRunHostHandler(async ({ prompt, kwargs }) => ({ prompt, kwargs }));
+		await expect(handler({ prompt: "task", kwargs: null })).rejects.toThrow("kwargs must be an object");
+		await expect(handler({ prompt: "task", kwargs: [] })).rejects.toThrow("kwargs must be an object");
+		await expect(handler({ prompt: "task", kwargs: { role: "reviewer" } })).resolves.toEqual({
+			prompt: "task",
+			kwargs: { role: "reviewer" },
+		});
 	});
 
 	it("projects a bounded sorted minimal role catalog", () => {

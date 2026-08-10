@@ -165,7 +165,10 @@ export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHand
 		if (typeof payload.prompt !== "string") {
 			throw new Error("rlm.run prompt must be a string");
 		}
-		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
+		if (!isRecord(payload.kwargs)) {
+			throw new Error("rlm.run kwargs must be an object");
+		}
+		const kwargs = payload.kwargs;
 		const cellSourceCode = typeof payload.cellSourceCode === "string" ? payload.cellSourceCode : undefined;
 		const result = await handler({
 			prompt: payload.prompt,
@@ -253,6 +256,8 @@ export interface CreateRlmSubagentRuntimeOptions {
 	rlmParentNodeId: string;
 	/** Source of the IPython cell that spawned this subagent, for display. */
 	spawnCode?: string;
+	/** Host-built policy preamble for the child task; never a kernel-provided value. */
+	policyPreamble?: string;
 	/** Publish the session to the parent before a host makes the runtime addressable. */
 	onSessionPublished?: (session: AgentSession) => void;
 }

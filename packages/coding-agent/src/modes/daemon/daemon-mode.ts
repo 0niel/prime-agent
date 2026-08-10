@@ -101,7 +101,6 @@ import {
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
-import type { SwarmRoleAssignment } from "../../core/swarm-role-policy.js";
 import {
 	canPassivateSession,
 	type IdleEvictionMinutes,
@@ -118,6 +117,7 @@ import {
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import type { SwarmRoleAssignment } from "../../core/swarm-role-policy.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -2890,6 +2890,7 @@ export class AgentDaemon {
 					prompt: entry.prompt,
 					spawnCode: entry.spawnCode,
 					model: entry.model,
+					swarmRoleAssignment: entry.swarmRoleAssignment,
 					status: entry.status,
 					createdAt: entry.createdAt,
 				})
@@ -2987,6 +2988,14 @@ export class AgentDaemon {
 					sessionLease,
 					sessionOptions: {
 						...(rehydratedModel ? { model: rehydratedModel } : {}),
+						...(entry.swarmRoleAssignment
+							? {
+									thinkingLevel: entry.swarmRoleAssignment.thinkingLevel,
+									serviceTier: entry.swarmRoleAssignment.serviceTier,
+									initialActiveToolNames: [...entry.swarmRoleAssignment.allowedToolNames],
+									allowedToolNames: [...entry.swarmRoleAssignment.allowedToolNames],
+								}
+							: {}),
 						agentMessageController: this.createAgentMessageController(() => stateRef),
 						agentObserveController: this.createAgentObserveController(() => stateRef),
 						rlmHeartbeatController: {
