@@ -403,6 +403,19 @@ type PassiveRlmSubagent = PassiveRlmRoot & {
 	chain: PersistedRlmSubagentRegistryEntry[];
 };
 
+/**
+ * A child id is parent-scoped. Keep persisted and attach deduplication on its
+ * immutable session storage identity, not its display/routing id. Legacy rows
+ * without a session directory have no safe identity and are ignored rather
+ * than merged with an unrelated child.
+ */
+function rlmChildIdentity(child: { childId?: unknown; id?: unknown; sessionDir?: unknown }): string | undefined {
+	const id = child.childId ?? child.id;
+	return typeof id === "string" && typeof child.sessionDir === "string" && child.sessionDir.length > 0
+		? JSON.stringify([child.sessionDir, id])
+		: undefined;
+}
+
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
@@ -987,13 +1000,12 @@ export class AgentDaemon {
 			return [];
 		}
 		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
-		// A malformed append is a tombstone for its selector, not an invitation to
-		// revive the older snapshot. This keeps replay deterministic when an
-		// append-only registry is interrupted or partially corrupted.
+		// A malformed append is a tombstone only when its stable identity is
+		// present. A legacy row without sessionDir cannot safely retire another
+		// parent's same-named child, so ignore it fail-closed instead.
 		const quarantineMalformedEntry = (entry: Partial<PersistedRlmSubagentRegistryEntry> | undefined) => {
-			if (typeof entry?.childId === "string") {
-				latest.delete(entry.childId);
-			}
+			const identity = entry ? rlmChildIdentity(entry) : undefined;
+			if (identity) latest.delete(identity);
 		};
 		let lines: string[];
 		try {
@@ -1030,8 +1042,14 @@ export class AgentDaemon {
 					continue;
 				}
 				const persisted = entry as PersistedRlmSubagentRegistryEntry;
-				// Only a complete later row deliberately republishes a quarantined child.
-				latest.set(persisted.childId, persisted);
+				const identity = rlmChildIdentity(persisted);
+				// sessionDir was validated above; retain the guard so malformed legacy
+				// data can never collapse unrelated parents during replay.
+				if (!identity) {
+					continue;
+				}
+				// Only a complete later row deliberately republishes its own child.
+				latest.set(identity, persisted);
 			} catch (error) {
 				quarantineMalformedEntry(entry);
 				this.log(
@@ -1126,12 +1144,16 @@ export class AgentDaemon {
 			rootState.activeSessionId,
 			...snapshots.flatMap((snapshot) => (snapshot.activeSessionId ? [snapshot.activeSessionId] : [])),
 		]);
-		const seenChildIds = new Set(snapshots.map((snapshot) => snapshot.id));
+		const seenSnapshots = new Set(
+			snapshots.map(rlmChildIdentity).filter((identity): identity is string => identity !== undefined),
+		);
 		for (const passive of await this.listPassiveRlmSubagents()) {
+			const identity = rlmChildIdentity(passive.entry);
 			if (
 				!passive.rootParentState ||
 				!residentParentIds.has(passive.rootParentState.activeSessionId) ||
-				seenChildIds.has(passive.entry.childId)
+				!identity ||
+				seenSnapshots.has(identity)
 			) {
 				continue;
 			}
@@ -1146,7 +1168,7 @@ export class AgentDaemon {
 				status: passive.entry.status === "completed" ? "done" : "error",
 				sessionDir: passive.entry.sessionDir,
 			});
-			seenChildIds.add(passive.entry.childId);
+			seenSnapshots.add(identity);
 		}
 		return snapshots;
 	}

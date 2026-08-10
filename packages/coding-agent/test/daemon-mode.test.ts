@@ -5140,6 +5140,153 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("retains same-id live and passive terminal children from distinct session directories and parents", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-daemon-child-identity.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const root = makeState("root");
+		const liveParent = makeState("live-parent", root.activeSessionId);
+		const liveChild = makeState("live-child", liveParent.activeSessionId);
+		const session = (id: string, name: string) =>
+			({
+				sessionId: id,
+				sessionName: name,
+				messages: [],
+				state: {},
+				isSessionActive: false,
+				isStreaming: false,
+				getRlmChildRunStatus: () => undefined,
+				_contextTokensForCurrentMessages: () => undefined,
+				getCurrentRecap: () => undefined,
+			}) as never;
+		root.runtime = {
+			...root.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: session("root-session", "root"),
+		} as never;
+		liveParent.runtime = {
+			...liveParent.runtime,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: root.activeSessionId,
+				rlmChildId: "live-parent",
+				sessionDir: "/tmp/live-parent",
+			},
+			session: session("live-parent-session", "live parent"),
+		} as never;
+		liveChild.runtime = {
+			...liveChild.runtime,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: liveParent.activeSessionId,
+				rlmChildId: "same-child-id",
+				sessionDir: "/tmp/live-parent/live-child",
+			},
+			session: session("live-child-session", "live child"),
+		} as never;
+		const passiveEntry = {
+			type: "rlm_subagent" as const,
+			childId: "same-child-id",
+			sessionName: "passive child",
+			sessionDir: "/tmp/passive-parent/passive-child",
+			sessionFile: "/tmp/passive-parent/passive-child/session.jsonl",
+			parentSessionId: "root-session",
+			status: "running" as const,
+			createdAt: 1,
+			updatedAt: "2026-01-01T00:00:00.000Z",
+		};
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			listPassiveRlmSubagents(): Promise<unknown[]>;
+			buildRlmChildSnapshotsWithPassiveRlmSubagents(
+				state: ActiveSessionState,
+			): Promise<NonNullable<DaemonAttachResult["snapshot"]["children"]>>;
+		};
+		internals.sessions.set(root.activeSessionId, root);
+		internals.sessions.set(liveParent.activeSessionId, liveParent);
+		internals.sessions.set(liveChild.activeSessionId, liveChild);
+		internals.listPassiveRlmSubagents = vi.fn(async () => [
+			{
+				rootParentState: root,
+				entry: passiveEntry,
+				info: { name: "passive child" },
+				chain: [passiveEntry],
+			},
+		]);
+
+		const children = await internals.buildRlmChildSnapshotsWithPassiveRlmSubagents(root);
+
+		expect(children.map(({ id, parentId, sessionDir, status }) => ({ id, parentId, sessionDir, status }))).toEqual([
+			{
+				id: "live-parent",
+				parentId: undefined,
+				sessionDir: "/tmp/live-parent",
+				status: "done",
+			},
+			{
+				id: "same-child-id",
+				parentId: "live-parent",
+				sessionDir: "/tmp/live-parent/live-child",
+				status: "done",
+			},
+			{
+				id: "same-child-id",
+				parentId: undefined,
+				sessionDir: "/tmp/passive-parent/passive-child",
+				status: "error",
+			},
+		]);
+	});
+
+	it("ignores a legacy passive registry row without sessionDir without tombstoning a scoped child", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-legacy-child-identity-"));
+		try {
+			const registryPath = join(tempDir, "rlm-subagents.jsonl");
+			writeFileSync(
+				registryPath,
+				[
+					JSON.stringify({
+						type: "rlm_subagent",
+						childId: "same-child-id",
+						sessionName: "scoped child",
+						sessionDir: "/tmp/parent-a/child",
+						sessionFile: "/tmp/parent-a/child/session.jsonl",
+						parentSessionId: "parent-a",
+						status: "completed",
+						createdAt: 1,
+						updatedAt: "2026-01-01T00:00:00.000Z",
+					}),
+					// Older malformed data cannot identify its parent scope. It must not
+					// delete or merge the valid same-id child above.
+					JSON.stringify({
+						type: "rlm_subagent",
+						childId: "same-child-id",
+						sessionName: "legacy child",
+						sessionFile: "/tmp/parent-b/child/session.jsonl",
+						parentSessionId: "parent-b",
+						status: "completed",
+					}),
+				].join("\n"),
+			);
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const internals = daemon as unknown as {
+				readLatestRlmSubagentRegistryPath(path: string): Promise<Array<{ sessionDir: string; childId: string }>>;
+			};
+
+			await expect(internals.readLatestRlmSubagentRegistryPath(registryPath)).resolves.toEqual([
+				expect.objectContaining({ childId: "same-child-id", sessionDir: "/tmp/parent-a/child" }),
+			]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("reports failed passive children as errors without creating child runtimes", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-lazy-rlm-list-"));
 		try {
