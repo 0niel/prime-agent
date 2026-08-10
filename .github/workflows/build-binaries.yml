@@ -28,7 +28,7 @@ jobs:
       contents: read
     outputs:
       beta_version: ${{ steps.context.outputs.beta_version }}
-      build_ref: ${{ steps.context.outputs.build_ref }}
+      source_sha: ${{ steps.context.outputs.source_sha }}
       production_version: ${{ steps.context.outputs.production_version }}
       publish_beta: ${{ steps.context.outputs.publish_beta }}
       publish_production: ${{ steps.context.outputs.publish_production }}
@@ -54,7 +54,7 @@ jobs:
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           beta_version=
-          build_ref=
+          source_sha=
           production_version=
           publish_beta=false
           publish_production=false
@@ -64,16 +64,28 @@ jobs:
               echo "Manual releases must run from the default branch (${DEFAULT_BRANCH}), not ${REF_NAME}." >&2
               exit 1
             fi
+            if ! printf '%s\n' "$INPUT_RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "release_tag must be a production tag like v0.0.1." >&2
+              exit 1
+            fi
+            if ! git show-ref --verify --quiet "refs/tags/$INPUT_RELEASE_TAG"; then
+              echo "Manual release tag $INPUT_RELEASE_TAG does not exist." >&2
+              exit 1
+            fi
+            source_sha=$(git rev-parse "refs/tags/$INPUT_RELEASE_TAG^{commit}")
+            if [ "$source_sha" != "$GITHUB_SHA_VALUE" ]; then
+              echo "Manual release tag $INPUT_RELEASE_TAG resolves to $source_sha, not the selected default-branch commit $GITHUB_SHA_VALUE." >&2
+              exit 1
+            fi
             production_version="${INPUT_RELEASE_TAG#v}"
-            build_ref="$GITHUB_SHA_VALUE"
             publish_production=true
           elif [ "$REF_TYPE" = tag ]; then
             production_version="${REF_NAME#v}"
-            build_ref="$REF_NAME"
+            source_sha="$GITHUB_SHA_VALUE"
             publish_production=true
           else
             production_version=$(node -p "require('./package.json').version")
-            build_ref="$GITHUB_SHA_VALUE"
+            source_sha="$GITHUB_SHA_VALUE"
             beta_version="${production_version}-beta.${RUN_NUMBER}.${RUN_ATTEMPT}.${GITHUB_SHA_VALUE::7}"
             publish_beta=true
 
@@ -86,11 +98,11 @@ jobs:
             if [ -z "$previous_version" ] || [ "$production_version" != "$previous_version" ]; then
               if git show-ref --verify --quiet "refs/tags/v${production_version}"; then
                 tagged_commit=$(git rev-list -n 1 "v${production_version}")
-                if [ "$tagged_commit" != "$GITHUB_SHA_VALUE" ]; then
-                  echo "Production v${production_version} already points to ${tagged_commit}, not ${GITHUB_SHA_VALUE}." >&2
+                if [ "$tagged_commit" != "$source_sha" ]; then
+                  echo "Production v${production_version} already points to ${tagged_commit}, not ${source_sha}." >&2
                   exit 1
                 fi
-                echo "Retrying production v${production_version} for ${GITHUB_SHA_VALUE}."
+                echo "Retrying production v${production_version} for ${source_sha}."
               fi
               publish_production=true
             elif ! git show-ref --verify --quiet "refs/tags/v${production_version}"; then
@@ -107,11 +119,11 @@ jobs:
           fi
 
           echo "beta_version=$beta_version" >> "$GITHUB_OUTPUT"
-          echo "build_ref=$build_ref" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "production_version=$production_version" >> "$GITHUB_OUTPUT"
           echo "publish_beta=$publish_beta" >> "$GITHUB_OUTPUT"
           echo "publish_production=$publish_production" >> "$GITHUB_OUTPUT"
-          echo "Build ref: $build_ref"
+          echo "Source SHA: $source_sha"
           echo "Production: $publish_production ${production_version:+v${production_version}}"
           echo "Beta: $publish_beta ${beta_version:+v${beta_version}}"
 
@@ -124,7 +136,7 @@ jobs:
       contents: read
     env:
       BETA_VERSION: ${{ needs.release-context.outputs.beta_version }}
-      BUILD_REF: ${{ needs.release-context.outputs.build_ref }}
+      SOURCE_SHA: ${{ needs.release-context.outputs.source_sha }}
       PRODUCTION_VERSION: ${{ needs.release-context.outputs.production_version }}
       PUBLISH_BETA: ${{ needs.release-context.outputs.publish_beta }}
       PUBLISH_PRODUCTION: ${{ needs.release-context.outputs.publish_production }}
@@ -132,12 +144,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.BUILD_REF }}
+          ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
+          fetch-depth: 1
 
-      - name: Record checked-out commit
+      - name: Verify immutable source checkout
         id: source-commit
-        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "commit=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -163,14 +178,14 @@ jobs:
           npm run release:pack -- \
             --channel stable \
             --version "$PRODUCTION_VERSION" \
-            --commit "$(git rev-parse HEAD)" \
+            --commit "$SOURCE_SHA" \
             --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
             --out-dir packages/coding-agent/release/production
           npm run release:verify -- \
             --artifact-dir packages/coding-agent/release/production/artifacts \
             --channel stable \
             --version "$PRODUCTION_VERSION" \
-            --commit "$(git rev-parse HEAD)" \
+            --commit "$SOURCE_SHA" \
             --dry-run
 
       - name: Pack beta release
@@ -182,14 +197,14 @@ jobs:
           npm run release:pack -- \
             --channel beta \
             --version "$BETA_VERSION" \
-            --commit "$(git rev-parse HEAD)" \
+            --commit "$SOURCE_SHA" \
             --base-url "$PRIME_AGENT_DOWNLOAD_BASE_URL" \
             --out-dir packages/coding-agent/release/beta
           npm run release:verify -- \
             --artifact-dir packages/coding-agent/release/beta/artifacts \
             --channel beta \
             --version "$BETA_VERSION" \
-            --commit "$(git rev-parse HEAD)" \
+            --commit "$SOURCE_SHA" \
             --dry-run
 
       - name: Upload production artifacts
@@ -218,7 +233,7 @@ jobs:
       AWS_DEFAULT_REGION: auto
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       BETA_VERSION: ${{ needs.release-context.outputs.beta_version }}
-      BUILD_REF: ${{ needs.release-context.outputs.build_ref }}
+      SOURCE_SHA: ${{ needs.release-context.outputs.source_sha }}
       SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
       PRODUCTION_VERSION: ${{ needs.release-context.outputs.production_version }}
       PUBLISH_BETA: ${{ needs.release-context.outputs.publish_beta }}
@@ -230,8 +245,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.BUILD_REF }}
+          ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
+          fetch-depth: 1
 
       - name: Download production artifacts
         if: env.PUBLISH_PRODUCTION == 'true'
@@ -247,8 +263,10 @@ jobs:
           name: prime-agent-beta
           path: release-artifacts/beta
 
-      - name: Confirm publication checkout matches packed source
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+      - name: Confirm immutable publication checkout matches packed source
+        run: |
+          test "$SOURCE_COMMIT" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
       - name: Prepare installer
         run: |
@@ -335,17 +353,12 @@ jobs:
         run: |
           RELEASE_TAG="v${PRODUCTION_VERSION}"
           PRODUCTION_DIR=release-artifacts/production
-          target_args=()
-          if [ "$BUILD_REF" != "$RELEASE_TAG" ]; then
-            target_args=(--target "$BUILD_REF")
-          fi
-
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "$PRODUCTION_DIR"/* --clobber
           else
             gh release create "$RELEASE_TAG" \
               --title "$RELEASE_TAG" \
-              "${target_args[@]}" \
+              --target "$SOURCE_SHA" \
               --notes-file /tmp/release-notes.md \
               "$PRODUCTION_DIR"/*
           fi
@@ -389,7 +402,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           latest_main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${DEFAULT_BRANCH}" --jq .sha)
-          if [ "$latest_main_sha" != "$BUILD_REF" ]; then
+          if [ "$latest_main_sha" != "$SOURCE_SHA" ]; then
             echo "A newer main commit exists; keeping its beta pointers in place."
             exit 0
           fi
@@ -415,16 +428,16 @@ jobs:
             --content-type text/x-shellscript \
             --cache-control no-cache
 
-          printf 'Automated beta build from `%s` (`%s`).\n' "$DEFAULT_BRANCH" "$BUILD_REF" > /tmp/beta-release-notes.md
+          printf 'Automated beta build from `%s` (`%s`).\n' "$DEFAULT_BRANCH" "$SOURCE_SHA" > /tmp/beta-release-notes.md
 
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/beta" >/dev/null 2>&1; then
             gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/beta" \
-              -F sha="$BUILD_REF" \
+              -F sha="$SOURCE_SHA" \
               -F force=true >/dev/null
           else
             gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
               -f ref=refs/tags/beta \
-              -f sha="$BUILD_REF" >/dev/null
+              -f sha="$SOURCE_SHA" >/dev/null
           fi
 
           if release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/beta" --jq .id 2>/dev/null); then
@@ -433,13 +446,13 @@ jobs:
             done
             gh release edit beta \
               --title "Beta (v${BETA_VERSION})" \
-              --target "$BUILD_REF" \
+              --target "$SOURCE_SHA" \
               --notes-file /tmp/beta-release-notes.md \
               --prerelease
           else
             gh release create beta \
               --title "Beta (v${BETA_VERSION})" \
-              --target "$BUILD_REF" \
+              --target "$SOURCE_SHA" \
               --notes-file /tmp/beta-release-notes.md \
               --prerelease
           fi

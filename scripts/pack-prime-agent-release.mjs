@@ -17,20 +17,14 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { publicPackageName, releaseComponents } from "./prime-agent-release-components.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultOutputDir = join(root, "packages", "coding-agent", "release");
 const defaultBaseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;
-const publicPackageName = process.env.PRIME_AGENT_PACKAGE_NAME || "prime-agent";
 const publicCommandName = process.env.PRIME_AGENT_CMD || "prime-agent";
 const releaseChannels = new Set(["stable", "beta"]);
-
-const releasePackages = [
-	{ packageDir: "ai", publicName: undefined, artifactName: "prime-agent-ai" },
-	{ packageDir: "tui", publicName: undefined, artifactName: "prime-agent-tui" },
-	{ packageDir: "agent", publicName: undefined, artifactName: "prime-agent-core" },
-	{ packageDir: "coding-agent", publicName: publicPackageName, artifactName: publicPackageName },
-];
+const releasePackages = releaseComponents;
 
 function parseArgs(args) {
 	const parsed = {
@@ -248,8 +242,29 @@ function sha256File(path) {
 	return hash.digest("hex");
 }
 
+function authoritativeSourceCommit() {
+	return run("git", ["rev-parse", "HEAD"], root);
+}
+
+function assertCleanTrackedSource() {
+	const dirty = run("git", ["status", "--porcelain=v1", "--untracked-files=no"], root);
+	if (dirty) {
+		throw new Error("Refusing to pack a release from a tracked-dirty source checkout");
+	}
+}
+
+function assertAuthoritativeSource(commit) {
+	const sourceCommit = authoritativeSourceCommit();
+	if (commit !== sourceCommit) {
+		throw new Error(`--commit must exactly match authoritative source HEAD ${sourceCommit}`);
+	}
+	assertCleanTrackedSource();
+	return sourceCommit;
+}
+
 function main() {
 	const args = parseArgs(process.argv.slice(2));
+	assertAuthoritativeSource(args.commit);
 	const sourcePackages = new Map(
 		releasePackages.map((releasePackage) => [
 			releasePackage.packageDir,
@@ -270,13 +285,10 @@ function main() {
 	const artifactFiles = new Map();
 	for (const releasePackage of releasePackages) {
 		const sourcePackage = sourcePackages.get(releasePackage.packageDir);
-		const packageName = releasePackage.publicName || releasePackage.artifactName || sourcePackage.name;
+		const packageName = releasePackage.packageName;
 		sourcePackageNames.set(releasePackage.packageDir, sourcePackage.name);
 		packageNames.set(releasePackage.packageDir, packageName);
-		artifactFiles.set(
-			releasePackage.packageDir,
-			npmTarballName(releasePackage.artifactName || packageName, releaseVersion),
-		);
+		artifactFiles.set(releasePackage.packageDir, npmTarballName(releasePackage.artifactName, releaseVersion));
 	}
 
 	const internalPackageUrls = new Map();
@@ -328,13 +340,13 @@ function main() {
 		}
 
 		tarballs.push({
-			name: packageName,
+			component: releasePackage.component,
+			package: packageName,
+			version: releaseVersion,
 			file: artifactFile,
 			sha256: sha256File(artifactPath),
 		});
 	}
-
-	tarballs.sort((left, right) => left.file.localeCompare(right.file));
 	writeFileSync(
 		join(artifactsDir, "SHA256SUMS"),
 		tarballs.map((tarball) => `${tarball.sha256}  ${tarball.file}`).join("\n") + "\n",
@@ -348,11 +360,7 @@ function main() {
 		},
 		package: publicPackageName,
 		tarball: `releases/v${releaseVersion}/${artifactFiles.get("coding-agent")}`,
-		tarballs: tarballs.map((tarball) => ({
-			package: tarball.name,
-			file: tarball.file,
-			sha256: tarball.sha256,
-		})),
+		tarballs,
 	});
 
 	for (const tarball of tarballs) {
