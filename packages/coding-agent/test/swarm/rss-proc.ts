@@ -9,6 +9,19 @@ export interface ProcessStat extends ProcessIdentity {
 	state: string;
 }
 
+// Linux task-state letters emitted by /proc/PID/status.
+const LINUX_PROCESS_STATES = new Set(["R", "S", "D", "Z", "T", "t", "W", "X", "x", "K", "P", "I"]);
+
+/**
+ * Confirms that two reads identify the same process-group member. State and
+ * parent PID are deliberately transient and therefore are not identity.
+ */
+export function hasStableProcessIdentity(initial: ProcessStat, confirmation: ProcessStat): boolean {
+	return (
+		initial.pid === confirmation.pid && initial.start === confirmation.start && initial.pgid === confirmation.pgid
+	);
+}
+
 /** The persisted artifact shape deliberately excludes transient procfs state. */
 export interface ProcessRecord extends ProcessIdentity {
 	rssKiB: number;
@@ -36,13 +49,20 @@ export function parseProcessStat(pid: number, statLine: string): ProcessStat | u
 /**
  * A process without an mm has no Vm* fields. Linux exposes this both for
  * zombies and briefly for fork/exec children, which are conservatively kept
- * as zero-RSS records after the status state confirms the stat identity.
+ * as zero-RSS records after an external stat reread confirms the identity.
+ * State is only a status-file integrity check: it may change between reads.
  */
-export function processRecordFromStatus(stat: ProcessStat, status: string): ProcessRecord | undefined {
+export function processRecordFromStatus(
+	stat: ProcessStat,
+	status: string,
+	confirmation: ProcessStat,
+): ProcessRecord | undefined {
+	if (!hasStableProcessIdentity(stat, confirmation)) return undefined;
+
 	const lines = status.split(/\r?\n/);
 	const stateLines = lines.filter((line) => line.startsWith("State:"));
 	const state = stateLines.length === 1 ? /^State:\s+(\S)(?:\s+\([^()]*\))?\s*$/.exec(stateLines[0])?.[1] : undefined;
-	if (state !== stat.state) return undefined;
+	if (state === undefined || !LINUX_PROCESS_STATES.has(state)) return undefined;
 
 	const vmLines = lines.filter((line) => line.startsWith("Vm"));
 	const rssLines = vmLines.filter((line) => line.startsWith("VmRSS:"));

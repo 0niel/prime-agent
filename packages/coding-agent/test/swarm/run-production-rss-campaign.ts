@@ -185,7 +185,11 @@ async function procIdentity(pid: number): Promise<ProcessStat | undefined> {
 
 async function procRecordForIdentity(identity: ProcessStat): Promise<ProcessRecord | undefined> {
 	try {
-		return processRecordFromStatus(identity, await readFile(`/proc/${identity.pid}/status`, "utf8"));
+		const status = await readFile(`/proc/${identity.pid}/status`, "utf8");
+		// State and PPID can change while status is read. A second stat read
+		// anchors the status to the original PID/start-time/process-group identity.
+		const confirmation = parseProcessStat(identity.pid, await readFile(`/proc/${identity.pid}/stat`, "utf8"));
+		return confirmation ? processRecordFromStatus(identity, status, confirmation) : undefined;
 	} catch {
 		return undefined;
 	}
@@ -243,7 +247,11 @@ async function groupSnapshot(pgid: number, injectFailure = false): Promise<Group
 	for (const identity of identities) {
 		if (identity.pgid !== pgid) continue;
 		try {
-			const record = processRecordFromStatus(identity, await readFile(`/proc/${identity.pid}/status`, "utf8"));
+			const status = await readFile(`/proc/${identity.pid}/status`, "utf8");
+			// State and PPID are not stable identity. Re-read stat after status so
+			// PID reuse or a process-group move makes the entire scan unavailable.
+			const confirmation = parseProcessStat(identity.pid, await readFile(`/proc/${identity.pid}/stat`, "utf8"));
+			const record = confirmation ? processRecordFromStatus(identity, status, confirmation) : undefined;
 			// A coherently read status without any Vm* fields denotes a process
 			// without an mm and is retained as a zero-RSS owned record.
 			if (!record) return { kind: "unavailable" };
