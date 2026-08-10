@@ -1,4 +1,5 @@
-import { execSync, spawn } from "child_process";
+import { EventEmitter } from "node:events";
+import { spawn, spawnSync } from "child_process";
 import { platform } from "os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { copyToClipboard } from "../src/utils/clipboard.js";
@@ -8,7 +9,7 @@ const mocks = vi.hoisted(() => {
 		clipboard: {
 			setText: vi.fn<(text: string) => Promise<void>>(),
 		},
-		execSync: vi.fn(),
+		spawnSync: vi.fn(),
 		spawn: vi.fn(),
 		platform: vi.fn<() => NodeJS.Platform>(),
 		isWaylandSession: vi.fn<() => boolean>(),
@@ -23,7 +24,7 @@ vi.mock("../src/utils/clipboard-native.js", () => {
 
 vi.mock("child_process", () => {
 	return {
-		execSync: mocks.execSync,
+		spawnSync: mocks.spawnSync,
 		spawn: mocks.spawn,
 	};
 });
@@ -40,7 +41,7 @@ vi.mock("../src/utils/clipboard-image.js", () => {
 	};
 });
 
-const mockedExecSync = vi.mocked(execSync);
+const mockedSpawnSync = vi.mocked(spawnSync);
 const mockedSpawn = vi.mocked(spawn);
 const mockedPlatform = vi.mocked(platform);
 
@@ -60,7 +61,8 @@ beforeEach(() => {
 	stdoutWrites = [];
 	nativeResolved = false;
 	mocks.clipboard.setText.mockReset();
-	mocks.execSync.mockReset();
+	mocks.spawnSync.mockReset();
+	mocks.spawnSync.mockReturnValue({ status: 0, signal: null } as ReturnType<typeof spawnSync>);
 	mocks.spawn.mockReset();
 	mocks.platform.mockReset();
 	mocks.isWaylandSession.mockReset();
@@ -92,7 +94,7 @@ describe("copyToClipboard", () => {
 
 		expect(mocks.clipboard.setText).toHaveBeenCalledWith("hello");
 		expect(osc52Writes()).toHaveLength(0);
-		expect(mockedExecSync).not.toHaveBeenCalled();
+		expect(mockedSpawnSync).not.toHaveBeenCalled();
 		expect(mockedSpawn).not.toHaveBeenCalled();
 	});
 
@@ -108,17 +110,18 @@ describe("copyToClipboard", () => {
 
 		expect(nativeResolved).toBe(true);
 		expect(osc52Writes()).toHaveLength(1);
-		expect(mockedExecSync).not.toHaveBeenCalled();
+		expect(mockedSpawnSync).not.toHaveBeenCalled();
 	});
 
 	test("local shell fallback success skips OSC 52", async () => {
 		mocks.clipboard.setText.mockRejectedValue(new Error("native failed"));
-		mockedExecSync.mockReturnValue(Buffer.alloc(0));
+		mockedSpawnSync.mockReturnValue({ status: 0, signal: null } as ReturnType<typeof spawnSync>);
 
 		await copyToClipboard("hello");
 
-		expect(mockedExecSync).toHaveBeenCalledWith("pbcopy", {
+		expect(mockedSpawnSync).toHaveBeenCalledWith("pbcopy", [], {
 			input: "hello",
+			shell: false,
 			stdio: ["pipe", "ignore", "ignore"],
 			timeout: 5000,
 		});
@@ -127,20 +130,58 @@ describe("copyToClipboard", () => {
 
 	test("uses OSC 52 fallback when native and shell tools fail", async () => {
 		mocks.clipboard.setText.mockRejectedValue(new Error("native failed"));
-		mockedExecSync.mockImplementation(() => {
-			throw new Error("pbcopy failed");
-		});
+		mockedSpawnSync.mockReturnValue({ status: 1, signal: null } as ReturnType<typeof spawnSync>);
 
 		await copyToClipboard("hello");
 
 		expect(osc52Writes()).toHaveLength(1);
 	});
 
+	test("handles an asynchronous wl-copy launch failure and falls back safely", async () => {
+		mockedPlatform.mockReturnValue("linux");
+		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+		mocks.isWaylandSession.mockReturnValue(true);
+		const child = new EventEmitter() as ReturnType<typeof spawn>;
+		child.stdin = new EventEmitter() as ReturnType<typeof spawn>["stdin"];
+		child.stdin!.end = vi.fn();
+		child.unref = vi.fn();
+		mockedSpawn.mockReturnValue(child);
+
+		const copying = copyToClipboard("hello");
+		child.emit("error", new Error("ENOENT"));
+		await copying;
+
+		expect(osc52Writes()).toHaveLength(1);
+	});
+
+	test("passes hostile clipboard text only on stdin and falls back from xclip to xsel", async () => {
+		mockedPlatform.mockReturnValue("linux");
+		vi.stubEnv("DISPLAY", ":0");
+		const hostileText = "$(touch /tmp/never) ; echo injected";
+		mockedSpawnSync
+			.mockReturnValueOnce({ status: 1, signal: null } as ReturnType<typeof spawnSync>)
+			.mockReturnValueOnce({ status: 0, signal: null } as ReturnType<typeof spawnSync>);
+
+		await copyToClipboard(hostileText);
+
+		expect(mockedSpawnSync).toHaveBeenNthCalledWith(1, "xclip", ["-selection", "clipboard"], {
+			input: hostileText,
+			shell: false,
+			stdio: ["pipe", "ignore", "ignore"],
+			timeout: 5000,
+		});
+		expect(mockedSpawnSync).toHaveBeenNthCalledWith(2, "xsel", ["--clipboard", "--input"], {
+			input: hostileText,
+			shell: false,
+			stdio: ["pipe", "ignore", "ignore"],
+			timeout: 5000,
+		});
+		expect(osc52Writes()).toHaveLength(0);
+	});
+
 	test("does not emit oversized OSC 52 payloads", async () => {
 		mocks.clipboard.setText.mockRejectedValue(new Error("native failed"));
-		mockedExecSync.mockImplementation(() => {
-			throw new Error("pbcopy failed");
-		});
+		mockedSpawnSync.mockReturnValue({ status: 1, signal: null } as ReturnType<typeof spawnSync>);
 
 		await expect(copyToClipboard("x".repeat(80_000))).rejects.toThrow("Failed to copy to clipboard");
 		expect(osc52Writes()).toHaveLength(0);

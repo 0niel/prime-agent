@@ -5,6 +5,7 @@
 - Fixed npm 12 blocking installer and self-update access to verified release dependencies ([#741](https://github.com/PrimeIntellect-ai/prime-agent/issues/741)).
 - Fixed published Node.js bundles omitting the Amazon Bedrock provider entry point ([#751](https://github.com/PrimeIntellect-ai/prime-agent/issues/751)).
 - Fixed session and artifact storage accepting traversal IDs, symlinked paths, permissive modes, and unsafe snapshot files ([#1105](https://github.com/PrimeIntellect-ai/prime-agent/pull/1105)).
+- Fixed kernel teardown leaving host-request work running and removed shell-based clipboard command execution ([#915](https://github.com/PrimeIntellect-ai/prime-agent/pull/915)).
 - Added a configurable copy action to login dialogs so raw sign-in URLs can be copied without selecting wrapped text ([#643](https://github.com/PrimeIntellect-ai/prime-agent/issues/643)).
 - Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.
