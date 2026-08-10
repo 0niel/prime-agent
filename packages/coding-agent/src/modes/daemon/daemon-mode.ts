@@ -1045,9 +1045,13 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		childId: string,
 		assignmentId: string,
+		operationId?: string,
 	): Promise<void> {
 		const latest = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
-			(entry) => entry.childId === childId && entry.assignmentId === assignmentId,
+			(entry) =>
+				entry.childId === childId &&
+				entry.assignmentId === assignmentId &&
+				(operationId === undefined ? entry.operationId === undefined : entry.operationId === operationId),
 		);
 		if (!latest || latest.status === "deleted") {
 			return;
@@ -2637,7 +2641,9 @@ export class AgentDaemon {
 				let deletionError: unknown;
 				if (status === "cancelled") {
 					try {
-						await this.recordRlmSubagentDeletion(parentState, options.id, assignmentId);
+						if (operationId)
+							await this.recordRlmSubagentDeletion(parentState, options.id, assignmentId, operationId);
+						else await this.recordRlmSubagentDeletion(parentState, options.id, assignmentId);
 					} catch (error) {
 						deletionError = error;
 					}
@@ -2737,7 +2743,11 @@ export class AgentDaemon {
 				if (
 					(this.sessions.get(parentState.activeSessionId) !== undefined &&
 						this.sessions.get(parentState.activeSessionId) !== parentState) ||
-					(state && this.sessions.get(state.activeSessionId) !== state)
+					(operationId !== undefined && parentState.eventGeneration !== parentGeneration) ||
+					(state &&
+						(this.sessions.get(state.activeSessionId) !== state ||
+							state.runtime.metadata.assignmentId !== assignmentId ||
+							state.runtime.metadata.operationId !== operationId))
 				) {
 					await childSession?.disposeAsync();
 					return;
@@ -2755,13 +2765,14 @@ export class AgentDaemon {
 					)
 						throw new Error(`Failed to persist durable deletion for RLM subagent ${childId}`);
 				}
-				if (assignmentId) await this.recordRlmSubagentDeletion(parentState, childId, assignmentId);
+				if (assignmentId) await this.recordRlmSubagentDeletion(parentState, childId, assignmentId, operationId);
 				// C01 append awaited above; reject a late A before it can close B.
 				if (
-					state &&
-					(this.sessions.get(state.activeSessionId) !== state ||
-						state.runtime.metadata.assignmentId !== assignmentId ||
-						state.runtime.metadata.operationId !== operationId)
+					parentState.eventGeneration !== parentGeneration ||
+					(state &&
+						(this.sessions.get(state.activeSessionId) !== state ||
+							state.runtime.metadata.assignmentId !== assignmentId ||
+							state.runtime.metadata.operationId !== operationId))
 				)
 					return;
 				const staleSession =
@@ -3008,6 +3019,7 @@ export class AgentDaemon {
 		const parentActiveSessionId = metadata.parentActiveSessionId;
 		const childId = metadata.rlmChildId;
 		const assignmentId = metadata.assignmentId;
+		const operationId = metadata.operationId;
 		// Legacy resident children remain readable but cannot let an asynchronous
 		// passivation callback unbind a newer same-selector assignment.
 		if (!assignmentId) return false;
@@ -3034,6 +3046,9 @@ export class AgentDaemon {
 				this.shuttingDown ||
 				this.updateRestart !== undefined ||
 				this.sessions.get(state.activeSessionId) !== state ||
+				state.eventGeneration !== passivationOperation.generation ||
+				state.runtime.metadata.assignmentId !== assignmentId ||
+				state.runtime.metadata.operationId !== operationId ||
 				!canPassivateSession(await this.sessionPassivationSnapshot(state), idleEvictionMinutes, now)
 			) {
 				return;
@@ -3043,11 +3058,14 @@ export class AgentDaemon {
 			const idleMinutes = Math.floor((now - snapshot.lastActivityAt) / 60_000);
 			// Detach parent tracking before the standard graceful runtime disposal. The
 			// registry/catalog rows remain the sole passive representation after close.
-			const unsubscribeChild = parentState.runtime.session.releaseRlmChildSession(
-				childId,
-				state.runtime.session,
-				assignmentId,
-			);
+			const unsubscribeChild = operationId
+				? parentState.runtime.session.releaseRlmChildSession(
+						childId,
+						state.runtime.session,
+						assignmentId,
+						operationId,
+					)
+				: parentState.runtime.session.releaseRlmChildSession(childId, state.runtime.session, assignmentId);
 			if (!unsubscribeChild) {
 				return;
 			}
@@ -3058,22 +3076,41 @@ export class AgentDaemon {
 				// parent's ownership map or disconnect its event forwarder.
 				if (
 					this.sessions.get(state.activeSessionId) === state &&
+					state.eventGeneration === passivationOperation.generation &&
+					state.runtime.metadata.assignmentId === assignmentId &&
+					state.runtime.metadata.operationId === operationId &&
 					this.sessions.get(parentActiveSessionId) === parentState &&
-					parentState.runtime.session.registerRlmChildSession(
-						childId,
-						state.runtime.session,
-						unsubscribeChild,
-						assignmentId,
-					)
+					(operationId
+						? parentState.runtime.session.registerRlmChildSession(
+								childId,
+								state.runtime.session,
+								unsubscribeChild,
+								assignmentId,
+								operationId,
+							)
+						: parentState.runtime.session.registerRlmChildSession(
+								childId,
+								state.runtime.session,
+								unsubscribeChild,
+								assignmentId,
+							))
 				) {
 					// The adapter is deliberately optional so old embedded/test hosts observe
 					// the historical register arity. Real AgentSession instances bind the
 					// durable assignment immediately after that compatibility call.
-					parentState.runtime.session.rebindRlmChildSessionAssignment?.(
-						childId,
-						state.runtime.session,
-						assignmentId,
-					);
+					if (operationId)
+						parentState.runtime.session.rebindRlmChildSessionAssignment?.(
+							childId,
+							state.runtime.session,
+							assignmentId,
+							operationId,
+						);
+					else
+						parentState.runtime.session.rebindRlmChildSessionAssignment?.(
+							childId,
+							state.runtime.session,
+							assignmentId,
+						);
 					throw error;
 				}
 				unsubscribeChild();
@@ -3478,12 +3515,14 @@ export class AgentDaemon {
 				this.sessions.get(parentState.activeSessionId) !== parentState ||
 				this.closingSessions.has(parentState.activeSessionId)
 			) {
-				const unsubscribeChild = parentState.runtime.session.releaseRlmChildSession(
-					entry.childId,
-					runtime.session,
-					entry.assignmentId,
-					entry.operationId,
-				);
+				const unsubscribeChild = entry.operationId
+					? parentState.runtime.session.releaseRlmChildSession(
+							entry.childId,
+							runtime.session,
+							entry.assignmentId,
+							entry.operationId,
+						)
+					: parentState.runtime.session.releaseRlmChildSession(entry.childId, runtime.session, entry.assignmentId);
 				try {
 					await this.closeSession(state, "replaced");
 				} finally {

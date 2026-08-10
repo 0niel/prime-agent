@@ -6,6 +6,7 @@ import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import { assertFreshUuid } from "./daemon-lifecycle-identity.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 
@@ -74,10 +75,12 @@ function savedRlmIncarnationKey(entry: SavedRlmSubagentRegistryEntry): string | 
 	if (typeof entry.childId !== "string") return undefined;
 	if (entry.assignmentId === undefined && entry.operationId === undefined && entry.deliveryId === undefined)
 		return `${entry.childId}\0legacy`;
+	// C03 durable identities are opaque canonical UUIDs. Any partial or malformed
+	// triple is untrusted registry history, not an alternative current incarnation.
 	if (
-		typeof entry.assignmentId !== "string" ||
-		typeof entry.operationId !== "string" ||
-		typeof entry.deliveryId !== "string"
+		!assertFreshUuid(entry.assignmentId) ||
+		!assertFreshUuid(entry.operationId) ||
+		!assertFreshUuid(entry.deliveryId)
 	)
 		return undefined;
 	return `${entry.childId}\0${entry.assignmentId}\0${entry.operationId}\0${entry.deliveryId}`;

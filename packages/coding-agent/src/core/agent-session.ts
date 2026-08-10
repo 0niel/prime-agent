@@ -9501,13 +9501,18 @@ export class AgentSession {
 		return this._deletingRlmChildren.has(this._rlmAssignmentKey(childId, assignmentId));
 	}
 
-	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun, expectedAssignmentId?: string): void {
+	private _removeRlmSubagentTracking(
+		childId: string,
+		run?: RlmChildRun,
+		expectedAssignmentId?: string,
+		expectedOperationId?: string,
+	): void {
 		const assignmentId = expectedAssignmentId ?? run?.assignmentId ?? this._rlmChildSessionAssignments.get(childId);
-		const operationId = run?.operationId ?? this._rlmChildSessionOperations.get(childId);
+		const operationId = expectedOperationId ?? run?.operationId ?? this._rlmChildSessionOperations.get(childId);
 		// A callback which cannot name its assignment is a legacy/display path and has
 		// no authority to mutate a C01 child incarnation.
 		if (!assignmentId) return;
-		if (run && run.assignmentId !== assignmentId) return;
+		if (run && (run.assignmentId !== assignmentId || run.operationId !== operationId)) return;
 		if (
 			this._rlmChildUnsubscribeAssignments.get(childId) === assignmentId &&
 			this._rlmChildUnsubscribeOperations.get(childId) === operationId
@@ -9526,7 +9531,10 @@ export class AgentSession {
 			this._rlmChildSessionOperations.delete(childId);
 			this._rlmChildCleanupFailures.delete(childId);
 		}
-		if (this._activeRlmChildRuns.get(childId)?.assignmentId === assignmentId) {
+		if (
+			this._activeRlmChildRuns.get(childId)?.assignmentId === assignmentId &&
+			this._activeRlmChildRuns.get(childId)?.operationId === operationId
+		) {
 			this._activeRlmChildRuns.delete(childId);
 		}
 		if (run) {
@@ -9568,7 +9576,7 @@ export class AgentSession {
 			}
 			if (liveSession) {
 				try {
-					await this._deleteRlmSubagentSession(childId, run.assignmentId, liveSession);
+					await this._deleteRlmSubagentSession(childId, run.assignmentId, liveSession, run.operationId);
 				} catch (error) {
 					if (this._disposed || this._disposing) {
 						this._removeRlmSubagentTracking(childId, run, run.assignmentId);
@@ -9622,7 +9630,7 @@ export class AgentSession {
 			await this._deleteRlmSubagentSession(childId, retainedAssignmentId, retained, retainedOperationId);
 		} catch (error) {
 			if (this._disposed || this._disposing) {
-				this._removeRlmSubagentTracking(childId, undefined, this._rlmChildSessionAssignments.get(childId));
+				this._removeRlmSubagentTracking(childId, undefined, retainedAssignmentId, retainedOperationId);
 				void retained?.disposeAsync().catch(() => undefined);
 			} else {
 				this._rlmChildCleanupFailures.set(childId, subagent);
@@ -9631,7 +9639,7 @@ export class AgentSession {
 		}
 		if (retainedAssignmentId) {
 			this._deletedRlmChildIds.add(this._rlmAssignmentKey(childId, retainedAssignmentId));
-			this._removeRlmSubagentTracking(childId, undefined, retainedAssignmentId);
+			this._removeRlmSubagentTracking(childId, undefined, retainedAssignmentId, retainedOperationId);
 		} else {
 			// Display-only legacy hosts never expose an assignment. This explicit
 			// user deletion still hides their public row, but it grants no authority
@@ -10008,10 +10016,12 @@ export class AgentSession {
 			const isCurrent = () => {
 				const activeOwner =
 					this._activeRlmChildRuns.get(run.id) === run &&
-					this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId;
+					this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
+					this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId;
 				const retainedOwner =
 					this._rlmChildSessions.get(run.id) === childSession &&
-					this._rlmChildSessionAssignments.get(run.id) === run.assignmentId;
+					this._rlmChildSessionAssignments.get(run.id) === run.assignmentId &&
+					this._rlmChildSessionOperations.get(run.id) === run.operationId;
 				return activeOwner || retainedOwner;
 			};
 			if (!isCurrent()) return;
@@ -10049,7 +10059,8 @@ export class AgentSession {
 			childSession = child;
 			if (
 				this._activeRlmChildRuns.get(run.id) !== run ||
-				this._activeRlmChildRuns.get(run.id)?.assignmentId !== run.assignmentId
+				this._activeRlmChildRuns.get(run.id)?.assignmentId !== run.assignmentId ||
+				this._activeRlmChildRuns.get(run.id)?.operationId !== run.operationId
 			)
 				return;
 			run.session = child;
@@ -10074,7 +10085,8 @@ export class AgentSession {
 		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
 			if (
 				this._activeRlmChildRuns.get(run.id) !== run ||
-				this._activeRlmChildRuns.get(run.id)?.assignmentId !== run.assignmentId
+				this._activeRlmChildRuns.get(run.id)?.assignmentId !== run.assignmentId ||
+				this._activeRlmChildRuns.get(run.id)?.operationId !== run.operationId
 			)
 				return;
 			// A daemon-owned host has the only durable terminal authority. In particular,
@@ -10148,10 +10160,13 @@ export class AgentSession {
 					// projecting this exact child session, but never let A's subscription
 					// observe a replacement B that reused the selector.
 					const activeOwner =
-						this._activeRlmChildRuns.get(run.id) === run && run.assignmentId === subagentOptions.assignmentId;
+						this._activeRlmChildRuns.get(run.id) === run &&
+						run.assignmentId === subagentOptions.assignmentId &&
+						run.operationId === subagentOptions.operationId;
 					const retainedOwner =
 						this._rlmChildSessions.get(run.id) === child &&
-						this._rlmChildSessionAssignments.get(run.id) === run.assignmentId;
+						this._rlmChildSessionAssignments.get(run.id) === run.assignmentId &&
+						this._rlmChildSessionOperations.get(run.id) === run.operationId;
 					if (!activeOwner && !retainedOwner) return;
 					if (event.type === "rlm_child_update") {
 						this._emit(event);
@@ -10331,13 +10346,22 @@ export class AgentSession {
 							await childSession.disposeAsync();
 						}
 						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
-							const activeOwner = this._activeRlmChildRuns.get(run.id) === run;
+							const activeOwner =
+								this._activeRlmChildRuns.get(run.id) === run &&
+								this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
+								this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId;
 							const retainedOwner =
 								this._rlmChildSessions.get(run.id) === childRuntime?.session &&
-								this._rlmChildSessionAssignments.get(run.id) === run.assignmentId;
+								this._rlmChildSessionAssignments.get(run.id) === run.assignmentId &&
+								this._rlmChildSessionOperations.get(run.id) === run.operationId;
 							if (activeOwner || retainedOwner) {
 								this._deletedRlmChildIds.add(this._rlmAssignmentKey(run.id, run.assignmentId));
-								this._removeRlmSubagentTracking(run.id, activeOwner ? run : undefined, run.assignmentId);
+								this._removeRlmSubagentTracking(
+									run.id,
+									activeOwner ? run : undefined,
+									run.assignmentId,
+									run.operationId,
+								);
 							}
 						}
 					} catch {
@@ -10352,10 +10376,11 @@ export class AgentSession {
 						// child. Remove only that captured session/assignment, never B.
 						if (
 							this._rlmChildSessions.get(run.id) === childRuntime.session &&
-							this._rlmChildSessionAssignments.get(run.id) === run.assignmentId
+							this._rlmChildSessionAssignments.get(run.id) === run.assignmentId &&
+							this._rlmChildSessionOperations.get(run.id) === run.operationId
 						) {
 							this._deletedRlmChildIds.add(this._rlmAssignmentKey(run.id, run.assignmentId));
-							this._removeRlmSubagentTracking(run.id, undefined, run.assignmentId);
+							this._removeRlmSubagentTracking(run.id, undefined, run.assignmentId, run.operationId);
 						}
 					} catch {
 						if (!this._disposed && !this._disposing && this._activeRlmChildRuns.get(run.id) === run) {
@@ -10366,13 +10391,21 @@ export class AgentSession {
 						}
 					}
 				}
-				if (this._activeRlmChildRuns.get(run.id) === run) {
+				if (
+					this._activeRlmChildRuns.get(run.id) === run &&
+					this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
+					this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId
+				) {
 					if (this._rlmChildSessions.has(run.id)) {
-						if (this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId)
+						if (
+							this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
+							this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId
+						)
 							this._activeRlmChildRuns.delete(run.id);
 						if (run.unsubscribe) {
 							this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
 							this._rlmChildUnsubscribeAssignments.set(run.id, run.assignmentId);
+							this._rlmChildUnsubscribeOperations.set(run.id, run.operationId);
 						}
 						run.abort = noopRlmChildAbort;
 						run.unsubscribe = undefined;

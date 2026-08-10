@@ -675,4 +675,84 @@ describe("RLM durable operation store", () => {
 			"terminal_recorded",
 		);
 	});
+
+	it("retains inbox and consumed facts across independent fsync cuts, then retries one delivery", () => {
+		const f = fixture();
+		const fdPaths = new Map<number, string>();
+		let failInbox = false;
+		let failConsumed = false;
+		const io = {
+			...fs,
+			openSync: ((path: fs.PathLike, flags: string | number, mode?: fs.Mode) => {
+				const fd = fs.openSync(path, flags, mode);
+				fdPaths.set(fd, String(path));
+				return fd;
+			}) as typeof fs.openSync,
+			closeSync: ((fd: number) => {
+				fdPaths.delete(fd);
+				return fs.closeSync(fd);
+			}) as typeof fs.closeSync,
+			fsyncSync: ((fd: number) => {
+				const path = fdPaths.get(fd) ?? "";
+				if (failInbox && path.endsWith("rlm-terminal-inbox.jsonl")) throw new Error("inbox fsync cut");
+				if (failConsumed && path.endsWith("rlm-terminal-consumed.jsonl")) throw new Error("consumed fsync cut");
+				return fs.fsyncSync(fd);
+			}) as typeof fs.fsyncSync,
+		} as unknown as RlmDurableIo;
+		const store = openRlmDurableOperationStore(f.parentArtifacts, { io, trustedChildRecoveryRoots: trustedRoots(f) });
+		store.admit(f.admission);
+		materialize(store, f);
+		store.appendOutbox(outbox(f));
+		store.recordTerminal({
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			deliveryId: delivery,
+			terminal: "done",
+		});
+
+		failInbox = true;
+		expect(() => store.importOutbox(outbox(f))).toThrow("inbox fsync cut");
+		// The receiver cannot advance to consumed after the failed acknowledgement.
+		expect(
+			openRlmDurableOperationStore(f.parentArtifacts, { trustedChildRecoveryRoots: trustedRoots(f) }).pendingInbox(),
+		).toHaveLength(1);
+		failInbox = false;
+		const afterInboxRestart = openRlmDurableOperationStore(f.parentArtifacts, {
+			io,
+			trustedChildRecoveryRoots: trustedRoots(f),
+		});
+		expect(afterInboxRestart.importOutbox(outbox(f))).toBe("already_received");
+		expect(afterInboxRestart.pendingInbox()).toHaveLength(1);
+
+		// Model the real transcript's deterministic id. A consumed fsync cut leaves
+		// this transcript fact and the durable inbox visible to the next importer.
+		const transcriptIds = new Set<string>();
+		transcriptIds.add(materializedTerminalMessageId(delivery));
+		failConsumed = true;
+		expect(() =>
+			afterInboxRestart.markMaterializedDelivery({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				deliveryId: delivery,
+				sessionMessageId: materializedTerminalMessageId(delivery),
+			}),
+		).toThrow("consumed fsync cut");
+		const afterConsumedRestart = openRlmDurableOperationStore(f.parentArtifacts, {
+			trustedChildRecoveryRoots: trustedRoots(f),
+		});
+		expect(afterConsumedRestart.pendingInbox()).toHaveLength(0);
+		expect(transcriptIds).toEqual(new Set([materializedTerminalMessageId(delivery)]));
+		failConsumed = false;
+		expect(
+			afterConsumedRestart.markMaterializedDelivery({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				deliveryId: delivery,
+				sessionMessageId: materializedTerminalMessageId(delivery),
+			}),
+		).toBe("already_materialized");
+	});
 });
