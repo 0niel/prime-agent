@@ -1723,6 +1723,16 @@ describe("daemon mode helpers", () => {
 			]);
 			// A later complete immutable B publication is the only recovery event.
 			writeFileSync(registryPath, `${readFileSync(registryPath, "utf8")}${JSON.stringify(b)}\n`);
+			const republished = await internals.readLatestRlmSubagentRegistryPath(registryPath);
+			expect(republished).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ childId: a.childId, assignmentId: assignmentB }),
+					expect.objectContaining({ childId: unrelated.childId, assignmentId: unrelatedAssignment }),
+				]),
+			);
+			expect(republished).not.toEqual(
+				expect.arrayContaining([expect.objectContaining({ assignmentId: a.assignmentId })]),
+			);
 			expect(await internals.readCurrentLiveRlmSubagentRegistryPath(registryPath)).toEqual(
 				expect.arrayContaining([
 					expect.objectContaining({ childId: a.childId, assignmentId: assignmentB }),

@@ -1259,6 +1259,13 @@ export class AgentDaemon {
 		// replaying the append-only journal so corruption cannot resurrect A.
 		const c03Selectors = new Set<string>();
 		const quarantinedSelectors = new Set<string>();
+		const quarantineSelector = (childId: string) => {
+			// A selector fence must also discard every prior incarnation. Otherwise
+			// the next complete publication clears the fence but exposes stale A via
+			// exact lifecycle reads alongside the newly published B.
+			quarantinedSelectors.add(childId);
+			for (const [key, entry] of latest) if (entry.childId === childId) latest.delete(key);
+		};
 		const quarantineMalformedEntry = (rawEntry: Partial<PersistedRlmSubagentRegistryEntry> | undefined) => {
 			if (typeof rawEntry?.childId !== "string") return;
 			const assignmentId = rawEntry.assignmentId;
@@ -1266,13 +1273,13 @@ export class AgentDaemon {
 				// An omitted ID is compatible only with a selector which has never
 				// carried C03 identity. Otherwise its target is ambiguous, so fence
 				// the selector rather than guessing an assignment to delete.
-				if (c03Selectors.has(rawEntry.childId)) quarantinedSelectors.add(rawEntry.childId);
+				if (c03Selectors.has(rawEntry.childId)) quarantineSelector(rawEntry.childId);
 				else latest.delete(this.rlmAssignmentKey({ childId: rawEntry.childId }));
 			} else if (!assertFreshUuid(assignmentId)) {
 				// An invalid ID cannot name an immutable assignment. Quarantine only
 				// its declared selector; in particular, never use it to delete an
 				// unrelated valid assignment sharing another selector.
-				quarantinedSelectors.add(rawEntry.childId);
+				quarantineSelector(rawEntry.childId);
 			} else {
 				// The selector and immutable ID are both syntactically meaningful, but
 				// the rest of this append-only update is corrupt. Fencing just that ID
@@ -1280,7 +1287,7 @@ export class AgentDaemon {
 				// after replay. Quarantine the entire selector until a later complete
 				// C03 publication explicitly repopulates it.
 				latest.delete(this.rlmAssignmentKey({ childId: rawEntry.childId, assignmentId }));
-				quarantinedSelectors.add(rawEntry.childId);
+				quarantineSelector(rawEntry.childId);
 			}
 		};
 		let lines: string[];
@@ -1338,7 +1345,7 @@ export class AgentDaemon {
 					// Legacy rows are accepted only before a selector enters C03. After
 					// that transition, a missing identity is malformed rather than a
 					// permitted fallback to mutable display identity.
-					quarantinedSelectors.add(persisted.childId);
+					quarantineSelector(persisted.childId);
 					continue;
 				}
 				if (persisted.assignmentId !== undefined) {
