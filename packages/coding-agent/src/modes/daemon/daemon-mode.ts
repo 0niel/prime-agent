@@ -17,6 +17,7 @@ import {
 	readFileSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
@@ -107,7 +108,12 @@ import {
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	getProcessStartId,
+	type SessionLease,
+} from "../../core/session-lease.js";
 import {
 	readSessionInfo,
 	resolveSessionRlmDepth,
@@ -337,6 +343,8 @@ const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SUPPORT
 const CLIENT_CATCHUP_RETRY_MS = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
 const SUPERVISOR_FENCE_POLL_MS = 250;
+const SUPERVISOR_LAUNCH_LOCK_STALE_MS = 30_000;
+const SUPERVISOR_LAUNCH_LOCK_PROCESS_START_ID_FILE = "process-start-id";
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
 	"Prime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been partially completed.\n" +
@@ -766,6 +774,16 @@ export class AgentDaemon {
 				writeFileSync(join(candidateDirectory, "pid"), `${process.pid}\n`, {
 					mode: 0o600,
 				});
+				const processStartId = getProcessStartId(process.pid);
+				if (processStartId) {
+					writeFileSync(
+						join(candidateDirectory, SUPERVISOR_LAUNCH_LOCK_PROCESS_START_ID_FILE),
+						`${processStartId}\n`,
+						{
+							mode: 0o600,
+						},
+					);
+				}
 				try {
 					renameSync(candidateDirectory, lockDirectory);
 					ownsLock = true;
@@ -777,12 +795,21 @@ export class AgentDaemon {
 						throw error;
 					}
 					let ownerPid: number | undefined;
+					let ownerProcessStartId: string | undefined;
 					try {
 						ownerPid = Number(readFileSync(join(lockDirectory, "pid"), "utf8").trim());
 					} catch {
 						// An invalid owner is reclaimed atomically below.
 					}
-					if (ownerPid && this.isProcessAlive(ownerPid)) {
+					try {
+						ownerProcessStartId = readFileSync(
+							join(lockDirectory, SUPERVISOR_LAUNCH_LOCK_PROCESS_START_ID_FILE),
+							"utf8",
+						).trim();
+					} catch {
+						// Legacy launch locks only contain a pid and expire by age.
+					}
+					if (ownerPid && this.isSupervisorLaunchLockActive(lockDirectory, ownerPid, ownerProcessStartId)) {
 						return;
 					}
 					const staleDirectory = `${lockDirectory}.stale-${process.pid}-${token}`;
@@ -837,6 +864,30 @@ export class AgentDaemon {
 				rmSync(lockDirectory, { recursive: true, force: true });
 			}
 			this.supervisorLaunchInProgress = false;
+		}
+	}
+
+	private isSupervisorLaunchLockActive(
+		lockDirectory: string,
+		ownerPid: number,
+		ownerProcessStartId?: string,
+	): boolean {
+		if (!this.isProcessAlive(ownerPid)) {
+			return false;
+		}
+		if (ownerProcessStartId) {
+			const observedProcessStartId = getProcessStartId(ownerPid);
+			if (observedProcessStartId !== undefined && observedProcessStartId !== ownerProcessStartId) {
+				return false;
+			}
+		}
+		try {
+			return Date.now() - statSync(lockDirectory).mtimeMs < SUPERVISOR_LAUNCH_LOCK_STALE_MS;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				return false;
+			}
+			throw error;
 		}
 	}
 
