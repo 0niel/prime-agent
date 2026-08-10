@@ -5573,6 +5573,33 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("rehydrates a persisted model ID containing a slash", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-slash-model-id-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir, { modelId: "org/scripted" });
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const row = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			row.model = { provider: "test", modelId: "org/scripted" };
+			writeFileSync(registryPath, `${JSON.stringify(row)}\n`);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createAgentMessageController(
+					getCurrentState: () => ActiveSessionState | undefined,
+				): AgentSessionMessageController;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+
+			await internals
+				.createAgentMessageController(() => parentState)
+				.sendAgentMessage({ target: "renamed-worker", message: "rehydrate slash-bearing model" });
+
+			expect(fixture.modelRegistry.find).toHaveBeenCalledWith("test", "org/scripted");
+			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions?.model).toBe(fixture.model);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("quarantines only the malformed registry selector until a full row deliberately republishes it", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-registry-replay-model-"));
 		try {
