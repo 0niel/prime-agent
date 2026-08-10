@@ -155,6 +155,21 @@ export interface SwarmEvidence {
 	};
 }
 
+/**
+ * Opaque in-process trust root for a specific emitted evidence directory and
+ * artifact-index commitment. It has no serialized representation. The unique
+ * brand is module-private and the registry is deliberately process-local, so
+ * neither can be reconstructed from manifest.json. Durable cross-process
+ * signed commitments are B00B work.
+ */
+declare const swarmEvidenceCapabilityBrand: unique symbol;
+export type SwarmEvidenceCapability = { readonly [swarmEvidenceCapabilityBrand]: true };
+type RegisteredBundle = Readonly<{ directory: string; artifactBundleId: string }>;
+const registeredBundles = new WeakMap<object, RegisteredBundle>();
+function issueSwarmEvidenceCapability(): SwarmEvidenceCapability {
+	return Object.freeze({}) as SwarmEvidenceCapability;
+}
+
 /** Canonical JSON rejects values which JSON.stringify silently changes. */
 export function canonicalJson(value: unknown): string {
 	if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
@@ -188,6 +203,9 @@ function assert(condition: unknown, message: string): asserts condition {
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function isString(value: unknown): value is string {
+	return typeof value === "string";
 }
 function isSafeInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -304,8 +322,12 @@ function assertContentFree(value: unknown, key?: string, untrustedObjectKeys = f
 		return;
 	}
 	if (value === null || typeof value === "boolean" || typeof value === "number") return;
-	if (Array.isArray(value))
-		return void value.forEach((item) => assertContentFree(item, undefined, untrustedObjectKeys));
+	if (Array.isArray(value)) {
+		value.forEach((item) => {
+			assertContentFree(item, undefined, untrustedObjectKeys);
+		});
+		return;
+	}
 	assert(isRecord(value), "non-content-free value type");
 	for (const [entryKey, item] of Object.entries(value)) {
 		assert(
@@ -667,13 +689,18 @@ function fileContents(evidence: SwarmEvidence): Record<(typeof EVIDENCE_FILES)[n
 		"summary.json": `${canonicalJson(redacted.summary)}\n`,
 	};
 }
-/** Writes only canonical, content-free artifacts and verifies them before returning. */
-export async function writeSwarmEvidence(directory: string, evidence: SwarmEvidence): Promise<void> {
+/**
+ * Writes canonical content-free artifacts and returns the only trust root the
+ * verifier accepts. The capability is registered in this process for this
+ * canonical directory and exact artifact-index commitment; it cannot be
+ * reconstructed from manifest.json.
+ */
+export async function writeSwarmEvidence(directory: string, evidence: SwarmEvidence): Promise<SwarmEvidenceCapability> {
 	await mkdir(directory, { recursive: true, mode: 0o700 });
 	await chmod(directory, 0o700);
+	const root = await realpath(directory);
 	const files = fileContents(evidence);
-	for (const name of EVIDENCE_FILES)
-		await writeFile(join(directory, name), files[name], { encoding: "utf8", mode: 0o600 });
+	for (const name of EVIDENCE_FILES) await writeFile(join(root, name), files[name], { encoding: "utf8", mode: 0o600 });
 	const artifacts: EvidenceArtifact[] = EVIDENCE_FILES.map((path) => ({
 		path,
 		bytes: Buffer.byteLength(files[path]),
@@ -686,8 +713,11 @@ export async function writeSwarmEvidence(directory: string, evidence: SwarmEvide
 		artifactBundleId: fingerprint(artifacts),
 		artifacts,
 	};
-	await writeFile(join(directory, "manifest.json"), `${canonicalJson(manifest)}\n`, { encoding: "utf8", mode: 0o600 });
-	await verifySwarmEvidence(directory, manifest.artifactBundleId);
+	await writeFile(join(root, "manifest.json"), `${canonicalJson(manifest)}\n`, { encoding: "utf8", mode: 0o600 });
+	const capability = issueSwarmEvidenceCapability();
+	registeredBundles.set(capability, { directory: root, artifactBundleId: manifest.artifactBundleId });
+	await verifySwarmEvidence(root, capability);
+	return capability;
 }
 function parseCanonicalJson(raw: string, label: string): unknown {
 	let parsed: unknown;
@@ -753,15 +783,19 @@ function requireManifest(manifest: unknown): asserts manifest is SwarmManifest &
 	};
 	assert(fingerprint(source) === manifest.fingerprint, "manifest fingerprint mismatch");
 }
-function verifyEvents(events: unknown[], oracle: unknown[], assignments: unknown[]): void {
+function verifyEvents(events: readonly unknown[], oracle: readonly unknown[], assignments: readonly unknown[]): void {
 	assert(events.length === oracle.length && events.length > 0, "event/oracle length mismatch");
-	const nodeIds = new Set((assignments as Record<string, unknown>[]).map((assignment) => assignment.nodeId));
+	const nodeIds = new Set(
+		(assignments as readonly Record<string, unknown>[]).map((assignment) => assignment.nodeId).filter(isString),
+	);
 	let previousSequence = 0;
 	const byNode = new Map<string, Record<string, unknown>[]>();
 	for (let index = 0; index < events.length; index++) {
-		assert(isRecord(events[index]) && isRecord(oracle[index]), "invalid event record");
-		const event = events[index]!,
-			logical = oracle[index]!;
+		const eventCandidate = events[index];
+		const logicalCandidate = oracle[index];
+		assert(isRecord(eventCandidate) && isRecord(logicalCandidate), "invalid event record");
+		const event: Record<string, unknown> = eventCandidate;
+		const logical: Record<string, unknown> = logicalCandidate;
 		assertContentFree(event);
 		assertContentFree(logical);
 		assert(
@@ -820,9 +854,11 @@ function verifyEvents(events: unknown[], oracle: unknown[], assignments: unknown
 				assert(isRecord(detail) && isSafeInteger(detail.outputTokens), "invalid completion usage");
 				break;
 		}
-		const lifecycle = byNode.get(event.nodeId as string) ?? [];
+		const nodeId = event.nodeId;
+		assert(typeof nodeId === "string", "invalid event identity");
+		const lifecycle = byNode.get(nodeId) ?? [];
 		lifecycle.push(event);
-		byNode.set(event.nodeId as string, lifecycle);
+		byNode.set(nodeId, lifecycle);
 	}
 	for (const nodeId of nodeIds) {
 		const lifecycle = byNode.get(nodeId) ?? [];
@@ -883,9 +919,9 @@ function verifySummary(events: Record<string, unknown>[], summary: unknown, assi
 }
 function verifyCosts(
 	costs: unknown,
-	assignments: unknown[],
-	priceCard: Record<string, unknown>,
-	events: Record<string, unknown>[],
+	assignments: readonly unknown[],
+	priceCard: Readonly<{ inputPerMillionTokens: unknown; outputPerMillionTokens: unknown }>,
+	events: readonly Record<string, unknown>[],
 ): void {
 	assert(Array.isArray(costs), "invalid cost attribution");
 	const inputPrice = priceCard.inputPerMillionTokens,
@@ -902,7 +938,7 @@ function verifyCosts(
 			assert(typeof row[key] === "number" && Number.isFinite(row[key]), `invalid ${key}`);
 	}
 	const nodes = rows.filter((row) => row.kind === "node");
-	const assignmentRows = assignments as Record<string, unknown>[];
+	const assignmentRows = assignments as readonly Record<string, unknown>[];
 	assert(
 		nodes.length === assignmentRows.length &&
 			nodes.every((node) => assignmentRows.some((assignment) => assignment.nodeId === node.id)),
@@ -932,14 +968,16 @@ function verifyCosts(
 		const children = assignmentRows
 			.filter((assignment) => assignment.parentNodeId === node.id)
 			.map((assignment) => nodeById.get(assignment.nodeId as string));
-		assert(children.every(Boolean), "missing child cost");
-		for (const suffix of ["InputTokens", "OutputTokens", "Cost"] as const)
+		assert(children.every(isRecord), "missing child cost");
+		for (const suffix of ["InputTokens", "OutputTokens", "Cost"] as const) {
+			const direct = node[`direct${suffix}`];
+			assert(typeof direct === "number", `invalid direct cost field: ${suffix}`);
 			assert(
 				node[`downstream${suffix}`] ===
-					node[`direct${suffix}`] +
-						children.reduce((sum, child) => sum + (child![`downstream${suffix}`] as number), 0),
+					direct + children.reduce((sum, child) => sum + (child[`downstream${suffix}`] as number), 0),
 				`node tree invariant failed: ${node.id}:${suffix}`,
 			);
+		}
 	}
 	const descendants = (id: string, visited = new Set<string>()): Record<string, unknown>[] => {
 		assert(!visited.has(id), "cycle in assignment tree");
@@ -1021,8 +1059,11 @@ function verifyProcessSamples(samples: unknown): void {
 }
 
 /** Strict verifier: expected set only, no links/extras, canonical bytes, hashes, and semantic joins. */
-export async function verifySwarmEvidence(directory: string, trustedArtifactBundleId: string): Promise<void> {
+export async function verifySwarmEvidence(directory: string, capability: SwarmEvidenceCapability): Promise<void> {
+	const registration = registeredBundles.get(capability);
+	assert(registration, "issued swarm evidence capability is required");
 	const root = await realpath(directory);
+	assert(root === registration.directory, "swarm evidence capability directory mismatch");
 	const names = (await readdir(root)).sort();
 	assert(
 		canonicalJson(names) === canonicalJson([...ALL_EVIDENCE_FILES].sort()),
@@ -1062,10 +1103,6 @@ export async function verifySwarmEvidence(directory: string, trustedArtifactBund
 	}
 	assert(indexed.size === EVIDENCE_FILES.length, "missing indexed artifact");
 	assert(manifest.artifactBundleId === fingerprint(manifest.artifacts), "artifact bundle identity mismatch");
-	assert(
-		typeof trustedArtifactBundleId === "string" && /^[0-9a-f]{64}$/.test(trustedArtifactBundleId),
-		"trusted artifact bundle identity is required",
-	);
 	const events = parseCanonicalJsonl(await readFile(join(root, "events.jsonl"), "utf8"), "events.jsonl");
 	const oracle = parseCanonicalJsonl(await readFile(join(root, "oracle.jsonl"), "utf8"), "oracle.jsonl");
 	verifyEvents(events, oracle, manifest.assignments);
@@ -1091,7 +1128,10 @@ export async function verifySwarmEvidence(directory: string, trustedArtifactBund
 		"summary.json": await readFile(join(root, "summary.json"), "utf8"),
 	});
 	assert(manifest.deterministicBundleId === deterministic, "deterministic bundle identity mismatch");
-	assert(manifest.artifactBundleId === trustedArtifactBundleId, "trusted artifact bundle identity mismatch");
+	assert(
+		manifest.artifactBundleId === registration.artifactBundleId,
+		"issued swarm evidence capability bundle mismatch",
+	);
 }
 export function createFixedFanoutScenario(fanout: (typeof SUPPORTED_SWARM_FANOUTS)[number]): SwarmBenchmarkConfig {
 	return {

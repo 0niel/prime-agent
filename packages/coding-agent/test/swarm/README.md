@@ -47,11 +47,14 @@ across equivalent fixture runs. `events.jsonl` (elapsed timings) and
 explicitly volatile and are **not** a deterministic replay claim.
 
 The manifest index detects ordinary at-rest corruption but is mutable with the
-artifact directory. For adversarial mutation protection, retain the emitted
-`artifactBundleId` outside that directory (or sign it) and pass it as the required second argument to
-`verifySwarmEvidence(directory, trustedArtifactBundleId)`. That trusted
-commitment makes artifact-index rehashing fail closed. B00A does not claim a
-signing/key-management implementation; that integration remains B00B.
+artifact directory. `writeSwarmEvidence(directory, evidence)` returns an opaque,
+module-branded capability registered for that canonical directory and artifact
+index in the current process. Pass that retained value to
+`verifySwarmEvidence(directory, capability)`. A string read back from
+`manifest.json` is not a capability and is rejected, and a capability issued for
+another directory/bundle is rejected. The capability is deliberately neither
+serialized nor reconstructible from the manifest. Durable cross-process signed
+commitments, keys, and signature verification are explicitly **B00B** work.
 
 `runSwarmBenchmark()` maps local fake assignments directly into `Promise.all`
 without a queue, semaphore, retry, local limiter, or synthetic 429. Its

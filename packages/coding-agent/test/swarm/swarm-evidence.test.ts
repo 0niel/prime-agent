@@ -10,6 +10,7 @@ import {
 	type ProcessSampler,
 	redactEvidence,
 	runSwarmBenchmark,
+	type SwarmEvidenceCapability,
 	verifySwarmEvidence,
 	writeSwarmEvidence,
 } from "./swarm-evidence.js";
@@ -18,24 +19,31 @@ const directories: string[] = [];
 afterEach(async () => {
 	await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
+const capabilities = new Map<string, SwarmEvidenceCapability>();
+const fixedProcessSampler: ProcessSampler = {
+	source: "test process sampler",
+	sample: () => [{ pid: 1, rssBytes: 1, label: "fixture" }],
+};
 async function evidenceDirectory(fanout = 4): Promise<string> {
 	const directory = await mkdtemp(join(tmpdir(), "prime-agent-b00a-"));
 	directories.push(directory);
-	await writeSwarmEvidence(directory, await runSwarmBenchmark(createFixedFanoutScenario(fanout as 1 | 4 | 16 | 64)));
-	await registerTrustedBundle(directory);
+	const evidence = await runSwarmBenchmark({
+		...createFixedFanoutScenario(fanout as 1 | 4 | 16 | 64),
+		processSampler: fixedProcessSampler,
+	});
+	capabilities.set(directory, await writeSwarmEvidence(directory, evidence));
 	return directory;
 }
 function hash(raw: string): string {
 	return createHash("sha256").update(raw).digest("hex");
 }
-const trustedBundles = new Map<string, string>();
-async function registerTrustedBundle(directory: string): Promise<void> {
-	trustedBundles.set(directory, JSON.parse(await readFile(join(directory, "manifest.json"), "utf8")).artifactBundleId);
+function capability(directory: string): SwarmEvidenceCapability {
+	const issued = capabilities.get(directory);
+	if (!issued) throw new Error(`missing test capability: ${directory}`);
+	return issued;
 }
 async function verify(directory: string): Promise<void> {
-	const trusted = trustedBundles.get(directory);
-	if (!trusted) throw new Error(`missing test trust root: ${directory}`);
-	return verifySwarmEvidence(directory, trusted);
+	return verifySwarmEvidence(directory, capability(directory));
 }
 async function rehashArtifact(directory: string, path: string, raw: string): Promise<void> {
 	await writeFile(join(directory, path), raw);
@@ -126,6 +134,24 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		expect(run).toMatchObject({ kind: "run", directCost: 0 });
 		expect(run?.downstreamCost).toBeGreaterThan(0);
 	});
+	test("accepts an empty process sample when the platform sampler has no visible processes", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "prime-agent-b00a-empty-processes-"));
+		directories.push(directory);
+		const evidence = await runSwarmBenchmark({
+			...createFixedFanoutScenario(1),
+			processSampler: { source: "unavailable platform sampler", sample: () => [] },
+		});
+		capabilities.set(directory, await writeSwarmEvidence(directory, evidence));
+		const samples = JSON.parse(await readFile(join(directory, "process-samples.json"), "utf8"));
+		expect(samples).toHaveLength(4);
+		expect(
+			samples.every(
+				(sample: { processes: unknown[]; totalRssBytes: number }) =>
+					sample.processes.length === 0 && sample.totalRssBytes === 0,
+			),
+		).toBe(true);
+		await expect(verify(directory)).resolves.toBeUndefined();
+	});
 	test("whole artifacts are canary-safe even for unicode, chunks, paths, and ordinary fields", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "prime-agent-b00a-canary-"));
 		directories.push(directory);
@@ -155,8 +181,7 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 				},
 			],
 		});
-		await writeSwarmEvidence(directory, evidence);
-		await registerTrustedBundle(directory);
+		capabilities.set(directory, await writeSwarmEvidence(directory, evidence));
 		const all = (
 			await Promise.all(
 				[
@@ -246,8 +271,7 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 			...createFixedFanoutScenario(1),
 			metadata: { [keyCanary]: "ordinary", [structuralKeyCanary]: "ordinary" },
 		});
-		await writeSwarmEvidence(directory, evidence);
-		await registerTrustedBundle(directory);
+		capabilities.set(directory, await writeSwarmEvidence(directory, evidence));
 		const tree = (
 			await Promise.all(
 				[
@@ -274,7 +298,10 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 	test("rejects rehashed non-content-free event and oracle data", async () => {
 		const directory = await evidenceDirectory(1);
 		const eventsPath = join(directory, "events.jsonl");
-		const events = (await readFile(eventsPath, "utf8")).trim().split("\n").map(JSON.parse);
+		const events = (await readFile(eventsPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
 		events[0].detail = { message: "ADVERSARIAL_EVENT_CANARY" };
 		const raw = `${events.map(canonicalJson).join("\n")}\n`;
 		await rehashArtifact(directory, "events.jsonl", raw);
@@ -302,7 +329,7 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		await rehashArtifact(directory, "cost-attribution.json", `${canonicalJson(costs)}\n`);
 		await expect(verify(directory)).rejects.toThrow("assignment input usage mismatch");
 	});
-	test("uses an explicit stable deterministic-subset identity and out-of-band artifact commitment", async () => {
+	test("uses a stable deterministic subset plus an opaque issued artifact capability", async () => {
 		const first = await evidenceDirectory(1),
 			second = await evidenceDirectory(1);
 		const firstManifest = JSON.parse(await readFile(join(first, "manifest.json"), "utf8"));
@@ -312,9 +339,77 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		const samples = JSON.parse(await readFile(join(first, "process-samples.json"), "utf8"));
 		samples[0].processes[0].pid += 1;
 		await rehashArtifact(first, "process-samples.json", `${canonicalJson(samples)}\n`);
-		await expect(verifySwarmEvidence(first, firstManifest.artifactBundleId)).rejects.toThrow(
-			"trusted artifact bundle identity mismatch",
+		await expect(verify(first)).rejects.toThrow("issued swarm evidence capability bundle mismatch");
+	});
+
+	test("rejects a capability issued for a different evidence directory", async () => {
+		const first = await evidenceDirectory(1);
+		const second = await evidenceDirectory(1);
+		await expect(verifySwarmEvidence(first, capability(second))).rejects.toThrow(
+			"swarm evidence capability directory mismatch",
 		);
+	});
+
+	test("rejects a manifest read-back value and a coherent forged bundle without its issued capability", async () => {
+		const directory = await evidenceDirectory(1);
+		const manifestPath = join(directory, "manifest.json");
+		const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+		const costsPath = join(directory, "cost-attribution.json");
+		const costs = JSON.parse(await readFile(costsPath, "utf8"));
+		const node = costs.find((cost: { kind: string }) => cost.kind === "node");
+		const role = costs.find((cost: { kind: string }) => cost.kind === "role");
+		const run = costs.find((cost: { kind: string }) => cost.kind === "run");
+		const eventsPath = join(directory, "events.jsonl");
+		const events = (await readFile(eventsPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		manifest.assignments[0].inputTokens = 999;
+		await writeFile(manifestPath, `${canonicalJson(manifest)}\n`);
+		const completion = events.find((event: { type: string }) => event.type === "provider_completed");
+		completion.detail.outputTokens = 999;
+		for (const row of [node, role, run]) {
+			row.directInputTokens = row.kind === "run" ? 0 : 999;
+			row.directOutputTokens = row.kind === "run" ? 0 : 999;
+			row.downstreamInputTokens = 999;
+			row.downstreamOutputTokens = 999;
+			row.directCost = row.kind === "run" ? 0 : 999 / 1_000_000 + (999 * 2) / 1_000_000;
+			row.downstreamCost = 999 / 1_000_000 + (999 * 2) / 1_000_000;
+		}
+		await rehashArtifact(directory, "events.jsonl", `${events.map(canonicalJson).join("\n")}\n`);
+		await rehashArtifact(
+			directory,
+			"oracle.jsonl",
+			`${events.map(({ elapsedMilliseconds: _elapsed, ...event }) => canonicalJson(event)).join("\n")}\n`,
+		);
+		await rehashArtifact(directory, "cost-attribution.json", `${canonicalJson(costs)}\n`);
+		const forged = JSON.parse(await readFile(manifestPath, "utf8"));
+		forged.fingerprint = hash(
+			canonicalJson({
+				schemaVersion: forged.schemaVersion,
+				benchmarkVersion: forged.benchmarkVersion,
+				scenario: forged.scenario,
+				assignments: forged.assignments,
+				faultSchedule: forged.faultSchedule,
+				priceCard: forged.priceCard,
+				metadata: forged.metadata,
+			}),
+		);
+		forged.deterministicBundleId = hash(
+			canonicalJson({
+				oracle: await readFile(join(directory, "oracle.jsonl"), "utf8"),
+				costAttribution: await readFile(costsPath, "utf8"),
+				summary: await readFile(join(directory, "summary.json"), "utf8"),
+			}),
+		);
+		forged.artifactBundleId = hash(canonicalJson(forged.artifacts));
+		await writeFile(manifestPath, `${canonicalJson(forged)}\n`);
+		const readBack = JSON.parse(await readFile(manifestPath, "utf8")).artifactBundleId;
+		expect(typeof readBack).toBe("string");
+		await expect(verifySwarmEvidence(directory, readBack)).rejects.toThrow(
+			"issued swarm evidence capability is required",
+		);
+		await expect(verify(directory)).rejects.toThrow("issued swarm evidence capability bundle mismatch");
 	});
 
 	test("binds direct output usage to provider_completed terminal evidence", async () => {
