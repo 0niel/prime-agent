@@ -118,6 +118,23 @@ describe("daemon supervisor C01 process identity fencing", () => {
 			}
 		});
 
+		it("clears its settled deferred join after the same worker publishes a new generation", async () => {
+			vi.useFakeTimers();
+			try {
+				const target = worker();
+				const supervisor = supervisorFor(target) as any;
+				supervisor.isWorkerRecoveryCandidate = vi.fn(() => false);
+				supervisor.deferWorkerRecovery(target, new Error("A"));
+				const deferred = target.deferredRecovery;
+				target.descriptor.generation = "published-after-A";
+				await vi.advanceTimersByTimeAsync(10_000);
+				await deferred;
+				expect(target.deferredRecovery).toBeUndefined();
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
 		it("does not let recovery A clear an installed B join", async () => {
 			vi.useFakeTimers();
 			try {

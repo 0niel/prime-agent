@@ -492,9 +492,12 @@ describe("daemon supervisor restart passivation", () => {
 			summaries: new Map(),
 		};
 		supervisor.workers.set(worker.descriptor.workerId, worker);
+		const request = vi.fn().mockResolvedValue({ type: "response", command: "prompt", success: true });
 		supervisor.recoverWorker = vi.fn(async () => {
+			// Launch publishes a fresh incarnation on this same resident object.
+			worker.descriptor.generation = "woken-generation";
 			worker.descriptor.lifecycle = "ready";
-			worker.client = { request: vi.fn() };
+			worker.client = { request };
 		});
 
 		for (const command of [
@@ -512,6 +515,11 @@ describe("daemon supervisor restart passivation", () => {
 			message: "resume",
 		});
 		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
+		expect(request).toHaveBeenCalledOnce();
+		expect(request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "prompt", activeSessionId: "active-read" }),
+			expect.any(Number),
+		);
 	});
 
 	it.each([

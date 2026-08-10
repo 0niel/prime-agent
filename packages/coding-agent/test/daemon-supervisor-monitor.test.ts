@@ -988,6 +988,51 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it("continues global shutdown after skipping quarantined evidence", async () => {
+		const stopWorker = vi.fn(async (worker: { descriptor: { workerId: string } }) => {
+			if (worker.descriptor.workerId === "failing") {
+				throw new Error("ordinary worker cleanup failed");
+			}
+		});
+		const log = vi.fn();
+		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+			throw new Error(`exit ${code}`);
+		}) as typeof process.exit);
+		const quarantined = { descriptor: { workerId: "quarantined" }, quarantined: true };
+		const failing = { descriptor: { workerId: "failing" } };
+		const healthy = { descriptor: { workerId: "healthy" } };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			shuttingDown: false,
+			signalCleanupHandlers: [],
+			workers: new Map([
+				["quarantined", quarantined],
+				["failing", failing],
+				["healthy", healthy],
+			]),
+			clients: new Set(),
+			catalog: { stop: vi.fn(async () => undefined) },
+			stopWorker,
+			hasPersistedWorkerDescriptors: vi.fn(() => true),
+			clearIdleEvictionTimer: vi.fn(),
+			cleanupSocket: vi.fn(),
+			snapshotCacheRoot: "\0",
+			log,
+		}) as any;
+
+		try {
+			await expect(supervisor.shutdown(24, true)).rejects.toThrow("exit 24");
+			expect(stopWorker).toHaveBeenCalledTimes(2);
+			expect(stopWorker).toHaveBeenCalledWith(failing, true, false, true);
+			expect(stopWorker).toHaveBeenCalledWith(healthy, true, false, true);
+			expect(supervisor.workers.get("quarantined")).toBe(quarantined);
+			expect(log).toHaveBeenCalledWith(expect.stringContaining("quarantined session worker quarantined"));
+			expect(log).toHaveBeenCalledWith(expect.stringContaining("session worker failing"));
+			expect(exit).toHaveBeenCalledWith(24);
+		} finally {
+			exit.mockRestore();
+		}
+	});
+
 	it("does not poll a healthy supervisor after the startup check", async () => {
 		vi.useFakeTimers();
 		let resolveProbe: () => void = () => undefined;
@@ -1104,6 +1149,53 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(recoverWorker).toHaveBeenCalledOnce();
 		expect(worker.deferredRecovery).toBeUndefined();
 		await vi.advanceTimersByTimeAsync(10_000);
+		expect(recoverWorker).toHaveBeenCalledOnce();
+	});
+
+	it("recovers after a second disconnect callback clears the active client", async () => {
+		const client = {};
+		const worker: DeferredRecoveryWorker = {
+			descriptor: {
+				workerId: "worker-second-close",
+				pid: process.pid,
+				rootActiveSessionId: "active-second-close",
+				lifecycle: "ready",
+			},
+			client,
+			snapshotCache: new Map(),
+			incomingTranscriptActiveSessionIds: new Set(),
+			transcriptCaches: new Map(),
+			duplicateIncomingTranscriptChunkIndexes: new Map(),
+			snapshotTransferFrames: new Map<string, never>(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		let releaseAdmission!: () => void;
+		const admission = new Promise<void>((resolve) => {
+			releaseAdmission = resolve;
+		});
+		const assertRecoveryAllowed = vi.fn(async () => admission);
+		const recoverWorker = vi.fn(async () => {
+			worker.recovery = Promise.resolve();
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			assertRecoveryAllowed,
+			persistWorker: vi.fn(),
+			syncAgentPeers: vi.fn(async () => undefined),
+			recoverWorker,
+		}) as DeferredRecoveryHarness;
+
+		const first = supervisor.handleWorkerClose(worker, client, new Error("first disconnect"));
+		await Promise.resolve();
+		const second = supervisor.handleWorkerClose(worker, client, new Error("second disconnect"));
+		releaseAdmission();
+		await Promise.all([first, second]);
+
+		expect(worker.client).toBeUndefined();
+		expect(worker.descriptor.lifecycle).toBe("recovering");
 		expect(recoverWorker).toHaveBeenCalledOnce();
 	});
 

@@ -2924,7 +2924,11 @@ export class DaemonSupervisor {
 		}
 		if (
 			!this.isWorkerRecoveryEligible(worker) ||
-			(generation !== undefined && !this.acceptsWorkerCallback(worker, generation, client))
+			// The first callback fence deliberately consumed `client` by clearing it.
+			// Requiring worker.client === client here would strand this exact
+			// incarnation after assertRecoveryAllowed() yields. A duplicate close still
+			// fails the entry fence; this continuation needs only identity authority.
+			(generation !== undefined && !this.matchesCurrentWorker(worker, generation))
 		) {
 			return;
 		}
@@ -2955,15 +2959,13 @@ export class DaemonSupervisor {
 		if (worker.deferredRecovery) {
 			return;
 		}
-		const generation = worker.descriptor.generation;
 		let deferred!: Promise<void>;
 		deferred = this.resumeDeferredWorkerRecovery(worker, disconnectError).finally(() => {
-			// Legacy test harnesses may omit generation. Runtime descriptors cannot,
-			// but both forms need their settled deferred fence released.
-			if (
-				worker.deferredRecovery === deferred &&
-				(generation === undefined || this.matchesCurrentWorker(worker, generation))
-			) {
+			// This field is a join handle, not a lifecycle authority. A successful
+			// recovery may publish a new generation before it settles; promise
+			// equality alone both releases this exact settled cycle and protects a
+			// newer deferred cycle that replaced it.
+			if (worker.deferredRecovery === deferred) {
 				worker.deferredRecovery = undefined;
 			}
 		});
@@ -3854,15 +3856,17 @@ export class DaemonSupervisor {
 		command: DaemonCommand,
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<DaemonResponse> {
-		const generation = worker.descriptor.generation;
+		let generation = worker.descriptor.generation;
 		if (!generation || !this.matchesCurrentWorker(worker, generation)) {
 			throw new Error(`Session worker ${worker.descriptor.workerId} was superseded`);
 		}
 		if (this.commandExplicitlyWakesWorker(command)) {
 			await this.wakePassivatedWorker(worker);
-			// An explicit wake may suspend while a replacement takes this worker's
-			// public child selector. Do not let the stale route forward into A or B.
-			if (!this.matchesCurrentWorker(worker, generation)) {
+			// Waking a passivated resident legitimately launches a new generation on
+			// the same object. Reacquire its published generation and client after the
+			// await, while still rejecting a different object that took this selector.
+			generation = worker.descriptor.generation;
+			if (!generation || !this.matchesCurrentWorker(worker, generation)) {
 				throw new Error(`Session worker ${worker.descriptor.workerId} was superseded`);
 			}
 		}
@@ -5586,8 +5590,22 @@ export class DaemonSupervisor {
 			cleanup();
 		}
 		if (stopWorkers) {
+			// A malformed descriptor is retained as raw quarantine evidence. Its stop
+			// refusal must not prevent shutdown from stopping every healthy worker or
+			// releasing the daemon's global resources.
 			await Promise.all(
-				[...this.workers.values()].map((worker) => this.stopWorker(worker, true, forceWorkers, true)),
+				[...this.workers.values()].map(async (worker) => {
+					if (worker.quarantined) {
+						this.reportCleanupFailure(
+							`quarantined session worker ${worker.descriptor.workerId}`,
+							new Error("Skipped stop to preserve quarantined lifecycle evidence"),
+						);
+						return;
+					}
+					await this.runCleanupStep(`session worker ${worker.descriptor.workerId}`, () =>
+						this.stopWorker(worker, true, forceWorkers, true),
+					);
+				}),
 			);
 			if (!this.hasPersistedWorkerDescriptors()) {
 				rmSync(this.supervisorConfigPath, { force: true });
