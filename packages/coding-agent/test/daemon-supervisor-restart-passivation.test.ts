@@ -15,6 +15,7 @@ vi.mock("node:child_process", async (importOriginal) => ({
 }));
 
 import { SessionManager } from "../src/core/session-manager.js";
+import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { DAEMON_UPDATE_RESTART_FORMAT_VERSION } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
@@ -24,6 +25,11 @@ const directories: string[] = [];
 afterEach(() => {
 	for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
+
+type AttachClientFixture = Pick<
+	DaemonSocketClient,
+	"id" | "attachedActiveSessionIds" | "capabilities" | "supportsExtensionUi"
+>;
 
 interface WorkerFixture {
 	descriptor: DaemonWorkerDescriptor;
@@ -35,6 +41,15 @@ interface WorkerFixture {
 	archiveFinalization?: Promise<void>;
 	stopFinalized?: boolean;
 	stopFailure?: Error;
+}
+
+interface PassivatedWorkerFixture extends WorkerFixture {
+	snapshotCache: Map<string, unknown>;
+	transcriptCaches: Map<string, unknown>;
+	snapshotGenerations: Map<string, Map<string, unknown>>;
+	snapshotLoads: Map<string, Promise<unknown>>;
+	intentionalStop: boolean;
+	stopRevision: number;
 }
 
 interface SupervisorInternals {
@@ -507,7 +522,7 @@ describe("daemon supervisor restart passivation", () => {
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals & {
 			attachClient(
-				client: { id: string },
+				client: AttachClientFixture,
 				command: { type: "attach"; activeSessionId: string; launchEnv?: Record<string, string> },
 			): Promise<unknown>;
 		};
@@ -886,7 +901,7 @@ describe("daemon supervisor restart passivation", () => {
 			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
-		const worker = {
+		const worker: PassivatedWorkerFixture = {
 			descriptor: (() => {
 				const { pid: _pid, processStartId: _start, ...passive } = descriptor(fixture, "failed-stop", session);
 				return { ...passive, lifecycle: "passivated" as const };
