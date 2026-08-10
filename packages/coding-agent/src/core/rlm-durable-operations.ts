@@ -399,7 +399,12 @@ class Store implements RlmDurableOperationStore {
 		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
-		if (!operation || operation.uncertain || operation.lifecycle !== "admitted") return false;
+		if (
+			!operation ||
+			operation.uncertain ||
+			(operation.lifecycle !== "admitted" && operation.lifecycle !== "materialized")
+		)
+			return false;
 		const childFile = canonicalExistingFile(input.childSessionFile, input.childSessionRoot, this.io);
 		try {
 			assertSessionIdentity(input.childSessionId, childFile, this.io);

@@ -128,6 +128,19 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return this._session;
 	}
 
+	/** Preserve C03 identity when this daemon runtime is used as a release callback handle. */
+	get assignmentId(): string | undefined {
+		return this._metadata.assignmentId;
+	}
+
+	get operationId(): string | undefined {
+		return this._metadata.operationId;
+	}
+
+	get deliveryId(): string | undefined {
+		return this._metadata.deliveryId;
+	}
+
 	get cwd(): string {
 		return this._services.cwd;
 	}

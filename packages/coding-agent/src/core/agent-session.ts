@@ -9258,9 +9258,16 @@ export class AgentSession {
 		return true;
 	}
 
-	/** Status of a direct RLM child run, while the run is still tracked. */
-	getRlmChildRunStatus(childId: string): RlmChildAgentStatus | undefined {
-		return this._activeRlmChildRuns.get(childId)?.status;
+	/** Status of a direct RLM child run, optionally fenced to its exact durable incarnation. */
+	getRlmChildRunStatus(childId: string, assignmentId?: string, operationId?: string): RlmChildAgentStatus | undefined {
+		const run = this._activeRlmChildRuns.get(childId);
+		if (
+			!run ||
+			(assignmentId !== undefined && run.assignmentId !== assignmentId) ||
+			(operationId !== undefined && run.operationId !== operationId)
+		)
+			return undefined;
+		return run.status;
 	}
 
 	private async _currentActiveSessionId(): Promise<string | undefined> {

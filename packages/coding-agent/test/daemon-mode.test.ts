@@ -1441,7 +1441,7 @@ describe("daemon mode helpers", () => {
 		expect(internals.sessions.get(childB.activeSessionId)).toBe(childB);
 	});
 
-	it("keeps an assignment-only passive delete display-only without minting authority", async () => {
+	it("deletes an assignment-only passive row without minting C03 authority", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-legacy-delete-assignment-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
@@ -1463,8 +1463,11 @@ describe("daemon mode helpers", () => {
 					(line) =>
 						JSON.parse(line) as { childId: string; assignmentId?: string; operationId?: string; status: string },
 				);
-			expect(rows).toEqual([expect.objectContaining({ childId: fixture.childId, status: "completed" })]);
-			expect(rows[0]?.operationId).toBeUndefined();
+			expect(rows).toEqual([
+				expect.objectContaining({ childId: fixture.childId, status: "completed" }),
+				expect.objectContaining({ childId: fixture.childId, status: "deleted" }),
+			]);
+			expect(rows.every((row) => row.operationId === undefined)).toBe(true);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -6614,7 +6617,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("does not match a renamed passive child by its stale registry name", async () => {
+	it("matches a legacy passive child by its persisted session name rather than another row's stale name", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-lazy-rlm-renamed-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
@@ -6627,9 +6630,13 @@ describe("daemon mode helpers", () => {
 			const siblingSessionFile = siblingManager.getSessionFile();
 			if (!siblingSessionFile) throw new Error("Missing sibling session file");
 			const parentRegistry = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const legacyPrimary = JSON.parse(readFileSync(parentRegistry, "utf8")) as Record<string, unknown>;
+			delete legacyPrimary.assignmentId;
+			delete legacyPrimary.operationId;
+			delete legacyPrimary.deliveryId;
 			writeFileSync(
 				parentRegistry,
-				`${readFileSync(parentRegistry, "utf8")}${JSON.stringify({
+				`${JSON.stringify(legacyPrimary)}\n${JSON.stringify({
 					type: "rlm_subagent",
 					childId: siblingId,
 					sessionName: "spawn-worker",
@@ -6657,8 +6664,10 @@ describe("daemon mode helpers", () => {
 				internals
 					.createAgentMessageController(() => parentState)
 					.sendAgentMessage({ target: "spawn-worker", message: "report progress" }),
-			).rejects.toThrow("Unknown active session");
-			expect(fixture.createRuntime).toHaveBeenCalledOnce();
+			).resolves.toMatchObject({ target: { sessionName: "spawn-worker" } });
+			// The C03 row has been renamed in its session transcript; lookup must wake
+			// the distinct legacy child whose current persisted name still matches.
+			expect(fixture.createRuntime).toHaveBeenCalledTimes(2);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

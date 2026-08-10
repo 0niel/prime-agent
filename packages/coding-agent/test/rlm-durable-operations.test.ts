@@ -193,6 +193,25 @@ describe("RLM durable operation store", () => {
 		expect(mode(join(f.parentArtifacts, "rlm-terminal-consumed.jsonl"))).toBe(0o600);
 	});
 
+	it("makes exact materialization retries idempotent after the lifecycle advances", () => {
+		const f = fixture();
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		store.admit(f.admission);
+		materialize(store, f);
+		expect(
+			store.markMaterialized({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				childSessionId,
+				childSessionFile: f.childFile,
+				childSessionRoot: f.root,
+				childArtifactDir: f.childArtifacts,
+				childArtifactRoot: f.root,
+			}),
+		).toBe(true);
+	});
+
 	it("makes exact duplicates idempotent and conflicting terminal body uncertain/fail-closed", () => {
 		const f = fixture();
 		const store = openRlmDurableOperationStore(f.parentArtifacts);

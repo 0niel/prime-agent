@@ -968,11 +968,23 @@ export class AgentDaemon {
 	private currentLiveRlmSubagentRegistryEntries(
 		entries: readonly PersistedRlmSubagentRegistryEntry[],
 	): PersistedRlmSubagentRegistryEntry[] {
-		const currentByChildId = new Map<string, PersistedRlmSubagentRegistryEntry>();
+		const c03ByChildId = new Map<string, PersistedRlmSubagentRegistryEntry>();
+		const displayByChildId = new Map<string, PersistedRlmSubagentRegistryEntry>();
 		for (const entry of entries) {
-			if (this.isAuthoritativeC03RegistryEntry(entry)) currentByChildId.set(entry.childId, entry);
+			if (this.isAuthoritativeC03RegistryEntry(entry)) {
+				c03ByChildId.set(entry.childId, entry);
+			} else {
+				// Pre-C03 rows remain selectable for display/compatibility, but never
+				// outrank an authoritative C03 lifecycle incarnation of the selector.
+				displayByChildId.set(entry.childId, entry);
+			}
 		}
-		return [...currentByChildId.values()].filter((entry) => entry.status !== "deleted");
+		return [
+			...[...c03ByChildId.values()].filter((entry) => entry.status !== "deleted"),
+			...[...displayByChildId.values()].filter(
+				(entry) => !c03ByChildId.has(entry.childId) && entry.status !== "deleted",
+			),
+		];
 	}
 
 	private requireRlmSubagentRegistryPath(parentState: ActiveSessionState): string {
@@ -2887,7 +2899,11 @@ export class AgentDaemon {
 				// its exact delete intent. Keep only the active cancelled run alive long
 				// enough for its abort to write the owner-local terminal hand-off. Passive
 				// and passivating instances have no such owner and must close normally.
-				if (assignmentId && operationId && parent.getRlmChildRunStatus(childId) === "cancelled") {
+				if (
+					assignmentId &&
+					operationId &&
+					parent.getRlmChildRunStatus(childId, assignmentId, operationId) === "cancelled"
+				) {
 					const pendingDelete = durableStore()
 						.rebuild()
 						.operations.get(JSON.stringify([parent.sessionId, assignmentId, operationId]));
@@ -3664,6 +3680,19 @@ export class AgentDaemon {
 			}
 			return state;
 		} catch (error) {
+			// Registration happens before inbox import. If a later hydration step fails,
+			// detach this exact incarnation so a retry is not blocked by the closed child.
+			if (runtime && entry.assignmentId) {
+				const unsubscribe = entry.operationId
+					? parentState.runtime.session.releaseRlmChildSession(
+							entry.childId,
+							runtime.session,
+							entry.assignmentId,
+							entry.operationId,
+						)
+					: parentState.runtime.session.releaseRlmChildSession(entry.childId, runtime.session, entry.assignmentId);
+				if (unsubscribe) unsubscribe();
+			}
 			if (stateRef && this.sessions.get(stateRef.activeSessionId) === stateRef) {
 				await this.closeSession(stateRef, "completed").catch(() => undefined);
 			} else {
@@ -5871,8 +5900,12 @@ export class AgentDaemon {
 		// AgentSessionMessageAgentSummary ABI intentionally has no assignment or
 		// operation fields, but this internal seam can exactly suppress only A while
 		// retaining a later same-childId B or an identity-less legacy catalog row.
+		// Each child is tombstoned in its direct parent's registry. The result can
+		// include descendants and siblings, so inspect every resident owner rather
+		// than only `current`'s direct registry.
 		const deletedC03Operations = new Set(
-			(await this.readLatestRlmSubagentRegistry(current))
+			(await Promise.all([...this.sessions.values()].map((state) => this.readLatestRlmSubagentRegistry(state))))
+				.flat()
 				.filter((entry) => this.isAuthoritativeC03RegistryEntry(entry) && entry.status === "deleted")
 				.map((entry) => `${entry.assignmentId}\u0000${entry.operationId}`),
 		);
@@ -5941,6 +5974,7 @@ export class AgentDaemon {
 	private isNonresidentAuthoritativeC03Passive(passive: PassiveRlmSubagent): boolean {
 		return (
 			this.isAuthoritativeC03RegistryEntry(passive.entry) &&
+			(passive.entry.status === "completed" || passive.entry.status === "deleted") &&
 			this.findSessionBySessionFile(passive.entry.sessionFile) === undefined
 		);
 	}
