@@ -11268,6 +11268,59 @@ describe("C03 durable daemon publication", () => {
 		expect(closeSession).toHaveBeenCalledWith(child, "killed");
 	});
 
+	it("does not launch or materialize an admitted child after global durable uncertainty", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-c03-global-uncertainty-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				createRlmSubagentRuntime(
+					parent: ActiveSessionState,
+					options: CreateRlmSubagentRuntimeOptions,
+				): Promise<ActiveSessionState["runtime"]>;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childDir = join(fixture.parentArtifactDir, "global-uncertainty-child");
+			mkdirSync(childDir, { recursive: true });
+			const options: CreateRlmSubagentRuntimeOptions = {
+				parentSession: parent.runtime.session,
+				id: "globally-quarantined-child",
+				assignmentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+				operationId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000010",
+				deliveryId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000020",
+				prompt: "must never start",
+				sessionName: "globally-quarantined-child",
+				sessionDir: childDir,
+				model: { provider: "test", id: "durable-model" } as Model<Api>,
+				thinkingLevel: "off",
+				serviceTier: null,
+				scopedModels: [],
+				activeToolNames: [],
+				customTools: [],
+				includeGoals: false,
+				includeCompactSkill: false,
+				rlmDepth: 1,
+				rlmMaxDepth: 4,
+				rlmParentNodeId: "globally-quarantined-child",
+			};
+			internals.createSubagentRuntimeHost(parent).admitRlmSubagentOperation?.(options);
+			writeFileSync(
+				join(fixture.parentArtifactDir, "rlm-operation-ledger.jsonl"),
+				"{complete malformed unkeyed durable record}\n",
+				{ flag: "a" },
+			);
+			const runtimeCallsBefore = fixture.createRuntime.mock.calls.length;
+			await expect(internals.createRlmSubagentRuntime(parent, options)).rejects.toThrow("globally uncertain");
+			expect(fixture.createRuntime).toHaveBeenCalledTimes(runtimeCallsBefore);
+			expect(readRlmDurableOperationRegistry(fixture.parentArtifactDir)).toMatchObject({
+				hasGlobalUncertainty: true,
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("fsyncs admission before factory work, materializes before registry/publication, and leaves a failed child pending", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-c03-durable-publication-"));
 		try {

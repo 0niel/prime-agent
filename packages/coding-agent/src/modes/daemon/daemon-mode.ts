@@ -2403,7 +2403,9 @@ export class AgentDaemon {
 			// Every mutation is preceded by the complete parent + resident child fence.
 			if (!current()) return;
 			store.importPendingOutboxes();
-			if (!current()) return;
+			// A complete unkeyed record globally quarantines the recovery projection.
+			// Do not wake a provider-facing parent or materialize any transcript body.
+			if (store.rebuild().hasGlobalUncertainty || !current()) return;
 			for (const inbox of store.pendingInbox()) {
 				if (
 					inbox.parentSessionId !== parent.sessionId ||
@@ -2966,6 +2968,11 @@ export class AgentDaemon {
 			if (!parentArtifactDir) throw new Error("Durable RLM requires a persisted parent artifact");
 			return openRlmDurableOperationStore(parentArtifactDir);
 		};
+		// Admission may have preceded a later complete corrupt append.  Check again
+		// before creating a child session: global uncertainty must not launch or
+		// materialize a provider-facing operation.
+		if (options.operationId && durableStore().rebuild().hasGlobalUncertainty)
+			throw new Error("Durable RLM history is globally uncertain");
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
@@ -3486,6 +3493,14 @@ export class AgentDaemon {
 		clientEnv?: Record<string, string>,
 	): Promise<ActiveSessionState> {
 		const hydrationEnv = parentState.clientEnv ?? clientEnv;
+		// Recovery must not wake a durable child after a complete unkeyed/malformed
+		// record quarantines the parent's history.  This read is intentionally before
+		// acquiring the child lease or opening its session manager.
+		if (entry.operationId && entry.assignmentId && entry.deliveryId) {
+			const parentArtifactDir = parentState.runtime.session.sessionManager.getSessionArtifactDir?.();
+			if (parentArtifactDir && openRlmDurableOperationStore(parentArtifactDir).rebuild().hasGlobalUncertainty)
+				throw new Error("Durable RLM history is globally uncertain");
+		}
 		let stateRef: ActiveSessionState | undefined;
 		let runtime: AgentSessionRuntime | undefined;
 		let sessionLease: SessionLease | undefined;

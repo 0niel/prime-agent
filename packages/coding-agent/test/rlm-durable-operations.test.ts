@@ -284,6 +284,127 @@ describe("RLM durable operation store", () => {
 		).toBe("already_materialized");
 	});
 
+	it("globally quarantines prior and later operations after an unkeyed complete corrupt record", () => {
+		const f = fixture();
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		store.admit(f.admission);
+		materialize(store, f);
+		expect(store.appendOutbox(outbox(f))).toBe("new");
+		expect(
+			store.recordTerminal({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				deliveryId: delivery,
+				terminal: "done",
+			}),
+		).toBe(true);
+		expect(store.importOutbox(outbox(f))).toBe("new");
+
+		const ledger = join(f.parentArtifacts, "rlm-operation-ledger.jsonl");
+		appendFileSync(ledger, "{this is a complete but unkeyed corrupt record}\n");
+		const later = JSON.parse(readFileSync(ledger, "utf8").split("\n")[0]!) as Record<string, unknown>;
+		const laterAssignment = uuid(10);
+		const laterOperation = uuid(11);
+		const laterDelivery = uuid(12);
+		appendRecord(ledger, {
+			...later,
+			childId: uuid(13),
+			assignmentId: laterAssignment,
+			operationId: laterOperation,
+			deliveryId: laterDelivery,
+		});
+
+		const rebuilt = store.rebuild();
+		const aKey = JSON.stringify([parentId, assignment, operation]);
+		const bKey = JSON.stringify([parentId, laterAssignment, laterOperation]);
+		expect(rebuilt.hasUncertainRecords).toBe(true);
+		expect(rebuilt.operations.get(aKey)?.uncertain).toBe(true);
+		expect(rebuilt.deliveries.get(JSON.stringify([aKey, delivery]))?.uncertain).toBe(true);
+		expect(rebuilt.operations.get(bKey)?.uncertain).toBe(true);
+		expect(store.pendingInbox()).toEqual([]);
+		expect(store.importPendingOutboxes()).toBe(0);
+		expect(() =>
+			store.admit({ ...f.admission, assignmentId: uuid(14), operationId: uuid(15), deliveryId: uuid(16) }),
+		).toThrow(/globally uncertain/);
+		expect(
+			store.markMaterialized({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				childSessionId,
+				childSessionFile: f.childFile,
+				childSessionRoot: f.root,
+				childArtifactDir: f.childArtifacts,
+				childArtifactRoot: f.root,
+			}),
+		).toBe(false);
+		expect(
+			store.recordTerminal({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				deliveryId: delivery,
+				terminal: "done",
+			}),
+		).toBe(false);
+		expect(() => store.appendOutbox(outbox(f))).toThrow(/globally uncertain/);
+		expect(() => store.importOutbox(outbox(f))).toThrow(/globally uncertain/);
+		expect(() =>
+			store.markMaterializedDelivery({
+				parentSessionId: parentId,
+				assignmentId: assignment,
+				operationId: operation,
+				deliveryId: delivery,
+				sessionMessageId: materializedTerminalMessageId(delivery),
+			}),
+		).toThrow(/globally uncertain/);
+		expect(
+			store.recordDeleteIntent({ parentSessionId: parentId, assignmentId: assignment, operationId: operation }),
+		).toBe(false);
+		expect(
+			store.recordRelease(
+				{ parentSessionId: parentId, assignmentId: assignment, operationId: operation },
+				"released",
+			),
+		).toBe(false);
+		// Quarantine has no recovery/mutation writes; only the intentionally injected
+		// corrupt record and the later valid admission are present after the original facts.
+		expect(readFileSync(ledger, "utf8").split("\n")).toHaveLength(6);
+	});
+
+	it("globally quarantines a complete malformed record even when it carries a valid-looking key", () => {
+		const f = fixture();
+		const store = openRlmDurableOperationStore(f.parentArtifacts);
+		store.admit(f.admission);
+		const ledger = join(f.parentArtifacts, "rlm-operation-ledger.jsonl");
+		appendRecord(ledger, {
+			version: 1,
+			type: "materialized",
+			parentSessionId: parentId,
+			assignmentId: assignment,
+			operationId: operation,
+			childSessionId: "not-a-uuid",
+			childSessionFile: f.childFile,
+			childSessionRoot: f.root,
+			childArtifactDir: f.childArtifacts,
+			childArtifactRoot: f.root,
+			recordedAt: new Date().toISOString(),
+		});
+		const rebuilt = store.rebuild();
+		expect(rebuilt).toMatchObject({ hasUncertainRecords: true, hasGlobalUncertainty: true });
+		expect(rebuilt.operations.get(JSON.stringify([parentId, assignment, operation]))?.uncertain).toBe(true);
+		expect(() =>
+			store.admit({
+				...f.admission,
+				childId: uuid(20),
+				assignmentId: uuid(21),
+				operationId: uuid(22),
+				deliveryId: uuid(23),
+			}),
+		).toThrow(/globally uncertain/);
+	});
+
 	it("ignores and repairs every non-newline final tail before a subsequent append", () => {
 		const f = fixture();
 		const store = openRlmDurableOperationStore(f.parentArtifacts);

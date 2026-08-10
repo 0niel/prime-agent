@@ -237,8 +237,10 @@ export interface RlmDurableDelivery {
 export interface RlmDurableOperationRegistry {
 	operations: Map<string, RlmDurableOperation>;
 	deliveries: Map<string, RlmDurableDelivery>;
-	/** A corrupt line without a usable compound key still makes the history unsafe. */
+	/** Any reducer corruption, including exact-key corruption. */
 	hasUncertainRecords: boolean;
+	/** A complete record without an attributable operation key quarantines all operations. */
+	hasGlobalUncertainty: boolean;
 	diagnostics: readonly string[];
 }
 
@@ -369,6 +371,7 @@ class Store implements RlmDurableOperationStore {
 	admit(input: RlmOperationAdmission): RlmDurableOperation {
 		this.assertAdmission(input);
 		const registry = this.reduce();
+		assertGloballyCertain(registry);
 		const key = operationKey(input.parentSessionId, input.assignmentId, input.operationId);
 		const existing = registry.operations.get(key);
 		const record: RlmOperationAdmittedRecord = {
@@ -399,6 +402,7 @@ class Store implements RlmDurableOperationStore {
 	markMaterialized(input: RlmOperationMaterialization): boolean {
 		assertOperationInput(input);
 		const registry = this.reduce();
+		if (registry.hasGlobalUncertainty) return false;
 		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
@@ -456,6 +460,7 @@ class Store implements RlmDurableOperationStore {
 		assertUuid(input.deliveryId, "deliveryId");
 		assertTerminal(input.terminal);
 		const registry = this.reduce();
+		if (registry.hasGlobalUncertainty) return false;
 		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
@@ -524,6 +529,7 @@ class Store implements RlmDurableOperationStore {
 			throw new Error("sessionMessageId must be the deterministic durable delivery id");
 		}
 		const registry = this.reduce();
+		assertGloballyCertain(registry);
 		const delivery = registry.deliveries.get(
 			deliveryKey(operationKey(input.parentSessionId, input.assignmentId, input.operationId), input.deliveryId),
 		);
@@ -540,6 +546,7 @@ class Store implements RlmDurableOperationStore {
 		assertOperationInput(input);
 		assertUuid(input.deliveryId, "deliveryId");
 		const registry = this.reduce();
+		assertGloballyCertain(registry);
 		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
@@ -562,6 +569,7 @@ class Store implements RlmDurableOperationStore {
 
 	importPendingOutboxes(): number {
 		const registry = this.reduce();
+		if (registry.hasGlobalUncertainty) return 0;
 		let imported = 0;
 		for (const delivery of registry.deliveries.values()) {
 			const operation = registry.operations.get(delivery.operationKey);
@@ -585,21 +593,28 @@ class Store implements RlmDurableOperationStore {
 	}
 
 	pendingInbox(): readonly RlmTerminalInboxRecord[] {
-		return [...this.reduce().deliveries.values()]
+		const registry = this.reduce();
+		if (registry.hasGlobalUncertainty) return [];
+		return [...registry.deliveries.values()]
 			.filter((delivery) => delivery.received && !delivery.consumed && !delivery.uncertain && delivery.inboxRecord)
 			.map((delivery) => delivery.inboxRecord!);
 	}
 
 	rebuild(): RlmDurableOperationRegistry {
 		const registry = this.reduce();
-		this.writeIndex(registry); // cache failure cannot undo an fsynced authority append.
+		// A global quarantine is read-only, including its non-authoritative cache:
+		// recovery must not make any durable write before an operator repairs the
+		// complete corrupt record.
+		if (!registry.hasGlobalUncertainty) this.writeIndex(registry);
 		return registry;
 	}
 
 	/** Durable exact-key delete request for a live operation. It is not completion. */
 	recordDeleteIntent(input: Pick<RlmOperationTerminal, "parentSessionId" | "assignmentId" | "operationId">): boolean {
 		assertOperationInput(input);
-		const operation = this.reduce().operations.get(
+		const registry = this.reduce();
+		if (registry.hasGlobalUncertainty) return false;
+		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
 		if (!operation || operation.uncertain) return false;
@@ -622,7 +637,9 @@ class Store implements RlmDurableOperationStore {
 		type: "released" | "deleted",
 	): boolean {
 		assertOperationInput(input);
-		const operation = this.reduce().operations.get(
+		const registry = this.reduce();
+		if (registry.hasGlobalUncertainty) return false;
+		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
 		if (!operation || operation.uncertain || operation.lifecycle !== "terminal_recorded") return false;
@@ -640,6 +657,7 @@ class Store implements RlmDurableOperationStore {
 		assertTerminal(input.terminal);
 		assertTerminalMessage(input.message);
 		const registry = this.reduce();
+		assertGloballyCertain(registry);
 		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
@@ -740,6 +758,7 @@ function reduceArtifact(
 		operations: new Map(),
 		deliveries: new Map(),
 		hasUncertainRecords: false,
+		hasGlobalUncertainty: false,
 		diagnostics: [],
 	};
 	let canonicalParent: string;
@@ -816,8 +835,7 @@ function readJsonl(path: string, io: RlmDurableIo, registry: RlmDurableOperation
 	for (let i = 0; i < count; i++) {
 		const line = lines[i]!;
 		if (!line) {
-			registry.hasUncertainRecords = true;
-			registry.diagnostics = [...registry.diagnostics, `${kind}: empty complete line ${i + 1}`];
+			globalUncertain(registry, `${kind}: empty complete line ${i + 1}`);
 			continue;
 		}
 		// A final record becomes authoritative only with its newline delimiter. A
@@ -827,8 +845,7 @@ function readJsonl(path: string, io: RlmDurableIo, registry: RlmDurableOperation
 		try {
 			parsed.push(JSON.parse(line));
 		} catch {
-			registry.hasUncertainRecords = true;
-			registry.diagnostics = [...registry.diagnostics, `${kind}: malformed complete line ${i + 1}`];
+			globalUncertain(registry, `${kind}: malformed complete line ${i + 1}`);
 		}
 	}
 	return parsed;
@@ -836,12 +853,12 @@ function readJsonl(path: string, io: RlmDurableIo, registry: RlmDurableOperation
 
 function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void {
 	if (!isObject(raw) || raw.version !== 1 || typeof raw.type !== "string") {
-		globalUncertain(registry, "invalid ledger record");
+		markInvalidRecord(raw, registry, "invalid ledger record");
 		return;
 	}
 	if (raw.type === "admitted") {
 		if (!validAdmitted(raw)) {
-			globalUncertain(registry, "invalid admitted record");
+			markInvalidRecord(raw, registry, "invalid admitted record");
 			return;
 		}
 		const record = raw as unknown as RlmOperationAdmittedRecord;
@@ -862,7 +879,8 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 				rlmMaxDepth: record.rlmMaxDepth,
 				lifecycle: "admitted",
 				deleteIntent: false,
-				uncertain: false,
+				// An unattributable complete record quarantines every later reduction too.
+				uncertain: registry.hasGlobalUncertainty,
 			});
 		} else if (!sameAdmitted(existing, record)) markOperationUncertain(existing, registry, "conflicting admission");
 		return;
@@ -878,7 +896,7 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 	}
 	if (raw.type === "materialized") {
 		if (!validMaterialized(raw)) {
-			markOperationUncertain(operation, registry, "invalid materialization");
+			globalUncertain(registry, "invalid materialization");
 			return;
 		}
 		if (!operation.childSessionFile) {
@@ -899,13 +917,16 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 		return;
 	}
 	if (raw.type === "terminal_recorded") {
+		if (!validTerminalRecorded(raw)) {
+			globalUncertain(registry, "invalid terminal record");
+			return;
+		}
 		if (
-			!validTerminalRecorded(raw) ||
 			(operation.lifecycle !== "materialized" && operation.lifecycle !== "delete_intent") ||
 			!operation.childSessionFile ||
 			raw.deliveryId !== operation.deliveryId
 		) {
-			markOperationUncertain(operation, registry, "invalid terminal");
+			markOperationUncertain(operation, registry, "invalid terminal transition");
 			return;
 		}
 		if (!operation.terminal) {
@@ -917,7 +938,7 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 	}
 	if (raw.type === "delete_intent") {
 		if (!validDeleteIntent(raw)) {
-			markOperationUncertain(operation, registry, "invalid delete intent");
+			globalUncertain(registry, "invalid delete intent record");
 			return;
 		}
 		if (operation.lifecycle === "deleted") return;
@@ -936,7 +957,7 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 	}
 	if (raw.type === "released" || raw.type === "deleted") {
 		if (!validReleased(raw)) {
-			markOperationUncertain(operation, registry, "invalid release");
+			globalUncertain(registry, "invalid release record");
 			return;
 		}
 		if (operation.lifecycle === raw.type) return;
@@ -947,12 +968,12 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 		operation.lifecycle = raw.type;
 		return;
 	}
-	markOperationUncertain(operation, registry, "unknown ledger event");
+	globalUncertain(registry, "unknown ledger event");
 }
 
 function reduceOutbox(raw: unknown, registry: RlmDurableOperationRegistry): void {
 	if (!validOutbox(raw, "terminal")) {
-		globalUncertain(registry, "invalid outbox record");
+		markInvalidRecord(raw, registry, "invalid outbox record");
 		return;
 	}
 	const record = raw as RlmTerminalOutboxRecord;
@@ -1006,7 +1027,7 @@ function reconcileTerminalOutboxes(registry: RlmDurableOperationRegistry): void 
 
 function reduceInbox(raw: unknown, registry: RlmDurableOperationRegistry): void {
 	if (!validOutbox(raw, "received")) {
-		globalUncertain(registry, "invalid inbox record");
+		markInvalidRecord(raw, registry, "invalid inbox record");
 		return;
 	}
 	const record = raw as RlmTerminalInboxRecord;
@@ -1039,7 +1060,7 @@ function reduceInbox(raw: unknown, registry: RlmDurableOperationRegistry): void 
 
 function reduceConsumed(raw: unknown, registry: RlmDurableOperationRegistry): void {
 	if (!validConsumed(raw)) {
-		globalUncertain(registry, "invalid consumed record");
+		markInvalidRecord(raw, registry, "invalid consumed record");
 		return;
 	}
 	const record = raw as RlmTerminalConsumedRecord;
@@ -1076,7 +1097,14 @@ function deliveryFor(
 	const key = deliveryKey(operation.key, deliveryId);
 	let delivery = registry.deliveries.get(key);
 	if (!delivery) {
-		delivery = { key, operationKey: operation.key, deliveryId, outboxed: false, received: false, uncertain: false };
+		delivery = {
+			key,
+			operationKey: operation.key,
+			deliveryId,
+			outboxed: false,
+			received: false,
+			uncertain: registry.hasGlobalUncertainty,
+		};
 		registry.deliveries.set(key, delivery);
 	}
 	return delivery;
@@ -1113,6 +1141,18 @@ function digestOutbox(record: RlmTerminalOutboxRecord | RlmTerminalInboxRecord):
 		)
 		.digest("hex");
 }
+/**
+ * A complete malformed record has no safely attributable meaning, even if it
+ * happens to contain fields that look like an operation key.  In particular,
+ * accepting the apparent key would let an attacker or a torn serializer hide
+ * a conflicting lifecycle fact behind it.  Complete malformed records are
+ * therefore global corruption; only a torn final tail is explicitly repaired
+ * and ignored by readJsonl/appendJsonl.
+ */
+function markInvalidRecord(_raw: unknown, registry: RlmDurableOperationRegistry, message: string): void {
+	globalUncertain(registry, message);
+}
+
 function markOperationUncertain(
 	operation: RlmDurableOperation,
 	registry: RlmDurableOperationRegistry,
@@ -1131,9 +1171,20 @@ function markDeliveryUncertain(
 	delivery.uncertain = true;
 	markOperationUncertain(operation, registry, message);
 }
+/**
+ * A complete record with no trustworthy compound identity cannot be scoped to
+ * one operation. It therefore taints the entire authoritative history, rather
+ * than allowing a reducer order or a later valid record to re-enable work.
+ */
 function globalUncertain(registry: RlmDurableOperationRegistry, message: string): void {
 	registry.hasUncertainRecords = true;
+	registry.hasGlobalUncertainty = true;
+	for (const operation of registry.operations.values()) operation.uncertain = true;
+	for (const delivery of registry.deliveries.values()) delivery.uncertain = true;
 	registry.diagnostics = [...registry.diagnostics, message];
+}
+function assertGloballyCertain(registry: RlmDurableOperationRegistry): void {
+	if (registry.hasGlobalUncertainty) throw new Error("Durable history is globally uncertain");
 }
 
 function appendJsonl(path: string, record: unknown, io: RlmDurableIo): void {
@@ -1223,6 +1274,7 @@ function bodylessIndex(registry: RlmDurableOperationRegistry): unknown {
 			uncertain: delivery.uncertain,
 		})),
 		uncertain: registry.hasUncertainRecords,
+		globallyUncertain: registry.hasGlobalUncertainty,
 	};
 }
 function operationKey(parentSessionId: string, assignmentId: string, operationId: string): string {
