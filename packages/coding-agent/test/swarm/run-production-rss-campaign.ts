@@ -319,16 +319,17 @@ async function runCell(
 	const enqueue = (phase: Phase, memberPids: readonly number[] = []): Promise<void> => {
 		for (const pid of memberPids) pendingMemberPids.add(pid);
 		queue = queue.then(async () => {
-			if (!ownership) return;
+			const currentOwnership = ownership;
+			if (!currentOwnership) return;
 			// The worker supplies its direct fixture PIDs at each boundary. Preserve
 			// their PID/start/PGID identities before a timeout can make the leader exit.
 			const announced = await Promise.all([...pendingMemberPids].map(procRecord));
 			remember(
-				ownership,
-				announced.filter((record): record is ProcessRecord => record?.pgid === ownership.pgid),
+				currentOwnership,
+				announced.filter((record): record is ProcessRecord => record?.pgid === currentOwnership.pgid),
 			);
-			const records = await groupSnapshot(ownership.pgid);
-			remember(ownership, records);
+			const records = await groupSnapshot(currentOwnership.pgid);
+			remember(currentOwnership, records);
 			const entry = sample(phase, records);
 			if (phase === "started") {
 				if (lastPeriodicSample !== undefined && entry.monotonicMs - lastPeriodicSample > settings.intervalMs)
