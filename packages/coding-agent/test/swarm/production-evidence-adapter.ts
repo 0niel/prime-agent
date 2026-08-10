@@ -23,7 +23,8 @@ import {
 
 const execFile = promisify(execFileCallback);
 const MODEL_IDS = new Set(["fixture-a", "fixture-b", "fixture-zero"]);
-const RESOLVED_MODEL_IDS = new Set([...MODEL_IDS].map((id) => `${id}-resolved`));
+const RESPONSE_MODEL_IDS = new Set([...MODEL_IDS].map((id) => `${id}-resolved`));
+const PROVIDER = "b00b-scripted";
 
 export interface ExactUsage {
 	/** Integer micro-tokens.  No floating point token or price field is accepted. */
@@ -36,7 +37,7 @@ export interface ImmutableAttemptObservation {
 	readonly requestId: `request-${string}`;
 	readonly attempt: number;
 	readonly requested: Readonly<{ provider: string; model: string; revision?: string; effort?: string }>;
-	readonly resolved: Readonly<{ provider: string; model: string; responseModel: string }>;
+	readonly resolved: Readonly<{ api: string; provider: string; model: string; responseModel: string }>;
 	readonly terminal: "done" | "error" | "aborted";
 	readonly usage: ExactUsage;
 }
@@ -63,13 +64,11 @@ function assert(condition: unknown, code: string): asserts condition {
 function integer(value: number): boolean {
 	return Number.isSafeInteger(value) && value >= 0;
 }
-function safeModel(value: string, resolved = false): string {
-	return (resolved ? RESOLVED_MODEL_IDS : MODEL_IDS).has(value) ? value : "[REDACTED]";
+function safeModel(value: string, responseModel = false): string {
+	return (responseModel ? RESPONSE_MODEL_IDS : MODEL_IDS).has(value) ? value : "[REDACTED]";
 }
-function publicAttemptId(observation: ImmutableAttemptObservation, index: number): string {
-	// Input identity is only used inside B00A's in-memory projection. B00A
-	// assigns the public worker/request IDs and redacts all other identities.
-	return `attempt-${index + 1}-${observation.attempt}`;
+function publicAttemptId(observation: ImmutableAttemptObservation): string {
+	return `attempt-${observation.requestId.slice("request-".length)}-${String(observation.attempt).padStart(2, "0")}`;
 }
 function assertInput(input: ProductionEvidenceInput): void {
 	assert(input.attempts.length > 0, "B00B_EVIDENCE_NO_ATTEMPTS");
@@ -86,33 +85,52 @@ function assertInput(input: ProductionEvidenceInput): void {
 		assert(!identities.has(`${observation.requestId}:${observation.attempt}`), "B00B_EVIDENCE_DUPLICATE_ATTEMPT");
 		identities.add(`${observation.requestId}:${observation.attempt}`);
 		for (const value of Object.values(observation.usage)) assert(integer(value), "B00B_EVIDENCE_NON_INTEGER_USAGE");
+		assert(
+			Boolean(observation.requested.provider && observation.requested.model),
+			"B00B_EVIDENCE_REQUESTED_PROVENANCE",
+		);
+		assert(
+			Boolean(
+				observation.resolved.api &&
+					observation.resolved.provider &&
+					observation.resolved.model &&
+					observation.resolved.responseModel,
+			),
+			"B00B_EVIDENCE_RESOLVED_PROVENANCE",
+		);
 	}
 }
 
 /**
  * Converts immutable terminal observations into B00A input. The B00A schema
- * currently has input/output columns only, so cache usage is deliberately
- * included in input micro-tokens rather than silently discarded. Its separate
- * integer fields remain part of the immutable adapter input and can be
- * independently recomputed by callers.
+ * records only integer usage: cache read/write are included in direct input,
+ * terminal error/abort output is zero, and every retry attempt is a distinct
+ * stable assignment. B00A stores exact cost numerators over its documented
+ * 1,000,000 scale, never binary floating-point money.
  */
 export function projectProductionObservations(input: ProductionEvidenceInput): SwarmBenchmarkConfig {
 	assertInput(input);
 	return {
 		scenario: input.scenario,
 		assignments: input.attempts.map((observation, index) => ({
-			nodeId: publicAttemptId(observation, index),
+			nodeId: `attempt-worker-${String(index + 1).padStart(4, "0")}`,
 			role: "provider-attempt",
+			requestId: observation.requestId,
+			attempt: observation.attempt,
+			attemptId: publicAttemptId(observation),
 			requested: {
-				provider: observation.requested.provider === "b00b-scripted" ? "b00b-scripted" : "[REDACTED]",
+				provider: observation.requested.provider === PROVIDER ? PROVIDER : "[REDACTED]",
 				model: safeModel(observation.requested.model),
-				...(observation.requested.revision === undefined ? {} : { revision: observation.requested.revision }),
-				...(observation.requested.effort === undefined ? {} : { effort: observation.requested.effort }),
+				// revision/effort remain explicitly present but content-free.
+				...(observation.requested.revision === undefined ? {} : { revision: "[REDACTED]" }),
+				...(observation.requested.effort === undefined ? {} : { effort: "[REDACTED]" }),
 			},
 			resolved: {
-				provider: observation.resolved.provider === "b00b-scripted" ? "b00b-scripted" : "[REDACTED]",
-				// responseModel is the attribution authority, never the selected model.
-				model: safeModel(observation.resolved.responseModel, true),
+				api: observation.resolved.api === PROVIDER ? PROVIDER : "[REDACTED]",
+				provider: observation.resolved.provider === PROVIDER ? PROVIDER : "[REDACTED]",
+				model: safeModel(observation.resolved.model),
+				// responseModel, not selected resolved model, is the attribution authority.
+				responseModel: safeModel(observation.resolved.responseModel, true),
 			},
 			inputTokens:
 				observation.usage.inputMicroTokens +
@@ -125,7 +143,7 @@ export function projectProductionObservations(input: ProductionEvidenceInput): S
 				observation.terminal === "done"
 					? undefined
 					: {
-							nodeId: publicAttemptId(observation, index),
+							nodeId: `attempt-worker-${String(index + 1).padStart(4, "0")}`,
 							actions: [{ type: "failure" as const, code: "[REDACTED]", message: "[REDACTED]" }],
 						},
 			)

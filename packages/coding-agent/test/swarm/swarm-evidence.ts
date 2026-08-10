@@ -14,7 +14,12 @@ import { performance } from "node:perf_hooks";
 
 export const SUPPORTED_SWARM_FANOUTS = [1, 4, 16, 64] as const;
 export const SWARM_EVIDENCE_SCHEMA_VERSION = "prime-agent.swarm-evidence/v1";
-const MICRO_TOKENS = 1_000_000;
+/**
+ * Cost amounts are exact safe-integer numerators over this fixed denominator.
+ * `costNumerator / COST_NUMERATOR_SCALE` is presentation only; every signed
+ * artifact invariant operates exclusively on the numerator.
+ */
+export const COST_NUMERATOR_SCALE = 1_000_000;
 const REDACTED = "[REDACTED]";
 const EVIDENCE_FILES = [
 	"cost-attribution.json",
@@ -47,17 +52,29 @@ export interface FakeProviderFaultSchedule {
 	readonly nodeId: string;
 	readonly actions: readonly FakeProviderAction[];
 }
+export interface RequestedModelProvenance {
+	readonly provider: string;
+	readonly model: string;
+	readonly revision?: string;
+	readonly effort?: string;
+}
+/** Response model is the attribution authority; selected resolved model is retained separately. */
+export interface ResolvedModelProvenance {
+	readonly api: string;
+	readonly provider: string;
+	readonly model: string;
+	readonly responseModel: string;
+}
 export interface AssignmentSpec {
 	readonly nodeId: string;
 	readonly parentNodeId?: string;
 	readonly role: string;
-	readonly requested: {
-		readonly provider: string;
-		readonly model: string;
-		readonly revision?: string;
-		readonly effort?: string;
-	};
-	readonly resolved?: AssignmentSpec["requested"];
+	/** Stable public linkage for a request and its individual retry attempt. */
+	readonly requestId?: string;
+	readonly attempt?: number;
+	readonly attemptId?: string;
+	readonly requested: RequestedModelProvenance;
+	readonly resolved?: ResolvedModelProvenance;
 	readonly inputTokens?: number;
 	readonly outputTokens?: number;
 }
@@ -129,10 +146,10 @@ export interface CostAttribution {
 	readonly kind: "node" | "role" | "run";
 	readonly directInputTokens: number;
 	readonly directOutputTokens: number;
-	readonly directCost: number;
+	readonly directCostNumerator: number;
 	readonly downstreamInputTokens: number;
 	readonly downstreamOutputTokens: number;
-	readonly downstreamCost: number;
+	readonly downstreamCostNumerator: number;
 }
 export interface EvidenceArtifact {
 	readonly path: (typeof EVIDENCE_FILES)[number];
@@ -285,6 +302,10 @@ const SAFE_EVIDENCE_KEYS = new Set([
 	"model",
 	"revision",
 	"effort",
+	"api",
+	"responseModel",
+	"attempt",
+	"attemptId",
 	"inputTokens",
 	"outputTokens",
 	"actions",
@@ -312,10 +333,10 @@ const SAFE_EVIDENCE_KEYS = new Set([
 	"kind",
 	"directInputTokens",
 	"directOutputTokens",
-	"directCost",
+	"directCostNumerator",
 	"downstreamInputTokens",
 	"downstreamOutputTokens",
-	"downstreamCost",
+	"downstreamCostNumerator",
 	"admitted",
 	"started",
 	"completed",
@@ -331,6 +352,7 @@ function safeEvidenceString(value: string, key?: string): boolean {
 	return (
 		(key === "nodeId" && /^worker-\d{4}$/.test(value)) ||
 		(key === "requestId" && /^request-\d{4}$/.test(value)) ||
+		(key === "attemptId" && /^attempt-\d{4}-\d{2}$/.test(value)) ||
 		(key === "parentNodeId" && (value === "root" || /^worker-\d{4}$/.test(value))) ||
 		((key === "id" || key === "role") &&
 			(value === "run" || /^worker-\d{4}$/.test(value) || /^role-\d{4}$/.test(value))) ||
@@ -344,8 +366,9 @@ function safeEvidenceString(value: string, key?: string): boolean {
 		((key === "fingerprint" || key === "deterministicBundleId" || key === "artifactBundleId" || key === "sha256") &&
 			/^[0-9a-f]{64}$/.test(value)) ||
 		(key === "path" && (EVIDENCE_FILES as readonly string[]).includes(value)) ||
-		(key === "provider" && value === "b00b-scripted") ||
-		(key === "model" &&
+		((key === "provider" || key === "api") && value === "b00b-scripted") ||
+		((key === "revision" || key === "effort") && value === REDACTED) ||
+		((key === "model" || key === "responseModel") &&
 			[
 				"fixture-a",
 				"fixture-b",
@@ -397,8 +420,17 @@ function assertContentFree(value: unknown, key?: string, untrustedObjectKeys = f
 		);
 	}
 }
-function money(tokens: number, pricePerMillion: number): number {
-	return (tokens * pricePerMillion) / MICRO_TOKENS;
+/** Exact numerator with denominator COST_NUMERATOR_SCALE; never use decimal money in evidence invariants. */
+function costNumerator(tokens: number, pricePerMillionTokens: number): number {
+	const numerator = tokens * pricePerMillionTokens;
+	assert(isSafeInteger(numerator), "cost numerator exceeds safe integer range");
+	return numerator;
+}
+/** Sum authenticated integer fields without ever crossing into binary decimal money. */
+function exactSum(values: readonly number[]): number {
+	const total = values.reduce((sum, value) => sum + value, 0);
+	assert(isSafeInteger(total), "exact accounting sum exceeds safe integer range");
+	return total;
 }
 function validate(config: SwarmBenchmarkConfig): void {
 	assert(config.scenario.trim().length > 0, "scenario must not be empty");
@@ -424,6 +456,12 @@ function validate(config: SwarmBenchmarkConfig): void {
 			assignment.outputTokens === undefined || isSafeInteger(assignment.outputTokens),
 			"output tokens must be non-negative safe integers",
 		);
+		if (assignment.requestId !== undefined)
+			assert(/^request-\d{4}$/.test(assignment.requestId), "request IDs must be stable public IDs");
+		if (assignment.attempt !== undefined)
+			assert(isSafeInteger(assignment.attempt) && assignment.attempt > 0, "attempt must be positive");
+		if (assignment.attemptId !== undefined)
+			assert(/^attempt-\d{4}-\d{2}$/.test(assignment.attemptId), "attempt IDs must be stable public IDs");
 	}
 	for (const schedule of config.faultSchedule ?? []) {
 		assert(
@@ -457,6 +495,9 @@ function publicConfig(config: SwarmBenchmarkConfig): Omit<SwarmManifest, "finger
 			? { parentNodeId: originalToPublic.get(assignment.parentNodeId) }
 			: {}),
 		role: roleIds.get(assignment.role)!,
+		...(assignment.requestId ? { requestId: assignment.requestId } : {}),
+		...(assignment.attempt === undefined ? {} : { attempt: assignment.attempt }),
+		...(assignment.attemptId ? { attemptId: assignment.attemptId } : {}),
 		requested: redactEvidence(assignment.requested),
 		...(assignment.resolved ? { resolved: redactEvidence(assignment.resolved) } : {}),
 		inputTokens: assignment.inputTokens ?? 32,
@@ -541,14 +582,15 @@ export async function runSwarmBenchmark(config: SwarmBenchmarkConfig): Promise<S
 	const startedAt = performance.now();
 	const events: SwarmEvent[] = [];
 	const processSamples: ProcessSample[] = [];
-	const requestFor = (nodeId: string) => `request-${nodeId.slice("worker-".length)}`;
+	const requestFor = (assignment: AssignmentSpec) =>
+		assignment.requestId ?? `request-${assignment.nodeId.slice("worker-".length)}`;
 	const record = (type: EventType, nodeId: string, detail?: Readonly<Record<string, unknown>>) =>
 		events.push({
 			sequence: ++sequence,
 			elapsedMilliseconds: performance.now() - startedAt,
 			type,
 			nodeId,
-			requestId: requestFor(nodeId),
+			requestId: requestFor(publicAssignments.find((assignment) => assignment.nodeId === nodeId)!),
 			...(detail === undefined ? {} : { detail }),
 		});
 	const sample = (phase: ProcessSample["phase"]) => {
@@ -621,20 +663,24 @@ export async function runSwarmBenchmark(config: SwarmBenchmarkConfig): Promise<S
 			.map((candidate) => calculate(candidate.assignment.nodeId));
 		const directInputTokens = result.assignment.inputTokens ?? 32;
 		const directOutputTokens = result.outputTokens;
-		const directCost =
-			money(directInputTokens, config.priceCard.inputPerMillionTokens) +
-			money(directOutputTokens, config.priceCard.outputPerMillionTokens);
+		const directCostNumerator =
+			costNumerator(directInputTokens, config.priceCard.inputPerMillionTokens) +
+			costNumerator(directOutputTokens, config.priceCard.outputPerMillionTokens);
 		const attribution = {
 			id,
 			kind: "node" as const,
 			directInputTokens,
 			directOutputTokens,
-			directCost,
-			downstreamInputTokens:
-				directInputTokens + children.reduce((sum, child) => sum + child.downstreamInputTokens, 0),
-			downstreamOutputTokens:
-				directOutputTokens + children.reduce((sum, child) => sum + child.downstreamOutputTokens, 0),
-			downstreamCost: directCost + children.reduce((sum, child) => sum + child.downstreamCost, 0),
+			directCostNumerator,
+			downstreamInputTokens: exactSum([directInputTokens, ...children.map((child) => child.downstreamInputTokens)]),
+			downstreamOutputTokens: exactSum([
+				directOutputTokens,
+				...children.map((child) => child.downstreamOutputTokens),
+			]),
+			downstreamCostNumerator: exactSum([
+				directCostNumerator,
+				...children.map((child) => child.downstreamCostNumerator),
+			]),
 		};
 		costs.set(id, attribution);
 		return attribution;
@@ -662,16 +708,16 @@ export async function runSwarmBenchmark(config: SwarmBenchmarkConfig): Promise<S
 			.filter((result) => result.assignment.role === role)
 			.map((result) => calculate(result.assignment.nodeId));
 		const sum = (items: readonly CostAttribution[], key: keyof CostAttribution) =>
-			items.reduce((total, item) => total + (item[key] as number), 0);
+			exactSum(items.map((item) => item[key] as number));
 		return {
 			id: role,
 			kind: "role" as const,
 			directInputTokens: sum(direct, "directInputTokens"),
 			directOutputTokens: sum(direct, "directOutputTokens"),
-			directCost: sum(direct, "directCost"),
+			directCostNumerator: sum(direct, "directCostNumerator"),
 			downstreamInputTokens: sum([...included.values()], "directInputTokens"),
 			downstreamOutputTokens: sum([...included.values()], "directOutputTokens"),
-			downstreamCost: sum([...included.values()], "directCost"),
+			downstreamCostNumerator: sum([...included.values()], "directCostNumerator"),
 		};
 	});
 	const roots = results
@@ -682,10 +728,10 @@ export async function runSwarmBenchmark(config: SwarmBenchmarkConfig): Promise<S
 		kind: "run",
 		directInputTokens: 0,
 		directOutputTokens: 0,
-		directCost: 0,
-		downstreamInputTokens: roots.reduce((sum, item) => sum + item.downstreamInputTokens, 0),
-		downstreamOutputTokens: roots.reduce((sum, item) => sum + item.downstreamOutputTokens, 0),
-		downstreamCost: roots.reduce((sum, item) => sum + item.downstreamCost, 0),
+		directCostNumerator: 0,
+		downstreamInputTokens: exactSum(roots.map((item) => item.downstreamInputTokens)),
+		downstreamOutputTokens: exactSum(roots.map((item) => item.downstreamOutputTokens)),
+		downstreamCostNumerator: exactSum(roots.map((item) => item.downstreamCostNumerator)),
 	};
 	const firstTerminal = events.findIndex(
 		(event) => event.type === "provider_completed" || event.type === "provider_failure",
@@ -828,6 +874,29 @@ function requireManifest(manifest: unknown): asserts manifest is SwarmManifest &
 		"invalid artifact bundle identity",
 	);
 	assertContentFree(manifest);
+	const attemptIds = new Set<string>();
+	for (const assignment of manifest.assignments as Record<string, unknown>[]) {
+		assert(isRecord(assignment) && isRecord(assignment.requested), "invalid assignment provenance");
+		for (const key of ["provider", "model"])
+			assert(typeof assignment.requested[key] === "string", `missing requested ${key}`);
+		if (assignment.resolved !== undefined) {
+			assert(isRecord(assignment.resolved), "invalid resolved provenance");
+			for (const key of ["api", "provider", "model", "responseModel"])
+				assert(typeof assignment.resolved[key] === "string", `missing resolved ${key}`);
+		}
+		if (assignment.attemptId !== undefined) {
+			const attemptId = assignment.attemptId;
+			assert(
+				typeof assignment.requestId === "string" &&
+					isSafeInteger(assignment.attempt) &&
+					typeof attemptId === "string" &&
+					/^attempt-\d{4}-\d{2}$/.test(attemptId) &&
+					!attemptIds.has(attemptId),
+				"invalid or duplicate request attempt identity",
+			);
+			attemptIds.add(attemptId);
+		}
+	}
 	const source = {
 		schemaVersion: manifest.schemaVersion,
 		benchmarkVersion: manifest.benchmarkVersion,
@@ -841,9 +910,9 @@ function requireManifest(manifest: unknown): asserts manifest is SwarmManifest &
 }
 function verifyEvents(events: readonly unknown[], oracle: readonly unknown[], assignments: readonly unknown[]): void {
 	assert(events.length === oracle.length && events.length > 0, "event/oracle length mismatch");
-	const nodeIds = new Set(
-		(assignments as readonly Record<string, unknown>[]).map((assignment) => assignment.nodeId).filter(isString),
-	);
+	const assignmentRows = assignments as readonly Record<string, unknown>[];
+	const nodeIds = new Set(assignmentRows.map((assignment) => assignment.nodeId).filter(isString));
+	const assignmentByNode = new Map(assignmentRows.map((assignment) => [assignment.nodeId as string, assignment]));
 	let previousSequence = 0;
 	const byNode = new Map<string, Record<string, unknown>[]>();
 	for (let index = 0; index < events.length; index++) {
@@ -870,10 +939,11 @@ function verifyEvents(events: readonly unknown[], oracle: readonly unknown[], as
 				(EVENT_TYPES as readonly unknown[]).includes(event.type),
 			"invalid event timing/type",
 		);
+		const eventAssignment = assignmentByNode.get(event.nodeId as string);
 		assert(
 			typeof event.nodeId === "string" &&
 				nodeIds.has(event.nodeId) &&
-				event.requestId === `request-${event.nodeId.slice("worker-".length)}`,
+				event.requestId === (eventAssignment?.requestId ?? `request-${event.nodeId.slice("worker-".length)}`),
 			"invalid event identity",
 		);
 		assert(
@@ -895,6 +965,14 @@ function verifyEvents(events: readonly unknown[], oracle: readonly unknown[], as
 				break;
 			case "provider_request_started":
 				exactDetail(["role", "requested", "resolved"]);
+				assert(
+					isRecord(detail) &&
+						canonicalJson(detail.role) === canonicalJson(eventAssignment?.role) &&
+						canonicalJson(detail.requested) === canonicalJson(eventAssignment?.requested) &&
+						canonicalJson(detail.resolved) ===
+							canonicalJson(eventAssignment?.resolved ?? eventAssignment?.requested),
+					"event provenance mismatch",
+				);
 				break;
 			case "progress":
 				exactDetail(["message"]);
@@ -990,8 +1068,8 @@ function verifyCosts(
 		ids.add(row.id);
 		for (const key of ["directInputTokens", "directOutputTokens", "downstreamInputTokens", "downstreamOutputTokens"])
 			assert(isSafeInteger(row[key]), `invalid ${key}`);
-		for (const key of ["directCost", "downstreamCost"])
-			assert(typeof row[key] === "number" && Number.isFinite(row[key]), `invalid ${key}`);
+		for (const key of ["directCostNumerator", "downstreamCostNumerator"])
+			assert(isSafeInteger(row[key]), `invalid ${key}`);
 	}
 	const nodes = rows.filter((row) => row.kind === "node");
 	const assignmentRows = assignments as readonly Record<string, unknown>[];
@@ -1017,20 +1095,21 @@ function verifyCosts(
 			`terminal output usage mismatch: ${node.id}`,
 		);
 		assert(
-			node.directCost ===
-				money(node.directInputTokens as number, inputPrice) + money(node.directOutputTokens as number, outputPrice),
+			node.directCostNumerator ===
+				costNumerator(node.directInputTokens as number, inputPrice) +
+					costNumerator(node.directOutputTokens as number, outputPrice),
 			"direct economics mismatch",
 		);
 		const children = assignmentRows
 			.filter((assignment) => assignment.parentNodeId === node.id)
 			.map((assignment) => nodeById.get(assignment.nodeId as string));
 		assert(children.every(isRecord), "missing child cost");
-		for (const suffix of ["InputTokens", "OutputTokens", "Cost"] as const) {
+		for (const suffix of ["InputTokens", "OutputTokens", "CostNumerator"] as const) {
 			const direct = node[`direct${suffix}`];
 			assert(typeof direct === "number", `invalid direct cost field: ${suffix}`);
 			assert(
 				node[`downstream${suffix}`] ===
-					direct + children.reduce((sum, child) => sum + (child[`downstream${suffix}`] as number), 0),
+					exactSum([direct as number, ...children.map((child) => child[`downstream${suffix}`] as number)]),
 				`node tree invariant failed: ${node.id}:${suffix}`,
 			);
 		}
@@ -1056,26 +1135,30 @@ function verifyCosts(
 			.filter((assignment) => assignment.role === role.id)
 			.map((assignment) => nodeById.get(assignment.nodeId as string)!);
 		const included = new Map(direct.flatMap((node) => descendants(node.id as string)).map((node) => [node.id, node]));
-		for (const suffix of ["InputTokens", "OutputTokens", "Cost"] as const) {
+		for (const suffix of ["InputTokens", "OutputTokens", "CostNumerator"] as const) {
 			assert(
-				role[`direct${suffix}`] === direct.reduce((sum, node) => sum + (node[`direct${suffix}`] as number), 0),
+				role[`direct${suffix}`] === exactSum(direct.map((node) => node[`direct${suffix}`] as number)),
 				`role direct invariant failed: ${role.id}:${suffix}`,
 			);
 			assert(
 				role[`downstream${suffix}`] ===
-					[...included.values()].reduce((sum, node) => sum + (node[`direct${suffix}`] as number), 0),
+					exactSum([...included.values()].map((node) => node[`direct${suffix}`] as number)),
 				`role tree invariant failed: ${role.id}:${suffix}`,
 			);
 		}
 	}
 	const run = rows.find((row) => row.id === "run" && row.kind === "run");
 	assert(run, "missing run cost");
+	assert(
+		run.directInputTokens === 0 && run.directOutputTokens === 0 && run.directCostNumerator === 0,
+		"run direct invariant failed",
+	);
 	const roots = nodes.filter(
 		(node) => !assignmentRows.find((assignment) => assignment.nodeId === node.id)?.parentNodeId,
 	);
-	for (const suffix of ["InputTokens", "OutputTokens", "Cost"] as const)
+	for (const suffix of ["InputTokens", "OutputTokens", "CostNumerator"] as const)
 		assert(
-			run[`downstream${suffix}`] === roots.reduce((sum, node) => sum + (node[`downstream${suffix}`] as number), 0),
+			run[`downstream${suffix}`] === exactSum(roots.map((node) => node[`downstream${suffix}`] as number)),
 			`run tree invariant failed: ${suffix}`,
 		);
 }

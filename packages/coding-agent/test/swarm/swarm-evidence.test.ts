@@ -135,8 +135,8 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		const lead = evidence.costAttribution.find((cost) => cost.id === "role-0001");
 		const run = evidence.costAttribution.find((cost) => cost.id === "run");
 		expect(lead?.downstreamInputTokens).toBe(64);
-		expect(run).toMatchObject({ kind: "run", directCost: 0 });
-		expect(run?.downstreamCost).toBeGreaterThan(0);
+		expect(run).toMatchObject({ kind: "run", directCostNumerator: 0 });
+		expect(run?.downstreamCostNumerator).toBeGreaterThan(0);
 	});
 	test("accepts an empty process sample when the platform sampler has no visible processes", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "prime-agent-b00a-empty-processes-"));
@@ -248,7 +248,7 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		const directory = await evidenceDirectory(1);
 		const costsPath = join(directory, "cost-attribution.json");
 		const costs = JSON.parse(await readFile(costsPath, "utf8"));
-		costs.find((cost: { kind: string }) => cost.kind === "node").directCost = 7;
+		costs.find((cost: { kind: string }) => cost.kind === "node").directCostNumerator = 7;
 		const costsRaw = `${canonicalJson(costs)}
 `;
 		await writeFile(costsPath, costsRaw);
@@ -319,17 +319,17 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		const costs = JSON.parse(await readFile(costsPath, "utf8"));
 		const node = costs.find((cost: { kind: string }) => cost.kind === "node");
 		node.directInputTokens = 999;
-		node.directCost = (999 + node.directOutputTokens * 2) / 1_000_000;
+		node.directCostNumerator = 999 + node.directOutputTokens * 2;
 		node.downstreamInputTokens = 999;
-		node.downstreamCost = node.directCost;
+		node.downstreamCostNumerator = node.directCostNumerator;
 		const role = costs.find((cost: { kind: string }) => cost.kind === "role");
 		role.directInputTokens = 999;
 		role.downstreamInputTokens = 999;
-		role.directCost = node.directCost;
-		role.downstreamCost = node.directCost;
+		role.directCostNumerator = node.directCostNumerator;
+		role.downstreamCostNumerator = node.directCostNumerator;
 		const run = costs.find((cost: { kind: string }) => cost.kind === "run");
 		run.downstreamInputTokens = 999;
-		run.downstreamCost = node.directCost;
+		run.downstreamCostNumerator = node.directCostNumerator;
 		await rehashArtifact(directory, "cost-attribution.json", `${canonicalJson(costs)}\n`);
 		await expect(verify(directory)).rejects.toThrow("assignment input usage mismatch");
 	});
@@ -377,8 +377,8 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 			row.directOutputTokens = row.kind === "run" ? 0 : 999;
 			row.downstreamInputTokens = 999;
 			row.downstreamOutputTokens = 999;
-			row.directCost = row.kind === "run" ? 0 : 999 / 1_000_000 + (999 * 2) / 1_000_000;
-			row.downstreamCost = 999 / 1_000_000 + (999 * 2) / 1_000_000;
+			row.directCostNumerator = row.kind === "run" ? 0 : 999 + 999 * 2;
+			row.downstreamCostNumerator = 999 + 999 * 2;
 		}
 		await rehashArtifact(directory, "events.jsonl", `${events.map(canonicalJson).join("\n")}\n`);
 		await rehashArtifact(
@@ -422,17 +422,17 @@ describe("PR-B00A deterministic local swarm evidence", () => {
 		const costs = JSON.parse(await readFile(costsPath, "utf8"));
 		const node = costs.find((cost: { kind: string }) => cost.kind === "node");
 		node.directOutputTokens = 999;
-		node.directCost = (node.directInputTokens + 999 * 2) / 1_000_000;
+		node.directCostNumerator = node.directInputTokens + 999 * 2;
 		node.downstreamOutputTokens = 999;
-		node.downstreamCost = node.directCost;
+		node.downstreamCostNumerator = node.directCostNumerator;
 		const role = costs.find((cost: { kind: string }) => cost.kind === "role");
 		role.directOutputTokens = 999;
 		role.downstreamOutputTokens = 999;
-		role.directCost = node.directCost;
-		role.downstreamCost = node.directCost;
+		role.directCostNumerator = node.directCostNumerator;
+		role.downstreamCostNumerator = node.directCostNumerator;
 		const run = costs.find((cost: { kind: string }) => cost.kind === "run");
 		run.downstreamOutputTokens = 999;
-		run.downstreamCost = node.directCost;
+		run.downstreamCostNumerator = node.directCostNumerator;
 		await rehashArtifact(directory, "cost-attribution.json", `${canonicalJson(costs)}\n`);
 		await expect(verify(directory)).rejects.toThrow("terminal output usage mismatch");
 	});

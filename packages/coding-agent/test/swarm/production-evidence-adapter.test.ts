@@ -5,11 +5,19 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import {
 	type ProductionEvidenceInput,
+	projectProductionObservations,
 	verifySignedProductionEvidence,
 	verifySignedProductionEvidenceFreshProcess,
 	writeSignedProductionEvidence,
 } from "./production-evidence-adapter.js";
-import { canonicalJson, SWARM_EVIDENCE_COMMITMENT_SCHEMA, swarmEvidenceCommitmentPayload } from "./swarm-evidence.js";
+import {
+	COST_NUMERATOR_SCALE,
+	canonicalJson,
+	createSwarmEvidenceTrustRoot,
+	SWARM_EVIDENCE_COMMITMENT_SCHEMA,
+	swarmEvidenceCommitmentPayload,
+	verifyAuthenticatedSwarmEvidence,
+} from "./swarm-evidence.js";
 
 const cleanup: string[] = [];
 afterEach(async () => {
@@ -31,15 +39,39 @@ function input(): ProductionEvidenceInput {
 				requestId: "request-0001",
 				attempt: 1,
 				requested: { provider: "b00b-scripted", model: "fixture-a", revision: "alias-secret", effort: "high" },
-				resolved: { provider: "b00b-scripted", model: "fixture-a", responseModel: "fixture-b-resolved" },
+				resolved: {
+					api: "b00b-scripted",
+					provider: "b00b-scripted",
+					model: "fixture-a",
+					responseModel: "fixture-b-resolved",
+				},
 				terminal: "done",
 				usage: { inputMicroTokens: 101, outputMicroTokens: 13, cacheReadMicroTokens: 7, cacheWriteMicroTokens: 3 },
+			},
+			{
+				// A failed retry remains a separately authenticated attempt even at zero usage.
+				requestId: "request-0001",
+				attempt: 2,
+				requested: { provider: "b00b-scripted", model: "fixture-zero" },
+				resolved: {
+					api: "b00b-scripted",
+					provider: "b00b-scripted",
+					model: "fixture-zero",
+					responseModel: "fixture-zero-resolved",
+				},
+				terminal: "error",
+				usage: { inputMicroTokens: 0, outputMicroTokens: 99, cacheReadMicroTokens: 0, cacheWriteMicroTokens: 0 },
 			},
 			{
 				requestId: "request-0002",
 				attempt: 1,
 				requested: { provider: "b00b-scripted", model: "fixture-zero" },
-				resolved: { provider: "b00b-scripted", model: "fixture-zero", responseModel: "fixture-zero-resolved" },
+				resolved: {
+					api: "b00b-scripted",
+					provider: "b00b-scripted",
+					model: "fixture-zero",
+					responseModel: "fixture-zero-resolved",
+				},
 				terminal: "aborted",
 				usage: { inputMicroTokens: 9, outputMicroTokens: 99, cacheReadMicroTokens: 2, cacheWriteMicroTokens: 0 },
 			},
@@ -47,9 +79,25 @@ function input(): ProductionEvidenceInput {
 	};
 }
 async function allFiles(directory: string): Promise<string> {
-	return (await Promise.all((await readdir(directory)).map((name) => readFile(join(directory, name), "utf8")))).join(
-		"\n",
-	);
+	const contents: string[] = [];
+	for (const entry of await readdir(directory, { withFileTypes: true })) {
+		const path = join(directory, entry.name);
+		if (entry.isDirectory()) contents.push(await allFiles(path));
+		else if (entry.isFile()) contents.push(await readFile(path, "utf8"));
+	}
+	return contents.join("\n");
+}
+function privacyVariants(value: string): readonly string[] {
+	const unicodeEscaped = [...value]
+		.map((character) => `\\u${character.codePointAt(0)!.toString(16).padStart(4, "0")}`)
+		.join("");
+	return [value, value.normalize("NFC"), value.normalize("NFKC"), unicodeEscaped];
+}
+function expectNoCanaryLeak(chunks: readonly string[]): void {
+	const joined = chunks.join("");
+	for (const canary of canaries)
+		for (const variant of privacyVariants(canary))
+			expect(joined.normalize("NFKC")).not.toContain(variant.normalize("NFKC"));
 }
 
 /** Coherently re-index a semantic-preserving process-sample mutation. */
@@ -88,23 +136,34 @@ describe("B00B signed production evidence adapter", () => {
 			verifySignedProductionEvidenceFreshProcess(artifactDirectory, written.commitmentPath, publicPem),
 		).resolves.toBeUndefined();
 		const content = await allFiles(artifactDirectory);
-		for (const canary of canaries) expect(content).not.toContain(canary);
+		expectNoCanaryLeak([content]);
 		const costs = JSON.parse(await readFile(join(artifactDirectory, "cost-attribution.json"), "utf8"));
 		const firstAttempt = costs.find((cost: { id: string }) => cost.id === "worker-0001");
 		expect(firstAttempt).toMatchObject({
 			directInputTokens: 111,
 			directOutputTokens: 13,
-			directCost: (111 * 17 + 13 * 29) / 1_000_000,
+			directCostNumerator: 111 * 17 + 13 * 29,
 		});
+		expect(COST_NUMERATOR_SCALE).toBe(1_000_000);
 		const run = costs.find((cost: { id: string }) => cost.id === "run");
 		expect(run).toMatchObject({
 			downstreamInputTokens: 122,
 			downstreamOutputTokens: 13,
-			downstreamCost: (122 * 17 + 13 * 29) / 1_000_000,
+			downstreamCostNumerator: 122 * 17 + 13 * 29,
 		});
 		// The terminal response model, not the selected requested alias, is retained as the resolved attribution.
 		expect(content).toContain("fixture-b-resolved");
+		expect(content).toContain('"api":"b00b-scripted"');
+		expect(content).toContain('"responseModel":"fixture-b-resolved"');
 		expect(content).not.toContain("alias-secret");
+		const manifest = JSON.parse(await readFile(join(artifactDirectory, "manifest.json"), "utf8"));
+		expect(manifest.assignments.map((assignment: { attemptId: string }) => assignment.attemptId)).toEqual([
+			"attempt-0001-01",
+			"attempt-0001-02",
+			"attempt-0002-01",
+		]);
+		const retry = manifest.assignments[1];
+		expect(retry.resolved).toMatchObject({ model: "fixture-zero", responseModel: "fixture-zero-resolved" });
 	});
 
 	test("rejects manifest read-back, coherent forgery, wrong key, and a commitment from another artifact directory", async () => {
@@ -182,6 +241,76 @@ describe("B00B signed production evidence adapter", () => {
 		await writeFile(written.commitmentPath, `${canonicalJson(commitment)}\n`);
 		await expect(
 			verifySignedProductionEvidence(artifactDirectory, written.commitmentPath, publicPem),
+		).rejects.toThrow("B00B_EVIDENCE_BAD_SIGNATURE");
+	});
+	test("keeps zero-price, cache, done/error/abort, and retry economics in exact numerators", () => {
+		const source = input();
+		const zero: ProductionEvidenceInput = {
+			...source,
+			priceCard: {
+				...source.priceCard,
+				inputMicroCurrencyPerMillionMicroTokens: 0,
+				outputMicroCurrencyPerMillionMicroTokens: 0,
+			},
+		};
+		const projected = projectProductionObservations(zero);
+		expect(projected.assignments).toHaveLength(3);
+		expect(projected.assignments.map((assignment) => assignment.inputTokens)).toEqual([111, 0, 11]);
+		expect(projected.assignments.map((assignment) => assignment.outputTokens)).toEqual([13, 0, 0]);
+		expect(projected.assignments.map((assignment) => assignment.attemptId)).toEqual([
+			"attempt-0001-01",
+			"attempt-0001-02",
+			"attempt-0002-01",
+		]);
+		expect(projected.priceCard).toMatchObject({ inputPerMillionTokens: 0, outputPerMillionTokens: 0 });
+	});
+
+	test("privacy scans recursive normal outputs and captured console/stderr in normalized, escaped, and split forms", async () => {
+		const artifactDirectory = await mkdtemp(join(tmpdir(), "b00b-privacy-artifact-"));
+		const trustDirectory = await mkdtemp(join(tmpdir(), "b00b-privacy-trust-"));
+		cleanup.push(artifactDirectory, trustDirectory);
+		const keys = generateKeyPairSync("ed25519");
+		const capturedConsole: string[] = [];
+		const capturedStderr: string[] = [];
+		const originalError = console.error;
+		const originalWrite = process.stderr.write;
+		console.error = (...values: unknown[]) => capturedConsole.push(values.map(String).join(" "));
+		process.stderr.write = ((chunk: unknown) => {
+			capturedStderr.push(String(chunk));
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			await writeSignedProductionEvidence(artifactDirectory, trustDirectory, input(), keys.privateKey);
+		} finally {
+			console.error = originalError;
+			process.stderr.write = originalWrite;
+		}
+		expectNoCanaryLeak([await allFiles(artifactDirectory), ...capturedConsole, ...capturedStderr]);
+	});
+	test("rejects fabricated trust roots and malformed or noncanonical commitments", async () => {
+		const artifactDirectory = await mkdtemp(join(tmpdir(), "b00b-root-artifact-"));
+		const trustDirectory = await mkdtemp(join(tmpdir(), "b00b-root-trust-"));
+		cleanup.push(artifactDirectory, trustDirectory);
+		const keys = generateKeyPairSync("ed25519");
+		const written = await writeSignedProductionEvidence(artifactDirectory, trustDirectory, input(), keys.privateKey);
+		const publicPem = keys.publicKey.export({ type: "spki", format: "pem" }).toString();
+		const commitment = await readFile(written.commitmentPath, "utf8");
+		await expect(
+			verifyAuthenticatedSwarmEvidence(
+				artifactDirectory,
+				commitment,
+				{} as ReturnType<typeof createSwarmEvidenceTrustRoot>,
+			),
+		).rejects.toThrow("registered swarm evidence trust root is required");
+		await expect(
+			verifyAuthenticatedSwarmEvidence(artifactDirectory, `${commitment} `, createSwarmEvidenceTrustRoot(publicPem)),
+		).rejects.toThrow("non-canonical JSON: artifact commitment");
+		await expect(
+			verifyAuthenticatedSwarmEvidence(
+				artifactDirectory,
+				`${canonicalJson({ schemaVersion: SWARM_EVIDENCE_COMMITMENT_SCHEMA, artifactBundleId: written.artifactBundleId, signature: "%%%" })}\n`,
+				createSwarmEvidenceTrustRoot(publicPem),
+			),
 		).rejects.toThrow("B00B_EVIDENCE_BAD_SIGNATURE");
 	});
 });
