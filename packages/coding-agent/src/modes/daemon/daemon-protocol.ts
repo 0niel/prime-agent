@@ -217,6 +217,8 @@ export const DAEMON_PERSISTED_LAUNCH_ENV_KEYS = [
 	"XDG_DATA_HOME",
 	"XDG_RUNTIME_DIR",
 	"XDG_STATE_HOME",
+	// Source/development installs may relaunch through tsx after recovery.
+	"TSX_TSCONFIG_PATH",
 	// ENV_AGENT_DIR is the current application's configurable agent directory.
 	// PI_CODING_AGENT_DIR remains for compatibility with the upstream CLI.
 	ENV_AGENT_DIR,

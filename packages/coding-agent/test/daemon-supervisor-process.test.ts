@@ -411,13 +411,13 @@ describe("daemon supervisor resident workers", () => {
 			`prime-supervisor-resident-env-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
 		);
 		const extensionPath = join(projectDir, "resident-env-extension.ts");
-		const markerPath = join(root, "resident-env-marker");
+		const markerPath = join(projectDir, "resident-env-marker");
 		mkdirSync(projectDir, { recursive: true });
 		writeFileSync(
 			extensionPath,
 			[
 				"import { appendFileSync } from 'node:fs';",
-				`export default function() { appendFileSync(${JSON.stringify(markerPath)}, process.pid + ':' + process.env.PRIME_AGENT_TRACES_BASE_URL + ':' + (process.env.PRIME_AGENT_TEST_CREDENTIAL ?? '') + '\\n'); }`,
+				"export default function() { appendFileSync('resident-env-marker', process.pid + ':' + process.env.PRIME_AGENT_TRACES_BASE_URL + ':' + (process.env.PRIME_AGENT_TEST_CREDENTIAL ?? '') + '\\n'); }",
 				"",
 			].join("\n"),
 		);
