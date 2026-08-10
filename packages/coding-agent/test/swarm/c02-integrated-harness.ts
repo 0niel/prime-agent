@@ -382,9 +382,13 @@ export async function runC02IntegratedRepetition(measured = true): Promise<C02In
 			await afterMacrotask();
 		}
 
-		// A fresh monitor is reset after session construction, then disabled before
-		// teardown. Startup filesystem work is not misreported as event-loop C02 work.
+		// Begin a fresh measurement only after fixture/session construction and all
+		// 64 child admissions. Prime the new monitor for one setup-only turn, then
+		// reset immediately before the owner recap. From that reset through lifecycle
+		// teardown, do not reset it: every measured C02 owner, hook, terminal,
+		// attachment, InteractiveMode, and cleanup path is in the reported interval.
 		delay.enable();
+		await afterMacrotask();
 		delay.reset();
 		for (const handle of handles) {
 			const child = session.getRlmChildSession(handle.rlm_child_id);
@@ -428,24 +432,11 @@ export async function runC02IntegratedRepetition(measured = true): Promise<C02In
 		);
 		const attachments = await exerciseAttachments();
 		const interactive = await exerciseInteractive();
-		// Reset immediately before the bounded quiet sampling window. This records
-		// C02's event-loop responsiveness, not intentional setup/teardown I/O.
-		// Every run gets a new monitor and reset; the warmup is excluded at export.
-		delay.reset();
-		await bounded("event-loop delay sample", new Promise<void>((resolve) => setTimeout(resolve, 25)));
-		const delayStats = measured
-			? {
-					delayP50Milliseconds: delay.percentile(50) / 1_000_000,
-					delayP95Milliseconds: delay.percentile(95) / 1_000_000,
-					delayP99Milliseconds: delay.percentile(99) / 1_000_000,
-					delayMaxMilliseconds: delay.max / 1_000_000,
-				}
-			: { delayP50Milliseconds: 0, delayP95Milliseconds: 0, delayP99Milliseconds: 0, delayMaxMilliseconds: 0 };
-		delay.disable();
 
 		// Exercise every real owner shutdown edge after terminals: explicit abort,
 		// update-restart abort, then disposal. All retained child state must be inert
-		// after one macrotask rather than leaking a timer or late update.
+		// after one macrotask rather than leaking a timer or late update. This remains
+		// inside the delay measurement, rather than being treated as teardown noise.
 		await bounded("parent abort cleanup", session.abort());
 		session.abortForUpdateRestart();
 		await afterMacrotask();
@@ -456,6 +447,20 @@ export async function runC02IntegratedRepetition(measured = true): Promise<C02In
 			"abort/restart/dispose leaves no owner callback",
 		);
 		requireInvariant(session._activeRlmChildRuns.size === 0, "dispose releases real child runs");
+
+		// Allow the monitor's own sampling timer one final turn only after every
+		// measured path above has completed. This is not a second sampling window:
+		// the monitor has remained enabled and un-reset since before the owner recap.
+		await bounded("event-loop delay final sample", new Promise<void>((resolve) => setTimeout(resolve, 25)));
+		const delayStats = measured
+			? {
+					delayP50Milliseconds: delay.percentile(50) / 1_000_000,
+					delayP95Milliseconds: delay.percentile(95) / 1_000_000,
+					delayP99Milliseconds: delay.percentile(99) / 1_000_000,
+					delayMaxMilliseconds: delay.max / 1_000_000,
+				}
+			: { delayP50Milliseconds: 0, delayP95Milliseconds: 0, delayP99Milliseconds: 0, delayMaxMilliseconds: 0 };
+		delay.disable();
 		return {
 			parentPendingHighWater,
 			terminalDeliveries: delivered.size,
