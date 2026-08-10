@@ -715,10 +715,45 @@ describe("AgentsViewMode persistent catalog state", () => {
 					kind: "subagent",
 					createdAt: expect.any(Number),
 					parentSessionId: scopeRoot.sessionId,
-					parentActiveSessionId: scopeRoot.activeSessionId,
 					parentSessionFile: scopeRoot.sessionFile,
 				}),
 			}),
+		);
+		expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
+	});
+
+	it("creates a top-level session from a scoped view when the scope root has no session file", async () => {
+		const scopeRoot = summary({ rlmDepth: 0, sessionFile: undefined });
+		const created = summary({
+			id: "created-active",
+			activeSessionId: "created-active",
+			sessionId: "created-session",
+		});
+		modeMocks.clientRequest.mockResolvedValue({
+			type: "response",
+			command: "create",
+			success: true,
+			data: created,
+		});
+		const self = {
+			creatingNewSession: false,
+			stopped: false,
+			scopeRootSummary: scopeRoot,
+			options: { config: {} },
+			connectDedicatedClient: async () => ({
+				request: modeMocks.clientRequest,
+				close: vi.fn(),
+				supportsServerCapability: () => true,
+			}),
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			finish: vi.fn(),
+		};
+
+		await expect(invoke("createNewSession", self)).resolves.toBe(true);
+
+		expect(modeMocks.clientRequest).toHaveBeenCalledWith(
+			expect.not.objectContaining({ runtimeMetadata: expect.anything() }),
 		);
 		expect(self.finish).toHaveBeenCalledWith({ type: "open", summary: created });
 	});

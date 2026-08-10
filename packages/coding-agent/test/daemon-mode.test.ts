@@ -932,7 +932,6 @@ describe("daemon mode helpers", () => {
 					kind: "subagent",
 					createdAt: Date.now(),
 					parentSessionId: parentState.runtime.session.sessionId,
-					parentActiveSessionId: parentState.activeSessionId,
 					parentSessionFile,
 				},
 			});
@@ -943,10 +942,10 @@ describe("daemon mode helpers", () => {
 			});
 			expect(childState.runtime.metadata).toMatchObject({
 				kind: "subagent",
-				parentActiveSessionId: parentState.activeSessionId,
 				parentSessionId: parentState.runtime.session.sessionId,
 				parentSessionFile,
 			});
+			expect(childState.runtime.metadata).not.toHaveProperty("parentActiveSessionId");
 
 			Object.assign(childState.runtime.session, {
 				isBashRunning: false,
@@ -963,6 +962,23 @@ describe("daemon mode helpers", () => {
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
+	});
+
+	it("does not cascade-close a ctrl+n scoped agent when its scope root closes", () => {
+		const parent = makeState("parent");
+		const scopedChild = makeState("scoped-child");
+		Object.assign(scopedChild.runtime.metadata, {
+			parentSessionId: "parent-session",
+			parentSessionFile: "/tmp/parent.jsonl",
+		});
+		const kernelChild = makeState("kernel-child", "parent");
+		const sessions = new Map<string, ActiveSessionState>(
+			[parent, scopedChild, kernelChild].map((state) => [state.activeSessionId, state]),
+		);
+
+		expect(getChildActiveSessionStates(sessions, parent).map((state) => state.activeSessionId)).toEqual([
+			"kernel-child",
+		]);
 	});
 
 	it("defers RLM heartbeats while a subagent is binding", async () => {

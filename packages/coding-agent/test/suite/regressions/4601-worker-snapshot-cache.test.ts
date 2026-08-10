@@ -200,7 +200,7 @@ describe("ENG-4601 worker snapshot cache", () => {
 			activeSessionId,
 			clients: new Set([client]),
 			extensionUiRequests: new Map(),
-			runtime: { metadata: { kind: "subagent" } },
+			runtime: { metadata: { kind: "subagent", rlmChildId: "child-4601" } },
 		} as unknown as ActiveSessionState;
 		const written: DaemonOutbound[] = [];
 		const signal = markClientSnapshotStreaming(client, activeSessionId);
@@ -281,7 +281,7 @@ describe("ENG-4601 worker snapshot cache", () => {
 			activeSessionId,
 			clients: new Set([client]),
 			extensionUiRequests: new Map(),
-			runtime: { metadata: { kind: "subagent" } },
+			runtime: { metadata: { kind: "subagent", rlmChildId: "child-4601" } },
 		} as unknown as ActiveSessionState;
 		const written: DaemonOutbound[] = [];
 		const produced: number[] = [];
@@ -396,7 +396,7 @@ describe("ENG-4601 worker snapshot cache", () => {
 				activeSessionId,
 				clients: new Set([client]),
 				extensionUiRequests: new Map(),
-				runtime: { metadata: { kind: "subagent" } },
+				runtime: { metadata: { kind: "subagent", rlmChildId: "child-4601" } },
 			} as unknown as ActiveSessionState;
 			const signal = markClientSnapshotStreaming(client, activeSessionId);
 			const internals = daemon as unknown as {

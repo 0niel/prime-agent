@@ -255,13 +255,15 @@ export function getAgentsViewDepth(scopeRoot: SessionSummary | undefined): numbe
 	return scopeRoot ? (scopeRoot.rlmDepth ?? 0) + 1 : 0;
 }
 
-export function createAgentsViewScopedRuntimeMetadata(scopeRoot: SessionSummary): AgentSessionRuntimeMetadata {
+export function createAgentsViewScopedRuntimeMetadata(
+	scopeRoot: SessionSummary,
+	sessionFile: string,
+): AgentSessionRuntimeMetadata {
 	return {
 		kind: "subagent",
 		createdAt: Date.now(),
 		parentSessionId: scopeRoot.sessionId,
-		...(scopeRoot.activeSessionId ? { parentActiveSessionId: scopeRoot.activeSessionId } : {}),
-		...(scopeRoot.sessionFile ? { parentSessionFile: scopeRoot.sessionFile } : {}),
+		parentSessionFile: sessionFile,
 	};
 }
 
@@ -1775,12 +1777,13 @@ export class AgentsViewMode implements Component, Focusable {
 			try {
 				this.setStatusMessage("Creating session...");
 				const scopeRoot = this.scopeRootSummary;
+				const scopeSessionFile = scopeRoot?.sessionFile;
 				const response = await client.request({
 					type: "create",
 					config: this.options.config,
 					env: collectDaemonClientEnv(),
-					...(scopeRoot && client.supportsServerCapability("scoped_session_create")
-						? { runtimeMetadata: createAgentsViewScopedRuntimeMetadata(scopeRoot) }
+					...(scopeRoot && scopeSessionFile && client.supportsServerCapability("scoped_session_create")
+						? { runtimeMetadata: createAgentsViewScopedRuntimeMetadata(scopeRoot, scopeSessionFile) }
 						: {}),
 				});
 				const created = expectSessionSummary(requireDaemonData(response));
