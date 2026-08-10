@@ -267,3 +267,26 @@ Provider credentials are resolved by the TypeScript host. The bounded model cata
 ## Focused Validation
 
 From the repository root, the implementation is covered by focused kernel, recursion, context-tree, daemon RLM, and runtime tests. When changing child creation or accounting, include `agent-session-recursion.test.ts`; when changing comm transport, include the kernel comm tests; when changing daemon retention, include the daemon RLM lifecycle tests.
+
+## Background update delivery (C02)
+
+Child-update publication is a presentation path only. `AgentSession` retains at most one
+replaceable activity snapshot per child until the next event-loop turn. Replaceable snapshots
+include assistant/tool progress, usage or timer-derived activity, and unchanged child `running`
+state. A newer snapshot for the same child replaces the older one; distinct children retain their
+own latest snapshot. This local map and its single zero-delay flush timer never admit, throttle,
+or cancel model/provider work.
+
+Lifecycle edges (`queued` and first `running`), child identity changes, terminal states (`done`,
+`error`, `cancelled`), errors, human-input events, and every other structural event are delivered
+synchronously in source order. Before one of those boundaries is delivered, retained snapshots
+are flushed onto the normal event tail. In particular, the final retained activity is delivered
+before that child's terminal update. Pending snapshots are discarded only during parent abort,
+update restart, or disposal, and the current child-owner fence is checked both when a snapshot is
+retained and immediately before publication.
+
+Interactive-mode rendering applies the same rule to its UI-owned bounded keyed queue. It is
+capped at 128 independently keyed snapshots; reaching the cap drains the complete ordered batch
+onto the existing UI event tail instead of evicting an entity. This is deliberately not a durable
+terminal-delivery mechanism. C03 owns durable terminal handoff and recovery; it may rely on C02
+only for bounded, best-effort live presentation.

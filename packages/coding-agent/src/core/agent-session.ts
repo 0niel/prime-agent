@@ -929,6 +929,14 @@ type AutonomousRuntimeSnapshot = Pick<
 	"continuationsUsed" | "gateAttempts" | "lastGateFailure" | "lastGateFailureSnapshot"
 >;
 
+type RlmChildUpdateEvent = Extract<AgentSessionEvent, { type: "rlm_child_update" }>;
+
+interface PendingRlmChildUpdate {
+	event: RlmChildUpdateEvent;
+	/** Current child-owner fence rechecked both at enqueue and publication. */
+	isCurrent: () => boolean;
+}
+
 interface RlmChildRun {
 	id: string;
 	prompt: string;
@@ -1097,6 +1105,10 @@ export class AgentSession {
 		followUps: [],
 	};
 	private _agentEventQueue: Promise<void> = Promise.resolve();
+	// Presentation-only, per-parent coalescing. This never gates child admission or model work.
+	private _rlmChildUpdateFlushTimer: ReturnType<typeof setTimeout> | undefined;
+	private _rlmChildUpdateGeneration = 0;
+	private readonly _pendingRlmChildUpdates = new Map<string, PendingRlmChildUpdate>();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
@@ -1485,6 +1497,13 @@ export class AgentSession {
 
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
+		const terminalChildUpdate =
+			event.type === "rlm_child_update" &&
+			(event.child.status === "done" || event.child.status === "error" || event.child.status === "cancelled");
+		if ((event.type !== "rlm_child_update" || terminalChildUpdate) && this._pendingRlmChildUpdates.size > 0) {
+			// Structural and terminal events cannot overtake a retained progress snapshot.
+			this._flushRlmChildUpdates();
+		}
 		for (const l of this._eventListeners) {
 			try {
 				l(event);
@@ -1493,6 +1512,66 @@ export class AgentSession {
 				// receiving lifecycle and persistence events.
 			}
 		}
+	}
+
+	/**
+	 * Retain only the newest nonterminal snapshot per child until the next turn.
+	 * The caller supplies the current-owner fence so a replaced child cannot be
+	 * published from a stale timeout.
+	 */
+	private _queueRlmChildUpdate(
+		event: RlmChildUpdateEvent,
+		isCurrent: () => boolean,
+		publishSynchronously: boolean,
+	): void {
+		if (this._disposed || !isCurrent()) return;
+		const { child } = event;
+		const terminal = child.status === "done" || child.status === "error" || child.status === "cancelled";
+		if (terminal) {
+			// A terminal must follow, rather than replace, every retained activity snapshot.
+			this._flushRlmChildUpdates();
+			if (!this._disposed && isCurrent()) this._emit(event);
+			return;
+		}
+		if (publishSynchronously) {
+			// A lifecycle or structural edge supersedes only its own replaceable
+			// snapshot, while retaining order with activity for other children.
+			this._pendingRlmChildUpdates.delete(child.id);
+			this._flushRlmChildUpdates();
+			if (!this._disposed && isCurrent()) this._emit(event);
+			return;
+		}
+
+		this._pendingRlmChildUpdates.set(child.id, { event, isCurrent });
+		if (this._rlmChildUpdateFlushTimer !== undefined) return;
+		const generation = this._rlmChildUpdateGeneration;
+		this._rlmChildUpdateFlushTimer = setTimeout(() => {
+			if (generation !== this._rlmChildUpdateGeneration) return;
+			this._rlmChildUpdateFlushTimer = undefined;
+			if (this._disposed) return;
+			this._flushRlmChildUpdates();
+		}, 0);
+	}
+
+	private _flushRlmChildUpdates(): void {
+		if (this._rlmChildUpdateFlushTimer !== undefined) {
+			clearTimeout(this._rlmChildUpdateFlushTimer);
+			this._rlmChildUpdateFlushTimer = undefined;
+		}
+		const pending = [...this._pendingRlmChildUpdates.values()];
+		this._pendingRlmChildUpdates.clear();
+		for (const { event, isCurrent } of pending) {
+			if (!this._disposed && isCurrent()) this._emit(event);
+		}
+	}
+
+	private _cancelRlmChildUpdateFlush(): void {
+		this._rlmChildUpdateGeneration++;
+		if (this._rlmChildUpdateFlushTimer !== undefined) {
+			clearTimeout(this._rlmChildUpdateFlushTimer);
+			this._rlmChildUpdateFlushTimer = undefined;
+		}
+		this._pendingRlmChildUpdates.clear();
 	}
 
 	private _emitQueueUpdate(): void {
@@ -3973,6 +4052,7 @@ export class AgentSession {
 		if (this._disposed) {
 			return;
 		}
+		this._cancelRlmChildUpdateFlush();
 		this._disposed = true;
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
@@ -6530,6 +6610,7 @@ export class AgentSession {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
 		this.requestAbort();
+		this._cancelRlmChildUpdateFlush();
 		this._cancelActiveRlmChildRuns("Parent session aborted");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		try {
@@ -6552,6 +6633,7 @@ export class AgentSession {
 		this._sessionInputPumpSuspended = true;
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
+		this._cancelRlmChildUpdateFlush();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		this.agent.abort();
@@ -9667,9 +9749,13 @@ export class AgentSession {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 		};
 		this._activeRlmChildRuns.set(run.id, run);
-		const emitChildUpdate = () => {
+		let runningPublished = false;
+		const emitChildUpdate = (structural = false) => {
+			const isCurrent = () =>
+				this._activeRlmChildRuns.get(run.id) === run || this._rlmChildSessions.get(run.id) === childSession;
+			if (!isCurrent()) return;
 			const childModel = childSession?.model ?? modelSelection.model;
-			this._emit({
+			const event: RlmChildUpdateEvent = {
 				type: "rlm_child_update",
 				child: {
 					id: childNodeId,
@@ -9688,7 +9774,12 @@ export class AgentSession {
 					repliedSinceTask: childSession?._repliedToParentSinceTask,
 					error: run.error,
 				},
-			});
+			};
+			const terminal = run.status === "done" || run.status === "error" || run.status === "cancelled";
+			const publishSynchronously =
+				structural || run.status === "queued" || (run.status === "running" && !runningPublished) || terminal;
+			this._queueRlmChildUpdate(event, isCurrent, publishSynchronously);
+			if (run.status === "running") runningPublished = true;
 		};
 		run.emitUpdate = emitChildUpdate;
 		emitChildUpdate();
@@ -9806,7 +9897,11 @@ export class AgentSession {
 						runningToolCount = Math.max(0, runningToolCount - 1);
 						if (runningToolCount === 0) activity = { kind: "waiting" };
 						emitChildUpdate();
-					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
+					} else if (event.type === "session_info_changed") {
+						// Child identity changes are structural, so they cannot wait behind
+						// replaceable progress from the same event-loop turn.
+						emitChildUpdate(true);
+					} else if (event.type === "recap_update") {
 						emitChildUpdate();
 					}
 				});

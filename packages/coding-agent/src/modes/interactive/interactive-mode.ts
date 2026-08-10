@@ -529,6 +529,8 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // inline limit before storing, so this holds many recent pastes; the oldest are
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
+/** Bound UI-only coalescing memory without limiting agent or provider work. */
+const MAX_PENDING_PROGRESS_EVENTS = 128;
 const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
@@ -928,6 +930,14 @@ export class InteractiveMode {
 	// Serializes session event handling; see subscribeToAgent
 	private sessionEventQueue: Promise<void> = Promise.resolve();
 	private sessionEventGeneration = 0;
+	// Streaming progress is replaceable per UI entity: retain each entity's newest
+	// update until the next turn, but always put retained work back on the normal
+	// event tail before a structural transition.
+	private progressFlushTimer?: ReturnType<typeof setTimeout>;
+	private progressFlushGeneration = 0;
+	private pendingProgressEvents = new Map<string, AgentConnectionSessionEvent>();
+	private progressFlushStopped = false;
+	private readonly progressChildStatuses = new Map<string, AgentConnectionRlmChildAgentSnapshot["status"]>();
 	private fastModeToggleQueue: Promise<void> = Promise.resolve();
 
 	// Tool execution tracking: toolCallId -> component
@@ -5033,20 +5043,166 @@ export class InteractiveMode {
 		};
 	}
 
+	private isReplaceableProgressEvent(event: AgentConnectionSessionEvent): boolean {
+		if (event.type === "message_update") return event.message?.role === "assistant";
+		if (event.type === "tool_execution_update") return true;
+		if (event.type !== "rlm_child_update") return false;
+
+		const { id, status } = event.child;
+		const previous = this.progressChildStatuses.get(id);
+		if (status !== "queued" && status !== "running") {
+			this.progressChildStatuses.delete(id);
+			return false;
+		}
+		this.progressChildStatuses.set(id, status);
+		// The first observation and queued/running edge affect the child summary;
+		// preserve them, and coalesce only later snapshots in the same state.
+		return previous === status;
+	}
+
+	/** Return a stable key for each independently replaceable progress entity. */
+	private getProgressEventKey(event: AgentConnectionSessionEvent): string | undefined {
+		if (event.type === "message_update" && event.message.role === "assistant") {
+			// responseId is the only message identity exposed by AssistantMessage. A
+			// session can have only one active assistant stream when it is absent.
+			return `assistant:${event.message.responseId ?? "active"}`;
+		}
+		if (event.type === "tool_execution_update") return `tool:${event.toolCallId}`;
+		if (event.type === "rlm_child_update") return `rlm-child:${event.child.id}`;
+		return undefined;
+	}
+
+	/** Add work to the one UI-owned event tail, and keep that tail usable after errors. */
+	private enqueueSessionEvent(
+		event: AgentConnectionSessionEvent,
+		generation: number,
+		options: { preserveAcrossReplacement?: boolean } = {},
+	): Promise<void> {
+		const run = this.sessionEventQueue.then(() => {
+			if (
+				this.progressFlushStopped ||
+				(!options.preserveAcrossReplacement && generation !== this.sessionEventGeneration)
+			) {
+				return;
+			}
+			return this.handleEvent(event);
+		});
+		this.sessionEventQueue = run.catch(() => {});
+		return run;
+	}
+
+	private reportProgressFlushError(error: unknown): void {
+		// Keep the error surface consistent with the subscription's outer catch.
+		this.showError(error instanceof Error ? error.message : String(error));
+	}
+
+	private pendingProgress(): Map<string, AgentConnectionSessionEvent> {
+		// Prototype-based focused harnesses deliberately only supply the state they
+		// exercise. Lazily initializing here also keeps this UI-only queue resilient.
+		if (!this.pendingProgressEvents) this.pendingProgressEvents = new Map();
+		return this.pendingProgressEvents;
+	}
+
+	private drainPendingProgressEvents(): AgentConnectionSessionEvent[] {
+		const pending = [...this.pendingProgress().values()];
+		this.pendingProgress().clear();
+		return pending;
+	}
+
+	private enqueueFlushedProgress(
+		events: readonly AgentConnectionSessionEvent[],
+		generation: number,
+		options: { preserveAcrossReplacement?: boolean } = {},
+	): void {
+		for (const event of events) {
+			void this.enqueueSessionEvent(event, generation, options).catch((error) =>
+				this.reportProgressFlushError(error),
+			);
+		}
+	}
+
+	/**
+	 * Apply replaceable progress updates on a later turn. This is UI work only;
+	 * it neither delays nor limits agent/provider work.
+	 */
+	private queueProgressEvent(event: AgentConnectionSessionEvent, sessionGeneration: number): void {
+		if (this.progressFlushStopped || sessionGeneration !== this.sessionEventGeneration) return;
+		const key = this.getProgressEventKey(event);
+		if (!key) return;
+
+		const pending = this.pendingProgress();
+		// A replacement is a later event, so move it to the tail to preserve event
+		// order among the newest retained snapshots.
+		if (pending.has(key)) {
+			pending.delete(key);
+		} else if (pending.size >= MAX_PENDING_PROGRESS_EVENTS) {
+			// Do not evict UI entities. Put this complete ordered batch onto the
+			// existing UI tail now, then retain the new entity for its scheduled flush.
+			// The batch was received before any later replacement, so it must retain
+			// that ordering even when the replacement advances the generation before
+			// this queued UI work gets a turn. This bounds only local coalescing
+			// memory, never provider/agent work.
+			this.enqueueFlushedProgress(this.drainPendingProgressEvents(), sessionGeneration, {
+				preserveAcrossReplacement: true,
+			});
+		}
+		pending.set(key, event);
+		if (this.progressFlushTimer) return;
+
+		const progressGeneration = this.progressFlushGeneration;
+		this.progressFlushTimer = setTimeout(() => {
+			this.progressFlushTimer = undefined;
+			if (
+				this.progressFlushStopped ||
+				progressGeneration !== this.progressFlushGeneration ||
+				sessionGeneration !== this.sessionEventGeneration
+			) {
+				return;
+			}
+			this.enqueueFlushedProgress(this.drainPendingProgressEvents(), sessionGeneration);
+		}, 0);
+	}
+
+	/** Put retained progress ahead of the next structural event on the existing tail. */
+	private flushPendingProgress(): void {
+		if (this.progressFlushTimer) {
+			clearTimeout(this.progressFlushTimer);
+			this.progressFlushTimer = undefined;
+		}
+		if (!this.progressFlushStopped) {
+			// A replacement advances sessionEventGeneration synchronously. These events
+			// were received by the old UI and are deliberately ordered before it.
+			this.enqueueFlushedProgress(this.drainPendingProgressEvents(), this.sessionEventGeneration, {
+				preserveAcrossReplacement: true,
+			});
+		}
+	}
+
+	/** Invalidate timers and retained updates before a replacement or UI teardown. */
+	private cancelPendingProgress(): void {
+		this.progressFlushGeneration++;
+		if (this.progressFlushTimer) {
+			clearTimeout(this.progressFlushTimer);
+			this.progressFlushTimer = undefined;
+		}
+		this.pendingProgress()?.clear();
+		this.progressChildStatuses?.clear();
+	}
+
 	private subscribeToAgent(): void {
 		this.unsubscribe = this.agentConnection.subscribe(async (event) => {
 			try {
 				if (event.type === "session_event") {
-					// Connection adapters dispatch without awaiting, so serialize events.
-					// Replacement advances the generation before entering this queue, which
-					// prevents already-queued source events from mutating the target UI.
 					const generation = this.sessionEventGeneration;
-					const run = this.sessionEventQueue.then(() =>
-						generation === this.sessionEventGeneration ? this.handleEvent(event.event) : undefined,
-					);
-					this.sessionEventQueue = run.catch(() => {});
-					await run;
+					if (this.isReplaceableProgressEvent(event.event)) {
+						this.queueProgressEvent(event.event, generation);
+					} else {
+						this.flushPendingProgress();
+						await this.enqueueSessionEvent(event.event, generation);
+					}
 				} else if (event.type === "session_replaced") {
+					this.flushPendingProgress();
+					this.cancelPendingProgress();
 					const generation = ++this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return;
@@ -5061,6 +5217,8 @@ export class InteractiveMode {
 					this.sessionEventQueue = run.catch(() => {});
 					await run;
 				} else if (event.type === "session_resynced") {
+					this.flushPendingProgress();
+					this.cancelPendingProgress();
 					const generation = this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
 						if (generation !== this.sessionEventGeneration) return false;
@@ -9724,6 +9882,10 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 	}
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {
+		// Cancel before detaching the connection or stopping the TUI: a delayed
+		// progress callback must never repaint or mutate a stopped UI.
+		this.progressFlushStopped = true;
+		this.cancelPendingProgress();
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 		this.clearEscapeRepeat();
