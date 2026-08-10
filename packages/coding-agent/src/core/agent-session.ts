@@ -110,6 +110,7 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -2684,9 +2685,6 @@ export class AgentSession {
 		const contextWindow = this.model?.contextWindow ?? 0;
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
-		if (compactionTimestamp !== undefined && context.message.timestamp <= compactionTimestamp) {
-			return false;
-		}
 
 		const contextTokens = this._getThresholdContextTokens(context.message, compactionTimestamp);
 		if (contextTokens === undefined || !shouldCompact(contextTokens, contextWindow, settings)) {
@@ -5174,7 +5172,7 @@ export class AgentSession {
 					flushPendingBashBeforeValidation: true,
 					validateModelAndAuth: true,
 					awaitPendingModelSelection: true,
-					preTurnCompaction: options.skipPrePromptWork ? "skip" : "afterModelSelection",
+					preTurnCompaction: "afterModelSelection",
 					finalRefineBarrier: "ifInFlight",
 				},
 				runBeforeAgentStart: !options.skipPrePromptWork,
@@ -7960,6 +7958,9 @@ export class AgentSession {
 		compactionTimestamp: number | undefined,
 	): number | undefined {
 		const messages = this.agent.state.messages;
+		if (compactionTimestamp !== undefined && assistantMessage.timestamp <= compactionTimestamp) {
+			return messages.reduce((tokens, message) => tokens + estimateTokens(message), 0);
+		}
 		const estimate = estimateContextTokens(messages);
 		if (estimate.lastUsageIndex !== null) {
 			// Verify the usage source is post-compaction. Kept pre-compaction messages
@@ -7971,7 +7972,7 @@ export class AgentSession {
 				usageMsg.role === "assistant" &&
 				(usageMsg as AssistantMessage).timestamp <= compactionTimestamp
 			) {
-				return undefined;
+				return messages.reduce((tokens, message) => tokens + estimateTokens(message), 0);
 			}
 			return estimate.tokens;
 		}
@@ -8060,7 +8061,7 @@ export class AgentSession {
 			return await this._runAutoCompaction("requested", false);
 		}
 
-		if (!settings.enabled || assistantIsFromBeforeCompaction) return false;
+		if (!settings.enabled) return false;
 
 		// Case 3: Threshold - context is getting large.
 		// Use the full-session estimate so messages appended after the last successful

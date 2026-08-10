@@ -419,6 +419,17 @@ export function createHeartbeatPromptMessage(
 	};
 }
 
+/** Messages retained in the model-facing projection of the append-only journal. */
+export function isModelContextMessage(message: AgentMessage): boolean {
+	if (message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+		return false;
+	}
+	if (message.role === "custom" && message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
+		return false;
+	}
+	return true;
+}
+
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
@@ -429,6 +440,7 @@ export function createHeartbeatPromptMessage(
  */
 export function convertToLlm(messages: AgentMessage[]): Message[] {
 	return messages
+		.filter(isModelContextMessage)
 		.map((m): Message | undefined => {
 			switch (m.role) {
 				case "bashExecution":

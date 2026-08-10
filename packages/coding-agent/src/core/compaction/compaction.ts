@@ -6,13 +6,14 @@
  */
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	isModelContextMessage,
 } from "../messages.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import {
@@ -78,10 +79,17 @@ function extractFileOperations(
  */
 function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	if (entry.type === "message") {
-		return entry.message;
+		return isModelContextMessage(entry.message) ? entry.message : undefined;
 	}
 	if (entry.type === "custom_message") {
-		return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
+		const message = createCustomMessage(
+			entry.customType,
+			entry.content,
+			entry.display,
+			entry.details,
+			entry.timestamp,
+		);
+		return isModelContextMessage(message) ? message : undefined;
 	}
 	if (entry.type === "branch_summary") {
 		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
@@ -241,6 +249,7 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
  * This is conservative (overestimates tokens).
  */
 export function estimateTokens(message: AgentMessage): number {
+	if (!isModelContextMessage(message)) return 0;
 	let chars = 0;
 
 	switch (message.role) {
@@ -313,6 +322,7 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 		const entry = entries[i];
 		switch (entry.type) {
 			case "message": {
+				if (!isModelContextMessage(entry.message)) break;
 				const role = entry.message.role;
 				switch (role) {
 					case "bashExecution":
@@ -339,8 +349,10 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 				break;
 		}
 
-		// branch_summary and custom_message are user-role messages, valid cut points
-		if (entry.type === "branch_summary" || entry.type === "custom_message") {
+		// branch summaries and model-visible custom messages are user-role cut points.
+		if (entry.type === "branch_summary") {
+			cutPoints.push(i);
+		} else if (entry.type === "custom_message" && getMessageFromEntry(entry)) {
 			cutPoints.push(i);
 		}
 	}
@@ -356,7 +368,7 @@ export function findTurnStartIndex(entries: SessionEntry[], entryIndex: number, 
 	for (let i = entryIndex; i >= startIndex; i--) {
 		const entry = entries[i];
 		// branch_summary and custom_message are user-role messages, can start a turn
-		if (entry.type === "branch_summary" || entry.type === "custom_message") {
+		if (entry.type === "branch_summary" || (entry.type === "custom_message" && getMessageFromEntry(entry))) {
 			return i;
 		}
 		if (entry.type === "message") {
@@ -553,9 +565,155 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
  */
+const SUMMARY_CHARS_PER_TOKEN = 2;
+const SUMMARY_TRUNCATION_MARKER = "\n[... oversized message truncated for compaction ...]";
+
+interface BoundedSummaryOptions {
+	messages: AgentMessage[];
+	model: Model<Api>;
+	maxTokens: number;
+	apiKey: string;
+	headers?: Record<string, string>;
+	signal?: AbortSignal;
+	thinkingLevel?: ThinkingLevel;
+	previousSummary?: string;
+	instructions: (hasPreviousSummary: boolean, customInstructions?: string) => string;
+	customInstructions?: string;
+	failureLabel: string;
+}
+
+function truncateForSummary(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	if (maxChars <= SUMMARY_TRUNCATION_MARKER.length) return text.slice(0, Math.max(0, maxChars));
+	const keep = maxChars - SUMMARY_TRUNCATION_MARKER.length;
+	return `${text.slice(0, keep)}${SUMMARY_TRUNCATION_MARKER}`;
+}
+
+function summaryRequestLimits(
+	model: Model<Api>,
+	requestedMaxTokens: number,
+): {
+	maxTokens: number;
+	maxPromptChars: number;
+} {
+	const contextWindow = Math.max(1, model.contextWindow);
+	const maxTokens = Math.max(1, Math.min(requestedMaxTokens, model.maxTokens, Math.floor(contextWindow * 0.25)));
+	const safetyTokens = Math.max(256, Math.min(4096, Math.floor(contextWindow * 0.05)));
+	const inputTokens = contextWindow - maxTokens - safetyTokens;
+	const maxPromptChars = Math.floor(inputTokens * SUMMARY_CHARS_PER_TOKEN - SUMMARIZATION_SYSTEM_PROMPT.length);
+	if (maxPromptChars <= 0) {
+		throw new Error(`Model context window is too small for compaction (${contextWindow} tokens)`);
+	}
+	return { maxTokens, maxPromptChars };
+}
+
+function buildBoundedSummaryPrompt(
+	conversation: string,
+	previousSummary: string | undefined,
+	instructions: string,
+): string {
+	let prompt = `<conversation>\n${conversation}\n</conversation>\n\n`;
+	if (previousSummary) prompt += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+	return prompt + instructions;
+}
+
+async function generateBoundedSummary(options: BoundedSummaryOptions): Promise<string> {
+	const limits = summaryRequestLimits(options.model, options.maxTokens);
+	const llmMessages = convertToLlm(options.messages);
+	const pending = llmMessages.map((message) => serializeConversation([message]));
+	let rollingSummary = options.previousSummary;
+	let firstRequest = true;
+
+	do {
+		const boundedCustomInstructions = options.customInstructions
+			? truncateForSummary(options.customInstructions, Math.floor(limits.maxPromptChars * 0.15))
+			: undefined;
+		let boundedPreviousSummary = rollingSummary
+			? truncateForSummary(rollingSummary, Math.floor(limits.maxPromptChars * 0.4))
+			: undefined;
+		let instructions = options.instructions(!!boundedPreviousSummary, boundedCustomInstructions);
+		let fixedPrompt = buildBoundedSummaryPrompt("", boundedPreviousSummary, instructions);
+		if (fixedPrompt.length >= limits.maxPromptChars && boundedPreviousSummary) {
+			boundedPreviousSummary = truncateForSummary(
+				boundedPreviousSummary,
+				Math.max(0, boundedPreviousSummary.length - (fixedPrompt.length - limits.maxPromptChars) - 1),
+			);
+			instructions = options.instructions(!!boundedPreviousSummary, boundedCustomInstructions);
+			fixedPrompt = buildBoundedSummaryPrompt("", boundedPreviousSummary, instructions);
+		}
+		const conversationBudget = limits.maxPromptChars - fixedPrompt.length;
+		if (conversationBudget <= 0) {
+			throw new Error("Compaction instructions exceed the model context window");
+		}
+
+		const chunk: string[] = [];
+		let chunkChars = 0;
+		while (pending.length > 0) {
+			const separatorChars = chunk.length === 0 ? 0 : 1;
+			const available = conversationBudget - chunkChars - separatorChars;
+			if (available <= 0) break;
+			const next = pending[0];
+			if (next.length <= available) {
+				pending.shift();
+				chunk.push(next);
+				chunkChars += separatorChars + next.length;
+				continue;
+			}
+			if (chunk.length > 0) break;
+			pending.shift();
+			const truncated = truncateForSummary(next, available);
+			chunk.push(truncated);
+			chunkChars += truncated.length;
+		}
+
+		const promptText = buildBoundedSummaryPrompt(chunk.join("\n"), boundedPreviousSummary, instructions);
+		const summarizationMessages = [
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: promptText }],
+				timestamp: Date.now(),
+			},
+		];
+		const completionOptions =
+			options.model.reasoning && options.thinkingLevel && options.thinkingLevel !== "off"
+				? {
+						maxTokens: limits.maxTokens,
+						signal: options.signal,
+						apiKey: options.apiKey,
+						headers: options.headers,
+						reasoning: options.thinkingLevel,
+					}
+				: {
+						maxTokens: limits.maxTokens,
+						signal: options.signal,
+						apiKey: options.apiKey,
+						headers: options.headers,
+					};
+		const response = await completeSimple(
+			options.model,
+			{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+			completionOptions,
+		);
+		if (response.stopReason === "error") {
+			throw new Error(`${options.failureLabel}: ${response.errorMessage || "Unknown error"}`);
+		}
+		rollingSummary = response.content
+			.filter((content): content is { type: "text"; text: string } => content.type === "text")
+			.map((content) => content.text)
+			.join("\n");
+		firstRequest = false;
+	} while (pending.length > 0 || firstRequest);
+
+	return rollingSummary ?? "";
+}
+
+/**
+ * Generate a summary of the conversation using dynamically bounded rolling requests.
+ * If previousSummary is provided, each chunk updates it sequentially.
+ */
 export async function generateSummary(
 	currentMessages: AgentMessage[],
-	model: Model<any>,
+	model: Model<Api>,
 	reserveTokens: number,
 	apiKey: string,
 	headers?: Record<string, string>,
@@ -564,51 +722,20 @@ export async function generateSummary(
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
 ): Promise<string> {
-	const maxTokens = Math.floor(0.8 * reserveTokens);
-
-	const basePrompt = buildSummarizationPrompt(customInstructions, previousSummary);
-
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const completionOptions =
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
-
-	const response = await completeSimple(
+	return generateBoundedSummary({
+		messages: currentMessages,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	const textContent = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
-
-	return textContent;
+		maxTokens: Math.floor(0.8 * reserveTokens),
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		previousSummary,
+		customInstructions,
+		instructions: (hasPreviousSummary, boundedInstructions) =>
+			buildSummarizationPrompt(boundedInstructions, hasPreviousSummary ? "rolling" : undefined),
+		failureLabel: "Summarization failed",
+	});
 }
 
 // ============================================================================
@@ -744,7 +871,7 @@ Be concise. Focus on what's needed to understand the kept suffix.`;
  */
 export async function compact(
 	preparation: CompactionPreparation,
-	model: Model<any>,
+	model: Model<Api>,
 	apiKey: string,
 	headers?: Record<string, string>,
 	customInstructions?: string,
@@ -829,39 +956,25 @@ export async function compact(
  */
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
-	model: Model<any>,
+	model: Model<Api>,
 	reserveTokens: number,
 	apiKey: string,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 ): Promise<string> {
-	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const response = await completeSimple(
+	return generateBoundedSummary({
+		messages,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
-	);
-
-	if (response.stopReason === "error") {
-		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);
-	}
-
-	return response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
+		maxTokens: Math.floor(0.5 * reserveTokens),
+		apiKey,
+		headers,
+		signal,
+		thinkingLevel,
+		instructions: (hasPreviousSummary) =>
+			hasPreviousSummary
+				? `${TURN_PREFIX_SUMMARIZATION_PROMPT}\n\nUpdate the previous turn-prefix summary with the new conversation chunk.`
+				: TURN_PREFIX_SUMMARIZATION_PROMPT,
+		failureLabel: "Turn prefix summarization failed",
+	});
 }

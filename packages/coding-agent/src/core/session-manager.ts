@@ -39,6 +39,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	isModelContextMessage,
 } from "./messages.js";
 import { cloneUsage } from "./usage.js";
 
@@ -574,11 +575,16 @@ export function buildSessionContext(
 
 	const appendMessage = (entry: SessionEntry, target = messages) => {
 		if (entry.type === "message") {
-			target.push(entry.message);
+			if (isModelContextMessage(entry.message)) target.push(entry.message);
 		} else if (entry.type === "custom_message") {
-			target.push(
-				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+			const message = createCustomMessage(
+				entry.customType,
+				entry.content,
+				entry.display,
+				entry.details,
+				entry.timestamp,
 			);
+			if (isModelContextMessage(message)) target.push(message);
 		} else if (entry.type === "branch_summary" && entry.summary) {
 			target.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
 		}
