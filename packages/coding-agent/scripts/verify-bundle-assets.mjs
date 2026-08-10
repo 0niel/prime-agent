@@ -1,42 +1,73 @@
 #!/usr/bin/env node
 
-import { stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { lstat, readFile, readdir, realpath } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const REQUIRED_BUNDLE_PROVIDER_ASSETS = [
-	{
-		file: "amazon-bedrock.js",
-		exports: ["streamBedrock", "streamSimpleBedrock"],
-	},
-];
+const NODE_ONLY_PROVIDER_IMPORT = /\bimportNodeOnlyProvider[A-Za-z0-9_$]*\(\s*(["'`])(\.[^"'`]+)\1\s*\)/g;
+
+async function listJavaScriptFiles(directory) {
+	const files = [];
+	for (const entry of await readdir(directory, { withFileTypes: true })) {
+		const entryPath = resolve(directory, entry.name);
+		if (entry.isDirectory()) files.push(...(await listJavaScriptFiles(entryPath)));
+		else if (entry.isFile() && entry.name.endsWith(".js")) files.push(entryPath);
+	}
+	return files;
+}
+
+function assertPathInside(root, target, description) {
+	const pathFromRoot = relative(root, target);
+	if (pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))) return;
+	throw new Error(`${description} resolves outside the bundle directory: ${target}`);
+}
+
+export async function findNodeOnlyProviderReferences(outdir) {
+	const root = await realpath(resolve(outdir));
+	const references = [];
+	for (const sourcePath of await listJavaScriptFiles(root)) {
+		const source = await readFile(sourcePath, "utf8");
+		for (const match of source.matchAll(NODE_ONLY_PROVIDER_IMPORT)) {
+			const specifier = match[2];
+			const targetPath = resolve(dirname(sourcePath), specifier);
+			assertPathInside(root, targetPath, `Node-only provider reference ${specifier} in ${sourcePath}`);
+			references.push({ sourcePath, specifier, targetPath });
+		}
+	}
+	if (references.length === 0) {
+		throw new Error(`No node-only provider dynamic import references found in ${root}`);
+	}
+	return { root, references };
+}
 
 export async function verifyBundleProviderAssets(outdir) {
-	for (const asset of REQUIRED_BUNDLE_PROVIDER_ASSETS) {
-		const assetPath = resolve(outdir, asset.file);
-		let assetStat;
+	const { root, references } = await findNodeOnlyProviderReferences(outdir);
+	const targets = new Map();
+	for (const reference of references) {
+		let targetStat;
 		try {
-			assetStat = await stat(assetPath);
+			targetStat = await lstat(reference.targetPath);
 		} catch {
-			throw new Error(`Missing required provider bundle: ${assetPath}`);
-		}
-		if (!assetStat.isFile() || assetStat.size === 0) {
-			throw new Error(`Required provider bundle is not a non-empty file: ${assetPath}`);
-		}
-
-		let providerModule;
-		try {
-			providerModule = await import(`${pathToFileURL(assetPath).href}?verify=${Date.now()}`);
-		} catch (error) {
 			throw new Error(
-				`Required provider bundle could not be imported: ${assetPath}: ${error instanceof Error ? error.message : String(error)}`,
-				{ cause: error },
+				`Missing node-only provider bundle ${reference.specifier} referenced by ${reference.sourcePath}`,
 			);
 		}
-		for (const exportName of asset.exports) {
-			if (typeof providerModule[exportName] !== "function") {
-				throw new Error(`Required provider bundle ${assetPath} does not export ${exportName}()`);
-			}
+		if (!targetStat.isFile() || targetStat.isSymbolicLink() || targetStat.size === 0) {
+			throw new Error(`Node-only provider bundle is not a non-empty regular file: ${reference.targetPath}`);
+		}
+		const realTarget = await realpath(reference.targetPath);
+		assertPathInside(root, realTarget, `Node-only provider bundle ${reference.specifier}`);
+		targets.set(realTarget, reference);
+	}
+
+	for (const [targetPath, reference] of targets) {
+		try {
+			await import(`${pathToFileURL(targetPath).href}?verify=${Date.now()}`);
+		} catch (error) {
+			throw new Error(
+				`Node-only provider bundle ${reference.specifier} referenced by ${reference.sourcePath} could not be imported: ${error instanceof Error ? error.message : String(error)}`,
+				{ cause: error },
+			);
 		}
 	}
 }

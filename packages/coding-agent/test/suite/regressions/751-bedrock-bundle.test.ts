@@ -10,11 +10,25 @@ const verifier = join(packageRoot, "scripts", "verify-bundle-assets.mjs");
 const tempDirs: string[] = [];
 
 function createBundleDir(): string {
-	const root = mkdtempSync(join(tmpdir(), "prime-agent-bedrock-bundle-"));
+	const root = mkdtempSync(join(tmpdir(), "prime-agent-provider-bundle-"));
 	tempDirs.push(root);
 	const outdir = join(root, "bundle");
 	mkdirSync(outdir);
 	return outdir;
+}
+
+function writeProviderReferences(outdir: string, specifiers: string[]): void {
+	writeFileSync(
+		join(outdir, "chunk-provider-registry.js"),
+		[
+			"const importNodeOnlyProvider = (specifier) => import(specifier);",
+			...specifiers.map((specifier) => `importNodeOnlyProvider(${JSON.stringify(specifier)});`),
+		].join("\n"),
+	);
+}
+
+function writeProvider(outdir: string, name: string): void {
+	writeFileSync(join(outdir, name), `export const provider = ${JSON.stringify(name)};\n`);
 }
 
 function verify(outdir: string) {
@@ -27,27 +41,29 @@ afterEach(() => {
 	}
 });
 
-describe("issue #751 Bedrock release bundle", () => {
-	it("fails distribution verification when the Bedrock entry is absent", () => {
+describe("issue #751 node-only provider release bundles", () => {
+	it("fails closed when emitted output contains no node-only provider references", () => {
 		const result = verify(createBundleDir());
 
 		expect(result.status).toBe(1);
-		expect(result.stderr).toContain("Missing required provider bundle");
-		expect(result.stderr).toContain("amazon-bedrock.js");
+		expect(result.stderr).toContain("No node-only provider dynamic import references found");
 	});
 
-	it("requires the Bedrock bundle to expose both streaming entry points", () => {
+	it("derives every emitted reference and fails when a synthetic second provider is missing", () => {
 		const outdir = createBundleDir();
-		const asset = join(outdir, "amazon-bedrock.js");
-		writeFileSync(asset, "export function streamBedrock() {}\n");
-		expect(verify(outdir).stderr).toContain("does not export streamSimpleBedrock()");
+		writeProviderReferences(outdir, ["./provider-one.js", "./provider-two.js"]);
+		writeProvider(outdir, "provider-one.js");
 
-		writeFileSync(asset, "export function streamBedrock() {}\nexport function streamSimpleBedrock() {}\n");
-		const result = verify(outdir);
-		expect(result.status, result.stderr).toBe(0);
+		const missing = verify(outdir);
+		expect(missing.status).toBe(1);
+		expect(missing.stderr).toContain("Missing node-only provider bundle ./provider-two.js");
+
+		writeProvider(outdir, "provider-two.js");
+		const complete = verify(outdir);
+		expect(complete.status, complete.stderr).toBe(0);
 	});
 
-	it("wires the explicit provider entry and verifier into build and release packing", () => {
+	it("wires the explicit Bedrock entry and derived verifier into build and release packing", () => {
 		const bundleScript = readFileSync(join(packageRoot, "scripts", "bundle.mjs"), "utf8");
 		const releaseScript = readFileSync(join(repoRoot, "scripts", "pack-prime-agent-release.mjs"), "utf8");
 
