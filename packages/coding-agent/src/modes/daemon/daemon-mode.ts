@@ -5398,13 +5398,12 @@ export class AgentDaemon {
 							targetState = await this.waitForHydratingChild(hydratingChild, targetSelector);
 						} else if (this.options.worker && options.fromState) {
 							// The supervisor can resolve and wake a saved worker even when it is no longer
-							// present in this worker's resident peer snapshot.
-							return this.sendRemoteAgentSessionMessage(
-								options.fromState,
-								targetSelector,
-								message,
-								options.deliveryMode,
-							);
+							// present in this worker's resident peer snapshot. Preserve the legacy
+							// three-argument call for omitted selectors: worker implementations may
+							// distinguish an omitted optional argument from an explicit undefined.
+							return options.deliveryMode === undefined
+								? this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message)
+								: this.sendRemoteAgentSessionMessage(options.fromState, targetSelector, message, options.deliveryMode);
 						} else {
 							throw error;
 						}

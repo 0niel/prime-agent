@@ -321,7 +321,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 			type: "response",
 			command: "worker_deliver_message",
 			success: true,
-			data: { deliveryStatus: "delivered" },
+			data: { deliveryStatus: "delivered", deliveryMode: "follow_up" },
 		});
 		supervisor.workers.set("source", source);
 		supervisor.catalog.resolve = vi.fn(async () => "/tmp/target.jsonl");
@@ -334,6 +334,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 			targetActiveSessionId: "target-session",
 			fromActiveSessionId: "source-active",
 			message: "wake up",
+			deliveryMode: "follow_up",
 		});
 
 		expect(supervisor.catalog.resolve).toHaveBeenCalledWith("target-session", "/tmp/project", "/tmp/custom-sessions");
@@ -346,10 +347,16 @@ describe("daemon supervisor whole-tree eviction", () => {
 				type: "worker_deliver_message",
 				targetActiveSessionId: "target-active",
 				message: "wake up",
+				deliveryMode: "follow_up",
 			}),
 			24 * 60 * 60 * 1000,
 		);
-		expect(response).toMatchObject({ success: true, id: "message-1", command: "send_message" });
+		expect(response).toMatchObject({
+			success: true,
+			id: "message-1",
+			command: "send_message",
+			data: { deliveryStatus: "delivered", deliveryMode: "follow_up" },
+		});
 	});
 
 	it("delivers a same-worker name selector through its canonical active session id", async () => {

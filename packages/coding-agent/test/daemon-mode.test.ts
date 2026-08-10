@@ -1448,7 +1448,7 @@ describe("daemon mode helpers", () => {
 			message: "continue remotely",
 			deliveryStatus: "delivered",
 			deliveredAt: "2026-01-01T00:00:00.000Z",
-			deliveryMode: "auto",
+			deliveryMode: "steer",
 		};
 		const sendRemoteAgentSessionMessage = vi.fn().mockResolvedValue(receipt);
 		const internals = daemon as unknown as {
@@ -1491,7 +1491,7 @@ describe("daemon mode helpers", () => {
 		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, remoteSelector, "continue remotely");
 	});
 
-	it("routes nonresident agent-message targets through the supervisor wake path", async () => {
+	it("keeps the legacy three-argument remote call when nonresident delivery mode is omitted", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -1535,6 +1535,56 @@ describe("daemon mode helpers", () => {
 			}),
 		).rejects.toThrow("Unknown active session: deleted-child");
 		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "deleted-child", "continue");
+	});
+
+	it("propagates follow-up selection to a nonresident target through the supervisor", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+			worker: { authenticationToken: "worker-token" },
+		});
+		const source = makeState("source");
+		const receipt = {
+			id: "agentmsg-remote-follow-up",
+			source: "agent_message",
+			target: { activeSessionId: "nonresident-target", sessionId: "session-remote" },
+			message: "continue after this turn",
+			deliveryStatus: "queued",
+			queuedAt: "2026-01-01T00:00:00.000Z",
+			deliveryMode: "follow_up",
+		};
+		const sendRemoteAgentSessionMessage = vi.fn().mockResolvedValue(receipt);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendRemoteAgentSessionMessage: typeof sendRemoteAgentSessionMessage;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState: ActiveSessionState;
+				deliveryMode?: "auto" | "steer" | "follow_up";
+				origin: "agent";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(source.activeSessionId, source);
+		internals.sendRemoteAgentSessionMessage = sendRemoteAgentSessionMessage;
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: "nonresident-target",
+				message: "continue after this turn",
+				fromState: source,
+				deliveryMode: "follow_up",
+				origin: "agent",
+			}),
+		).resolves.toEqual(receipt);
+		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(
+			source,
+			"nonresident-target",
+			"continue after this turn",
+			"follow_up",
+		);
 	});
 
 	it("rejects invalid nonresident agent messages before remote fallback", async () => {
@@ -1643,6 +1693,94 @@ describe("daemon mode helpers", () => {
 				"Target session has too many pending messages",
 			);
 			expect(connectionCount).toBe(1);
+		} finally {
+			if (previousSupervisorSocket === undefined) {
+				delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			} else {
+				process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
+			}
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("forwards an explicit follow-up selector in its supervisor request", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-follow-up-"));
+		const socketPath = join(tempDir, "d.sock");
+		let receivedCommand: Record<string, unknown> | undefined;
+		const server = createServer((socket) => {
+			socket.write(
+				`${JSON.stringify({
+					type: "daemon_hello",
+					socketPath,
+					protocol: DAEMON_PROTOCOL_INFO,
+					schemaId: DAEMON_SCHEMA_ID,
+					clientId: "supervisor",
+					serverCapabilities: [],
+				})}\n`,
+			);
+			let buffer = "";
+			socket.on("data", (chunk) => {
+				buffer += chunk.toString();
+				const newline = buffer.indexOf("\n");
+				if (newline === -1 || receivedCommand) return;
+				const wire = JSON.parse(buffer.slice(0, newline)) as { id: string; command?: Record<string, unknown> };
+				receivedCommand = (wire.command ?? wire) as Record<string, unknown>;
+				socket.write(
+					`${JSON.stringify({
+						type: "response",
+						id: wire.id,
+						command: "send_message",
+						success: true,
+						data: {
+							id: "agentmsg-follow-up",
+							source: "agent_message",
+							target: { activeSessionId: "remote", sessionId: "session-remote" },
+							message: "continue after this turn",
+							deliveryStatus: "queued",
+							queuedAt: "2026-01-01T00:00:00.000Z",
+							deliveryMode: "follow_up",
+						},
+					})}\n`,
+				);
+			});
+		});
+		const previousSupervisorSocket = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		try {
+			await new Promise<void>((resolve, reject) => {
+				server.once("error", reject);
+				server.listen(socketPath, resolve);
+			});
+			process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "token" },
+			});
+			const internals = daemon as unknown as {
+				sendRemoteAgentSessionMessage(
+					fromState: ActiveSessionState,
+					targetSelector: string,
+					message: string,
+					deliveryMode?: "auto" | "steer" | "follow_up",
+				): Promise<unknown>;
+			};
+
+			await expect(
+				internals.sendRemoteAgentSessionMessage(
+					makeState("source"),
+					"remote",
+					"continue after this turn",
+					"follow_up",
+				),
+			).resolves.toMatchObject({ deliveryStatus: "queued", deliveryMode: "follow_up" });
+			expect(receivedCommand).toMatchObject({
+				type: "send_message",
+				targetActiveSessionId: "remote",
+				fromActiveSessionId: "source",
+				message: "continue after this turn",
+				deliveryMode: "follow_up",
+			});
 		} finally {
 			if (previousSupervisorSocket === undefined) {
 				delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
