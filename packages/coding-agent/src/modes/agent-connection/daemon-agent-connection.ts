@@ -756,9 +756,30 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.promptOnce(sourceActiveSessionId, type, message, options);
 			return;
 		} catch (error) {
-			if (!this.canRevivePrompt(error, sourceActiveSessionId, sourceSessionFile, options?.signal)) {
-				throw error;
+			if (!this.isDefinitiveUnknownSessionError(error, sourceActiveSessionId)) throw error;
+			const concurrentRevival = this.revival;
+			if (
+				concurrentRevival?.sourceActiveSessionId === sourceActiveSessionId &&
+				concurrentRevival.sessionFile === sourceSessionFile
+			) {
+				try {
+					await concurrentRevival.promise;
+				} catch {
+					throw error;
+				}
 			}
+			if (
+				sourceSessionFile &&
+				this.activeSessionId !== sourceActiveSessionId &&
+				this.attachedSessionFile === sourceSessionFile
+			) {
+				if (options?.signal?.aborted) {
+					throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
+				}
+				await this.promptOnce(this.activeSessionId, type, message, options);
+				return;
+			}
+			if (!this.canRevivePrompt(error, sourceActiveSessionId, sourceSessionFile, options?.signal)) throw error;
 			try {
 				await this.reviveArchivedSession(sourceActiveSessionId, sourceSessionFile!);
 			} catch {
@@ -773,6 +794,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	private isDefinitiveUnknownSessionError(error: unknown, activeSessionId: string): error is Error {
+		return (
+			error instanceof Error &&
+			this.definitiveRequestErrors.has(error) &&
+			error.message.trim() === `Unknown active session: ${activeSessionId}`
+		);
+	}
+
 	private canRevivePrompt(
 		error: unknown,
 		sourceActiveSessionId: string,
@@ -780,9 +809,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		signal: AbortSignal | undefined,
 	): boolean {
 		return (
-			error instanceof Error &&
-			this.definitiveRequestErrors.has(error) &&
-			error.message.trim() === `Unknown active session: ${sourceActiveSessionId}` &&
+			this.isDefinitiveUnknownSessionError(error, sourceActiveSessionId) &&
 			Boolean(sourceSessionFile) &&
 			Boolean(this.options.reviveConfig) &&
 			!this.options.ownedSession &&

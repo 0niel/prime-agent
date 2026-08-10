@@ -50,6 +50,8 @@ class FakeDaemonClient {
 	abortAndClearQueueUnknownCommand = false;
 	cronAddGate: Promise<void> | undefined;
 	promptGate: Promise<void> | undefined;
+	promptGatesByMessage = new Map<string, Promise<void>>();
+	promptErrorsByMessage = new Map<string, string>();
 	promptError: Error | undefined;
 	promptResponseError: string | undefined;
 	promptResponseErrors: string[] = [];
@@ -79,8 +81,13 @@ class FakeDaemonClient {
 			case "prompt":
 			case "prompt_and_wait": {
 				if (this.promptGate) await this.promptGate;
+				const messageGate = this.promptGatesByMessage.get(command.message);
+				if (messageGate) await messageGate;
 				if (this.promptError) throw this.promptError;
-				const responseError = this.promptResponseErrors.shift() ?? this.promptResponseError;
+				const targetedResponseError = this.promptErrorsByMessage.get(command.message);
+				this.promptErrorsByMessage.delete(command.message);
+				const responseError =
+					targetedResponseError ?? this.promptResponseErrors.shift() ?? this.promptResponseError;
 				if (responseError) {
 					return { type: "response", command: command.type, success: false, error: responseError };
 				}
@@ -789,6 +796,36 @@ describe("DaemonAgentConnection", () => {
 				request.type === "prompt" && request.activeSessionId === "active-revived",
 		);
 		expect(delivered.map((request) => request.message).sort()).toEqual(["first", "second"]);
+	});
+
+	it("retries a late stale rejection after another prompt finishes revival", async () => {
+		const fakeClient = new FakeDaemonClient();
+		let releaseLateResponse = () => {};
+		const lateResponseGate = new Promise<void>((resolve) => {
+			releaseLateResponse = resolve;
+		});
+		fakeClient.promptGatesByMessage.set("late", lateResponseGate);
+		fakeClient.promptErrorsByMessage.set("first", "Unknown active session: active-1");
+		fakeClient.promptErrorsByMessage.set("late", "Unknown active session: active-1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			reviveConfig: { cwd: "/tmp/project" },
+		});
+		await connection.attach();
+
+		const first = connection.prompt("first");
+		const late = connection.prompt("late");
+		await first;
+		expect(fakeClient.requests.filter((request) => request.type === "create")).toHaveLength(1);
+		releaseLateResponse();
+		await late;
+
+		expect(fakeClient.requests.filter((request) => request.type === "create")).toHaveLength(1);
+		expect(fakeClient.requests.filter((request) => request.type === "reattach")).toHaveLength(1);
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "prompt",
+			activeSessionId: "active-revived",
+			message: "late",
+		});
 	});
 
 	it("does not revive for an inexact unknown-session rejection", async () => {
