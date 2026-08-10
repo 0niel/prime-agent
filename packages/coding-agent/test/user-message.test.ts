@@ -129,6 +129,17 @@ describe("UserMessageComponent", () => {
 		expect(rendered).toContain(theme.fg("success", 'me.txt"'));
 	});
 
+	test("keeps multi-line quoted @paths on separate lines", () => {
+		initTheme("dark");
+		const lines = new UserMessageComponent('@"a\nb"').render(60);
+		const plain = lines.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, ""));
+		const content = plain.map((line) => line.trim()).filter((line) => line.length > 0);
+
+		expect(lines.every((line) => !line.includes("\n"))).toBe(true);
+		expect(content).toEqual(['@"a', 'b"']);
+		expect(lines.join("\n")).toContain(theme.fg("success", '@"a'));
+	});
+
 	test("does not highlight @ or -- without a whitespace boundary", () => {
 		initTheme("dark");
 		const email = new UserMessageComponent("email me@example.com").render(60).join("\n");
@@ -155,5 +166,15 @@ describe("UserMessageComponent", () => {
 
 		expect(plain.replace(/\s+/g, "")).toContain(`${command}界\uE000`);
 		expect(lines.every((line) => visibleWidth(line) === 8)).toBe(true);
+	});
+
+	test("renders a literal mask-range character before an @token uncorrupted", () => {
+		initTheme("dark");
+		const plain = new UserMessageComponent("\uE000 check @foo")
+			.render(60)
+			.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, ""))
+			.join("\n");
+
+		expect(plain).toContain("\uE000 check @foo");
 	});
 });

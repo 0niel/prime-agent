@@ -1,7 +1,7 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { type ThemeColor, theme } from "../theme/theme.js";
 
-const ARG_TOKEN_PATTERN = /@"[^"]*"|@[^\s\x1b]+|--[A-Za-z0-9][A-Za-z0-9-]*/g;
+const ARG_TOKEN_PATTERN = /@"[^"\n]*"|@[^\s\x1b]+|--[A-Za-z0-9][A-Za-z0-9-]*/g;
 const FG_SGR_PATTERN = /\x1b\[(?:0|39|3[0-7]|9[0-7]|38;[0-9;]+)m/g;
 /** Escape sequences the editor splices into displayed text (cursor highlight, IME marker). */
 const CURSOR_ESCAPE_PATTERN = /\x1b\[[0-9;]*m|\x1b_[^\x07]*\x07/g;
@@ -10,6 +10,8 @@ const MASK_BASE = "\uE000";
 const MASK_EXTRA_WIDTH = "\uFF9E";
 const MASK_ZERO_WIDTH = "\u2060";
 const MASK_PATTERN = /\u2060|\uE000\uFF9E*/gu;
+/** Literal mask-range characters would alias generated placeholders; messages containing them skip masking. */
+const MASK_LITERAL_PATTERN = /[\u2060\uE000\uFF9E]/u;
 
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
@@ -76,6 +78,10 @@ export class PromptTokenMask {
 	private offset = 0;
 
 	constructor(source: string, commandEnd = 0) {
+		if (MASK_LITERAL_PATTERN.test(source)) {
+			this.text = source;
+			return;
+		}
 		const tokens: ArgTokenSpan[] = [];
 		if (commandEnd > 0) {
 			tokens.push({ start: 0, end: commandEnd, color: "accent" });
