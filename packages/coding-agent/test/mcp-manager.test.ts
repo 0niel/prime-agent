@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { McpManager } from "../src/core/mcp/mcp-manager.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
@@ -19,6 +19,7 @@ describe("McpManager", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllGlobals();
 		resetOAuthProviders();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
@@ -70,6 +71,64 @@ describe("McpManager", () => {
 		expect(getOAuthProvider("mcp:acme")).toBeDefined();
 		registry.refresh(); // resets registry; hook must re-add the custom provider
 		expect(getOAuthProvider("mcp:acme")).toBeDefined();
+	});
+
+	it("logs a user-declared server in through its native MCP 401 challenge", async () => {
+		const resource = "https://93.184.216.34/mcp";
+		const metadataUrl = "https://93.184.216.34/protected-resource";
+		const issuer = "https://93.184.216.34";
+		let authUrl = "";
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+				if (url === resource && init?.method === "POST") {
+					return new Response(null, {
+						status: 401,
+						headers: { "WWW-Authenticate": `Bearer resource_metadata="${metadataUrl}"` },
+					});
+				}
+				if (url === metadataUrl) {
+					return Response.json({ resource, authorization_servers: [issuer] });
+				}
+				if (url === `${issuer}/.well-known/oauth-authorization-server`) {
+					return Response.json({
+						issuer,
+						authorization_endpoint: `${issuer}/authorize`,
+						token_endpoint: `${issuer}/token`,
+						registration_endpoint: `${issuer}/register`,
+						code_challenge_methods_supported: ["S256"],
+					});
+				}
+				if (url === `${issuer}/register`) return Response.json({ client_id: "manager-client" });
+				if (url === `${issuer}/token`) {
+					return Response.json({
+						access_token: "manager-access",
+						refresh_token: "manager-refresh",
+						expires_in: 3600,
+					});
+				}
+				throw new Error(`unexpected fetch: ${url}`);
+			}),
+		);
+		const manager = new McpManager({
+			authStorage,
+			getUserServers: () => ({
+				"challenge-only": { type: "http", url: resource, oauth: true },
+			}),
+		});
+		await authStorage.login("mcp:challenge-only", {
+			onAuth: (info) => {
+				authUrl = info.url;
+			},
+			onPrompt: async () => "",
+			onManualCodeInput: async () => {
+				const state = new URL(authUrl).searchParams.get("state") ?? "";
+				return `http://localhost:1455/auth/callback?code=manager-code&state=${state}`;
+			},
+		});
+		expect(authStorage.get("mcp:challenge-only")).toMatchObject({ access: "manager-access" });
+		expect(manager.listStatus().find((status) => status.server === "challenge-only")?.enabled).toBe(true);
 	});
 
 	it("exposes only mcp.refresh when no interactive login is wired", async () => {

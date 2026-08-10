@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOAuthFetchPolicy, safeFetchJson } from "../src/mcp/safe-fetch.js";
 
-const dnsLookup = vi.hoisted(() => vi.fn(async () => [{ address: "93.184.216.34", family: 4 as const }]));
+const dnsLookup = vi.hoisted(() => vi.fn(async () => [{ address: "93.184.216.34", family: 4 as 4 | 6 }]));
 vi.mock("node:dns/promises", () => ({ lookup: dnsLookup }));
 
 const originalFetch = global.fetch;
@@ -17,7 +17,7 @@ afterEach(() => {
 	vi.useRealTimers();
 	global.fetch = originalFetch;
 	dnsLookup.mockReset();
-	dnsLookup.mockImplementation(async () => [{ address: "93.184.216.34", family: 4 as const }]);
+	dnsLookup.mockImplementation(async () => [{ address: "93.184.216.34", family: 4 as 4 | 6 }]);
 	vi.restoreAllMocks();
 });
 
@@ -30,6 +30,19 @@ describe("MCP OAuth safe fetch", () => {
 		"https://[::1]/metadata",
 		"https://[::ffff:127.0.0.1]/metadata",
 		"https://[fe80::1]/metadata",
+		"https://[fec0::1]/metadata",
+		"https://[::192.168.1.1]/metadata",
+		"https://[::ffff:0:8.8.8.8]/metadata",
+		"https://[64:ff9b::127.0.0.1]/metadata",
+		"https://[64:ff9b:1::808:808]/metadata",
+		"https://[100::1]/metadata",
+		"https://[2001:2::1]/metadata",
+		"https://[2001:10::1]/metadata",
+		"https://[2001:20::1]/metadata",
+		"https://[2001:30::1]/metadata",
+		"https://[2001:db8::1]/metadata",
+		"https://[2002:a00:1::1]/metadata",
+		"https://[4000::1]/metadata",
 		"https://[ff02::1]/metadata",
 		"https://[3fff::1]/metadata",
 		"https://[5f00::1]/metadata",
@@ -39,14 +52,47 @@ describe("MCP OAuth safe fetch", () => {
 		expect(global.fetch).not.toHaveBeenCalled();
 	});
 
+	it.each([
+		"https://192.0.0.9/metadata",
+		"https://192.0.0.10/metadata",
+		"https://[::ffff:8.8.8.8]/metadata",
+		"https://[64:ff9b::808:808]/metadata",
+		"https://[2001:1::1]/metadata",
+		"https://[2001:1::2]/metadata",
+		"https://[2001:1::3]/metadata",
+		"https://[2001:3::1]/metadata",
+		"https://[2001:4:112::1]/metadata",
+		"https://[2606:4700:4700::1111]/metadata",
+	])("accepts globally reachable literal %s", async (url) => {
+		global.fetch = vi.fn(async () => jsonResponse({ ok: true })) as typeof fetch;
+		await expect(safeFetchJson(url, undefined, {})).resolves.toEqual({ ok: true });
+		expect(global.fetch).toHaveBeenCalledOnce();
+	});
+
 	it("rejects a hostname when any DNS answer is private", async () => {
 		dnsLookup.mockResolvedValueOnce([
-			{ address: "93.184.216.34", family: 4 as const },
-			{ address: "10.0.0.5", family: 4 as const },
+			{ address: "93.184.216.34", family: 4 as 4 | 6 },
+			{ address: "10.0.0.5", family: 4 as 4 | 6 },
 		]);
 		global.fetch = vi.fn(async () => jsonResponse({})) as typeof fetch;
 		await expect(safeFetchJson("https://public.test/metadata", undefined, {})).rejects.toThrow(/non-public/);
 		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
+	it.each(["fec0::1", "::192.168.1.1", "::ffff:192.168.1.1", "::ffff:0:8.8.8.8"])(
+		"rejects non-global IPv6 DNS answer %s",
+		async (address) => {
+			dnsLookup.mockResolvedValueOnce([{ address, family: 6 as const }]);
+			global.fetch = vi.fn(async () => jsonResponse({})) as typeof fetch;
+			await expect(safeFetchJson("https://answer.test/metadata", undefined, {})).rejects.toThrow(/non-public/);
+			expect(global.fetch).not.toHaveBeenCalled();
+		},
+	);
+
+	it("accepts a representative public IPv6 DNS answer", async () => {
+		dnsLookup.mockResolvedValueOnce([{ address: "2606:4700:4700::1111", family: 6 as const }]);
+		global.fetch = vi.fn(async () => jsonResponse({ ok: true })) as typeof fetch;
+		await expect(safeFetchJson("https://answer.test/metadata", undefined, {})).resolves.toEqual({ ok: true });
 	});
 
 	it("bounds DNS resolution time", async () => {
@@ -72,8 +118,8 @@ describe("MCP OAuth safe fetch", () => {
 
 	it("revalidates same-origin DNS on every redirect hop", async () => {
 		dnsLookup
-			.mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 as const }])
-			.mockResolvedValueOnce([{ address: "10.0.0.8", family: 4 as const }]);
+			.mockResolvedValueOnce([{ address: "93.184.216.34", family: 4 as 4 | 6 }])
+			.mockResolvedValueOnce([{ address: "10.0.0.8", family: 4 as 4 | 6 }]);
 		global.fetch = vi.fn(
 			async () => new Response(null, { status: 302, headers: { location: "/next" } }),
 		) as typeof fetch;

@@ -5,7 +5,13 @@ import type { Server } from "node:http";
 import { oauthErrorHtml, oauthSuccessHtml } from "../utils/oauth/oauth-page.js";
 import { generatePKCE } from "../utils/oauth/pkce.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "../utils/oauth/types.js";
-import { createOAuthFetchPolicy, type OAuthFetchPolicy, safeFetchJson, validateOAuthNetworkUrl } from "./safe-fetch.js";
+import {
+	createOAuthFetchPolicy,
+	type OAuthFetchPolicy,
+	probeMcpOAuthChallenge,
+	safeFetchJson,
+	validateOAuthNetworkUrl,
+} from "./safe-fetch.js";
 
 const CALLBACK_HOST = process.env.PI_OAUTH_CALLBACK_HOST || "127.0.0.1";
 // A range (not one port) so a leaked/concurrent login can't wedge all logins with EADDRINUSE.
@@ -283,13 +289,32 @@ async function discover(
 	const attempts: string[] = [];
 	const errors: string[] = [];
 	let sawAdvertisedIssuers = false;
-	const challenge = authorizationChallenge ? parseMcpOAuthChallenge(authorizationChallenge) : undefined;
-	const resourceCandidates = [
-		...new Set([
-			...(challenge?.resourceMetadataUrl ? [challenge.resourceMetadataUrl] : []),
-			...protectedResourceCandidates(resourceUrl),
-		]),
-	];
+	let challenge = authorizationChallenge ? parseMcpOAuthChallenge(authorizationChallenge) : undefined;
+	if (!challenge) {
+		try {
+			const probe = await probeMcpOAuthChallenge(resourceIdentifier, resourcePolicy);
+			if (probe.challenged) {
+				if (!probe.header) throw new Error("MCP OAuth challenge omitted WWW-Authenticate");
+				try {
+					challenge = parseMcpOAuthChallenge(probe.header);
+				} catch (cause) {
+					throw new Error("MCP OAuth challenge was invalid", { cause });
+				}
+				if (!challenge?.resourceMetadataUrl) {
+					throw new Error("MCP OAuth 401 did not advertise Bearer resource_metadata");
+				}
+			}
+		} catch (error) {
+			// A syntactically valid 401 is authoritative; transport failures and
+			// non-MCP endpoints may still use RFC 9728 well-known discovery.
+			if (error instanceof Error && /MCP OAuth (challenge|401)/.test(error.message)) throw error;
+		}
+	}
+	// An actual RFC 9728 challenge is authoritative. Never downgrade to a
+	// synthesized well-known location if its supplied metadata URL fails.
+	const resourceCandidates = challenge?.resourceMetadataUrl
+		? [challenge.resourceMetadataUrl]
+		: protectedResourceCandidates(resourceUrl);
 
 	for (const candidate of resourceCandidates) {
 		attempts.push(displayOAuthUrl(candidate));
@@ -297,6 +322,9 @@ async function discover(
 		try {
 			resource = (await safeFetchJson(candidate, undefined, resourcePolicy)) as ProtectedResourceMetadata;
 		} catch (error) {
+			if (challenge?.resourceMetadataUrl) {
+				throw new Error("Challenged OAuth resource metadata could not be fetched or validated", { cause: error });
+			}
 			errors.push(String(error));
 			continue;
 		}
@@ -307,6 +335,9 @@ async function discover(
 		}
 		const issuers = optionalStringArray(resource.authorization_servers, "authorization_servers")?.slice(0, 10) ?? [];
 		if (issuers.length === 0) {
+			if (challenge?.resourceMetadataUrl) {
+				throw new Error("Challenged OAuth resource metadata omitted authorization_servers");
+			}
 			errors.push(`${displayOAuthUrl(candidate)}: missing authorization_servers`);
 			continue;
 		}

@@ -35,6 +35,7 @@ function ipv4Kind(address: string): "public" | "loopback" | "blocked" {
 	if (!bytes) return "blocked";
 	const [a, b, c] = bytes;
 	if (a === 127) return "loopback";
+	if (a === 192 && b === 0 && c === 0 && (bytes[3] === 9 || bytes[3] === 10)) return "public";
 	if (
 		a === 0 ||
 		a === 10 ||
@@ -79,32 +80,64 @@ function ipv6Bytes(address: string): number[] | undefined {
 	});
 }
 
+function inCidr(bytes: number[], network: number[], prefixBits: number): boolean {
+	const wholeBytes = Math.floor(prefixBits / 8);
+	const remainder = prefixBits % 8;
+	for (let index = 0; index < wholeBytes; index++) {
+		if (bytes[index] !== network[index]) return false;
+	}
+	if (remainder === 0) return true;
+	const mask = (0xff << (8 - remainder)) & 0xff;
+	return (bytes[wholeBytes] & mask) === (network[wholeBytes] & mask);
+}
+
 function ipv6Kind(address: string): "public" | "loopback" | "blocked" {
 	const bytes = ipv6Bytes(address);
 	if (!bytes) return "blocked";
 	if (bytes.slice(0, 15).every((byte) => byte === 0) && bytes[15] === 1) return "loopback";
 	if (bytes.every((byte) => byte === 0)) return "blocked";
-	if (bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
+
+	// Normalize the operational IPv4-mapped socket alias before classification.
+	if (inCidr(bytes, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff], 96)) {
 		return ipv4Kind(bytes.slice(12).join("."));
 	}
-	const first = bytes[0];
-	const second = bytes[1];
-	const firstGroup = (first << 8) | second;
-	const secondGroup = (bytes[2] << 8) | bytes[3];
+	// Deprecated IPv4-compatible and RFC 2765 translated forms are not global
+	// IPv6 locators, even when their embedded IPv4 value is public.
 	if (
-		(first & 0xfe) === 0xfc ||
-		(first === 0xfe && (second & 0xc0) === 0x80) ||
-		first === 0xff ||
-		(firstGroup === 0x64 && secondGroup === 0xff9b) ||
-		(firstGroup === 0x100 && bytes.slice(2, 8).every((byte) => byte === 0)) ||
-		(firstGroup === 0x2001 && (bytes[2] <= 1 || secondGroup === 0x0db8)) ||
-		firstGroup === 0x2002 ||
-		(firstGroup === 0x3fff && (secondGroup & 0xf000) === 0) ||
-		firstGroup === 0x5f00
+		inCidr(bytes, new Array<number>(12).fill(0), 96) ||
+		inCidr(bytes, [0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0], 96)
 	) {
 		return "blocked";
 	}
-	return "public";
+	// RFC 6052's well-known NAT64 prefix is globally reachable only when its
+	// embedded destination is itself public; local-use translation prefixes
+	// remain excluded by the positive global-unicast gate below.
+	if (inCidr(bytes, [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0], 96)) {
+		return ipv4Kind(bytes.slice(12).join(".")) === "public" ? "public" : "blocked";
+	}
+
+	// Positive policy from the IANA IPv6 Special-Purpose Address Registry:
+	// currently allocated general global-unicast locators are in 2000::/3.
+	// This denies site/link-local, ULA, multicast, discard, translation,
+	// benchmarking and unallocated space by default.
+	if (!inCidr(bytes, [0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 3)) return "blocked";
+
+	// Globally reachable locator exceptions inside the otherwise special
+	// 2001::/23 IETF assignments block. ORCHIDv2 and DET identity prefixes
+	// are deliberately not treated as SSRF-safe network destinations even
+	// though the IANA registry marks them globally reachable.
+	const globalIetfException =
+		[1, 2, 3].some((last) => inCidr(bytes, [0x20, 0x01, 0, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, last], 128)) ||
+		inCidr(bytes, [0x20, 0x01, 0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32) ||
+		inCidr(bytes, [0x20, 0x01, 0, 0x04, 0x01, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 48);
+	if (globalIetfException) return "public";
+
+	const nonGlobalSpecial =
+		inCidr(bytes, [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 23) ||
+		inCidr(bytes, [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32) ||
+		inCidr(bytes, [0x20, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16) ||
+		inCidr(bytes, [0x3f, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 20);
+	return nonGlobalSpecial ? "blocked" : "public";
 }
 
 function addressKind(address: string, family: number): "public" | "loopback" | "blocked" {
@@ -219,11 +252,19 @@ function rendererRelease(reader: ReadableStreamDefaultReader<Uint8Array>): void 
 	}
 }
 
-export async function safeFetchJson(
+interface BoundedFetchResult {
+	status: number;
+	headers: Headers;
+	body: string;
+	url: URL;
+}
+
+async function safeFetchBounded(
 	rawUrl: string,
 	init: RequestInit | undefined,
 	policy: OAuthFetchPolicy,
-): Promise<unknown> {
+	discardBody = false,
+): Promise<BoundedFetchResult> {
 	const method = (init?.method ?? "GET").toUpperCase();
 	const requestBodyBytes =
 		typeof init?.body === "string"
@@ -286,18 +327,73 @@ export async function safeFetchJson(
 				continue;
 			}
 
-			const body = await readBoundedBody(response, maxBodyBytes);
-			if (!response.ok) throw new Error(`${method} ${redactedUrl(target.url)} failed with HTTP ${response.status}`);
-			try {
-				return JSON.parse(body);
-			} catch (cause) {
-				const contentType = response.headers.get("content-type") ?? "unknown content type";
-				throw new Error(`${method} ${redactedUrl(target.url)} returned non-JSON (${contentType})`, { cause });
+			let body = "";
+			if (discardBody) {
+				try {
+					await response.body?.cancel();
+				} catch {
+					// Headers are already bounded by Undici; teardown errors do not
+					// invalidate an authoritative authentication challenge.
+				}
+			} else {
+				body = await readBoundedBody(response, maxBodyBytes);
 			}
+			return { status: response.status, headers: new Headers(response.headers), body, url: target.url };
 		} finally {
 			clearTimeout(timeout);
 			init?.signal?.removeEventListener("abort", onAbort);
 			await dispatcher.close();
 		}
 	}
+}
+
+export async function safeFetchJson(
+	rawUrl: string,
+	init: RequestInit | undefined,
+	policy: OAuthFetchPolicy,
+): Promise<unknown> {
+	const method = (init?.method ?? "GET").toUpperCase();
+	const result = await safeFetchBounded(rawUrl, init, policy);
+	if (result.status < 200 || result.status >= 300) {
+		throw new Error(`${method} ${redactedUrl(result.url)} failed with HTTP ${result.status}`);
+	}
+	try {
+		return JSON.parse(result.body);
+	} catch (cause) {
+		const contentType = result.headers.get("content-type") ?? "unknown content type";
+		throw new Error(`${method} ${redactedUrl(result.url)} returned non-JSON (${contentType})`, { cause });
+	}
+}
+
+/** Perform a bounded unauthenticated MCP initialize probe and return only a 401 challenge. */
+export async function probeMcpOAuthChallenge(
+	rawUrl: string,
+	policy: OAuthFetchPolicy,
+): Promise<{ challenged: boolean; header?: string }> {
+	const body = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 1,
+		method: "initialize",
+		params: {
+			protocolVersion: "2025-06-18",
+			capabilities: {},
+			clientInfo: { name: "prime-agent-oauth-discovery", version: "1" },
+		},
+	});
+	const result = await safeFetchBounded(
+		rawUrl,
+		{
+			method: "POST",
+			headers: {
+				Accept: "application/json, text/event-stream",
+				"Content-Type": "application/json",
+			},
+			body,
+		},
+		policy,
+		true,
+	);
+	return result.status === 401
+		? { challenged: true, header: result.headers.get("www-authenticate") ?? undefined }
+		: { challenged: false };
 }

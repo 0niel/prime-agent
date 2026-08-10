@@ -82,6 +82,104 @@ describe.sequential("MCP OAuth provider", () => {
 		expect(authParams.get("resource")).toBe("https://srv.test/mcp");
 	});
 
+	it("does not downgrade a native 401 that omits its OAuth challenge", async () => {
+		const requested: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown): Promise<Response> => {
+				requested.push(urlOf(input));
+				if (urlOf(input) === "https://srv.test/mcp") return new Response(null, { status: 401 });
+				return jsonResponse(META);
+			}),
+		);
+		const provider = createMcpOAuthProvider({ server: "missing-challenge", url: "https://srv.test/mcp" });
+		await expect(provider.login({ onAuth: vi.fn(), onPrompt: async () => "" })).rejects.toThrow(
+			"omitted WWW-Authenticate",
+		);
+		expect(requested).toEqual(["https://srv.test/mcp"]);
+	});
+
+	it("uses the native initialize challenge for login and refresh discovery", async () => {
+		let authUrl = "";
+		let probes = 0;
+		const metadataUrl = "https://metadata.test/prm";
+		const externalMeta = {
+			...META,
+			issuer: "https://auth.test",
+			authorization_endpoint: "https://auth.test/authorize",
+			token_endpoint: "https://auth.test/token",
+			registration_endpoint: undefined,
+		};
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown, init?: RequestInit): Promise<Response> => {
+				const url = urlOf(input);
+				if (url === "https://resource.test/mcp" && init?.method === "POST") {
+					probes++;
+					expect(new Headers(init.headers).get("authorization")).toBeNull();
+					expect(new Headers(init.headers).get("accept")).toBe("application/json, text/event-stream");
+					expect(JSON.parse(String(init.body))).toMatchObject({
+						jsonrpc: "2.0",
+						method: "initialize",
+						params: { capabilities: {}, clientInfo: { name: "prime-agent-oauth-discovery" } },
+					});
+					return new Response("ignored".repeat(200_000), {
+						status: 401,
+						headers: {
+							"WWW-Authenticate": `Basic realm="decoy", Bearer resource_metadata="${metadataUrl}", scope="challenge.read"`,
+						},
+					});
+				}
+				if (url === metadataUrl) {
+					return jsonResponse({
+						resource: "https://resource.test/mcp",
+						authorization_servers: [externalMeta.issuer],
+					});
+				}
+				if (url === "https://auth.test/.well-known/oauth-authorization-server") return jsonResponse(externalMeta);
+				if (url === externalMeta.token_endpoint) {
+					const params = new URLSearchParams(String(init?.body));
+					expect(params.get("resource")).toBe("https://resource.test/mcp");
+					if (params.get("grant_type") === "refresh_token") {
+						expect(params.get("refresh_token")).toBe("refresh-native");
+						return jsonResponse({
+							access_token: "refreshed-native",
+							refresh_token: "refresh-native",
+							expires_in: 3600,
+						});
+					}
+					return jsonResponse({
+						access_token: "access-native",
+						refresh_token: "refresh-native",
+						expires_in: 3600,
+					});
+				}
+				throw new Error(`unexpected fetch: ${url}`);
+			}),
+		);
+		const provider = createMcpOAuthProvider({
+			server: "challenge-native",
+			url: "https://resource.test/mcp",
+			clientId: "configured-client",
+			scopes: "configured.scope",
+		});
+		const credentials = await provider.login({
+			onAuth: (info) => {
+				authUrl = info.url;
+			},
+			onPrompt: async () => "",
+			onManualCodeInput: async () => {
+				const state = new URL(authUrl).searchParams.get("state") ?? "";
+				return `${REDIRECT}?code=native-code&state=${state}`;
+			},
+		});
+		expect(new URL(authUrl).searchParams.get("scope")).toBe("challenge.read");
+		expect(credentials.access).toBe("access-native");
+		const refreshed = await provider.refreshToken(credentials);
+		expect(refreshed.access).toBe("refreshed-native");
+		expect(probes).toBe(2);
+	});
+
 	it("follows path-suffixed protected-resource metadata to an external issuer", async () => {
 		let authUrl = "";
 		const requested: string[] = [];
@@ -134,7 +232,8 @@ describe.sequential("MCP OAuth provider", () => {
 		expect(credentials.access).toBe("external-access");
 		expect(new URL(authUrl).origin).toBe("https://auth.test");
 		expect(new URL(authUrl).searchParams.get("resource")).toBe("https://resource.test/mcp/v1?tenant=a");
-		expect(requested.slice(0, 2)).toEqual([
+		expect(requested.slice(0, 3)).toEqual([
+			"https://resource.test/mcp/v1?tenant=a",
 			"https://resource.test/.well-known/oauth-protected-resource/mcp/v1?tenant=a",
 			"https://auth.test/.well-known/oauth-authorization-server/tenant",
 		]);
@@ -182,7 +281,8 @@ describe.sequential("MCP OAuth provider", () => {
 		});
 
 		expect(credentials.access).toBe("oidc-access");
-		expect(requested.slice(0, 4)).toEqual([
+		expect(requested.slice(0, 5)).toEqual([
+			"https://resource.test/mcp",
 			"https://resource.test/.well-known/oauth-protected-resource/mcp",
 			"https://auth.test/.well-known/oauth-authorization-server/tenant",
 			"https://auth.test/.well-known/openid-configuration/tenant",
@@ -233,7 +333,8 @@ describe.sequential("MCP OAuth provider", () => {
 		expect(credentials.access).toBe("root-access");
 		expect(new URL(authUrl).searchParams.get("scope")).toBe("resource.read");
 		expect(new URL(authUrl).searchParams.get("resource")).toBe("https://srv.test/mcp");
-		expect(requested.slice(0, 3)).toEqual([
+		expect(requested.slice(0, 4)).toEqual([
+			"https://srv.test/mcp",
 			"https://srv.test/.well-known/oauth-protected-resource/mcp",
 			"https://srv.test/.well-known/oauth-protected-resource",
 			"https://srv.test/.well-known/oauth-authorization-server",
@@ -424,6 +525,57 @@ describe.sequential("MCP OAuth provider", () => {
 		});
 		expect(requested[0]).toBe("https://hint.test/prm");
 		expect(new URL(authUrl).searchParams.get("scope")).toBe("challenge.scope");
+	});
+
+	it("fails closed when authoritative challenged resource metadata is unavailable", async () => {
+		const requested: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown): Promise<Response> => {
+				const url = urlOf(input);
+				requested.push(url);
+				if (url === "https://hint.test/missing") return new Response("not found", { status: 404 });
+				if (url.endsWith("/.well-known/oauth-protected-resource/mcp")) {
+					return jsonResponse({ resource: "https://srv.test/mcp", authorization_servers: [META.issuer] });
+				}
+				if (url.endsWith("/.well-known/oauth-authorization-server")) return jsonResponse(META);
+				throw new Error(`unexpected fetch: ${url}`);
+			}),
+		);
+		const provider = createMcpOAuthProvider({
+			server: "challenge-fail-closed",
+			url: "https://srv.test/mcp",
+			clientId: "client",
+			authorizationChallenge: 'Bearer resource_metadata="https://hint.test/missing"',
+		});
+		await expect(provider.login({ onAuth: vi.fn(), onPrompt: async () => "" })).rejects.toThrow(
+			"Challenged OAuth resource metadata",
+		);
+		expect(requested).toEqual(["https://hint.test/missing"]);
+	});
+
+	it("rejects authoritative challenged metadata without authorization servers", async () => {
+		const requested: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown): Promise<Response> => {
+				const url = urlOf(input);
+				requested.push(url);
+				if (url === "https://hint.test/no-issuer") return jsonResponse({ resource: "https://srv.test/mcp" });
+				if (url.endsWith("/.well-known/oauth-authorization-server")) return jsonResponse(META);
+				throw new Error(`unexpected fetch: ${url}`);
+			}),
+		);
+		const provider = createMcpOAuthProvider({
+			server: "challenge-no-issuer",
+			url: "https://srv.test/mcp",
+			clientId: "client",
+			authorizationChallenge: 'Bearer resource_metadata="https://hint.test/no-issuer"',
+		});
+		await expect(provider.login({ onAuth: vi.fn(), onPrompt: async () => "" })).rejects.toThrow(
+			"omitted authorization_servers",
+		);
+		expect(requested).toEqual(["https://hint.test/no-issuer"]);
 	});
 
 	it("rejects mismatched protected-resource metadata without discovery downgrade", async () => {
