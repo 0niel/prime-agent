@@ -5,15 +5,18 @@ import {
 	appendFileSync,
 	chmodSync,
 	chownSync,
+	closeSync,
 	existsSync,
+	fsyncSync,
 	mkdirSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
-	writeFileSync,
+	writeSync,
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
@@ -69,6 +72,25 @@ function statMetadataIfPresent(path: string): { mode: number; uid: number; gid: 
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
+	}
+}
+
+/** Write a buffer completely: Node's synchronous write may still make short progress. */
+function writeAllSync(fd: number, bytes: Buffer): void {
+	let offset = 0;
+	while (offset < bytes.length) {
+		const written = writeSync(fd, bytes, offset, bytes.length - offset);
+		if (written <= 0) throw new Error("Session persistence made no write progress");
+		offset += written;
+	}
+}
+
+function fsyncDirectorySync(directory: string): void {
+	const fd = openSync(directory, "r");
+	try {
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
 	}
 }
 
@@ -1373,21 +1395,33 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Replace the transcript atomically.  This is also the durability primitive
+	 * used when C03 creates a transcript: bytes and metadata are fsynced before
+	 * rename, then the containing directory is fsynced before acknowledgement.
+	 */
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
+		const bytes = Buffer.from(`${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`);
 		const targetPath = realpathIfPresent(this.sessionFile);
 		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
 		const tempPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
 		try {
 			const metadata = statMetadataIfPresent(targetPath);
-			writeFileSync(tempPath, content, metadata === undefined ? undefined : { mode: metadata.mode });
-			if (metadata !== undefined) {
-				chownSync(tempPath, metadata.uid, metadata.gid);
-				chmodSync(tempPath, metadata.mode);
+			const fd = openSync(tempPath, "wx", metadata?.mode ?? 0o600);
+			try {
+				writeAllSync(fd, bytes);
+				if (metadata !== undefined) {
+					chownSync(tempPath, metadata.uid, metadata.gid);
+					chmodSync(tempPath, metadata.mode);
+				}
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
 			}
 			renameSync(tempPath, targetPath);
+			fsyncDirectorySync(directory);
 		} finally {
 			rmSync(tempPath, { force: true });
 		}
@@ -1825,6 +1859,67 @@ export class SessionManager {
 		details?: T,
 	): string {
 		return this._appendEntryWithRollback(() => this.appendCustomMessageEntry(customType, content, display, details));
+	}
+
+	/**
+	 * Internal C03 seam: append one ordinary custom transcript entry without
+	 * using the prompt/stream queue.  It mutates the in-memory tree only while
+	 * the matching bytes are durably persisted and rolls the tree back on every
+	 * write/fsync/rename failure.  Returns false for non-persisted managers.
+	 */
+	appendDurableCustomMessageEntry<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+	): boolean {
+		if (!this.persist || !this.sessionFile) return false;
+		const entry: CustomMessageEntry<T> = {
+			type: "custom_message",
+			customType,
+			content,
+			display,
+			details,
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+		};
+		const previousLeafId = this.leafId;
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		this.leafId = entry.id;
+		try {
+			const file = this.sessionFile;
+			if (!this.flushed || !existsSync(file)) {
+				this._rewriteFile();
+				this.flushed = true;
+			} else {
+				const fd = openSync(file, "a");
+				try {
+					writeAllSync(fd, Buffer.from(`${JSON.stringify(entry)}\n`));
+					fsyncSync(fd);
+				} finally {
+					closeSync(fd);
+				}
+				this._notifyPersistListeners();
+			}
+			return true;
+		} catch (error) {
+			this.byId.delete(entry.id);
+			this.fileEntries.pop();
+			this.leafId = previousLeafId;
+			// A failed append can have reached the kernel before fsync reports an
+			// error. Best-effort restore the pre-append tree, never acknowledge this
+			// attempt, and force a later retry/restart to re-establish authority.
+			this.flushed = false;
+			try {
+				this._rewriteFile();
+				this.flushed = true;
+			} catch {
+				this.flushed = false;
+			}
+			throw error;
+		}
 	}
 
 	private _appendEntryWithRollback(append: () => string): string {

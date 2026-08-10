@@ -976,8 +976,14 @@ interface RlmChildRun {
 	session?: AgentSession;
 	/** True once the detached run task has finished its catch and cleanup paths. */
 	settled: boolean;
-	/** Selector snapshot for a delete admitted while runtime startup was still pending. */
+	/**
+	 * Exact selector snapshot for a delete admitted for this run. It is a
+	 * run-local capability, never a selector lookup: it lets only the captured A
+	 * cancellation terminal finish its durable delete chain after B reuses A's ID.
+	 */
 	detachedDeletion?: RlmSubagentRegistryEntry;
+	/** Resolves once the daemon has durably admitted the captured delete intent. */
+	deleteIntentReady?: Promise<void>;
 	/** Re-emits the run's rlm_child_update snapshot with its current status. */
 	emitUpdate?: () => void;
 	/** Idempotent child-event forwarder cleanup, once the child runtime exists. */
@@ -4630,8 +4636,9 @@ export class AgentSession {
 		deliveryId: string,
 		current: () => boolean = () => true,
 	): Promise<boolean> {
-		// The daemon supplies the complete parent/child incarnation fence. Check at
-		// the immediate mutation seam rather than only before awaiting this method.
+		// This intentionally does not use sendCustomMessage: its streaming branch
+		// creates a steer prompt. C03 must be an immediate ordinary transcript append,
+		// never provider/queue work, even while the parent is streaming.
 		if (!current()) return false;
 		const id = materializedTerminalMessageId(deliveryId);
 		const hasId = (candidate: unknown): boolean =>
@@ -4639,19 +4646,41 @@ export class AgentSession {
 			candidate !== null &&
 			(candidate as { role?: unknown }).role === "custom" &&
 			(candidate as { details?: { id?: unknown } }).details?.id === id;
-		if (
-			this.agent.state.messages.some(hasId) ||
-			this.sessionManager.getEntries().some((entry) => entry.type === "message" && hasId(entry.message))
-		)
-			return false;
-		// sendCustomMessage's no-turn branch is the normal transcript append seam.
-		// It writes an ordinary custom message, emits normal events, and cannot prompt.
-		await this.sendCustomMessage({ ...message, details: { ...message.details, id } }, { triggerTurn: false });
-		// A terminal notice is deliberately a no-turn custom message, so it may be
-		// the first transcript content and bypass SessionManager's assistant-driven
-		// persistence heuristic. Its durable-delivery acknowledgement must not outrun
-		// the actual parent transcript across a daemon restart.
-		this.sessionManager.flushNow();
+		// This manager is the sole C03 transcript writer. A matching tree entry is
+		// therefore a prior durable append (including a reopened session), whereas a
+		// queued streaming prompt never reaches this tree.
+		const persistedDuplicate = this.sessionManager
+			.getEntries()
+			.some(
+				(entry) =>
+					(entry.type === "message" && hasId(entry.message)) ||
+					(entry.type === "custom_message" && (entry.details as { id?: unknown } | undefined)?.id === id),
+			);
+		if (persistedDuplicate) return true;
+		if (!current()) return false;
+		const appMessage = {
+			role: "custom" as const,
+			customType: message.customType,
+			content: message.content,
+			display: message.display,
+			details: { ...message.details, id },
+			timestamp: Date.now(),
+		};
+		// Persist first. The manager's internal append performs write-all + file fsync
+		// (or write-all + temp fsync + rename + directory fsync) and rolls its tree
+		// back on failure. State/events therefore happen exactly once only after bytes
+		// are durable, and no flush shortcut can acknowledge a queued message.
+		if (!current()) return false;
+		const appended = this.sessionManager.appendDurableCustomMessageEntry(
+			appMessage.customType,
+			appMessage.content,
+			appMessage.display,
+			appMessage.details,
+		);
+		if (!appended) return false;
+		this.agent.state.messages.push(appMessage);
+		this._emit({ type: "message_start", message: appMessage });
+		this._emit({ type: "message_end", message: appMessage });
 		return true;
 	}
 
@@ -9577,6 +9606,9 @@ export class AgentSession {
 		const childId = subagent.rlm_child_id;
 		const run = this._activeRlmChildRuns.get(childId);
 		if (run) {
+			// Capture this incarnation before cancellation/host awaits. The terminal
+			// closure may run after B installs under the same public selector.
+			run.detachedDeletion ??= subagent;
 			if (!this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
 				this._emitRlmSubagentRemoval(subagent);
 			}
@@ -9588,7 +9620,12 @@ export class AgentSession {
 			}
 			if (liveSession) {
 				try {
-					await this._deleteRlmSubagentSession(childId, run.assignmentId, liveSession, run.operationId);
+					const deletion = this._deleteRlmSubagentSession(childId, run.assignmentId, liveSession, run.operationId);
+					run.deleteIntentReady = deletion.then(
+						() => undefined,
+						() => undefined,
+					);
+					await deletion;
 				} catch (error) {
 					if (this._disposed || this._disposing) {
 						this._removeRlmSubagentTracking(childId, run, run.assignmentId);
@@ -10095,12 +10132,27 @@ export class AgentSession {
 		};
 
 		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
-			if (
-				this._activeRlmChildRuns.get(run.id) !== run ||
-				this._activeRlmChildRuns.get(run.id)?.assignmentId !== run.assignmentId ||
-				this._activeRlmChildRuns.get(run.id)?.operationId !== run.operationId
-			)
-				return;
+			const activeOwner =
+				this._activeRlmChildRuns.get(run.id) === run &&
+				this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId &&
+				this._activeRlmChildRuns.get(run.id)?.operationId === run.operationId;
+			const detachedDeleteOwner =
+				run.detachedDeletion !== undefined &&
+				run.status === "cancelled" &&
+				this._subagentRuntimeHost?.assignmentIdentityFenced === true;
+			// A live delete records intent before its cancellation can hand off a
+			// terminal. For a delete admitted while startup was still pending, this is
+			// the first point at which the captured child session exists, so make the
+			// same exact delete request before handing off its known cancellation.
+			if (detachedDeleteOwner && !run.deleteIntentReady && childSession) {
+				const deletion = this._deleteRlmSubagentSession(run.id, run.assignmentId, childSession, run.operationId);
+				run.deleteIntentReady = deletion.then(
+					() => undefined,
+					() => undefined,
+				);
+			}
+			if (detachedDeleteOwner) await run.deleteIntentReady;
+			if (!activeOwner && !detachedDeleteOwner) return;
 			// A daemon-owned host has the only durable terminal authority. In particular,
 			// startup failure before a stable child materialization must not fall through
 			// to the old agent-message/prompt path and invent an undurable completion.

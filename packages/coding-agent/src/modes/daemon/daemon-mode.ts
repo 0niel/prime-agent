@@ -2407,8 +2407,11 @@ export class AgentDaemon {
 					continue;
 				}
 				if (!current()) return;
-				await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId, current);
-				if (!current()) return;
+				const persisted = await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId, current);
+				// `persisted` is true only for the actual fsynced append or the deterministic
+				// transcript duplicate. Recheck the complete resident incarnation after the
+				// call before the consumed fact: no stale/failed append may be acknowledged.
+				if (!persisted || !current()) return;
 				store.markMaterializedDelivery({
 					parentSessionId: parent.sessionId,
 					assignmentId: identity.assignmentId,

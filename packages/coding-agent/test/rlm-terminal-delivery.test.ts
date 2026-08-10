@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
@@ -192,6 +192,36 @@ function liveParent(root: string, file: string) {
 }
 
 describe("C03 real normal transcript materialization", () => {
+	it("persists immediately while parent streaming without a prompt, queue, or provider turn", async () => {
+		const f = fixture();
+		f.store.importOutbox(f.outbox);
+		const parent = liveParent(f.root, f.outbox.parentSessionFile);
+		const queue = vi.fn(async () => undefined);
+		Object.defineProperty(parent.agent.state, "isStreaming", { configurable: true, get: () => true });
+		vi.spyOn(parent, "sendCustomMessage");
+		vi.spyOn(
+			parent as unknown as { _queuePreparedPrompt: (...args: unknown[]) => Promise<void> },
+			"_queuePreparedPrompt",
+		).mockImplementation(queue);
+		const inbox = f.store.pendingInbox()[0]!;
+		expect(await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId)).toBe(true);
+		expect(parent.sendCustomMessage).not.toHaveBeenCalled();
+		expect(queue).not.toHaveBeenCalled();
+		const id = materializedTerminalMessageId(inbox.deliveryId);
+		expect(readFileSync(f.outbox.parentSessionFile, "utf8")).toContain(id);
+		// The caller may now acknowledge only after it observed this durable entry.
+		f.store.markMaterializedDelivery({
+			parentSessionId: inbox.parentSessionId,
+			assignmentId: inbox.assignmentId,
+			operationId: inbox.operationId,
+			deliveryId: inbox.deliveryId,
+			sessionMessageId: id,
+		});
+		expect(f.store.pendingInbox()).toEqual([]);
+		expect(parent.messages.filter((message) => message.role === "custom")).toHaveLength(1);
+		parent.dispose();
+	});
+
 	it("retries an inbox-before-transcript cut and appends one normal custom message without prompt/provider replay", async () => {
 		const f = fixture();
 		f.store.importOutbox(f.outbox);
@@ -202,7 +232,9 @@ describe("C03 real normal transcript materialization", () => {
 		expect(f.store.pendingInbox()).toHaveLength(1);
 		const inbox = f.store.pendingInbox()[0]!;
 		expect(await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId)).toBe(true);
-		expect(await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId)).toBe(false);
+		// A deterministic transcript duplicate is an idempotent durable success,
+		// not a second append.
+		expect(await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId)).toBe(true);
 		expect(append).toHaveBeenCalledTimes(2);
 		f.store.markMaterializedDelivery({
 			parentSessionId: inbox.parentSessionId,
