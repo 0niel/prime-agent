@@ -1699,6 +1699,108 @@ describe("daemon worker supervisor monitoring", () => {
 		]);
 	});
 
+	it.each(["SIGTERM", "SIGKILL"] as const)(
+		"fails closed for a legacy worker identity before %s",
+		(signal) => {
+			const worker = {
+				descriptor: { workerId: "worker-legacy-signal", pid: 111_121 },
+				stopRevision: 0,
+			};
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				processIdentity: vi.fn(),
+			}) as {
+				signalCurrentWorker(target: object, descriptor: object, revision: number, stopAt: undefined, signal: string): boolean;
+				processIdentity: ReturnType<typeof vi.fn>;
+			};
+			const childProcessModule = await import("../src/utils/child-process.js");
+			const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+			try {
+				expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 0, undefined, signal)).toBe(false);
+				expect(supervisor.processIdentity).not.toHaveBeenCalled();
+				expect(killSpy).not.toHaveBeenCalled();
+			} finally {
+				killSpy.mockRestore();
+			}
+		},
+	);
+
+	it("fails closed for a recycled pid before either stop signal", async () => {
+		const worker = {
+			descriptor: { workerId: "worker-recycled-signal", pid: 111_122, processStartId: "proc:original" },
+			stopRevision: 2,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			processIdentity: vi.fn(() => "replaced"),
+		}) as {
+			signalCurrentWorker(target: object, descriptor: object, revision: number, stopAt: undefined, signal: string): boolean;
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		try {
+			expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 2, undefined, "SIGTERM")).toBe(false);
+			expect(supervisor.signalCurrentWorker(worker, worker.descriptor, 2, undefined, "SIGKILL")).toBe(false);
+			expect(killSpy).not.toHaveBeenCalled();
+		} finally {
+			killSpy.mockRestore();
+		}
+	});
+
+	it("keeps a legacy tombstone authoritative during adoption without signalling", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-legacy-adoption",
+				pid: 111_123,
+				stopRequestedAt: new Date().toISOString(),
+			},
+			stopRevision: 0,
+		};
+		const stopWorker = vi.fn(async () => {});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			stopWorker,
+			log: vi.fn(),
+		}) as {
+			adoptOrRecoverWorker(target: object): Promise<void>;
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		try {
+			await supervisor.adoptOrRecoverWorker(worker);
+			expect(killSpy).not.toHaveBeenCalled();
+			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
+		} finally {
+			killSpy.mockRestore();
+		}
+	});
+
+	it("does not SIGKILL a legacy worker while recovering uncertain operations", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-legacy-recovery",
+				pid: 111_124,
+				recoveryJournalPath: join(tmpdir(), `prime-legacy-recovery-${randomUUID()}.jsonl`),
+			},
+			stopRevision: 0,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			assertRecoveryAllowed: vi.fn(async () => {}),
+		}) as {
+			recoverUncertainWorkerOperations(target: object, kill?: boolean): Promise<void>;
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		try {
+			await supervisor.recoverUncertainWorkerOperations(worker);
+			expect(killSpy).not.toHaveBeenCalled();
+		} finally {
+			killSpy.mockRestore();
+		}
+	});
+
 	it("finalizes a timed-out stop once the worker process dies", async () => {
 		vi.useFakeTimers();
 		const worker = {
@@ -1751,6 +1853,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-stuck-stop",
 				pid: process.pid,
+				processStartId: "proc:stuck",
 				rootActiveSessionId: "active-1",
 				stopRequestedAt: new Date().toISOString(),
 				archiveOnStop: true,
@@ -1772,7 +1875,9 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
+		const sessionLeaseModule = await import("../src/core/session-lease.js");
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockImplementation(() => alive);
+		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("proc:stuck");
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation((_pid, signal) => {
 			if (signal === "SIGKILL") {
 				alive = false;
@@ -1789,6 +1894,7 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, true);
 		} finally {
 			aliveSpy.mockRestore();
+			startIdSpy.mockRestore();
 			killSpy.mockRestore();
 		}
 	});

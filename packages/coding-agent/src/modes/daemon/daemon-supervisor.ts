@@ -2423,9 +2423,17 @@ export class DaemonSupervisor {
 		if (worker.descriptor.stopRequestedAt) {
 			try {
 				// A tombstoned worker must not run long enough to elect another
-				// supervisor while its intentional stop is being adopted.
-				signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
-				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
+				// supervisor while its intentional stop is being adopted. Legacy or
+				// unreadable identity deliberately keeps the tombstone for retries.
+				const descriptor = worker.descriptor;
+				this.signalCurrentWorker(
+					worker,
+					descriptor,
+					worker.stopRevision,
+					descriptor.stopRequestedAt,
+					"SIGKILL",
+				);
+				await this.stopWorker(worker, true, true, descriptor.archiveOnStop === true);
 				this.log(`Completed intentional stop for worker ${worker.descriptor.workerId} during supervisor adoption`);
 			} catch (error) {
 				worker.descriptor.lifecycle = "failed";
@@ -2867,10 +2875,11 @@ export class DaemonSupervisor {
 
 	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
 		await this.assertRecoveryAllowed();
+		const descriptor = worker.descriptor;
 		if (killWorkerProcess) {
-			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+			this.signalCurrentWorker(worker, descriptor, worker.stopRevision, descriptor.stopRequestedAt, "SIGKILL");
 		}
-		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
+		const orphanProcessJournalPath = descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
 			try {
 				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
@@ -4581,14 +4590,52 @@ export class DaemonSupervisor {
 		if (!isProcessAlive(pid)) {
 			return "gone";
 		}
+		// A legacy descriptor has no generation to bind the pid to. It is
+		// intentionally not signalable: a pid may have been recycled.
 		if (processStartId === undefined) {
-			return "current";
+			return "unknown";
 		}
 		const observed = getProcessStartId(pid);
 		if (observed === undefined) {
 			return "unknown";
 		}
 		return observed === processStartId ? "current" : "replaced";
+	}
+
+	/**
+	 * Signal only the exact registered worker incarnation. This deliberately
+	 * fails closed for legacy descriptors and transiently unreadable process
+	 * identity. Callers retain the tombstone/retry authority in that case.
+	 */
+	private signalCurrentWorker(
+		worker: ResidentWorker,
+		descriptor: DaemonWorkerDescriptor,
+		stopRevision: number,
+		stopRequestedAt: string | undefined,
+		signal: NodeJS.Signals,
+		directChild?: ChildProcess,
+	): boolean {
+		const { pid, processStartId } = descriptor;
+		if (
+			processStartId === undefined ||
+			this.workers.get(descriptor.workerId) !== worker ||
+			worker.descriptor !== descriptor ||
+			worker.descriptor.pid !== pid ||
+			worker.descriptor.processStartId !== processStartId ||
+			worker.stopRevision !== stopRevision ||
+			worker.descriptor.stopRequestedAt !== stopRequestedAt ||
+			(directChild !== undefined &&
+				(directChild.pid !== pid || directChild.exitCode !== null || directChild.signalCode !== null)) ||
+			this.processIdentity(pid, processStartId) !== "current"
+		) {
+			return false;
+		}
+		if (directChild) {
+			directChild.kill(signal);
+		} else {
+			signalProcessGroupOrProcess(pid, signal);
+		}
+		return true;
 	}
 
 	private async stopWorker(
@@ -4627,23 +4674,10 @@ export class DaemonSupervisor {
 			worker.stopRevision++;
 		}
 		// A retry can rescind this stop and relaunch the worker while we await
-		// below. Bind every liveness check and signal to the process this stop
-		// entered with, and abort cleanup once the stop no longer applies: the
-		// pid changed (relaunched) or a removeDescriptor stop lost its tombstone
-		// (rescinded, even before the successor pid lands).
-		const entryPid = worker.descriptor.pid;
-		const entryStartId = worker.descriptor.processStartId;
-		const assertStopStillApplies = () => {
-			if (directChild) {
-				return;
-			}
-			if (
-				worker.descriptor.pid !== entryPid ||
-				(removeDescriptor && worker.descriptor.stopRequestedAt === undefined)
-			) {
-				throw new Error(`Session worker ${worker.descriptor.workerId} was relaunched during stop`);
-			}
-		};
+		// below. Bind every mutation, liveness check, and signal to this exact
+		// worker object, descriptor incarnation, pid/start-id pair, stop revision,
+		// and stop marker. Do not claim supervisor-generation fencing here: it is
+		// not an enforced part of this stop tuple.
 		try {
 			if (removeDescriptor) {
 				this.persistWorkerStopTombstone(worker, archiveSession);
@@ -4658,6 +4692,24 @@ export class DaemonSupervisor {
 			}
 			this.reportCleanupFailure(`worker rollback state ${worker.descriptor.workerId}`, error);
 		}
+		const entryDescriptor = worker.descriptor;
+		const entryPid = entryDescriptor.pid;
+		const entryStartId = entryDescriptor.processStartId;
+		const entryStopRevision = worker.stopRevision;
+		const entryStopRequestedAt = entryDescriptor.stopRequestedAt;
+		const entryClient = worker.client;
+		const assertStopStillApplies = () => {
+			if (
+				this.workers.get(entryDescriptor.workerId) !== worker ||
+				worker.descriptor !== entryDescriptor ||
+				worker.descriptor.pid !== entryPid ||
+				worker.descriptor.processStartId !== entryStartId ||
+				worker.stopRevision !== entryStopRevision ||
+				worker.descriptor.stopRequestedAt !== entryStopRequestedAt
+			) {
+				throw new Error(`Session worker ${entryDescriptor.workerId} changed during stop`);
+			}
+		};
 		const transferError = new Error("Session worker stopped during snapshot transfer");
 		const generationTranscripts = new Set<SnapshotTranscriptCache>();
 		for (const [activeSessionId, generations] of [...(worker.snapshotGenerations ?? new Map())]) {
@@ -4680,20 +4732,29 @@ export class DaemonSupervisor {
 		worker.transcriptCaches.clear();
 		worker.snapshotCache.clear();
 		worker.snapshotGenerations?.clear();
-		if (worker.client) {
+		if (entryClient) {
 			if (archiveSession) {
-				await worker.client
+				await entryClient
 					.requestWorker({ type: "worker_archive_and_shutdown" }, force ? 1000 : 5000)
 					.catch(() => undefined);
 			} else {
-				await worker.client.request({ type: "shutdown" }, force ? 1000 : 5000).catch(() => undefined);
+				await entryClient.request({ type: "shutdown" }, force ? 1000 : 5000).catch(() => undefined);
 			}
-			worker.client.close();
-			worker.client = undefined;
-		} else if (directChild) {
-			directChild.child.kill("SIGTERM");
-		} else if (this.processIdentity(entryPid, entryStartId) === "current") {
-			signalProcessGroupOrProcess(entryPid, "SIGTERM");
+			assertStopStillApplies();
+			entryClient.close();
+			if (worker.client === entryClient) {
+				worker.client = undefined;
+			}
+		} else {
+			assertStopStillApplies();
+			this.signalCurrentWorker(
+				worker,
+				entryDescriptor,
+				entryStopRevision,
+				entryStopRequestedAt,
+				"SIGTERM",
+				directChild?.child,
+			);
 		}
 		// Identity-aware in both directions: a replaced pid counts as gone (never
 		// signal a recycled pid) while an unknown identity counts as alive (never
@@ -4719,18 +4780,24 @@ export class DaemonSupervisor {
 		while (isWorkerProcessAlive() && Date.now() < gracefulDeadline) {
 			await delay(25);
 		}
+		assertStopStillApplies();
 		if (force && isWorkerProcessAlive()) {
-			if (directChild) {
-				directChild.child.kill("SIGKILL");
-			} else if (this.processIdentity(entryPid, entryStartId) === "current") {
-				// Fresh, unthrottled check: the cached verdict may be up to 500ms
-				// old, long enough for the pid to be recycled.
-				signalProcessGroupOrProcess(entryPid, "SIGKILL");
-			}
+			assertStopStillApplies();
+			// signalCurrentWorker performs a fresh, unthrottled identity check;
+			// cached liveness may be old enough for pid reuse.
+			this.signalCurrentWorker(
+				worker,
+				entryDescriptor,
+				entryStopRevision,
+				entryStopRequestedAt,
+				"SIGKILL",
+				directChild?.child,
+			);
 			const forceDeadline = Date.now() + 1000;
 			while (isWorkerProcessAlive() && Date.now() < forceDeadline) {
 				await delay(25);
 			}
+			assertStopStillApplies();
 		}
 		if (isWorkerProcessAlive()) {
 			worker.intentionalStop = worker.descriptor.stopRequestedAt !== undefined;
@@ -4775,37 +4842,25 @@ export class DaemonSupervisor {
 	}
 
 	private async finalizeTimedOutWorkerStop(worker: ResidentWorker): Promise<void> {
-		// Bind to the exact process generation being stopped: a retry can rescind
-		// the stop and relaunch with a new pid, and the OS can recycle the old
-		// pid. The finalizer must never follow either successor.
-		const pid = worker.descriptor.pid;
-		let processStartId = worker.descriptor.processStartId;
-		if (processStartId === undefined) {
-			// The stop timed out because the process was still alive moments ago,
-			// so an identity observed now can be trusted and recorded. It lets the
-			// eventual stopWorker call fail closed on a recycled pid too.
-			const observed = getProcessStartId(pid);
-			if (observed !== undefined && isProcessAlive(pid)) {
-				processStartId = observed;
-				worker.descriptor.processStartId = observed;
-				try {
-					this.persistWorker(worker);
-				} catch (error) {
-					this.reportCleanupFailure(`worker identity record ${worker.descriptor.workerId}`, error);
-				}
-			}
-		}
+		// Bind to the exact stop tuple. A retry can replace the descriptor,
+		// rescind its tombstone, or relaunch with a new pid while this finalizer
+		// awaits. Legacy/unreadable identities deliberately remain unsignalable.
+		const descriptor = worker.descriptor;
+		const { pid, processStartId } = descriptor;
 		const stopRevision = worker.stopRevision;
+		const stopRequestedAt = descriptor.stopRequestedAt;
 		const isStopGenerationCurrent = () =>
-			this.workers.get(worker.descriptor.workerId) === worker &&
+			this.workers.get(descriptor.workerId) === worker &&
+			worker.descriptor === descriptor &&
 			worker.stopRevision === stopRevision &&
-			worker.descriptor.stopRequestedAt !== undefined &&
-			worker.descriptor.pid === pid;
-		// A replaced pid counts as gone (never SIGKILL a recycled pid); an
-		// unobservable identity counts as alive (never clean up a possibly-live
-		// worker). kill(0) probes every poll; ps-backed checks are throttled.
+			worker.descriptor.stopRequestedAt === stopRequestedAt &&
+			stopRequestedAt !== undefined &&
+			worker.descriptor.pid === pid &&
+			worker.descriptor.processStartId === processStartId;
+		// A replaced pid counts as gone (never SIGKILL a recycled pid); a
+		// missing or unobservable identity counts as alive (never clean up a
+		// possibly-live worker). kill(0) probes every poll; ps checks throttle.
 		let stoppedVerdict = true;
-		let stoppedCanSignal = true;
 		let stoppedCheckedAt = 0;
 		const isStoppedProcessAlive = () => {
 			if (!processIdExists(pid)) {
@@ -4816,16 +4871,8 @@ export class DaemonSupervisor {
 				return stoppedVerdict;
 			}
 			stoppedCheckedAt = now;
-			if (!isProcessAlive(pid)) {
-				stoppedVerdict = false;
-			} else if (processStartId === undefined) {
-				stoppedVerdict = true;
-				stoppedCanSignal = true;
-			} else {
-				const observed = getProcessStartId(pid);
-				stoppedVerdict = observed !== processStartId ? observed === undefined : true;
-				stoppedCanSignal = observed === processStartId;
-			}
+			const verdict = this.processIdentity(pid, processStartId);
+			stoppedVerdict = verdict !== "replaced" && verdict !== "gone";
 			return stoppedVerdict;
 		};
 		const sigkillDeadline = Date.now() + STOP_FINALIZATION_SIGKILL_GRACE_MS;
@@ -4837,17 +4884,10 @@ export class DaemonSupervisor {
 			if (!isStoppedProcessAlive()) {
 				break;
 			}
-			if (!killed && stoppedCanSignal && Date.now() >= sigkillDeadline) {
-				// Fresh, unthrottled identity check right before signalling: the
-				// cached verdict may be up to 500ms old, long enough for the pid
-				// to be recycled by an unrelated process. A transiently
-				// unobservable identity skips this attempt but keeps escalation
-				// armed so a wedged worker is still killed on a later pass.
-				const observedNow = processStartId === undefined ? undefined : getProcessStartId(pid);
-				if (processStartId === undefined || observedNow === processStartId) {
-					signalProcessGroupOrProcess(pid, "SIGKILL");
-					killed = true;
-				}
+			if (!killed && Date.now() >= sigkillDeadline) {
+				// signalCurrentWorker makes a fresh exact observation immediately
+				// before signalling. A miss keeps the tombstone and escalation armed.
+				killed = this.signalCurrentWorker(worker, descriptor, stopRevision, stopRequestedAt, "SIGKILL");
 			}
 			await unrefDelay(STOP_FINALIZATION_RECHECK_MS);
 		}
@@ -4855,10 +4895,7 @@ export class DaemonSupervisor {
 		// dead worker's registration is never stranded permanently. Each attempt
 		// bumps the worker's stopRevision, so rescission is detected through the
 		// registration and tombstone instead of the waiting-phase snapshot.
-		const isCleanupStillWanted = () =>
-			this.workers.get(worker.descriptor.workerId) === worker &&
-			worker.descriptor.stopRequestedAt !== undefined &&
-			worker.descriptor.pid === pid;
+		const isCleanupStillWanted = isStopGenerationCurrent;
 		while (!this.shuttingDown && isCleanupStillWanted()) {
 			try {
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
