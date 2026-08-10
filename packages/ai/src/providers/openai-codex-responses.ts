@@ -737,12 +737,16 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		const entry = websocketSessionCache.get(sessionId);
 		if (entry) closeEntry(entry);
 		websocketSessionCache.delete(sessionId);
+		websocketDebugStats.delete(sessionId);
+		websocketSseFallbackSessions.delete(sessionId);
 		return;
 	}
 	for (const entry of websocketSessionCache.values()) {
 		closeEntry(entry);
 	}
 	websocketSessionCache.clear();
+	websocketDebugStats.clear();
+	websocketSseFallbackSessions.clear();
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);

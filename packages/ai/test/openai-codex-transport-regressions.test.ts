@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	closeOpenAICodexWebSocketSessions,
+	getOpenAICodexWebSocketDebugStats,
 	streamOpenAICodexResponses,
 } from "../src/providers/openai-codex-responses.js";
 import type { Context, Model } from "../src/types.js";
@@ -298,6 +299,33 @@ describe("Codex WebSocket cancellation regressions", () => {
 		expect(socket?.closes.length).toBeGreaterThan(0);
 		expect(socket?.listenerCount()).toBe(0);
 		expect(global.fetch).toHaveBeenCalledOnce();
+	});
+
+	it("clears debug stats and sticky SSE fallback state during session cleanup", async () => {
+		let constructed = 0;
+		class MockWebSocket extends MockSocketBase {
+			constructor() {
+				super();
+				constructed++;
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+			send(): void {
+				this.dispatch("error", { message: "transport unavailable" });
+			}
+		}
+		globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+		global.fetch = vi.fn(async () => completeSSE("fallback")) as typeof fetch;
+		const sessionId = "cleanup-fallback";
+
+		await streamOpenAICodexResponses(model, context, { apiKey: token, transport: "auto", sessionId }).result();
+		expect(constructed).toBe(1);
+		expect(getOpenAICodexWebSocketDebugStats(sessionId)?.websocketFallbackActive).toBe(true);
+
+		closeOpenAICodexWebSocketSessions(sessionId);
+		expect(getOpenAICodexWebSocketDebugStats(sessionId)).toBeUndefined();
+
+		await streamOpenAICodexResponses(model, context, { apiKey: token, transport: "auto", sessionId }).result();
+		expect(constructed).toBe(2);
 	});
 
 	it("evicts an active aborted cached socket", async () => {
