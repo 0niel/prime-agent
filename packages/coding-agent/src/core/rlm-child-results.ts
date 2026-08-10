@@ -20,10 +20,12 @@ import {
 	unlinkSync,
 	writeSync,
 } from "node:fs";
-import { dirname, join, parse, relative, resolve } from "node:path";
+import { basename, dirname, join, parse, relative, resolve } from "node:path";
 
 export const CHILD_RESULT_SCHEMA_VERSION = 1 as const;
-export const MAX_CHILD_RESULT_JSON_BYTES = 64 * 1024;
+/** C04's opaque projection must still fit C03's 64 KiB full envelope.
+ * 60 KiB leaves 4 KiB for the fixed C03 JSON/message fields and presentation. */
+export const MAX_CHILD_RESULT_JSON_BYTES = 60 * 1024;
 export const MAX_SUMMARY_CHARS = 4_096;
 export const MAX_SUMMARY_BYTES = 16 * 1024;
 export const MAX_PREVIEW_CHARS = 2_048;
@@ -171,7 +173,7 @@ export async function createOrGetTerminalChildResult(
 	// Bind before creating C04 state: an untrusted sibling/renamed root never gets
 	// a durable directory merely because it was supplied by a caller.
 	validateChildBinding(owner, input.childArtifactRoot);
-	const root = prepareRoot(input.childArtifactRoot);
+	const root = prepareBoundRoot(owner, input.childArtifactRoot);
 	const now = input.now?.() ?? new Date();
 	if (!Number.isFinite(now.getTime())) throw new Error("C04 time is invalid");
 	const candidate = validateCandidate(input.candidate);
@@ -239,7 +241,8 @@ export async function createOrGetTerminalChildResult(
 			requestDigest,
 		};
 		assertStored(stored);
-		atomicJson(safePath(root, "results", `${resultId}.json`), stored);
+		// Initial result publication is immutable: a final name is never rename-overwritten.
+		atomicExclusiveJson(safePath(root, "results", `${resultId}.json`), stored);
 		for (const artifact of artifacts)
 			atomicExclusiveJson(safePath(root, "handle-index", `${artifact.handleId}.json`), {
 				version: 1,
@@ -276,9 +279,10 @@ export function getChildResultProjection(
 	now = new Date(),
 ): C04ChildResultReference | undefined {
 	try {
-		const root = prepareRoot(childArtifactRoot, false);
+		const verified = validateOwner(owner);
+		const root = prepareBoundRoot(verified, childArtifactRoot, false);
 		const result = readStored(root, resultId);
-		if (!sameOwner(result.owner, validateOwner(owner))) return denied(root, "owner_mismatch");
+		if (!sameOwner(result.owner, verified)) return denied(root, "owner_mismatch");
 		const reduced = expireIfElapsed(root, result, now);
 		return projection(reduced);
 	} catch {
@@ -294,9 +298,15 @@ export function resolveOwnedChildResult(
 	now = new Date(),
 ): { result: C04PublicChildResult; capability: object } | undefined {
 	try {
-		const root = prepareRoot(childArtifactRoot, false);
-		const result = readStored(root, handleResult(root, handleId));
-		if (!sameOwner(result.owner, validateOwner(owner)) || !result.artifacts.some((a) => a.handleId === handleId))
+		const verified = validateOwner(owner);
+		const root = prepareBoundRoot(verified, childArtifactRoot, false);
+		const indexed = readHandleIndex(root, handleId);
+		const result = readStored(root, indexed.resultId);
+		if (
+			!sameOwner(indexed.owner, verified) ||
+			!sameOwner(result.owner, verified) ||
+			!result.artifacts.some((a) => a.handleId === handleId)
+		)
 			return denied(root, "owner_mismatch");
 		const current = expireIfElapsed(root, result, now);
 		const artifact = current.artifacts.find((value) => value.handleId === handleId);
@@ -326,6 +336,9 @@ export function readOwnedArtifact(
 	)
 		return undefined;
 	try {
+		// Capabilities are bearer objects, not a substitute for the SessionManager
+		// binding: revalidate the parent/runtime-owned child root on every read.
+		if (prepareBoundRoot(grant.owner, dirname(grant.root), false) !== grant.root) return undefined;
 		// Retention is evaluated for every capability read, not merely resolution.
 		const result = expireIfElapsed(grant.root, readStored(grant.root, grant.resultId), new Date());
 		if (!sameOwner(result.owner, grant.owner)) return denied(grant.root, "owner_mismatch");
@@ -348,7 +361,14 @@ export function readOwnedArtifact(
 				return denied(grant.root, "integrity");
 			const bytes = Buffer.allocUnsafe(Math.min(range.length, artifact.byteLength - range.offset));
 			const read = readSync(fd, bytes, 0, bytes.length, range.offset);
-			if (fstatSync(fd).size !== artifact.byteLength) return denied(grant.root, "integrity");
+			const final = fstatSync(fd);
+			if (
+				final.size !== artifact.byteLength ||
+				final.dev !== before.dev ||
+				final.ino !== before.ino ||
+				hashOpenFile(fd, artifact.byteLength) !== artifact.sha256
+			)
+				return denied(grant.root, "integrity");
 			appendAudit(grant.root, "read_allowed", "read", artifact.handleId);
 			return bytes.subarray(0, read);
 		} finally {
@@ -366,9 +386,10 @@ export function recordChildResultDisposition(
 	childArtifactRoot: string,
 ): boolean {
 	try {
-		const root = prepareRoot(childArtifactRoot, false);
+		const verified = validateOwner(owner);
+		const root = prepareBoundRoot(verified, childArtifactRoot, false);
 		const result = readStored(root, input.resultId);
-		if (!sameOwner(result.owner, validateOwner(owner))) return false;
+		if (!sameOwner(result.owner, verified)) return false;
 		if (input.handleId && !result.artifacts.some((a) => a.handleId === input.handleId)) return false;
 		const changed = result.artifacts.map((artifact) =>
 			artifact.handleId === input.handleId || !input.handleId
@@ -586,7 +607,7 @@ async function writeArtifact(
 		fsyncSync(fd);
 		closeSync(fd);
 		fd = undefined;
-		renameSync(temp, finalPath);
+		publishExclusive(temp, finalPath);
 		fsyncDirectory(dirname(finalPath));
 		return {
 			version: 1,
@@ -622,7 +643,8 @@ function aggregateBytes(root: string, owner: C04ChildResultOwner): number {
 			if (
 				r.owner.parentSessionId === owner.parentSessionId &&
 				r.owner.childSessionId === owner.childSessionId &&
-				r.owner.childSessionFile === owner.childSessionFile
+				r.owner.childSessionFile === owner.childSessionFile &&
+				r.owner.assignmentId === owner.assignmentId
 			)
 				total += r.artifacts.reduce((n, a) => n + (a.retentionState === "retained" ? a.byteLength : 0), 0);
 		} catch {
@@ -632,21 +654,27 @@ function aggregateBytes(root: string, owner: C04ChildResultOwner): number {
 	return total;
 }
 const operationReservations = new Set<string>();
-/** Operation serialization plus a durable O_EXCL reservation prevents two live
- * streams from being assigned the same operation or independently passing quota. */
+/** Reservation ownership is a nonce-bound fact. A losing writer never unlinks
+ * a name it did not create, including during the create-one/create-two cut. */
 function reserveOperationAndQuota(root: string, owner: C04ChildResultOwner, indexPath: string): () => void {
-	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}`;
+	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}:${owner.assignmentId}`;
 	if (operationReservations.has(key)) throw immutableConflict(root, owner.operationId);
 	const reservation = safePath(root, "operation-index", `.${owner.operationId}.reserve`);
-	const quotaReservation = safePath(root, "operation-index", `.quota.${owner.childSessionId}.reserve`);
+	const quotaReservation = safePath(
+		root,
+		"operation-index",
+		`.quota.${owner.childSessionId}.${owner.assignmentId}.reserve`,
+	);
+	const nonce = randomUuid();
+	const token = canonicalJson({ version: 1, owner, indexPath, nonce });
 	let operationFd: number | undefined;
 	let quotaFd: number | undefined;
 	try {
-		// Lock both exact operation and child-session quota before the first byte.
 		operationFd = openSyncNoFollow(reservation, "wx", 0o600);
-		quotaFd = openSyncNoFollow(quotaReservation, "wx", 0o600);
-		writeAll(operationFd, Buffer.from(canonicalJson({ version: 1, owner, indexPath })));
+		writeAll(operationFd, Buffer.from(token));
 		fsyncSync(operationFd);
+		quotaFd = openSyncNoFollow(quotaReservation, "wx", 0o600);
+		writeAll(quotaFd, Buffer.from(token));
 		fsyncSync(quotaFd);
 		closeSync(operationFd);
 		closeSync(quotaFd);
@@ -656,16 +684,23 @@ function reserveOperationAndQuota(root: string, owner: C04ChildResultOwner, inde
 	} catch {
 		if (operationFd !== undefined) closeSync(operationFd);
 		if (quotaFd !== undefined) closeSync(quotaFd);
-		safeUnlink(reservation);
-		safeUnlink(quotaReservation);
+		unlinkReservationIfOwned(reservation, token);
+		unlinkReservationIfOwned(quotaReservation, token);
 		throw immutableConflict(root, owner.operationId);
 	}
 	return () => {
 		operationReservations.delete(key);
-		safeUnlink(reservation);
-		safeUnlink(quotaReservation);
+		unlinkReservationIfOwned(reservation, token);
+		unlinkReservationIfOwned(quotaReservation, token);
 		fsyncDirectory(dirname(reservation));
 	};
+}
+function unlinkReservationIfOwned(path: string, token: string): void {
+	try {
+		const stat = lstatSync(path);
+		if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 8192 && readFileSync(path, "utf8") === token)
+			unlinkSync(path);
+	} catch {}
 }
 function immutableConflict(root: string, operationId: string): Error {
 	appendAudit(root, "uncertain", "immutable_conflict", operationId);
@@ -676,9 +711,14 @@ function validateChildBinding(owner: C04ChildResultOwner, childArtifactRoot: str
 	const file = canonicalExistingRegularFile(owner.childSessionFile);
 	if (!file) throw new Error("C04 child session file is not a stable regular file");
 	const root = canonicalDirectoryNoSymlinks(childArtifactRoot);
-	// The file must remain beneath the same trusted child session hierarchy. This
-	// rejects a swapped/renamed child root passed independently from its session.
-	if (relative(dirname(file), root).startsWith("..")) throw new Error("C04 child artifact root escapes child session");
+	const sessionId = owner.childSessionId;
+	// This is the one layout SessionManager publishes. IDs and paths are all
+	// checked together so a sibling session's root cannot be substituted.
+	const sessionDir = dirname(file);
+	if (basename(sessionDir) !== "sessions" || basename(file) !== `${sessionId}.jsonl`)
+		throw new Error("C04 child session file is not the exact SessionManager child binding");
+	const expected = join(dirname(sessionDir), "session-artifacts", sessionId);
+	if (root !== expected) throw new Error("C04 child artifact root is not the exact SessionManager child binding");
 }
 function canonicalExistingRegularFile(path: string): string | undefined {
 	try {
@@ -705,26 +745,31 @@ function canonicalDirectoryNoSymlinks(path: string): string {
 	}
 	return absolute;
 }
-function prepareRoot(childArtifactRoot: string, create = true): string {
-	if (typeof childArtifactRoot !== "string" || !childArtifactRoot) throw new Error("invalid C04 artifact root");
-	// The trusted child artifact directory must already exist; never recursively
-	// create through an attacker-controlled ancestor.
-	const base = canonicalDirectoryNoSymlinks(childArtifactRoot);
+/** Re-check the SessionManager-shaped child binding before every C04 operation.
+ * SessionManager owns `<state>/sessions/<id>.jsonl` and
+ * `<state>/session-artifacts/<id>`; accepting merely a common ancestor would
+ * let a sibling child supply its artifact directory. */
+function prepareBoundRoot(owner: C04ChildResultOwner, childArtifactRoot: string, create = true): string {
+	validateChildBinding(owner, childArtifactRoot);
+	const base = assertPrivateDirectory(childArtifactRoot);
 	const root = join(base, "rlm-child-results");
 	if (create) mkdirSync(root, { recursive: true, mode: 0o700 });
-	assertDirectory(root);
+	assertPrivateDirectory(root);
 	for (const dir of ["operation-index", "results", "objects", "handle-index"]) {
 		const path = join(root, dir);
 		if (create) mkdirSync(path, { recursive: true, mode: 0o700 });
-		canonicalDirectoryNoSymlinks(path);
+		assertPrivateDirectory(path);
 	}
-	chmodSync(root, 0o700);
 	return root;
 }
-function assertDirectory(path: string): string {
-	const stat = lstatSync(path);
-	if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("C04 rejects symlink/non-directory");
-	return resolve(path);
+function assertPrivateDirectory(path: string): string {
+	const canonical = canonicalDirectoryNoSymlinks(path);
+	const stat = lstatSync(canonical);
+	if ((stat.mode & 0o077) !== 0) {
+		chmodSync(canonical, 0o700);
+		if ((lstatSync(canonical).mode & 0o077) !== 0) throw new Error("C04 directory is not owner-private");
+	}
+	return canonical;
 }
 function safePath(root: string, directory: string, name?: string): string {
 	if (
@@ -772,7 +817,10 @@ function readIndex(
 		return undefined;
 	}
 }
-function handleResult(root: string, handleId: string): string {
+function readHandleIndex(
+	root: string,
+	handleId: string,
+): { resultId: string; owner: C04ChildResultOwner; handleId: string } {
 	if (!isUuid(handleId)) throw new Error("invalid handle");
 	const path = safePath(root, "handle-index", `${handleId}.json`);
 	const st = lstatSync(path);
@@ -786,8 +834,7 @@ function handleResult(root: string, handleId: string): string {
 		!isUuid(index.resultId)
 	)
 		throw new Error("not found");
-	validateOwner(index.owner as C04ChildResultOwner);
-	return index.resultId;
+	return { resultId: index.resultId, owner: validateOwner(index.owner as C04ChildResultOwner), handleId };
 }
 
 function expireIfElapsed(root: string, result: StoredChildResult, now: Date): StoredChildResult {
@@ -807,7 +854,16 @@ function setExpired(root: string, result: StoredChildResult): StoredChildResult 
 	return expired;
 }
 function projection(result: StoredChildResult): C04ChildResultReference {
-	const { schemaVersion, owner, facts, nextActions, committedAt, retention, requestDigest, ...reference } = result;
+	const {
+		schemaVersion: _schemaVersion,
+		owner: _owner,
+		facts: _facts,
+		nextActions: _nextActions,
+		committedAt: _committedAt,
+		retention: _retention,
+		requestDigest: _requestDigest,
+		...reference
+	} = result;
 	assertReference(reference);
 	return reference;
 }
@@ -965,6 +1021,27 @@ function assertArtifactRef(value: unknown, resultId: string): asserts value is C
 		!retentionStates.has(value.retentionState)
 	)
 		throw new Error("invalid C04 artifact reference");
+}
+function publishExclusive(temp: string, path: string): void {
+	// link(2) is an atomic no-replace publication. Node has no linkSync import
+	// here, so create the destination exclusively and copy from the private temp
+	// FD; a collision can never overwrite an immutable object name.
+	const source = openSyncNoFollow(temp, "r");
+	let destination: number | undefined;
+	try {
+		destination = openSyncNoFollow(path, "wx", 0o600);
+		const buffer = Buffer.allocUnsafe(MAX_STREAM_CHUNK_BYTES);
+		for (;;) {
+			const count = readSync(source, buffer, 0, buffer.length, null);
+			if (count === 0) break;
+			writeAll(destination, buffer.subarray(0, count));
+		}
+		fsyncSync(destination);
+	} finally {
+		closeSync(source);
+		if (destination !== undefined) closeSync(destination);
+	}
+	safeUnlink(temp);
 }
 function atomicJson(path: string, value: unknown): void {
 	const temp = `${path}.${randomUuid()}.tmp`;

@@ -1076,34 +1076,31 @@ export function rlmChildLabel(prompt: string): string {
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
 }
 
-/** C04 terminal output is externalized as bounded byte chunks; do not join, read,
- * or truncate the child reply before persistence. */
-async function* streamAssistantTerminalOutput(session: AgentSession): AsyncGenerator<Uint8Array> {
+/** C04 receives producer-time terminal blocks only. Do not scan a session
+ * transcript or encode a whole block: both make a terminal's memory use depend
+ * on historical conversation size. */
+async function* streamAssistantTerminalOutput(message: AssistantMessage | undefined): AsyncGenerator<Uint8Array> {
+	if (!message) return;
 	const encoder = new TextEncoder();
-	for (const message of session.messages) {
-		if (message.role !== "assistant") continue;
-		for (const block of (message as AssistantMessage).content) {
-			if (block.type !== "text") continue;
-			const bytes = encoder.encode(block.text);
-			for (let offset = 0; offset < bytes.length; offset += 64 * 1024)
-				yield bytes.subarray(offset, offset + 64 * 1024);
+	for (const block of message.content) {
+		if (block.type !== "text") continue;
+		// Keep each UTF-8 conversion comfortably below C04's 64 KiB chunk limit.
+		for (let offset = 0; offset < block.text.length; offset += 8_192) {
+			const text = block.text.slice(offset, offset + 8_192);
+			const bytes = encoder.encode(text);
+			for (let byteOffset = 0; byteOffset < bytes.length; byteOffset += 64 * 1024)
+				yield bytes.subarray(byteOffset, byteOffset + 64 * 1024);
 		}
 	}
 }
-/** A bounded structured presentation is independent of the raw artifact. */
+/** A bounded sanitized presentation is maintained while the child produces it. */
 function safeAssistantPreview(message: AssistantMessage): string | undefined {
 	for (const block of message.content) {
 		if (block.type !== "text" || !block.text) continue;
-		return compactRlmText(block.text, 160);
+		const bounded = block.text.slice(0, 512);
+		return compactRlmText(bounded, 160).replace(/[\u0000-\u001f\u007f]/g, " ");
 	}
 	return undefined;
-}
-
-function readAssistantText(message: AssistantMessage): string {
-	return message.content
-		.filter((block) => block.type === "text")
-		.map((block) => block.text)
-		.join("");
 }
 
 function waitForPromiseOrAbort<T>(
@@ -10073,6 +10070,7 @@ export class AgentSession {
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
 		let answerPreview: string | undefined;
+		let terminalAssistantOutput: AssistantMessage | undefined;
 		let durationMs: number | undefined;
 		let toolUseCount = 0;
 		let runningToolCount = 0;
@@ -10211,7 +10209,7 @@ export class AgentSession {
 										{
 											kind: "terminal_output" as const,
 											contentType: "text/plain" as const,
-											data: streamAssistantTerminalOutput(childSession),
+											data: streamAssistantTerminalOutput(terminalAssistantOutput),
 										},
 									],
 								}
@@ -10397,6 +10395,7 @@ export class AgentSession {
 								}
 							}
 						}
+						terminalAssistantOutput = assistant;
 						const text = safeAssistantPreview(assistant);
 						if (text) answerPreview = text;
 						void flushAgentTraceUpload(child.sessionManager).catch(() => undefined);
