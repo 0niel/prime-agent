@@ -164,7 +164,7 @@ class HarnessStateTest(unittest.TestCase):
                             {
                                 "id": "refine_extra",
                                 "trigger": "extra keys",
-                                "changes": [1, "loaded"],
+                                "changes": ["loaded"],
                                 "ignored": "value",
                             },
                             {
@@ -189,9 +189,9 @@ class HarnessStateTest(unittest.TestCase):
             self.assertEqual(state.get("memory", "known").metadata, {})
             self.assertIsNone(state.get("memory", "missing_content"))
             self.assertEqual(state.refinements[0].id, "refine_extra")
-            self.assertEqual(state.refinements[0].changes, ["1", "loaded"])
+            self.assertEqual(state.refinements[0].changes, ["loaded"])
             self.assertEqual(len(state.refinements), 1)
-            self.assertIn("1, loaded", state.overview())
+            self.assertIn("loaded", state.overview())
 
             updated = state.update_memory("known", "Known memory", "Updated content.")
             self.assertEqual(updated.version, 3)
@@ -1017,16 +1017,30 @@ class HarnessStateTest(unittest.TestCase):
             self.assertEqual(loaded.snapshot().sha256, hashlib.sha256(canonical).hexdigest())
             self.assertEqual(path.read_bytes(), canonical)
 
-    def test_shared_legacy_fixture_migrates_to_the_canonical_v2_fixture(self) -> None:
+    def test_shared_normalized_and_sparse_legacy_fixtures_migrate_byte_for_byte(self) -> None:
+        root = Path(__file__).parent / "fixtures" / "harness_state"
+        manifest = json.loads((root / "expected-canonical-sha256.json").read_text("utf-8"))
+        for legacy, canonical in (("legacy-v1-normalized.json", "v2-populated.json"), ("legacy-v1-sparse.json", "v2-sparse.json")):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "harness_state.json"
+                path.write_bytes((root / legacy).read_bytes())
+                state = HarnessState(path)
+                state.save()
+                actual = path.read_bytes()
+                expected = (root / canonical).read_bytes()
+                self.assertEqual(actual, expected)
+                self.assertEqual(len(actual), manifest[canonical]["bytes"])
+                self.assertEqual(hashlib.sha256(actual).hexdigest(), manifest[canonical]["sha256"])
+
+    def test_legacy_refinement_changes_reject_null_bool_and_objects_without_coercion(self) -> None:
         root = Path(__file__).parent / "fixtures" / "harness_state"
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "harness_state.json"
-            path.write_bytes((root / "legacy-v1-normalized.json").read_bytes())
+            path.write_bytes((root / "legacy-v1-changes-rejected.json").read_bytes())
             state = HarnessState(path)
-            self.assertEqual(state.get("memory", "legacy_nfc").version, 2)
-            self.assertEqual(state.refinements[0].changes, ["migration"])
+            self.assertEqual([(event.id, event.changes) for event in state.refinements], [("keep_strings", ["first", "second"])])
             state.save()
-            self.assertEqual(path.read_bytes(), (root / "v2-populated.json").read_bytes())
+            self.assertEqual(path.read_bytes(), (root / "v2-changes-rejected.json").read_bytes())
 
     def test_atomic_state_file_is_owner_only_after_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

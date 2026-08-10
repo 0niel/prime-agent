@@ -1248,15 +1248,38 @@ describe("harness refinement", () => {
 		expect(readFileSync(getHarnessStatePath(dir))).toEqual(canonical);
 	});
 
-	it("migrates the shared legacy fixture to the canonical v2 fixture", () => {
+	it("deterministically migrates shared normalized and sparse schema-1 fixtures", () => {
+		const root = new URL("./fixtures/harness-state/", import.meta.url);
+		const manifest = JSON.parse(readFileSync(new URL("expected-canonical-sha256.json", root), "utf8")) as Record<
+			string,
+			{ bytes: number; sha256: string }
+		>;
+		for (const [legacy, canonical] of [
+			["legacy-v1-normalized.json", "v2-populated.json"],
+			["legacy-v1-sparse.json", "v2-sparse.json"],
+		] as const) {
+			const dir = makeTempDir();
+			writeFileSync(getHarnessStatePath(dir), readFileSync(new URL(legacy, root)));
+			const state = loadHarnessState(dir, "local");
+			saveHarnessState(dir, state);
+			const actual = readFileSync(getHarnessStatePath(dir));
+			const expected = readFileSync(new URL(canonical, root));
+			expect(actual).toEqual(expected);
+			expect(actual.length).toBe(manifest[canonical].bytes);
+			expect(createHash("sha256").update(actual).digest("hex")).toBe(manifest[canonical].sha256);
+		}
+	});
+
+	it("rejects non-string legacy refinement changes without coercion", () => {
 		const dir = makeTempDir();
 		const root = new URL("./fixtures/harness-state/", import.meta.url);
-		writeFileSync(getHarnessStatePath(dir), readFileSync(new URL("legacy-v1-normalized.json", root)));
+		writeFileSync(getHarnessStatePath(dir), readFileSync(new URL("legacy-v1-changes-rejected.json", root)));
 		const state = loadHarnessState(dir, "local");
-		expect(state.entries.memory.legacy_nfc.version).toBe(2);
-		expect(state.refinements[0].changes).toEqual(["migration"]);
+		expect(state.refinements).toEqual([
+			expect.objectContaining({ id: "keep_strings", changes: ["first", "second"] }),
+		]);
 		saveHarnessState(dir, state);
-		expect(readFileSync(getHarnessStatePath(dir))).toEqual(readFileSync(new URL("v2-populated.json", root)));
+		expect(readFileSync(getHarnessStatePath(dir))).toEqual(readFileSync(new URL("v2-changes-rejected.json", root)));
 	});
 
 	it("fails closed on duplicate-key or noncanonical lock owners", () => {

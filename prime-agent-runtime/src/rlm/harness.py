@@ -184,6 +184,8 @@ class HarnessRecoveryRequired(RuntimeError):
 
 _MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _RFC3339_MILLIS_Z = __import__("re").compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+# Schema-1 records without timestamps migrate to this documented epoch, never the reader clock.
+_LEGACY_DEFAULT_TIMESTAMP = "1970-01-01T00:00:00.000Z"
 
 
 def _pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -328,6 +330,15 @@ def _decode_v2(raw: bytes, scope: HarnessScope) -> tuple[dict[str, Any], Harness
     return data, HarnessSnapshot(data["generation"], _sha(raw))
 
 
+def _legacy_changes(value: Any) -> list[str] | None:
+    """Accept the schema-1 changes wire type without language-specific coercion."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(change, str) for change in value):
+        return value
+    return None
+
+
 def _legacy_data(raw: bytes, scope: HarnessScope) -> dict[str, Any]:
     """The only permissive read path, retained solely for schema-1 migration."""
     try:
@@ -347,15 +358,13 @@ def _legacy_data(raw: bytes, scope: HarnessScope) -> dict[str, Any]:
         for entry_id, raw_entry in records.items():
             if not isinstance(raw_entry, dict) or not isinstance(raw_entry.get("title"), str) or not isinstance(raw_entry.get("content"), str):
                 continue
-            entries[kind][str(entry_id)] = {"id": str(entry_id), "kind": kind, "title": raw_entry["title"], "content": raw_entry["content"], "path": raw_entry.get("path") if isinstance(raw_entry.get("path"), str) else "general", "scope": raw_entry.get("scope") if raw_entry.get("scope") in ("local", "global") else scope, "reference": raw_entry.get("reference") if isinstance(raw_entry.get("reference"), dict) else {}, "arguments": raw_entry.get("arguments") if isinstance(raw_entry.get("arguments"), dict) else {}, "metadata": raw_entry.get("metadata") if isinstance(raw_entry.get("metadata"), dict) else {}, "source": raw_entry.get("source") if isinstance(raw_entry.get("source"), str) else "agent", "created_at": raw_entry.get("created_at") if isinstance(raw_entry.get("created_at"), str) else _now(), "updated_at": raw_entry.get("updated_at") if isinstance(raw_entry.get("updated_at"), str) else _now(), "version": int(raw_entry.get("version", 1)) if isinstance(raw_entry.get("version", 1), (int, str)) and str(raw_entry.get("version", 1)).isdigit() and _safe_integer(int(raw_entry.get("version", 1)), positive=True) else 1}
+            entries[kind][str(entry_id)] = {"id": str(entry_id), "kind": kind, "title": raw_entry["title"], "content": raw_entry["content"], "path": raw_entry.get("path") if isinstance(raw_entry.get("path"), str) else "general", "scope": raw_entry.get("scope") if raw_entry.get("scope") in ("local", "global") else scope, "reference": raw_entry.get("reference") if isinstance(raw_entry.get("reference"), dict) else {}, "arguments": raw_entry.get("arguments") if isinstance(raw_entry.get("arguments"), dict) else {}, "metadata": raw_entry.get("metadata") if isinstance(raw_entry.get("metadata"), dict) else {}, "source": raw_entry.get("source") if isinstance(raw_entry.get("source"), str) else "agent", "created_at": raw_entry.get("created_at") if isinstance(raw_entry.get("created_at"), str) else _LEGACY_DEFAULT_TIMESTAMP, "updated_at": raw_entry.get("updated_at") if isinstance(raw_entry.get("updated_at"), str) else _LEGACY_DEFAULT_TIMESTAMP, "version": int(raw_entry.get("version", 1)) if isinstance(raw_entry.get("version", 1), (int, str)) and str(raw_entry.get("version", 1)).isdigit() and _safe_integer(int(raw_entry.get("version", 1)), positive=True) else 1}
     refinements = []
     for event in data.get("refinements", []) if isinstance(data.get("refinements"), list) else []:
         if isinstance(event, dict) and isinstance(event.get("id"), str) and isinstance(event.get("trigger"), str):
-            changes = event.get("changes")
-            if isinstance(changes, str):
-                changes = [changes]
-            if isinstance(changes, list):
-                refinements.append({"id": event["id"], "trigger": event["trigger"], "changes": [str(change) for change in changes], "evidence": event.get("evidence") if isinstance(event.get("evidence"), str) else "", "outcome": event.get("outcome") if isinstance(event.get("outcome"), str) else "", "created_at": event.get("created_at") if isinstance(event.get("created_at"), str) else _now()})
+            changes = _legacy_changes(event.get("changes"))
+            if changes is not None:
+                refinements.append({"id": event["id"], "trigger": event["trigger"], "changes": changes, "evidence": event.get("evidence") if isinstance(event.get("evidence"), str) else "", "outcome": event.get("outcome") if isinstance(event.get("outcome"), str) else "", "created_at": event.get("created_at") if isinstance(event.get("created_at"), str) else _LEGACY_DEFAULT_TIMESTAMP})
     return {"schema": 1, "entries": entries, "refinements": refinements}
 
 

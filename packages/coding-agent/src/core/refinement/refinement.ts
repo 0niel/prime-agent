@@ -330,6 +330,8 @@ const ENTRY_KEYS = [
 ];
 const EVENT_KEYS = ["changes", "created_at", "evidence", "id", "outcome", "trigger"];
 const ISO_MILLIS_Z = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
+/** Schema-1 records without timestamps migrate to this documented epoch, never the reader clock. */
+const LEGACY_DEFAULT_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 
 function scalarCompare(left: string, right: string): number {
 	const a = Array.from(left);
@@ -581,6 +583,17 @@ function legacyVersion(value: unknown): number {
 	if (safeInteger(value, true)) return value;
 	return typeof value === "string" && /^\d+$/.test(value) && safeInteger(Number(value), true) ? Number(value) : 1;
 }
+
+/**
+ * Schema-1 refinement changes are deliberately not stringified. Only a string
+ * or an array containing only strings survives migration. This avoids runtime-
+ * specific coercions (for example JavaScript String versus Python str) and
+ * prevents object-valued legacy input from entering the schema-2 wire format.
+ */
+function legacyChanges(value: unknown): string[] | undefined {
+	if (typeof value === "string") return [value];
+	return Array.isArray(value) && value.every((change) => typeof change === "string") ? value : undefined;
+}
 function legacyState(raw: Buffer, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot } | undefined {
 	// Schema 1 is deliberately permissive only where both runtimes can perform
 	// the same deterministic migration. Invalid retained values are rejected by
@@ -615,20 +628,15 @@ function legacyState(raw: Buffer, scope: HarnessScope): { state: HarnessState; s
 					arguments: isRecord(value.arguments) ? value.arguments : {},
 					metadata: isRecord(value.metadata) ? value.metadata : {},
 					source: typeof value.source === "string" ? value.source : "agent",
-					created_at: typeof value.created_at === "string" ? value.created_at : now(),
-					updated_at: typeof value.updated_at === "string" ? value.updated_at : now(),
+					created_at: typeof value.created_at === "string" ? value.created_at : LEGACY_DEFAULT_TIMESTAMP,
+					updated_at: typeof value.updated_at === "string" ? value.updated_at : LEGACY_DEFAULT_TIMESTAMP,
 					version: legacyVersion(value.version),
 				};
 	}
 	state.refinements = Array.isArray(parsed.refinements)
 		? parsed.refinements.filter(isRecord).flatMap((event: any) => {
 				if (typeof event.id !== "string" || typeof event.trigger !== "string") return [];
-				const changes =
-					typeof event.changes === "string"
-						? [event.changes]
-						: Array.isArray(event.changes)
-							? event.changes.map(String)
-							: undefined;
+				const changes = legacyChanges(event.changes);
 				if (!changes) return [];
 				return [
 					{
@@ -637,7 +645,7 @@ function legacyState(raw: Buffer, scope: HarnessScope): { state: HarnessState; s
 						changes,
 						evidence: typeof event.evidence === "string" ? event.evidence : "",
 						outcome: typeof event.outcome === "string" ? event.outcome : "",
-						created_at: typeof event.created_at === "string" ? event.created_at : now(),
+						created_at: typeof event.created_at === "string" ? event.created_at : LEGACY_DEFAULT_TIMESTAMP,
 					},
 				];
 			})
