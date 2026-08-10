@@ -9345,15 +9345,16 @@ export class AgentSession {
 			recorded.add(childId);
 		}
 		for (const [childId, daemonChild] of daemonChildren) {
+			// Daemon-mode catalog rows are already filtered against the durable C03
+			// (assignmentId, operationId) registry. This public summary deliberately
+			// carries no private incarnation identity, so a local A tombstone must not
+			// be guessed from childId: it could otherwise hide B (or a legacy row) that
+			// reused A's childId. Local runs/retained sessions above retain their own
+			// exact deletion fences; this fallback trusts the daemon's exact catalog.
 			if (
 				recorded.has(childId) ||
 				this._isRlmChildDeleting(childId, this._rlmChildSessionAssignments.get(childId)) ||
 				this._deletedRlmChildIds.has(this._rlmAssignmentKey(childId, this._currentRlmAssignment(childId))) ||
-				// A daemon catalog summary does not expose C03's assignment. Once the
-				// parent has removed A's local tracking during an explicit delete, retain
-				// its exact child-id tombstone rather than looking it up as legacy; B has
-				// a new child id even when it reuses A's public session name.
-				[...this._deletedRlmChildIds].some((key) => key.startsWith(`${childId}\u0000`)) ||
 				this._rlmChildCleanupFailures.has(childId) ||
 				!daemonChild.sessionDir
 			) {

@@ -647,6 +647,50 @@ describe("AgentSession rlm recursion", () => {
 		expect(internals._deletedRlmChildIds.has(`${childId}\0${assignmentA}`)).toBe(true);
 	});
 
+	it("does not let an exact A tombstone hide a daemon B or legacy row with the same child id", async () => {
+		const childId = "reused-daemon-child";
+		const assignmentA = "deleted-assignment-A";
+		const daemonRow = (sessionName: string) => ({
+			activeSessionId: `${sessionName}-active`,
+			sessionId: `${sessionName}-session`,
+			sessionName,
+			runtimeKind: "subagent" as const,
+			cwd: tempDir,
+			isStreaming: false,
+			unfinishedActionCount: 0,
+			parentActiveSessionId: "parent-active",
+			rlmChildId: childId,
+			sessionDir: join(tempDir, sessionName),
+		});
+		const listWith = (row: ReturnType<typeof daemonRow>) =>
+			createSession({
+				agentMessageController: {
+					listAgents: () => ({
+						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+						agents: [row],
+					}),
+					sendAgentMessage: vi.fn(),
+				},
+			});
+
+		// The daemon owns exact C03 (assignmentId, operationId) filtering. Its public
+		// list seam intentionally exposes neither identity, so an old local A key
+		// cannot be used as a child-id-wide fallback predicate.
+		const b = listWith(daemonRow("later-B"));
+		(b as unknown as InspectableRlmSession)._deletedRlmChildIds.add(`${childId}\0${assignmentA}`);
+		expect(await b.listRlmSubagents()).toMatchObject({
+			subagents: [expect.objectContaining({ rlm_child_id: childId, session_name: "later-B" })],
+		});
+
+		// The same guarantee applies to an identity-less legacy daemon row: it is not
+		// silently treated as A merely because it shares A's public child id.
+		const legacy = listWith(daemonRow("legacy-child"));
+		(legacy as unknown as InspectableRlmSession)._deletedRlmChildIds.add(`${childId}\0${assignmentA}`);
+		expect(await legacy.listRlmSubagents()).toMatchObject({
+			subagents: [expect.objectContaining({ rlm_child_id: childId, session_name: "legacy-child" })],
+		});
+	});
+
 	it("retries and releases failed retained child cleanup on the next compaction", async () => {
 		const childId = "retained-retry-child";
 		const childDir = join(tempDir, childId);

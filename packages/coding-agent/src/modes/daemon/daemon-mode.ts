@@ -5840,9 +5840,26 @@ export class AgentDaemon {
 	}
 
 	private async createAgentMessageListResult(current: ActiveSessionState): Promise<AgentSessionMessageListResult> {
-		const localAgents = this.listTargetableSessionStates(current).map((state) =>
-			this.createAgentMessageAgentSummary(state),
+		// Keep C03 deletion identity private to daemon mode. The model-facing
+		// AgentSessionMessageAgentSummary ABI intentionally has no assignment or
+		// operation fields, but this internal seam can exactly suppress only A while
+		// retaining a later same-childId B or an identity-less legacy catalog row.
+		const deletedC03Operations = new Set(
+			(await this.readLatestRlmSubagentRegistry(current))
+				.filter((entry) => this.isAuthoritativeC03RegistryEntry(entry) && entry.status === "deleted")
+				.map((entry) => `${entry.assignmentId}\u0000${entry.operationId}`),
 		);
+		const localAgents = this.listTargetableSessionStates(current)
+			.filter((state) => {
+				const metadata = state.runtime.metadata;
+				return !(
+					metadata.kind === "subagent" &&
+					metadata.assignmentId !== undefined &&
+					metadata.operationId !== undefined &&
+					deletedC03Operations.has(`${metadata.assignmentId}\u0000${metadata.operationId}`)
+				);
+			})
+			.map((state) => this.createAgentMessageAgentSummary(state));
 		for (const passive of await this.listPassiveRlmSubagents()) {
 			const { entry, info } = passive;
 			localAgents.push({
