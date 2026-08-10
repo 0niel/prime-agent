@@ -251,18 +251,26 @@ export interface RlmDurableIo {
 	realpathSync: typeof realpathSync;
 	renameSync: typeof renameSync;
 }
-export interface RlmTrustedChildRecoveryRoots {
+/**
+ * An owner/session-manager binding for one exact child assignment. Every
+ * value here is authority supplied by the manager, never an identity inferred
+ * from the materialized ledger record being checked.
+ */
+export interface RlmTrustedChildRecoveryBinding {
+	childSessionId: string;
+	childSessionFile: string;
 	childSessionRoot: string;
+	childArtifactDir: string;
 	childArtifactRoot: string;
 }
 /**
- * Recovery roots come from the owning session manager, never from JSONL. A
- * passive read without this authority deliberately leaves child outboxes
+ * Recovery bindings come from the owning session manager, never from JSONL.
+ * A passive read without an exact binding deliberately leaves child outboxes
  * unopened and their operations uncertain.
  */
 export type RlmChildRecoveryTrust = (
 	operation: Readonly<RlmDurableOperation>,
-) => RlmTrustedChildRecoveryRoots | undefined;
+) => RlmTrustedChildRecoveryBinding | undefined;
 export interface RlmDurableOperationStoreOptions {
 	io?: RlmDurableIo;
 	now?: () => string;
@@ -316,7 +324,7 @@ class Store implements RlmDurableOperationStore {
 	private readonly now: () => string;
 	private readonly parentArtifactDir: string;
 	private readonly trustedChildRecoveryRoots?: RlmChildRecoveryTrust;
-	private readonly inProcessChildRoots = new Map<string, RlmTrustedChildRecoveryRoots>();
+	private readonly inProcessChildBindings = new Map<string, RlmTrustedChildRecoveryBinding>();
 
 	constructor(parentArtifactDir: string, options: RlmDurableOperationStoreOptions) {
 		this.io = options.io ?? defaultIo;
@@ -395,8 +403,11 @@ class Store implements RlmDurableOperationStore {
 				return true;
 			return false;
 		}
-		this.inProcessChildRoots.set(operation.key, {
+		this.inProcessChildBindings.set(operation.key, {
+			childSessionId: record.childSessionId,
+			childSessionFile: record.childSessionFile,
 			childSessionRoot: record.childSessionRoot,
+			childArtifactDir: record.childArtifactDir,
 			childArtifactRoot: record.childArtifactRoot,
 		});
 		this.append(this.path(LEDGER), record);
@@ -442,7 +453,7 @@ class Store implements RlmDurableOperationStore {
 			}
 			return "already_recorded";
 		}
-		this.append(joinArtifact(input.childArtifactDir, OUTBOX, this.io), record);
+		this.append(joinArtifact(operation.childArtifactDir!, OUTBOX, this.io), record);
 		this.afterAppend();
 		return "new";
 	}
@@ -558,15 +569,20 @@ class Store implements RlmDurableOperationStore {
 		if (requireTerminal && operation.terminal !== input.terminal)
 			throw new Error("Outbox terminal is not ledger-recorded");
 		const parentFile = canonicalExistingFile(input.parentSessionFile, input.parentSessionRoot, this.io);
-		const childFile = canonicalExistingFile(input.childSessionFile, input.childSessionRoot, this.io);
+		const childSessionRoot = canonicalDirectory(input.childSessionRoot, input.childSessionRoot, this.io);
+		const childFile = canonicalExistingFile(input.childSessionFile, childSessionRoot, this.io);
+		const childArtifactRoot = canonicalDirectory(input.childArtifactRoot, input.childArtifactRoot, this.io);
+		const childArtifactDir = assertContainedDirectory(input.childArtifactDir, childArtifactRoot, this.io, false);
 		assertSessionIdentity(input.parentSessionId, parentFile, this.io);
 		assertSessionIdentity(input.childSessionId, childFile, this.io);
 		assertContainedDirectory(this.parentArtifactDir, input.parentArtifactRoot, this.io, false);
-		assertContainedDirectory(input.childArtifactDir, input.childArtifactRoot, this.io, true);
 		if (
 			operation.parentSessionFile !== parentFile ||
 			operation.childSessionFile !== childFile ||
 			operation.childSessionId !== input.childSessionId ||
+			operation.childSessionRoot !== childSessionRoot ||
+			operation.childArtifactDir !== childArtifactDir ||
+			operation.childArtifactRoot !== childArtifactRoot ||
 			operation.childId !== input.childId
 		) {
 			throw new Error("Outbox session identity/path conflicts with admission");
@@ -605,7 +621,7 @@ class Store implements RlmDurableOperationStore {
 		return reduceArtifact(
 			this.parentArtifactDir,
 			this.io,
-			(operation) => this.inProcessChildRoots.get(operation.key) ?? this.trustedChildRecoveryRoots?.(operation),
+			(operation) => this.inProcessChildBindings.get(operation.key) ?? this.trustedChildRecoveryRoots?.(operation),
 		);
 	}
 	private afterAppend(): RlmDurableOperationRegistry {
@@ -659,27 +675,38 @@ function reduceArtifact(
 			operation.uncertain
 		)
 			continue;
-		const roots = trustedChildRecoveryRoots?.(operation);
-		if (!roots) {
-			markOperationUncertain(operation, registry, "child recovery roots unavailable");
+		const binding = trustedChildRecoveryRoots?.(operation);
+		if (!binding) {
+			markOperationUncertain(operation, registry, "child recovery binding unavailable");
 			continue;
 		}
 		try {
-			const trustedSessionRoot = canonicalDirectory(roots.childSessionRoot, roots.childSessionRoot, io);
-			const trustedArtifactRoot = canonicalDirectory(roots.childArtifactRoot, roots.childArtifactRoot, io);
-			if (operation.childSessionRoot !== trustedSessionRoot || operation.childArtifactRoot !== trustedArtifactRoot)
-				throw new Error("persisted roots do not match session-manager authority");
-			const childFile = canonicalExistingFile(operation.childSessionFile, trustedSessionRoot, io);
-			assertSessionIdentity(operation.childSessionId, childFile, io);
-			if (childFile !== operation.childSessionFile) throw new Error("child session file changed");
-			const artifact = assertContainedDirectory(operation.childArtifactDir, trustedArtifactRoot, io, false);
-			if (artifact !== operation.childArtifactDir) throw new Error("child artifact path changed");
-			for (const parsed of readJsonl(joinArtifact(artifact, OUTBOX, io), io, registry, "outbox"))
+			// Validate manager authority first. In particular, do not use a ledger
+			// path or ID as the expected value for validating that same ledger fact.
+			const trustedSessionRoot = canonicalDirectory(binding.childSessionRoot, binding.childSessionRoot, io);
+			const trustedArtifactRoot = canonicalDirectory(binding.childArtifactRoot, binding.childArtifactRoot, io);
+			const trustedChildFile = canonicalExistingFile(binding.childSessionFile, trustedSessionRoot, io);
+			assertSessionIdentity(binding.childSessionId, trustedChildFile, io);
+			const trustedArtifact = assertContainedDirectory(binding.childArtifactDir, trustedArtifactRoot, io, false);
+			if (
+				operation.childSessionId !== binding.childSessionId ||
+				operation.childSessionFile !== trustedChildFile ||
+				operation.childSessionRoot !== trustedSessionRoot ||
+				operation.childArtifactDir !== trustedArtifact ||
+				operation.childArtifactRoot !== trustedArtifactRoot
+			)
+				throw new Error("persisted child binding does not match session-manager authority");
+			for (const parsed of readJsonl(joinArtifact(trustedArtifact, OUTBOX, io), io, registry, "outbox"))
 				reduceOutbox(parsed, registry);
 		} catch {
 			markOperationUncertain(operation, registry, "untrusted or unreadable child recovery binding");
 		}
 	}
+	// Ledger and child outbox files are independently durable, so recovery can
+	// observe a raw cut between their appends. Reconcile only after every
+	// authorized outbox has been reduced; a terminal fact without its immutable
+	// hand-off is never delivery authority.
+	reconcileTerminalOutboxes(registry);
 	for (const parsed of readJsonl(joinArtifact(canonicalParent, INBOX, io), io, registry, "inbox"))
 		reduceInbox(parsed, registry);
 	for (const parsed of readJsonl(joinArtifact(canonicalParent, CONSUMED, io), io, registry, "consumed"))
@@ -850,6 +877,22 @@ function reduceOutbox(raw: unknown, registry: RlmDurableOperationRegistry): void
 	)
 		markDeliveryUncertain(delivery, operation, registry, "conflicting outbox");
 	else defineDeliveryDigest(delivery, record);
+}
+
+function reconcileTerminalOutboxes(registry: RlmDurableOperationRegistry): void {
+	for (const operation of registry.operations.values()) {
+		if (!operation.terminal) continue;
+		const delivery = deliveryFor(operation, operation.deliveryId, registry);
+		if (
+			operation.uncertain ||
+			!delivery.outboxed ||
+			delivery.uncertain ||
+			delivery.terminal !== operation.terminal ||
+			!outboxDigest(delivery)
+		) {
+			markDeliveryUncertain(delivery, operation, registry, "terminal without matching durable outbox");
+		}
+	}
 }
 
 function reduceInbox(raw: unknown, registry: RlmDurableOperationRegistry): void {
