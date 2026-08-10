@@ -1253,6 +1253,32 @@ export class AgentDaemon {
 			return [];
 		}
 		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
+		// A C03 assignment is an immutable capability, not a display field. Once a
+		// selector has published one, a later assignment-less row cannot safely be
+		// interpreted as a legacy row for that selector. Keep this state while
+		// replaying the append-only journal so corruption cannot resurrect A.
+		const c03Selectors = new Set<string>();
+		const quarantinedSelectors = new Set<string>();
+		const quarantineMalformedEntry = (rawEntry: Partial<PersistedRlmSubagentRegistryEntry> | undefined) => {
+			if (typeof rawEntry?.childId !== "string") return;
+			const assignmentId = rawEntry.assignmentId;
+			if (assignmentId === undefined) {
+				// An omitted ID is compatible only with a selector which has never
+				// carried C03 identity. Otherwise its target is ambiguous, so fence
+				// the selector rather than guessing an assignment to delete.
+				if (c03Selectors.has(rawEntry.childId)) quarantinedSelectors.add(rawEntry.childId);
+				else latest.delete(this.rlmAssignmentKey({ childId: rawEntry.childId }));
+			} else if (!assertFreshUuid(assignmentId)) {
+				// An invalid ID cannot name an immutable assignment. Quarantine only
+				// its declared selector; in particular, never use it to delete an
+				// unrelated valid assignment sharing another selector.
+				quarantinedSelectors.add(rawEntry.childId);
+			} else {
+				// A well-formed C03 ID names exactly one assignment, even when some
+				// other field in this update is corrupt.
+				latest.delete(this.rlmAssignmentKey({ childId: rawEntry.childId, assignmentId }));
+			}
+		};
 		let lines: string[];
 		try {
 			lines = (await readFile(path, "utf8")).split(/\r?\n/);
@@ -1298,47 +1324,34 @@ export class AgentDaemon {
 					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
 					(entry.rlmMaxDepth !== undefined &&
 						(!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0)) ||
-					(entry.assignmentId !== undefined &&
-						(typeof entry.assignmentId !== "string" ||
-							!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-								entry.assignmentId,
-							)))
+					(entry.assignmentId !== undefined && !assertFreshUuid(entry.assignmentId))
 				) {
-					// A malformed update must not fall through to an older snapshot of the
-					// same durable assignment. It is quarantined until a later complete row
-					// deliberately republishes that assignment.
-					if (typeof rawEntry.childId === "string") {
-						latest.delete(
-							this.rlmAssignmentKey({
-								childId: rawEntry.childId,
-								assignmentId: rawEntry.assignmentId,
-							}),
-						);
-					}
+					quarantineMalformedEntry(rawEntry);
 					continue;
 				}
-				latest.set(
-					this.rlmAssignmentKey(entry as PersistedRlmSubagentRegistryEntry),
-					entry as PersistedRlmSubagentRegistryEntry,
-				);
-			} catch (error) {
-				// A malformed update must not fall through to an older snapshot of the
-				// same durable assignment. It is quarantined until a later complete row
-				// deliberately republishes that assignment.
-				if (typeof rawEntry?.childId === "string") {
-					latest.delete(
-						this.rlmAssignmentKey({
-							childId: rawEntry.childId,
-							assignmentId: rawEntry.assignmentId,
-						}),
-					);
+				const persisted = entry as PersistedRlmSubagentRegistryEntry;
+				if (persisted.assignmentId === undefined && c03Selectors.has(persisted.childId)) {
+					// Legacy rows are accepted only before a selector enters C03. After
+					// that transition, a missing identity is malformed rather than a
+					// permitted fallback to mutable display identity.
+					quarantinedSelectors.add(persisted.childId);
+					continue;
 				}
+				if (persisted.assignmentId !== undefined) {
+					c03Selectors.add(persisted.childId);
+					// A complete immutable publication is the only event which can
+					// deliberately republish a selector after corruption.
+					quarantinedSelectors.delete(persisted.childId);
+				}
+				latest.set(this.rlmAssignmentKey(persisted), persisted);
+			} catch (error) {
+				quarantineMalformedEntry(rawEntry);
 				this.log(
 					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
 		}
-		const entries = [...latest.values()];
+		const entries = [...latest.values()].filter((entry) => !quarantinedSelectors.has(entry.childId));
 		// Once an explicit hydrate has durably rebound an old display-only row,
 		// suppress that legacy duplicate from catalog traversal. Its late callbacks
 		// still cannot match the assigned row because callback matching is exact.

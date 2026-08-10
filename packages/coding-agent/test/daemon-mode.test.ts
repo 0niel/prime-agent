@@ -1630,6 +1630,92 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("quarantines missing or invalid C03 assignment IDs instead of waking an older assignment", async () => {
+		for (const corruptAssignment of [undefined, "not-a-uuid"]) {
+			const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-malformed-c03-assignment-"));
+			try {
+				const fixture = makePersistedRlmDaemonFixture(tempDir);
+				const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+				const valid = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+				const corrupt = { ...valid, assignmentId: corruptAssignment };
+				writeFileSync(registryPath, `${JSON.stringify(valid)}\n${JSON.stringify(corrupt)}\n`);
+				const internals = fixture.daemon as unknown as {
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+					createAgentMessageController(
+						getCurrentState: () => ActiveSessionState | undefined,
+					): AgentSessionMessageController;
+					readLatestRlmSubagentRegistryPath(path: string): Promise<unknown[]>;
+				};
+				expect(await internals.readLatestRlmSubagentRegistryPath(registryPath)).toEqual([]);
+				const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+				await expect(
+					internals
+						.createAgentMessageController(() => parent)
+						.sendAgentMessage({ target: "renamed-worker", message: "must not wake quarantined assignment" }),
+				).rejects.toThrow();
+				expect(fixture.createRuntime).toHaveBeenCalledOnce();
+			} finally {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("does not let malformed assignment or child selectors delete unrelated durable assignments", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-malformed-c03-selector-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const a = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			const assignmentB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+			const b = { ...a, childId: "unrelated-child-B", assignmentId: assignmentB, sessionName: "B" };
+			// An invalid C03 ID fences only A's selector. A child selector which is
+			// itself corrupt has no safe target and must not erase B by coincidence.
+			const malformedA = { ...a, assignmentId: "bogus-assignment" };
+			const malformedChild = { ...a, childId: { forged: "selector" }, assignmentId: "also-bogus" };
+			writeFileSync(
+				registryPath,
+				`${JSON.stringify(a)}\n${JSON.stringify(b)}\n${JSON.stringify(malformedA)}\n${JSON.stringify(malformedChild)}\n`,
+			);
+			const read = (
+				fixture.daemon as unknown as {
+					readLatestRlmSubagentRegistryPath(
+						path: string,
+					): Promise<Array<{ childId: string; assignmentId?: string }>>;
+				}
+			).readLatestRlmSubagentRegistryPath.bind(fixture.daemon);
+			expect(await read(registryPath)).toEqual([
+				expect.objectContaining({ childId: b.childId, assignmentId: assignmentB }),
+			]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("allows a later complete B publication to clear A's selector quarantine", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-c03-quarantine-republish-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const a = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			const assignmentB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+			const b = { ...a, assignmentId: assignmentB, sessionName: "republished-B" };
+			writeFileSync(
+				registryPath,
+				`${JSON.stringify(a)}\n${JSON.stringify({ ...a, assignmentId: "bogus-assignment" })}\n${JSON.stringify(b)}\n`,
+			);
+			const internals = fixture.daemon as unknown as {
+				readCurrentLiveRlmSubagentRegistryPath(
+					path: string,
+				): Promise<Array<{ assignmentId?: string; sessionName: string }>>;
+			};
+			expect(await internals.readCurrentLiveRlmSubagentRegistryPath(registryPath)).toEqual([
+				expect.objectContaining({ assignmentId: assignmentB, sessionName: "republished-B" }),
+			]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps B authoritative when A policy assignment reaches its terminal delete boundary", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-policy-assignment-boundary-"));
 		try {
