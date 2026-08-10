@@ -2121,19 +2121,40 @@ export class DaemonSupervisor {
 			command.launchEnv &&
 			(!worker.client || worker.descriptor.lifecycle !== "ready")
 		) {
-			// The first fresh resume owns the one-shot recovery environment. Later
-			// resumes join that recovery instead of replacing its credentials; their
-			// defined result is the same recovered worker, or its recorded failure.
+			// A recovery that already owns a fresh environment is single-flighted:
+			// later resumes join it and cannot replace its one-shot credentials. An
+			// automatic recovery has no such capability, however. Fence a fresh
+			// resume behind it so its finalizer cannot clear the newly adopted env.
 			const inFlightRecovery = worker.recovery;
 			if (inFlightRecovery) {
-				await inFlightRecovery;
-				if (!worker.client || worker.descriptor.lifecycle !== "ready") {
-					throw new Error(
-						worker.descriptor.lastError ??
-						`Session worker ${worker.descriptor.workerId} did not recover for the first fresh resume`,
-					);
+				if (worker.recoveryLaunchEnv) {
+					await inFlightRecovery;
+					if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+						throw new Error(
+							worker.descriptor.lastError ??
+								`Session worker ${worker.descriptor.workerId} did not recover for the first fresh resume`,
+						);
+					}
+					return worker;
 				}
-				return worker;
+
+				await inFlightRecovery;
+				if (worker.client && worker.descriptor.lifecycle === "ready") {
+					return worker;
+				}
+				// Another fresh resume can claim the one-shot environment after the
+				// env-less recovery settles. It is now the owner; join it instead
+				// of overwriting its credentials.
+				if (worker.recovery) {
+					await worker.recovery;
+					if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+						throw new Error(
+							worker.descriptor.lastError ??
+								`Session worker ${worker.descriptor.workerId} did not recover for the first fresh resume`,
+						);
+					}
+					return worker;
+				}
 			}
 			worker.recoveryLaunchEnv = command.launchEnv;
 			worker.intentionalStop = false;

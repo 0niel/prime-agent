@@ -1498,6 +1498,75 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(recoverWorker).toHaveBeenCalledOnce();
 	});
 
+	it("lets the first fresh resume adopt recovery after an automatic env-less recovery settles", async () => {
+		type RecoveryWorker = {
+			descriptor: {
+				workerId: string;
+				rootActiveSessionId: string;
+				lifecycle: "failed" | "recovering" | "ready";
+				consecutiveFailures: number;
+				stopRequestedAt?: string;
+				archiveOnStop?: boolean;
+				lastError?: string;
+			};
+			client?: object;
+			recovery?: Promise<void>;
+			recoveryLaunchEnv?: Record<string, string>;
+			intentionalStop: boolean;
+		};
+		type RecoveryHarness = {
+			persistWorker: ReturnType<typeof vi.fn>;
+			recoverWorker: ReturnType<typeof vi.fn>;
+			reuseWorkerForCreate(
+				worker: RecoveryWorker,
+				ownerClientId: undefined,
+				sessionPath: string,
+				command: { type: "create"; lifecycle?: "client_owned"; launchEnv: Record<string, string> },
+			): Promise<RecoveryWorker>;
+		};
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-automatic-env-less",
+				rootActiveSessionId: "active-automatic-env-less",
+				lifecycle: "recovering",
+				consecutiveFailures: 1,
+			},
+			intentionalStop: false,
+		};
+		const automaticRecoveryFinished = createDeferred<void>();
+		// This is the supervisor's automatic recovery: it owns no fresh environment
+		// and completes by publishing the terminal waiting-for-env failure.
+		const automaticRecovery = automaticRecoveryFinished.promise.finally(() => {
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = "Waiting for a client with fresh environment";
+			worker.recoveryLaunchEnv = undefined;
+			worker.recovery = undefined;
+		});
+		worker.recovery = automaticRecovery;
+		let adoptedEnv: Record<string, string> | undefined;
+		const recoverWorker = vi.fn(async (target: RecoveryWorker) => {
+			adoptedEnv = target.recoveryLaunchEnv;
+			target.client = {};
+			target.descriptor.lifecycle = "ready";
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			persistWorker: vi.fn(),
+			recoverWorker,
+		}) as RecoveryHarness;
+
+		const resumeB = supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/automatic-env-less", {
+			type: "create",
+			launchEnv: { ACP_FIXTURE_API_KEY: "fresh-B" },
+		});
+		await Promise.resolve();
+		expect(recoverWorker).not.toHaveBeenCalled();
+
+		automaticRecoveryFinished.resolve();
+		await expect(resumeB).resolves.toBe(worker);
+		expect(recoverWorker).toHaveBeenCalledOnce();
+		expect(adoptedEnv).toEqual({ ACP_FIXTURE_API_KEY: "fresh-B" });
+	});
+
 	it("consumes a reconnect recovery environment before a later crash", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
