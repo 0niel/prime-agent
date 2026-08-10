@@ -988,7 +988,10 @@ async function createDaemonClientConnection(options: {
 				await listActiveDaemonSessionSummaries(client),
 				options.sessionPath,
 			);
-			if (activeSummary) {
+			// A failed resident has no credential-bearing worker to attach to. Fall
+			// through to create so the resuming ACP client can offer a fresh,
+			// transient launch environment to its supervised recovery path.
+			if (activeSummary && activeSummary.workerState !== "failed") {
 				return await attach(activeSummary);
 			}
 		}
