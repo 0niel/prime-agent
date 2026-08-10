@@ -2,7 +2,7 @@ import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
 	type ProductionEvidenceInput,
 	projectProductionObservations,
@@ -14,6 +14,7 @@ import {
 	COST_NUMERATOR_SCALE,
 	canonicalJson,
 	createSwarmEvidenceTrustRoot,
+	currentProcessSampler,
 	SWARM_EVIDENCE_COMMITMENT_SCHEMA,
 	swarmEvidenceCommitmentPayload,
 	verifyAuthenticatedSwarmEvidence,
@@ -104,7 +105,12 @@ function expectNoCanaryLeak(chunks: readonly string[]): void {
 async function forgeProcessSampleBundle(directory: string): Promise<string> {
 	const samplePath = join(directory, "process-samples.json");
 	const samples = JSON.parse(await readFile(samplePath, "utf8"));
-	samples[0].processes[0].pid += 1;
+	const firstSample = samples[0];
+	const firstProcess = firstSample.processes[0];
+	if (firstProcess) firstProcess.pid += 1;
+	// B00A's default sampler legitimately returns no processes on some hosts.
+	// A zero-RSS process remains schema-valid and leaves the sample total intact.
+	else firstSample.processes.push({ pid: 1, rssBytes: 0 });
 	const sampleRaw = `${canonicalJson(samples)}\n`;
 	await writeFile(samplePath, sampleRaw);
 	const manifestPath = join(directory, "manifest.json");
@@ -219,6 +225,49 @@ describe("B00B signed production evidence adapter", () => {
 		await expect(
 			verifySignedProductionEvidence(secondArtifactDirectory, second.commitmentPath, wrongKey),
 		).rejects.toThrow("B00B_EVIDENCE_BAD_SIGNATURE");
+	});
+
+	test("coherently forges an empty default B00A sample but cannot satisfy the original external commitment", async () => {
+		const artifactDirectory = await mkdtemp(join(tmpdir(), "b00b-empty-artifact-"));
+		const trustDirectory = await mkdtemp(join(tmpdir(), "b00b-empty-trust-"));
+		cleanup.push(artifactDirectory, trustDirectory);
+		const sampler = vi.spyOn(currentProcessSampler, "sample").mockReturnValue([]);
+		const signer = generateKeyPairSync("ed25519");
+		const publicPem = signer.publicKey.export({ type: "spki", format: "pem" }).toString();
+		let written: Awaited<ReturnType<typeof writeSignedProductionEvidence>>;
+		try {
+			written = await writeSignedProductionEvidence(artifactDirectory, trustDirectory, input(), signer.privateKey);
+		} finally {
+			sampler.mockRestore();
+		}
+		const originalSamples = JSON.parse(await readFile(join(artifactDirectory, "process-samples.json"), "utf8"));
+		expect(originalSamples[0].processes).toEqual([]);
+		expect(originalSamples[0].totalRssBytes).toBe(0);
+		const forgedBundleId = await forgeProcessSampleBundle(artifactDirectory);
+		const forgedSamples = JSON.parse(await readFile(join(artifactDirectory, "process-samples.json"), "utf8"));
+		expect(forgedSamples[0]).toMatchObject({ processes: [{ pid: 1, rssBytes: 0 }], totalRssBytes: 0 });
+		// The forged artifact remains B00A-canonical when re-indexed against its new identity.
+		const attacker = generateKeyPairSync("ed25519");
+		const attackerCommitmentPath = join(trustDirectory, "attacker-commitment.json");
+		await writeFile(
+			attackerCommitmentPath,
+			`${canonicalJson({
+				schemaVersion: SWARM_EVIDENCE_COMMITMENT_SCHEMA,
+				artifactBundleId: forgedBundleId,
+				signature: sign(
+					null,
+					Buffer.from(canonicalJson(swarmEvidenceCommitmentPayload(forgedBundleId))),
+					attacker.privateKey,
+				).toString("base64"),
+			})}\n`,
+		);
+		const attackerPublicPem = attacker.publicKey.export({ type: "spki", format: "pem" }).toString();
+		await expect(
+			verifySignedProductionEvidence(artifactDirectory, attackerCommitmentPath, attackerPublicPem),
+		).resolves.toBeUndefined();
+		await expect(
+			verifySignedProductionEvidence(artifactDirectory, written.commitmentPath, publicPem),
+		).rejects.toThrow("trusted artifact bundle mismatch");
 	});
 
 	test("rejects a coherent manifest/index forgery and tampered external commitment", async () => {
