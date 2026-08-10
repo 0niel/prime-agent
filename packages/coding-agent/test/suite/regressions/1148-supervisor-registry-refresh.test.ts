@@ -3,12 +3,34 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const filesystemFailureState = vi.hoisted(() => ({ failReleasedDirectoryRemoval: false }));
+
+interface FsModule {
+	rmSync(path: string, options?: { force?: boolean; recursive?: boolean }): void;
+}
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<FsModule>();
+	return {
+		...actual,
+		rmSync(path: string, options?: { force?: boolean; recursive?: boolean }): void {
+			if (filesystemFailureState.failReleasedDirectoryRemoval && path.includes(".released-")) {
+				filesystemFailureState.failReleasedDirectoryRemoval = false;
+				throw Object.assign(new Error("injected quarantine cleanup failure"), { code: "EIO" });
+			}
+			actual.rmSync(path, options);
+		},
+	};
+});
+
 import { acquireDaemonSupervisorOwnership } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
 	vi.useRealTimers();
+	filesystemFailureState.failReleasedDirectoryRemoval = false;
 	for (const directory of tempDirs.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
 	}
@@ -99,11 +121,35 @@ describe("#1148 supervisor registry pruning recovery", () => {
 		});
 		try {
 			await expect(original.assertCurrent()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
+			await expect(original.updatePhase("owner")).rejects.toMatchObject({ code: "supervisor_generation_stale" });
+			const replacementRecord = JSON.parse(
+				readFileSync(join(ownerDirectory(paths.registryDir, replacement.record.generation), "owner.json"), "utf8"),
+			) as { phase: string };
+			expect(replacementRecord.phase).toBe("starting");
 		} finally {
 			await replacement.release();
 			await original.release();
 		}
 	});
+	it("keeps release irrevocable when quarantine cleanup fails", async () => {
+		const paths = fixture();
+		const generation = "release-cleanup-failure-generation";
+		const ownership = await acquireDaemonSupervisorOwnership({
+			...paths,
+			generation,
+			appVersion: "test",
+		});
+		const directory = ownerDirectory(paths.registryDir, generation);
+		filesystemFailureState.failReleasedDirectoryRemoval = true;
+
+		await expect(ownership.release()).resolves.toBeUndefined();
+
+		expect(existsSync(directory)).toBe(false);
+		await expect(ownership.assertCurrent()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
+		await expect(ownership.updatePhase("owner")).resolves.toBeUndefined();
+		expect(existsSync(directory)).toBe(false);
+	});
+
 	it("does not reconstruct ownership when release races a guarded phase update", async () => {
 		const paths = fixture();
 		const generation = "release-race-generation";

@@ -151,10 +151,16 @@ class DaemonSupervisorOwnership {
 	}
 
 	async updatePhase(phase: DaemonSupervisorOwnerPhase): Promise<void> {
+		if (this.state === "lost") {
+			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+		}
 		if (this.state !== "active") {
 			return;
 		}
 		return this.enqueueOperation(async () => {
+			if (this.state === "lost") {
+				throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+			}
 			if (this.state !== "active") {
 				return;
 			}
@@ -166,7 +172,7 @@ class DaemonSupervisorOwnership {
 			}
 			if (!updated) {
 				this.markLost();
-				throw new Error(`Daemon supervisor ownership was lost for ${this.record.socketPath}`);
+				throw new DaemonSupervisorOwnershipLostError(this.record.generation);
 			}
 		});
 	}
@@ -183,19 +189,27 @@ class DaemonSupervisorOwnership {
 		this.stopRefreshTimer();
 		this.releasePromise = this.enqueueOperation(async () => {
 			let releasedDirectory: string | undefined;
+			let releaseCommitted = false;
 			try {
 				await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
 					const current = readOwnerRecord(this.ownerDirectory);
-					if (!current || current.token !== this.record.token) {
-						return;
+					if (current?.token === this.record.token) {
+						releasedDirectory = `${this.ownerDirectory}.released-${randomUUID()}`;
+						renameSync(this.ownerDirectory, releasedDirectory);
 					}
-					releasedDirectory = `${this.ownerDirectory}.released-${randomUUID()}`;
-					renameSync(this.ownerDirectory, releasedDirectory);
+					releaseCommitted = true;
 				});
-				this.state = "released";
-			} finally {
-				if (releasedDirectory) {
+			} catch (error) {
+				if (!releaseCommitted) {
+					throw error;
+				}
+			}
+			this.state = "released";
+			if (releasedDirectory) {
+				try {
 					rmSync(releasedDirectory, { recursive: true, force: true });
+				} catch {
+					// The canonical owner is already gone; quarantine cleanup is best-effort.
 				}
 			}
 		}).catch((error) => {
