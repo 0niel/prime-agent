@@ -11,14 +11,18 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { cpus, platform, release, totalmem } from "node:os";
 import { dirname, join } from "node:path";
+import {
+	DEFAULT_RSS_REQUESTED_PERIOD_MS,
+	MAX_RSS_SAMPLE_GAP_MS,
+	validateRssSampleCadence,
+} from "./rss-campaign-cadence.js";
 
 const FANOUTS = [1, 4, 16, 64] as const;
 const WORKER = new URL("./rss-campaign-worker.ts", import.meta.url);
-const MIN_INTERVAL_MS = 50;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const REAP_GRACE_MS = 250;
 const REAP_VERIFY_MS = 1_000;
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 type SupportedPlatform = "linux";
 type Phase = "baseline" | "started" | "barrier-held" | "terminals" | "cleanup" | "final";
@@ -62,7 +66,13 @@ interface Repetition {
 	fanout: number;
 	repetition: number;
 	warmup: boolean;
-	sampler: { source: "proc-status"; intervalMs: number; sharedPages: "summed-per-process" } | null;
+	sampler: {
+		source: "proc-status";
+		requestedPeriodMs: number;
+		maxGapMs: number;
+		maxObservedGapMs: number | null;
+		sharedPages: "summed-per-process";
+	} | null;
 	reasonCode: number | null;
 	baselineRssKiB: number | null;
 	peakRssKiB: number | null;
@@ -79,7 +89,7 @@ interface Config {
 	fanouts: readonly number[];
 	repetitions: number;
 	output: string;
-	intervalMs: number;
+	requestedPeriodMs: number;
 	timeoutMs: number;
 	platformRequired?: string;
 	fixtureCommand?: string;
@@ -113,7 +123,8 @@ function parseFanouts(value: string | undefined): readonly number[] {
 }
 
 function config(): Config {
-	const intervalMs = safeInteger("--interval-ms", MIN_INTERVAL_MS, MIN_INTERVAL_MS);
+	const maxGapMs = safeInteger("--interval-ms", MAX_RSS_SAMPLE_GAP_MS, MAX_RSS_SAMPLE_GAP_MS);
+	if (maxGapMs !== MAX_RSS_SAMPLE_GAP_MS) throw new Error("interval_ms_must_be_50");
 	const fixtureArgs: string[] = [];
 	for (let index = 0; index < process.argv.length; index += 1) {
 		if (process.argv[index] === "--fixture-arg") {
@@ -127,7 +138,7 @@ function config(): Config {
 		fanouts: parseFanouts(option("--fanout")),
 		repetitions: safeInteger("--repetitions", 3, 1),
 		output: option("--output") ?? "b00b-rss-artifacts",
-		intervalMs,
+		requestedPeriodMs: DEFAULT_RSS_REQUESTED_PERIOD_MS + safeInteger("--test-scheduler-jitter-ms", 0, 0),
 		timeoutMs: safeInteger("--timeout-ms", DEFAULT_TIMEOUT_MS, 1),
 		platformRequired: option("--platform-required"),
 		fixtureCommand: option("--fixture-command"),
@@ -159,26 +170,47 @@ async function writeOwnerFile(path: string, content: string): Promise<void> {
 	await chmod(path, 0o600);
 }
 
-async function procRecord(pid: number): Promise<ProcessRecord | undefined> {
+interface ProcessIdentity {
+	pid: number;
+	ppid: number;
+	pgid: number;
+	start: number;
+}
+
+function parseProcessIdentity(pid: number, statLine: string): ProcessIdentity | undefined {
+	const close = statLine.lastIndexOf(")");
+	const fields = statLine
+		.slice(close + 2)
+		.trim()
+		.split(/\s+/);
+	const ppid = Number(fields[1]); // field 4 after removing pid/comm
+	const pgid = Number(fields[2]); // field 5 after removing pid/comm
+	const start = Number(fields[19]); // field 22 after removing pid/comm
+	if (![ppid, pgid, start].every(Number.isSafeInteger)) return undefined;
+	return { pid, ppid, pgid, start };
+}
+
+async function procIdentity(pid: number): Promise<ProcessIdentity | undefined> {
 	try {
-		const [statLine, status] = await Promise.all([
-			readFile(`/proc/${pid}/stat`, "utf8"),
-			readFile(`/proc/${pid}/status`, "utf8"),
-		]);
-		const close = statLine.lastIndexOf(")");
-		const fields = statLine
-			.slice(close + 2)
-			.trim()
-			.split(/\s+/);
-		const ppid = Number(fields[1]); // field 4 after removing pid/comm
-		const pgid = Number(fields[2]); // field 5 after removing pid/comm
-		const start = Number(fields[19]); // field 22 after removing pid/comm
-		const rss = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status)?.[1];
-		if (![ppid, pgid, start].every(Number.isSafeInteger) || rss === undefined) return undefined;
-		return { pid, ppid, pgid, start, rssKiB: Number(rss) };
+		return parseProcessIdentity(pid, await readFile(`/proc/${pid}/stat`, "utf8"));
 	} catch {
 		return undefined;
 	}
+}
+
+async function procRecordForIdentity(identity: ProcessIdentity): Promise<ProcessRecord | undefined> {
+	try {
+		const status = await readFile(`/proc/${identity.pid}/status`, "utf8");
+		const rss = /^VmRSS:\s+(\d+)\s+kB$/m.exec(status)?.[1];
+		return rss === undefined ? undefined : { ...identity, rssKiB: Number(rss) };
+	} catch {
+		return undefined;
+	}
+}
+
+async function procRecord(pid: number): Promise<ProcessRecord | undefined> {
+	const identity = await procIdentity(pid);
+	return identity ? procRecordForIdentity(identity) : undefined;
 }
 
 async function groupSnapshot(pgid: number): Promise<readonly ProcessRecord[]> {
@@ -188,11 +220,15 @@ async function groupSnapshot(pgid: number): Promise<readonly ProcessRecord[]> {
 	} catch {
 		return [];
 	}
-	const records = await Promise.all(
-		entries.filter((entry) => /^\d+$/.test(entry)).map((entry) => procRecord(Number(entry))),
+	// Scanning all /proc stat files identifies the process group without reading
+	// every status file; VmRSS is read only for members of this measured group.
+	const identities = await Promise.all(
+		entries.filter((entry) => /^\d+$/.test(entry)).map((entry) => procIdentity(Number(entry))),
 	);
+	const members = identities.filter((identity): identity is ProcessIdentity => identity?.pgid === pgid);
+	const records = await Promise.all(members.map(procRecordForIdentity));
 	return records
-		.filter((record): record is ProcessRecord => record?.pgid === pgid)
+		.filter((record): record is ProcessRecord => record !== undefined)
 		.sort((left, right) => left.pid - right.pid);
 }
 
@@ -311,10 +347,7 @@ async function runCell(
 	let completed = 0;
 	let failed = fanout;
 	let allocatedBytes = 0;
-	let cadenceFailed = false;
 	let queue = Promise.resolve();
-	let lastPeriodicSample: number | undefined;
-	let periodicSamples = 0;
 	const pendingMemberPids = new Set<number>();
 	const enqueue = (phase: Phase, memberPids: readonly number[] = []): Promise<void> => {
 		for (const pid of memberPids) pendingMemberPids.add(pid);
@@ -331,12 +364,6 @@ async function runCell(
 			const records = await groupSnapshot(currentOwnership.pgid);
 			remember(currentOwnership, records);
 			const entry = sample(phase, records);
-			if (phase === "started") {
-				if (lastPeriodicSample !== undefined && entry.monotonicMs - lastPeriodicSample > settings.intervalMs)
-					cadenceFailed = true;
-				lastPeriodicSample = entry.monotonicMs;
-				periodicSamples += 1;
-			}
 			samples.push(entry);
 		});
 		return queue;
@@ -350,7 +377,10 @@ async function runCell(
 			if (timer) clearInterval(timer);
 			if (timeout) clearTimeout(timeout);
 			await queue;
-			if (requested === "complete" && periodicSamples < 2) cadenceFailed = true;
+			const cadence = validateRssSampleCadence(
+				samples.filter((entry) => entry.phase === "started").map((entry) => entry.monotonicMs),
+			);
+			const cadenceFailed = !cadence.valid;
 			const reaped = await reapOwnGroup(ownership);
 			const finalRecords = ownership ? await groupSnapshot(ownership.pgid) : [];
 			samples.push(sample("final", finalRecords));
@@ -364,7 +394,13 @@ async function runCell(
 				fanout,
 				repetition,
 				warmup,
-				sampler: { source: "proc-status", intervalMs: settings.intervalMs, sharedPages: "summed-per-process" },
+				sampler: {
+					source: "proc-status",
+					requestedPeriodMs: settings.requestedPeriodMs,
+					maxGapMs: MAX_RSS_SAMPLE_GAP_MS,
+					maxObservedGapMs: cadence.maxObservedGapMs,
+					sharedPages: "summed-per-process",
+				},
 				reasonCode: status === "complete" ? null : timedOut ? 1 : cadenceFailed ? 4 : 2,
 				baselineRssKiB: 0,
 				peakRssKiB: active.length ? Math.max(...active.map((entry) => entry.totalRssKiB)) : null,
@@ -403,7 +439,7 @@ async function runCell(
 			void enqueue("started");
 			timer = setInterval(() => {
 				if (!stopped) void enqueue("started");
-			}, settings.intervalMs);
+			}, settings.requestedPeriodMs);
 		});
 		timeout = setTimeout(() => {
 			timedOut = true;
@@ -526,7 +562,8 @@ async function main(): Promise<void> {
 		memoryBytes: totalmem(),
 		gitSha: await gitSha(),
 		collector: kind === "linux" ? "proc-status" : "unsupported",
-		intervalMs: settings.intervalMs,
+		requestedPeriodMs: settings.requestedPeriodMs,
+		maxGapMs: MAX_RSS_SAMPLE_GAP_MS,
 		timeoutMs: settings.timeoutMs,
 		fanouts: settings.fanouts,
 		repetitions: settings.repetitions,

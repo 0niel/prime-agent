@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { validateRssSampleCadence } from "./rss-campaign-cadence.js";
 
 const execute = promisify(execFile);
 const launcher = fileURLToPath(new URL("./run-production-rss-campaign.ts", import.meta.url));
@@ -85,22 +86,52 @@ describe("B00B RSS campaign", () => {
 		},
 	);
 
+	it("validates unchanged sample timestamps at the 50 ms max-gap contract", () => {
+		expect(validateRssSampleCadence([0, 50, 100]).valid).toBe(true);
+		expect(validateRssSampleCadence([0, 25, 76])).toEqual({ maxObservedGapMs: 51, valid: false });
+	});
+
 	it.skipIf(process.platform !== "linux")(
-		"records a real 20 Hz fanout-64 cadence or marks the cell failed",
+		"uses 25 ms jitter headroom while recording the 50 ms cadence contract",
 		async () => {
 			const output = join(await directory("cadence"), "output");
-			await campaign(output, ["--fanout", "64", "--repetitions", "1", "--interval-ms", "50"]);
+			await campaign(output, ["--fanout", "64", "--repetitions", "1"]);
 			const result = await run(output, 64, 1);
-			if (result.status === "complete") {
-				const periodic = (result.samples as { phase: string; monotonicMs: number }[]).filter(
-					(sample) => sample.phase === "started",
-				);
-				const gaps = periodic.slice(1).map((sample, index) => sample.monotonicMs - periodic[index].monotonicMs);
-				expect(gaps.length).toBeGreaterThan(0);
-				expect(Math.max(...gaps)).toBeLessThanOrEqual(50);
-			} else {
-				expect(result.reasonCode).toBe(4);
-			}
+			const sampler = result.sampler as {
+				requestedPeriodMs: number;
+				maxGapMs: number;
+				maxObservedGapMs: number | null;
+			};
+			expect(sampler.requestedPeriodMs).toBe(25);
+			expect(sampler.maxGapMs).toBe(50);
+			if (result.status === "complete") expect(sampler.maxObservedGapMs).toBeLessThanOrEqual(50);
+			else expect(result.reasonCode).toBe(4);
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")(
+		"fails rather than relabeling samples when injected scheduler jitter exceeds 50 ms",
+		async () => {
+			const output = join(await directory("cadence-jitter"), "output");
+			await campaign(output, [
+				"--fanout",
+				"1",
+				"--repetitions",
+				"1",
+				"--test-scheduler-jitter-ms",
+				"26",
+				"--fixture-command",
+				process.execPath,
+				"--fixture-arg",
+				"-e",
+				"--fixture-arg",
+				"setTimeout(()=>process.exit(0),150)",
+			]);
+			const result = await run(output, 1, 1);
+			expect(result.status).toBe("failed");
+			expect(result.reasonCode).toBe(4);
+			expect((result.sampler as { requestedPeriodMs: number }).requestedPeriodMs).toBe(51);
+			expect((result.sampler as { maxObservedGapMs: number }).maxObservedGapMs).toBeGreaterThan(50);
 		},
 	);
 
