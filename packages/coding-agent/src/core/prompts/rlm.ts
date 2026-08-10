@@ -17,6 +17,21 @@ const DEFAULT_CONTROL_LOOP_PROMPT = [
 	"If a runtime offers `follow_up` or `steer`, use its documented contract when appropriate; this prompt neither implements nor guarantees callback delivery, follow-up scheduling, or user-input priority.",
 ].join("\n");
 
+const CLEAR_DIRECT_PROSE_PROMPT = [
+	"### Clear direct prose",
+	"When you write short direct prose for the user, use clear and direct English.",
+	"Prefer short sentences. Use common words and concrete verbs. State one main",
+	"action or fact in each sentence when practical. Use a list when it makes",
+	"steps or conditions easier to scan. Keep needed technical terms, names,",
+	"commands, code, paths, and exact quoted text unchanged. If a detail is",
+	"uncertain, say that it is uncertain. Do not claim that text is ASD-STE100",
+	"compliant, certified, approved, or guaranteed.",
+	"",
+	"This is writing guidance, not a compliance check. Do not invent a rule,",
+	"measurement, warning, or refusal solely to enforce this guidance. Preserve",
+	"the user's requested format, tone, terminology, and necessary precision.",
+].join("\n");
+
 const IPYTHON_CONTROL_PROMPT = [
 	"IPython is the agent's long-lived notebook: a persistent control environment for reasoning, context management, state, tool orchestration, and recursive subcalls. Use it to keep intermediate variables, inspect and transform outputs, write small helper functions, and preserve useful state across turns or compaction.",
 	"",
@@ -82,7 +97,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		"",
 		DEFAULT_CONTROL_LOOP_PROMPT,
 		"",
-		"For prose that you write yourself, use ASD-STE100 simplified technical English unless the user asks for another style. Use short direct sentences. Use active voice. Put one instruction in each sentence. Use common approved words. Keep required technical terms, code, commands, identifiers, quotations, and URLs unchanged. Do not change user-provided text.",
+		CLEAR_DIRECT_PROSE_PROMPT,
 		"",
 		`Working directory: ${cwd}`,
 		`Conversation log: ${messagesPath}`,

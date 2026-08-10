@@ -66,9 +66,7 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain(followUpClause);
 		expect(prompt).toContain(nonGuaranteeClause);
 		expect(prompt.indexOf(nonblockingClause)).toBeLessThan(prompt.indexOf(followUpClause));
-		expect(prompt.indexOf(followUpClause)).toBeLessThan(
-			prompt.indexOf("For prose that you write yourself, use ASD-STE100"),
-		);
+		expect(prompt.indexOf(followUpClause)).toBeLessThan(prompt.indexOf("### Clear direct prose"));
 	});
 
 	test("includes default control-loop guidance without IPython mechanics", () => {
@@ -554,27 +552,82 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).not.toContain("await refine.run()");
 	});
 
-	test("adds the simplified-English rule only to the default prompt", () => {
-		const defaultPrompt = buildSystemPrompt({
+	test("adds the exact clear-direct-prose block once at the stable built-in guidance location", () => {
+		const block = [
+			"### Clear direct prose",
+			"When you write short direct prose for the user, use clear and direct English.",
+			"Prefer short sentences. Use common words and concrete verbs. State one main",
+			"action or fact in each sentence when practical. Use a list when it makes",
+			"steps or conditions easier to scan. Keep needed technical terms, names,",
+			"commands, code, paths, and exact quoted text unchanged. If a detail is",
+			"uncertain, say that it is uncertain. Do not claim that text is ASD-STE100",
+			"compliant, certified, approved, or guaranteed.",
+			"",
+			"This is writing guidance, not a compliance check. Do not invent a rule,",
+			"measurement, warning, or refusal solely to enforce this guidance. Preserve",
+			"the user's requested format, tone, terminology, and necessary precision.",
+		].join("\n");
+		const prompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			activeTools: ["ipython"],
+			allowRecursion: false,
+		});
+		const blockIndex = prompt.indexOf(block);
+
+		expect(blockIndex).toBeGreaterThan(prompt.indexOf("When you are done, stop calling tools"));
+		expect(blockIndex).toBeLessThan(prompt.indexOf("Working directory: /repo"));
+		expect(prompt.slice(blockIndex, blockIndex + block.length)).toBe(block);
+		expect(prompt.match(/### Clear direct prose/g)).toHaveLength(1);
+	});
+
+	test("keeps all P02 prose guidance out of custom prompts, including lookalikes", () => {
+		const p02Heading = "### Clear direct prose";
+		const distinctiveCustomPrompt = "CUSTOM-PROMPT-BYTES: Preserve this exact caller text.";
+		const customPrompt = buildSystemPrompt({
+			customPrompt: distinctiveCustomPrompt,
 			selectedTools: ["ipython"],
 			contextFiles: [],
 			skills: [],
 			cwd: "/repo",
 		});
-		const customPrompt = buildSystemPrompt({
-			customPrompt: "Use the user-provided style.",
+		const lookalikeCustomPrompt = `Caller-owned guidance only.\n${p02Heading}\nUse clear and direct English.`;
+		const assembledLookalike = buildSystemPrompt({
+			customPrompt: lookalikeCustomPrompt,
 			selectedTools: ["ipython"],
 			contextFiles: [],
 			skills: [],
 			cwd: "/repo",
 		});
 
-		expect(defaultPrompt).toContain(
-			"For prose that you write yourself, use ASD-STE100 simplified technical English unless the user asks for another style.",
-		);
-		expect(defaultPrompt).toContain("Do not change user-provided text.");
-		expect(customPrompt).toContain("Use the user-provided style.");
-		expect(customPrompt).not.toContain("For prose that you write yourself, use ASD-STE100");
+		expect(customPrompt.slice(0, distinctiveCustomPrompt.length)).toBe(distinctiveCustomPrompt);
+		expect(customPrompt).not.toContain(p02Heading);
+		expect(customPrompt).not.toContain("This is writing guidance, not a compliance check.");
+		expect(assembledLookalike.slice(0, lookalikeCustomPrompt.length)).toBe(lookalikeCustomPrompt);
+		expect(assembledLookalike.match(/### Clear direct prose/g)).toHaveLength(1);
+		expect(assembledLookalike.match(/clear and direct English/g)).toHaveLength(1);
+	});
+
+	test("does not make ASD-STE100 certification, checker, or conformance claims", () => {
+		const prompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			activeTools: ["bash"],
+			allowRecursion: false,
+		});
+
+		for (const forbiddenClaim of [
+			"This text is ASD-STE100 compliant",
+			"compliant with ASD-STE100",
+			"ASD-STE100 certified",
+			"ASD-STE100 approved",
+			"guaranteed to conform",
+			"is an ASD-STE100 checker",
+			"enforces ASD-STE100",
+			"ASD-STE100 edition",
+		]) {
+			expect(prompt).not.toContain(forbiddenClaim);
+		}
 	});
 
 	test("uses built-in assembly when provenance is absent", () => {
