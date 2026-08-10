@@ -2124,7 +2124,7 @@ export class DaemonSupervisor {
 				const existing = activeMatches[0]!.worker;
 				// Preserve the #836 access collision behavior: do not let an
 				// unauthorized create revive a client-owned passive root.
-				this.reuseWorkerForCreate(existing, ownerClientId, command.sessionPath);
+				this.reuseWorkerForCreate(existing, ownerClientId, command.sessionPath, command.launchEnv);
 				await this.wakePassivatedWorker(existing);
 				return existing;
 			}
@@ -2138,7 +2138,7 @@ export class DaemonSupervisor {
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing) {
-				this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath);
+				this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath, command.launchEnv);
 				await this.wakePassivatedWorker(existing.worker);
 				return existing.worker;
 			}
@@ -2242,11 +2242,17 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
 		sessionPath: string,
+		launchEnv: Record<string, string> | undefined,
 	): ResidentWorker {
-		if (worker.descriptor.ownerClientId === ownerClientId) {
-			return worker;
+		if (worker.descriptor.ownerClientId !== ownerClientId) {
+			throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
 		}
-		throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
+		// Only an authorized owner may supply the process environment used to wake
+		// its passive worker. Keep a previously authorized environment when absent.
+		if (ownerClientId !== undefined) {
+			worker.launchEnv = launchEnv ?? worker.launchEnv;
+		}
+		return worker;
 	}
 
 	private async promoteOwnedWorker(client: DaemonSocketClient, worker: ResidentWorker): Promise<void> {

@@ -506,15 +506,18 @@ describe("daemon supervisor restart passivation", () => {
 		expect(supervisor.workers.get("busy")?.descriptor.lifecycle).toBe("recovering");
 	});
 
-	it("recovers an orphan cron dispatch but passivates a matched completed dispatch", async () => {
+	it("recovers orphan and completed-recurring cron dispatches but passivates a matched completed one-shot", async () => {
 		const fixture = fixtureRoot();
 		const orphan = persistSession(fixture.sessionDir, fixture.root, "completed");
 		const completed = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const completedRecurring = persistSession(fixture.sessionDir, fixture.root, "completed");
 		const orphanEntry = descriptor(fixture, "orphan-dispatch", orphan);
 		const completedEntry = descriptor(fixture, "completed-dispatch", completed);
+		const completedRecurringEntry = descriptor(fixture, "completed-recurring-dispatch", completedRecurring);
 		const artifact = (session: { id: string }) => join(fixture.agentDir, "session-artifacts", session.id);
 		mkdirSync(artifact(orphan), { recursive: true });
 		mkdirSync(artifact(completed), { recursive: true });
+		mkdirSync(artifact(completedRecurring), { recursive: true });
 		writeFileSync(
 			join(artifact(orphan), "scheduled-jobs.json"),
 			JSON.stringify({
@@ -558,7 +561,36 @@ describe("daemon supervisor restart passivation", () => {
 				],
 			}),
 		);
-		for (const entry of [orphanEntry, completedEntry])
+		writeFileSync(
+			join(artifact(completedRecurring), "scheduled-jobs.json"),
+			JSON.stringify({
+				jobs: [
+					{
+						id: "completed-recurring",
+						status: "completed",
+						source: "cron",
+						activeSessionId: completedRecurringEntry.rootActiveSessionId,
+						sessionId: completedRecurring.id,
+						sessionFile: completedRecurring.sessionFile,
+						cwd: fixture.root,
+						prompt: "interrupted recurring schedule",
+						schedule: { kind: "interval", expression: "every 1m", intervalMs: 60_000 },
+						createdAt: new Date(0).toISOString(),
+						updatedAt: new Date(0).toISOString(),
+						runCount: 1,
+					},
+				],
+				dispatches: [
+					{
+						id: "completed-recurring-dispatch",
+						jobId: "completed-recurring",
+						claimedAt: new Date(0).toISOString(),
+						scheduledFor: new Date(0).toISOString(),
+					},
+				],
+			}),
+		);
+		for (const entry of [orphanEntry, completedEntry, completedRecurringEntry])
 			writeFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), JSON.stringify(entry));
 		const supervisor = new DaemonSupervisor(fixture.socketPath, {
 			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
@@ -567,6 +599,7 @@ describe("daemon supervisor restart passivation", () => {
 		await supervisor.loadWorkerDescriptors();
 		expect(supervisor.workers.get(orphanEntry.workerId)?.descriptor.lifecycle).toBe("recovering");
 		expect(supervisor.workers.get(completedEntry.workerId)?.descriptor.lifecycle).toBe("passivated");
+		expect(supervisor.workers.get(completedRecurringEntry.workerId)?.descriptor.lifecycle).toBe("recovering");
 	});
 
 	it("does not recover a saved processless client-owned passive root until its owner attaches with env", async () => {
@@ -625,6 +658,72 @@ describe("daemon supervisor restart passivation", () => {
 			},
 			{ type: "attach", activeSessionId: entry.rootActiveSessionId, launchEnv: { HERDR_PANE_ID: "pane" } },
 		);
+		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
+	});
+
+	it("lets only the owner replace launch env before reusing a passive client-owned root", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const entry = {
+			...descriptor(fixture, "client-owned-reuse", session),
+			ownerClientId: "owner-client",
+			lifecycle: "passivated" as const,
+		};
+		delete entry.pid;
+		writeFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), JSON.stringify(entry));
+
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals & {
+			createOrReuseWorker(
+				clientId: string,
+				command: {
+					type: "create";
+					sessionPath: string;
+					lifecycle?: "client_owned";
+					launchEnv?: Record<string, string>;
+				},
+			): Promise<WorkerFixture & { launchEnv?: Record<string, string> }>;
+		};
+		await supervisor.loadWorkerDescriptors();
+		const passive = supervisor.workers.get(entry.workerId);
+		if (!passive) throw new Error("passive owner worker was not loaded");
+		supervisor.recoverWorker = vi.fn(async () => {
+			passive.descriptor.lifecycle = "ready";
+			passive.client = {};
+		});
+
+		await expect(
+			supervisor.createOrReuseWorker("other-client", {
+				type: "create",
+				sessionPath: session.sessionFile,
+				lifecycle: "client_owned",
+				launchEnv: { HERDR_PANE_ID: "injected" },
+			}),
+		).rejects.toThrow("already active");
+		expect((passive as { launchEnv?: Record<string, string> }).launchEnv).toBeUndefined();
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+
+		const reused = await supervisor.createOrReuseWorker("owner-client", {
+			type: "create",
+			sessionPath: session.sessionFile,
+			lifecycle: "client_owned",
+			launchEnv: { HERDR_PANE_ID: "owner-pane" },
+		});
+		expect(reused).toBe(passive);
+		expect(reused.launchEnv).toEqual({ HERDR_PANE_ID: "owner-pane" });
+		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
+
+		// Reuse by the active-session selector takes the other matching path and
+		// must update the authorized owner's environment without another wake.
+		await supervisor.createOrReuseWorker("owner-client", {
+			type: "create",
+			sessionPath: entry.rootActiveSessionId,
+			lifecycle: "client_owned",
+			launchEnv: { HERDR_PANE_ID: "owner-pane-after-restart" },
+		});
+		expect(reused.launchEnv).toEqual({ HERDR_PANE_ID: "owner-pane-after-restart" });
 		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
 	});
 

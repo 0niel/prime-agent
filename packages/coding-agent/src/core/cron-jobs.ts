@@ -263,8 +263,14 @@ export class AgentCronJobStore {
 			// Dispatches are not independently meaningful. An orphan, cross-session,
 			// or terminal-state mismatch may represent work whose result was lost. A
 			// completed one-shot dispatch is safe: its durable terminal job proves there
-			// is no schedule left to revive.
-			if (!job || job.sessionId !== sessionId || (job.status !== "active" && job.status !== "completed")) {
+			// is no schedule left to revive. A recurring job can become completed only
+			// after an interrupted state transition, so its outstanding dispatch is
+			// recoverable rather than evidence that passivation is safe.
+			if (
+				!job ||
+				job.sessionId !== sessionId ||
+				(job.status !== "active" && (job.status !== "completed" || job.schedule.kind !== "once"))
+			) {
 				return true;
 			}
 		}
