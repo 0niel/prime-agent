@@ -1,17 +1,29 @@
 /** Production-path coverage for the B00B test-only scripted provider. */
+import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { AgentSession } from "../../src/core/agent-session.js";
+import {
+	type AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionFromServices,
+	createAgentSessionRuntime,
+	createAgentSessionServices,
+} from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
 import { createTestResourceLoader } from "../utilities.js";
+import {
+	verifySignedProductionEvidenceFreshProcess,
+	writeSignedProductionEvidence,
+} from "./production-evidence-adapter.js";
 import { createBarrierScriptedProvider, type ProviderScript } from "./production-scripted-provider.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -44,9 +56,9 @@ const canaries = [
 
 function provider(scripts: Record<string, readonly ProviderScript[]>, expected: readonly string[]) {
 	const registered = createBarrierScriptedProvider({
-		api: "b00b-scripted-api",
+		api: "b00b-scripted",
 		provider: "b00b-scripted",
-		barrier: { expected, timeoutMs: 2_000 },
+		barrier: { expected, timeoutMs: 10_000 },
 		models: [
 			{
 				id: "fixture-a",
@@ -88,6 +100,91 @@ function agentFor(
 async function readTree(directory: string): Promise<string> {
 	const names = await readdir(directory);
 	return (await Promise.all(names.map((name) => readFile(join(directory, name), "utf8")))).join("\n");
+}
+
+function providerRegistration(models: ReturnType<typeof provider>["models"]) {
+	return {
+		baseUrl: models[0]!.baseUrl,
+		apiKey: "fixture-key",
+		api: models[0]!.api,
+		models: models.map((model) => ({
+			id: model.id,
+			name: model.name,
+			api: model.api,
+			reasoning: model.reasoning,
+			input: model.input,
+			cost: model.cost,
+			contextWindow: model.contextWindow,
+			maxTokens: model.maxTokens,
+			baseUrl: model.baseUrl,
+		})),
+	};
+}
+
+/**
+ * Builds the same in-process runtime host used by production sessions.  In
+ * particular, children are created by AgentSessionRuntime rather than injected
+ * AgentSession fixtures, so this reaches runRlmChild -> runtime -> agent-loop.
+ */
+async function runtimeForRlmFixture(
+	fixture: ReturnType<typeof provider>,
+	directory: string,
+): Promise<AgentSessionRuntime> {
+	const authStorage = AuthStorage.inMemory();
+	const rootModel = fixture.models[0]!;
+	authStorage.setRuntimeApiKey(rootModel.provider, "fixture-key");
+	const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
+	const registration = providerRegistration(fixture.models);
+	const createRuntime: CreateAgentSessionRuntimeFactory = async (runtimeOptions) => {
+		const services = await createAgentSessionServices({
+			cwd: runtimeOptions.cwd,
+			agentDir: directory,
+			authStorage,
+			settingsManager,
+			telemetryDisabled: true,
+			resourceLoaderOptions: {
+				extensionFactories: [
+					(pi) => {
+						pi.registerProvider(rootModel.provider, registration);
+					},
+				],
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+			},
+		});
+		const result = await createAgentSessionFromServices({
+			services,
+			sessionManager: runtimeOptions.sessionManager,
+			sessionStartEvent: runtimeOptions.sessionStartEvent,
+			...runtimeOptions.sessionOptions,
+		});
+		return { ...result, services, diagnostics: services.diagnostics };
+	};
+	return createAgentSessionRuntime(createRuntime, {
+		cwd: directory,
+		agentDir: directory,
+		sessionManager: SessionManager.create(directory, join(directory, "sessions")),
+		sessionOptions: {
+			model: rootModel,
+			noTools: "all",
+			includeGoals: false,
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
+		},
+	});
+}
+
+function requestIds(fanout: number, offset = 10): string[] {
+	return Array.from({ length: fanout }, (_, index) => `request-${String(index + offset).padStart(4, "0")}`);
+}
+
+async function waitForTerminals(fixture: ReturnType<typeof provider>, count: number): Promise<void> {
+	await vi.waitFor(
+		() =>
+			expect(fixture.observations().filter((observation) => observation.eventKinds.length > 0)).toHaveLength(count),
+		{ timeout: 10_000, interval: 10 },
+	);
 }
 
 describe("B00B production scripted provider", () => {
@@ -249,6 +346,189 @@ describe("B00B production scripted provider", () => {
 			responseModel: "fixture-zero-resolved",
 		});
 		expect(observed.filter((item) => item.requestId === ids[0])[0]?.eventKinds).toHaveLength(1);
+	});
+
+	test.each([1, 4, 16, 64])(
+		"admits a real RLM fanout of %i children before the provider barrier opens",
+		async (fanout) => {
+			const ids = requestIds(fanout, fanout === 1 ? 20 : fanout * 100);
+			const fixture = provider(
+				Object.fromEntries(ids.map((id) => [id, [simple(id, { waitForRelease: true })]])),
+				ids,
+			);
+			const directory = await mkdtemp(join(tmpdir(), `b00b-rlm-${fanout}-`));
+			const runtime = await runtimeForRlmFixture(fixture, directory);
+			cleanups.push(async () => {
+				await runtime.dispose();
+				await rm(directory, { recursive: true, force: true });
+			});
+
+			const handles = await Promise.all(
+				ids.map((id, index) =>
+					runtime.session.runRlmChild(id, {
+						name: `worker-${String(index + 1).padStart(4, "0")}`,
+						model: `${fixture.models[index % fixture.models.length]!.provider}/${fixture.models[index % fixture.models.length]!.id}`,
+					}),
+				),
+			);
+			// Admission is detached: every handle returns before an entry is allowed
+			// to leave its observation latch.  This is deliberately not a fanout
+			// semaphore or permit queue.
+			expect(handles).toHaveLength(fanout);
+			expect(new Set(handles.map((handle) => handle.rlm_child_id)).size).toBe(fanout);
+			await fixture.open;
+			const entered = fixture.observations();
+			expect(entered).toHaveLength(fanout);
+			expect(entered.map((entry) => entry.requestId).sort()).toEqual([...ids].sort());
+			expect(entered.every((entry) => entry.eventKinds.length === 0 && entry.attempt === 1)).toBe(true);
+			expect(entered.map((entry) => entry.sequence)).toEqual(
+				Array.from({ length: fanout }, (_, index) => index + 1),
+			);
+
+			// Fast siblings complete while the held first request has not emitted a
+			// provider event.  This proves the latch observes independently admitted
+			// streams rather than serializing their execution.
+			fixture.release(ids.slice(1));
+			if (fanout > 1) await waitForTerminals(fixture, fanout - 1);
+			expect(fixture.observations().find((entry) => entry.requestId === ids[0])?.eventKinds).toEqual([]);
+			fixture.release([ids[0]!]);
+			await waitForTerminals(fixture, fanout);
+			expect(fixture.observations().every((entry) => entry.terminal === "done")).toBe(true);
+		},
+		20_000,
+	);
+
+	test("uses the RLM runtime child host for cancel, real scripted 429, and sibling isolation", async () => {
+		const ids = ["request-0701", "request-0702", "request-0703"] as const;
+		const fixture = provider(
+			{
+				[ids[0]]: [simple(ids[0], { waitForRelease: true })],
+				[ids[1]]: [
+					{
+						requestId: ids[1],
+						waitForRelease: true,
+						upstreamStatus: 429,
+						errorCode: "upstream-429",
+						usage: usage(23, 0, 5, 0),
+					},
+				],
+				[ids[2]]: [
+					simple(ids[2], { waitForRelease: true, responseModel: "fixture-zero-resolved", usage: usage(3, 2) }),
+				],
+			},
+			ids,
+		);
+		const directory = await mkdtemp(join(tmpdir(), "b00b-rlm-isolation-"));
+		const runtime = await runtimeForRlmFixture(fixture, directory);
+		cleanups.push(async () => {
+			await runtime.dispose();
+			await rm(directory, { recursive: true, force: true });
+		});
+		const handles = await Promise.all(
+			ids.map((id, index) =>
+				runtime.session.runRlmChild(id, {
+					name: `worker-${String(index + 701).padStart(4, "0")}`,
+					model: `${fixture.models[index]!.provider}/${fixture.models[index]!.id}`,
+				}),
+			),
+		);
+		await fixture.open;
+		expect(fixture.observations().every((entry) => entry.eventKinds.length === 0)).toBe(true);
+		await vi.waitFor(() => expect(runtime.session.getRlmChildSession(handles[0]!.rlm_child_id)).toBeDefined());
+		expect(runtime.session.cancelRlmChildRun(handles[0]!.rlm_child_id, "B00B_CANCELLED")).toBe(true);
+		fixture.release([ids[1], ids[2]]);
+		await waitForTerminals(fixture, 3);
+		const observed = fixture.observations();
+		expect(observed.find((entry) => entry.requestId === ids[0])).toMatchObject({
+			terminal: "aborted",
+			signalAborted: true,
+			eventKinds: ["error"],
+		});
+		expect(observed.find((entry) => entry.requestId === ids[1])).toMatchObject({
+			upstreamStatus: 429,
+			terminal: "error",
+			eventKinds: ["error"],
+		});
+		expect(observed.find((entry) => entry.requestId === ids[2])).toMatchObject({
+			terminal: "done",
+			responseModel: "fixture-zero-resolved",
+		});
+		// The fixture’s disabled retry setting is an explicit per-child policy:
+		// no synthetic local 429 and no shared client-side limiter intervene.
+		expect(observed.filter((entry) => entry.requestId === ids[1])).toHaveLength(1);
+	});
+
+	test("projects immutable real RLM observations into signed B00A evidence and verifies in a fresh process", async () => {
+		const id = "request-0801";
+		const fixture = provider(
+			{
+				[id]: [
+					simple(id, { waitForRelease: true, responseModel: "fixture-b-resolved", usage: usage(101, 13, 7, 3) }),
+				],
+			},
+			[id],
+		);
+		const directory = await mkdtemp(join(tmpdir(), "b00b-rlm-evidence-"));
+		const artifactDirectory = await mkdtemp(join(tmpdir(), "b00b-rlm-artifact-"));
+		const trustDirectory = await mkdtemp(join(tmpdir(), "b00b-rlm-trust-"));
+		const runtime = await runtimeForRlmFixture(fixture, directory);
+		cleanups.push(async () => {
+			await runtime.dispose();
+			await rm(directory, { recursive: true, force: true });
+			await rm(artifactDirectory, { recursive: true, force: true });
+			await rm(trustDirectory, { recursive: true, force: true });
+		});
+		const [handle] = await Promise.all([
+			runtime.session.runRlmChild(id, { name: "worker-0801", model: `${fixture.models[1]!.provider}/fixture-b` }),
+		]);
+		expect(handle).toMatchObject({ model: `${fixture.models[1]!.provider}/fixture-b` });
+		await fixture.open;
+		fixture.release([id]);
+		await waitForTerminals(fixture, 1);
+		const observation = fixture.observations()[0]!;
+		expect(observation.requested).toMatchObject({ provider: "b00b-scripted", model: "fixture-b" });
+		expect(observation.responseModel).toBe("fixture-b-resolved");
+		expect(observation.usage).toMatchObject({ input: 101, output: 13, cacheRead: 7, cacheWrite: 3 });
+		const keys = generateKeyPairSync("ed25519");
+		const written = await writeSignedProductionEvidence(
+			artifactDirectory,
+			trustDirectory,
+			{
+				scenario: "rlm-real-path",
+				priceCard: {
+					version: "fixture-price-card-v1",
+					inputMicroCurrencyPerMillionMicroTokens: 17,
+					outputMicroCurrencyPerMillionMicroTokens: 29,
+				},
+				attempts: [
+					{
+						requestId: observation.requestId as `request-${string}`,
+						attempt: observation.attempt,
+						requested: { provider: observation.requested.provider, model: observation.requested.model },
+						resolved: {
+							api: "b00b-scripted",
+							provider: observation.requested.provider,
+							model: observation.requested.model,
+							responseModel: observation.responseModel!,
+						},
+						terminal: observation.terminal,
+						usage: {
+							inputMicroTokens: observation.usage!.input,
+							outputMicroTokens: observation.usage!.output,
+							cacheReadMicroTokens: observation.usage!.cacheRead,
+							cacheWriteMicroTokens: observation.usage!.cacheWrite,
+						},
+					},
+				],
+			},
+			keys.privateKey,
+		);
+		await verifySignedProductionEvidenceFreshProcess(
+			artifactDirectory,
+			written.commitmentPath,
+			keys.publicKey.export({ type: "spki", format: "pem" }).toString(),
+		);
+		expect(written.artifactBundleId).toMatch(/^[a-f0-9]{64}$/);
 	});
 
 	test("runs through AgentSession.promptAndWait with a registered provider and writes no canary or network fixture", async () => {
