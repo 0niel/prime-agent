@@ -214,6 +214,7 @@ import {
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
+import { materializedTerminalMessageId, type RlmTerminalMessage } from "./rlm-durable-operations.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -962,6 +963,8 @@ interface RlmChildRun {
 	id: string;
 	/** UUID attempt fence, minted before this run is visible to any host. */
 	assignmentId: string;
+	operationId: string;
+	deliveryId: string;
 	prompt: string;
 	sessionName: string;
 	sessionDir: string;
@@ -4610,6 +4613,28 @@ export class AgentSession {
 			customMessage,
 		});
 		if (customMessage?.details.fromRelationship === "parent") this._repliedToParentSinceTask = false;
+	}
+
+	/**
+	 * C03's no-prompt persistence seam. It deliberately appends an ordinary custom
+	 * session message and emits ordinary message events; it never schedules a turn.
+	 */
+	async appendDurableRlmTerminalMessage(message: RlmTerminalMessage, deliveryId: string): Promise<boolean> {
+		const id = materializedTerminalMessageId(deliveryId);
+		const hasId = (candidate: unknown): boolean =>
+			typeof candidate === "object" &&
+			candidate !== null &&
+			(candidate as { role?: unknown }).role === "custom" &&
+			(candidate as { details?: { id?: unknown } }).details?.id === id;
+		if (
+			this.agent.state.messages.some(hasId) ||
+			this.sessionManager.getEntries().some((entry) => entry.type === "message" && hasId(entry.message))
+		)
+			return false;
+		// sendCustomMessage's no-turn branch is the normal transcript append seam.
+		// It writes an ordinary custom message, emits normal events, and cannot prompt.
+		await this.sendCustomMessage({ ...message, details: { ...message.details, id } }, { triggerTurn: false });
+		return true;
 	}
 
 	async queueAgentMessagePrompt(
@@ -9054,6 +9079,8 @@ export class AgentSession {
 	private _createRlmSubagentRuntimeOptions(options: {
 		id: string;
 		assignmentId: string;
+		operationId: string;
+		deliveryId: string;
 		prompt: string;
 		sessionName: string;
 		spawnCode?: string;
@@ -9064,6 +9091,8 @@ export class AgentSession {
 			parentSession: this,
 			id: options.id,
 			assignmentId: options.assignmentId,
+			operationId: options.operationId,
+			deliveryId: options.deliveryId,
 			prompt: options.prompt,
 			sessionName: options.sessionName,
 			spawnCode: options.spawnCode,
@@ -9628,7 +9657,7 @@ export class AgentSession {
 		// compatibility shims; daemon-owned hosts always receive and verify assignmentId.
 		const completionResult = completeRuntime
 			? this._subagentRuntimeHost?.assignmentIdentityFenced
-				? completeRuntime(childId, session, expectedAssignmentId)
+				? completeRuntime(childId, session, expectedAssignmentId, run?.operationId)
 				: completeRuntime(childId, session)
 			: undefined;
 		if (completionResult === false) {
@@ -9886,6 +9915,8 @@ export class AgentSession {
 		const run: RlmChildRun = {
 			id: childNodeId,
 			assignmentId: randomUUID(),
+			operationId: randomUUID(),
+			deliveryId: randomUUID(),
 			prompt,
 			sessionName,
 			sessionDir: childSessionDir,
@@ -9897,6 +9928,21 @@ export class AgentSession {
 		const throwIfCancelled = () => {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 		};
+		// A daemon host fsyncs admission before this run becomes visible or any
+		// detached construction/provider work can begin.
+		this._subagentRuntimeHost?.admitRlmSubagentOperation?.({
+			...this._createRlmSubagentRuntimeOptions({
+				id: childNodeId,
+				assignmentId: run.assignmentId,
+				operationId: run.operationId,
+				deliveryId: run.deliveryId,
+				prompt,
+				sessionName,
+				spawnCode,
+				sessionDir: childSessionDir,
+				model: modelSelection.model,
+			}),
+		});
 		this._activeRlmChildRuns.set(run.id, run);
 		let runningPublished = false;
 		const emitChildUpdate = (structural = false) => {
@@ -9955,6 +10001,8 @@ export class AgentSession {
 			...this._createRlmSubagentRuntimeOptions({
 				id: childNodeId,
 				assignmentId: run.assignmentId,
+				operationId: run.operationId,
+				deliveryId: run.deliveryId,
 				prompt,
 				sessionName,
 				spawnCode,
@@ -9970,6 +10018,34 @@ export class AgentSession {
 				this._activeRlmChildRuns.get(run.id)?.assignmentId !== run.assignmentId
 			)
 				return;
+			// A daemon-owned host has the only durable terminal authority. In particular,
+			// startup failure before a stable child materialization must not fall through
+			// to the old agent-message/prompt path and invent an undurable completion.
+			if (this._subagentRuntimeHost?.deliverRlmSubagentTerminal) {
+				if (childSession) {
+					const runtime = {
+						session: childSession,
+						assignmentId: run.assignmentId,
+						operationId: run.operationId,
+						deliveryId: run.deliveryId,
+					};
+					await this._subagentRuntimeHost.deliverRlmSubagentTerminal(
+						runtime,
+						subagentOptions,
+						run.status === "cancelled" ? "cancelled" : run.status === "error" ? "error" : "done",
+						message as RlmTerminalMessage,
+					);
+				}
+				return;
+			}
+			const terminalId = materializedTerminalMessageId(run.deliveryId);
+			if (
+				this.agent.state.messages.some(
+					(entry) =>
+						entry.role === "custom" && (entry as { details?: { id?: string } }).details?.id === terminalId,
+				)
+			)
+				return;
 			const childController = childSession?._agentMessageController;
 			if (childController) {
 				try {
@@ -9982,12 +10058,16 @@ export class AgentSession {
 					// An unattributed notice beats silence, so fall through to the injected path.
 				}
 			}
-			await this._promptInjectedMessage(message.content as string, message, {
-				streamingBehavior: "followUp",
-				queueIfBusy: true,
-				returnAfterAccepted: true,
-				suppressAutonomousContinuation: true,
-			}).catch(() => undefined);
+			await this._promptInjectedMessage(
+				message.content as string,
+				{ ...message, details: { ...(message.details as object), id: terminalId } } as CustomMessage,
+				{
+					streamingBehavior: "followUp",
+					queueIfBusy: true,
+					returnAfterAccepted: true,
+					suppressAutonomousContinuation: true,
+				},
+			).catch(() => undefined);
 		};
 
 		// Runtime startup and the task run are deliberately detached. The public
@@ -10185,6 +10265,7 @@ export class AgentSession {
 										run.id,
 										childRuntime.session,
 										run.assignmentId,
+										run.operationId,
 									)
 								: this._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session));
 						} else if (childSession) {

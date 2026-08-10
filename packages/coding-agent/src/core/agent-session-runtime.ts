@@ -61,6 +61,9 @@ export interface AgentSessionRuntimeMetadata {
 	generation?: string;
 	/** Required for C01-created subagent runtimes; internal only. */
 	assignmentId?: string;
+	/** C03 internal durable identities. */
+	operationId?: string;
+	deliveryId?: string;
 	rlmParentNodeId?: string;
 	/** Runtime restored from an already-persisted completed registry entry. */
 	rehydratedCompleted?: boolean;
@@ -379,6 +382,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					parentSessionFile: options.parentSession.sessionFile,
 					rlmChildId: options.id,
 					assignmentId: assignmentId,
+					operationId: options.operationId,
+					deliveryId: options.deliveryId,
 					rlmParentNodeId: options.rlmParentNodeId,
 					prompt: options.prompt,
 					spawnCode: options.spawnCode,
@@ -411,15 +416,29 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			await runtime.dispose();
 			throw error;
 		}
-		return runtime;
+		return {
+			session: runtime.session,
+			assignmentId,
+			operationId: options.operationId,
+			deliveryId: options.deliveryId,
+		};
 	}
 
-	async deleteRlmSubagentRuntime(childId: string, childSession?: AgentSession, assignmentId?: string): Promise<void> {
+	async deleteRlmSubagentRuntime(
+		childId: string,
+		childSession?: AgentSession,
+		assignmentId?: string,
+		operationId?: string,
+	): Promise<void> {
 		const runtime = this.subagentRuntimes.get(childId);
 		const currentAssignment = this.subagentRuntimeAssignments.get(childId);
 		// Inline runtimes have no durable daemon registry. Preserve direct delete
 		// compatibility, but a named C01 assignment fences stale callbacks.
-		if (!runtime || (assignmentId !== undefined && currentAssignment !== assignmentId)) {
+		if (
+			!runtime ||
+			(assignmentId !== undefined && currentAssignment !== assignmentId) ||
+			(operationId !== undefined && runtime.metadata.operationId !== operationId)
+		) {
 			await childSession?.disposeAsync();
 			return;
 		}

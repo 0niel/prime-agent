@@ -15,6 +15,7 @@ import type { AgentObserveController } from "../src/core/agent-observe.js";
 import type { SessionActionRecoverySnapshot } from "../src/core/agent-session.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { readRlmDurableOperationRegistry } from "../src/core/rlm-durable-operations.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -1698,6 +1699,17 @@ describe("daemon mode helpers", () => {
 			);
 			if (!childState?.runtime.session.sessionFile) throw new Error("Missing child state");
 			const host = internals.createSubagentRuntimeHost(parentState);
+			// This direct legacy host call predates C03 and has a C01 assignment but
+			// no operation metadata. It stays compatible only on the exact legacy
+			// shape: naming a fabricated C03 operation must not complete it.
+			expect(
+				host.completeRlmSubagentRuntime?.(
+					"child-1",
+					childRuntime.session,
+					childRuntime.metadata.assignmentId!,
+					"00000000-0000-4000-8000-000000000099",
+				),
+			).toBe(false);
 			expect(
 				host.completeRlmSubagentRuntime?.("child-1", childRuntime.session, childRuntime.metadata.assignmentId!),
 			).toBe(true);
@@ -10841,3 +10853,109 @@ function makeClient(id: string, activeSessionId: string, supportsExtensionUi = f
 		capabilities: new Set(supportsExtensionUi ? ["extension_ui"] : []),
 	};
 }
+
+describe("C03 durable daemon publication", () => {
+	it("fsyncs admission before factory work, materializes before registry/publication, and leaves a failed child pending", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-c03-durable-publication-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				createRlmSubagentRuntime(
+					parent: ActiveSessionState,
+					options: CreateRlmSubagentRuntimeOptions,
+				): Promise<ActiveSessionState["runtime"]>;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const host = internals.createSubagentRuntimeHost(parent);
+			const model = { provider: "test", id: "durable-model" } as Model<Api>;
+			const makeOptions = (
+				assignmentId: string,
+				operationId: string,
+				deliveryId: string,
+				sessionDir: string,
+				onSessionPublished?: (session: never) => void,
+			): CreateRlmSubagentRuntimeOptions => ({
+				parentSession: parent.runtime.session,
+				id: "c03-reused-selector",
+				assignmentId,
+				operationId,
+				deliveryId,
+				prompt: `durable ${operationId}`,
+				sessionName: "c03-reused-selector",
+				sessionDir,
+				model,
+				thinkingLevel: "off",
+				serviceTier: null,
+				scopedModels: [],
+				activeToolNames: [],
+				customTools: [],
+				includeGoals: false,
+				includeCompactSkill: false,
+				rlmDepth: 1,
+				rlmMaxDepth: 4,
+				rlmParentNodeId: "c03-reused-selector",
+				...(onSessionPublished ? { onSessionPublished: onSessionPublished as never } : {}),
+			});
+			const aDir = join(fixture.parentArtifactDir, "c03-A");
+			mkdirSync(aDir, { recursive: true });
+			const a = makeOptions(
+				"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+				"aaaaaaaa-aaaa-4aaa-8aaa-000000000010",
+				"aaaaaaaa-aaaa-4aaa-8aaa-000000000020",
+				aDir,
+			);
+			// The durable fact exists before the daemon calls its runtime factory.
+			host.admitRlmSubagentOperation?.(a);
+			let ledger = readRlmDurableOperationRegistry(fixture.parentArtifactDir);
+			const admittedA = ledger.operations.get(
+				JSON.stringify([fixture.parentSessionId, a.assignmentId, a.operationId]),
+			);
+			expect(admittedA).toMatchObject({ lifecycle: "admitted" });
+			expect(admittedA?.childSessionFile).toBeUndefined();
+
+			let publicationSawMaterialized = false;
+			const runtimeA = await internals.createRlmSubagentRuntime(
+				parent,
+				makeOptions(a.assignmentId, a.operationId, a.deliveryId, a.sessionDir, () => {
+					const row = readRlmDurableOperationRegistry(fixture.parentArtifactDir).operations.get(
+						JSON.stringify([fixture.parentSessionId, a.assignmentId, a.operationId]),
+					);
+					publicationSawMaterialized = row?.lifecycle === "materialized";
+				}),
+			);
+			expect(runtimeA.metadata.operationId).toBe(a.operationId);
+			expect(publicationSawMaterialized).toBe(true);
+			const registryRows = readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8");
+			expect(registryRows).toContain(a.operationId);
+
+			// A second admission is durable even when construction fails. It has neither
+			// a materialized child nor a fake running/completed registry row.
+			const bDir = join(fixture.parentArtifactDir, "c03-B-failed");
+			mkdirSync(bDir, { recursive: true });
+			const b = makeOptions(
+				"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+				"bbbbbbbb-bbbb-4bbb-8bbb-000000000010",
+				"bbbbbbbb-bbbb-4bbb-8bbb-000000000020",
+				bDir,
+			);
+			host.admitRlmSubagentOperation?.(b);
+			fixture.createRuntime.mockImplementationOnce(async () => {
+				throw new Error("injected child factory failure");
+			});
+			await expect(internals.createRlmSubagentRuntime(parent, b)).rejects.toThrow("injected child factory failure");
+			ledger = readRlmDurableOperationRegistry(fixture.parentArtifactDir);
+			const admittedB = ledger.operations.get(
+				JSON.stringify([fixture.parentSessionId, b.assignmentId, b.operationId]),
+			);
+			expect(admittedB).toMatchObject({ lifecycle: "admitted" });
+			expect(admittedB?.childSessionFile).toBeUndefined();
+			expect(readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")).not.toContain(
+				b.operationId,
+			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+});

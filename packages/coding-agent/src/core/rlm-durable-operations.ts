@@ -219,6 +219,9 @@ export interface RlmDurableDelivery {
 	received: boolean;
 	consumed?: "materialized" | "discarded";
 	uncertain: boolean;
+	/** Internal reducer projection; never cached or sent on a public surface. */
+	inboxRecord?: RlmTerminalInboxRecord;
+	outboxRecord?: RlmTerminalOutboxRecord;
 }
 export interface RlmDurableOperationRegistry {
 	operations: Map<string, RlmDurableOperation>;
@@ -236,6 +239,15 @@ export interface RlmDurableOperationStore {
 	importOutbox(input: RlmTerminalOutbox): "new" | "already_received";
 	markMaterializedDelivery(input: RlmDeliveryMaterialization): "new" | "already_materialized";
 	markDiscardedDelivery(input: RlmDeliveryDiscard): "new" | "already_discarded";
+	/** Owner-only recovery join: append eligible authenticated outboxes to the inbox. */
+	importPendingOutboxes(): number;
+	/** Owner-only pending bodies, after durable inbox reduction. */
+	pendingInbox(): readonly RlmTerminalInboxRecord[];
+	/** Exact-key terminal-only lifecycle transition for daemon adapters. */
+	recordRelease(
+		input: Pick<RlmOperationTerminal, "parentSessionId" | "assignmentId" | "operationId">,
+		type: "released" | "deleted",
+	): boolean;
 	rebuild(): RlmDurableOperationRegistry;
 }
 
@@ -522,6 +534,36 @@ class Store implements RlmDurableOperationStore {
 		this.append(this.path(CONSUMED), { version: 1, type: "discarded", ...input, recordedAt: this.now() });
 		this.afterAppend();
 		return "new";
+	}
+
+	importPendingOutboxes(): number {
+		const registry = this.reduce();
+		let imported = 0;
+		for (const delivery of registry.deliveries.values()) {
+			const operation = registry.operations.get(delivery.operationKey);
+			const record = delivery.outboxRecord;
+			if (
+				!operation ||
+				operation.uncertain ||
+				delivery.uncertain ||
+				delivery.received ||
+				!record ||
+				operation.terminal !== record.terminal ||
+				!delivery.outboxed
+			)
+				continue;
+			const { recordedAt: _recordedAt, ...outboxFact } = record;
+			this.append(this.path(INBOX), { ...outboxFact, type: "received", receivedAt: this.now() });
+			imported++;
+		}
+		if (imported) this.afterAppend();
+		return imported;
+	}
+
+	pendingInbox(): readonly RlmTerminalInboxRecord[] {
+		return [...this.reduce().deliveries.values()]
+			.filter((delivery) => delivery.received && !delivery.consumed && !delivery.uncertain && delivery.inboxRecord)
+			.map((delivery) => delivery.inboxRecord!);
 	}
 
 	rebuild(): RlmDurableOperationRegistry {
@@ -870,6 +912,7 @@ function reduceOutbox(raw: unknown, registry: RlmDurableOperationRegistry): void
 	if (!delivery.outboxed) {
 		delivery.outboxed = true;
 		delivery.terminal = record.terminal;
+		delivery.outboxRecord = record;
 		defineDeliveryDigest(delivery, record);
 	} else if (
 		delivery.terminal !== record.terminal ||
@@ -922,6 +965,7 @@ function reduceInbox(raw: unknown, registry: RlmDurableOperationRegistry): void 
 	}
 	if (!delivery.received) {
 		delivery.received = true;
+		delivery.inboxRecord = record;
 		defineDeliveryDigest(delivery, record);
 	} else if (deliveryDigest(delivery, record) !== digestMessage(record.message))
 		markDeliveryUncertain(delivery, operation, registry, "conflicting inbox");

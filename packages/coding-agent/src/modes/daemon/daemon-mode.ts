@@ -100,7 +100,16 @@ import {
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
-import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
+import {
+	materializedTerminalMessageId,
+	openRlmDurableOperationStore,
+	type RlmTerminalOutbox,
+} from "../../core/rlm-durable-operations.js";
+import type {
+	CreateRlmSubagentRuntimeOptions,
+	RlmSubagentRuntime,
+	SubagentRuntimeHost,
+} from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
 	type IdleEvictionMinutes,
@@ -381,6 +390,9 @@ interface PersistedRlmSubagentRegistryEntry {
 	childId: string;
 	/** Undefined only for legacy display rows; C01 callbacks must never bind one. */
 	assignmentId?: string;
+	/** C03 private recovery binding facts; never sent through catalog/wire output. */
+	operationId?: string;
+	deliveryId?: string;
 	sessionName: string;
 	sessionDir: string;
 	sessionFile: string;
@@ -458,6 +470,8 @@ export class AgentDaemon {
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
 	private readonly bindingCompletions = new Map<string, Promise<void>>();
+	/** Parent-object/generation-local delivery joins; never a global delivery queue. */
+	private readonly rlmTerminalImportJoins = new WeakMap<ActiveSessionState, Map<string, Promise<void>>>();
 	/**
 	 * Resolved-session-file keyed passivations let wake paths join after closeSessionOnce
 	 * removes the live session. This intentionally complements closingSessions: that map
@@ -988,6 +1002,8 @@ export class AgentDaemon {
 		input: {
 			childId: string;
 			assignmentId: string;
+			operationId?: string;
+			deliveryId?: string;
 			sessionName: string;
 			sessionDir: string;
 			sessionFile: string;
@@ -1006,6 +1022,8 @@ export class AgentDaemon {
 			type: "rlm_subagent",
 			childId: input.childId,
 			assignmentId: input.assignmentId,
+			operationId: input.operationId,
+			deliveryId: input.deliveryId,
 			sessionName: input.sessionName,
 			sessionDir: input.sessionDir,
 			sessionFile: input.sessionFile,
@@ -1097,7 +1115,11 @@ export class AgentDaemon {
 						(typeof entry.assignmentId !== "string" ||
 							!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
 								entry.assignmentId,
-							)))
+							))) ||
+					(entry.operationId !== undefined &&
+						(typeof entry.operationId !== "string" || !assertFreshUuid(entry.operationId))) ||
+					(entry.deliveryId !== undefined &&
+						(typeof entry.deliveryId !== "string" || !assertFreshUuid(entry.deliveryId)))
 				) {
 					continue;
 				}
@@ -2325,11 +2347,225 @@ export class AgentDaemon {
 		return passive ? this.hydratePassiveRlmSubagent(passive) : this.getOrHydrateBoundSessionState(selector);
 	}
 
+	private importBoundRlmTerminalInbox(
+		parentState: ActiveSessionState,
+		child: RlmSubagentRuntime,
+		identity: { childId: string; assignmentId: string; operationId: string; deliveryId: string },
+		store: ReturnType<typeof openRlmDurableOperationStore>,
+	): Promise<void> {
+		const parent = parentState.runtime.session;
+		const generation = parentState.eventGeneration;
+		const key = `${identity.assignmentId}\u0000${identity.operationId}\u0000${identity.deliveryId}`;
+		let joins = this.rlmTerminalImportJoins.get(parentState);
+		if (!joins) {
+			joins = new Map();
+			this.rlmTerminalImportJoins.set(parentState, joins);
+		}
+		const existing = joins.get(key);
+		if (existing) return existing;
+		const current = () =>
+			this.sessions.get(parentState.activeSessionId) === parentState &&
+			parentState.eventGeneration === generation &&
+			!this.closingSessions.has(parentState.activeSessionId) &&
+			parentState.runtime.session === parent &&
+			child.session.sessionId !== "";
+		const work = (async () => {
+			if (!current()) return;
+			store.importPendingOutboxes();
+			if (!current()) return;
+			for (const inbox of store.pendingInbox()) {
+				if (
+					inbox.parentSessionId !== parent.sessionId ||
+					inbox.childId !== identity.childId ||
+					inbox.assignmentId !== identity.assignmentId ||
+					inbox.operationId !== identity.operationId ||
+					inbox.deliveryId !== identity.deliveryId
+				)
+					continue;
+				if (!current()) return;
+				const operation = store
+					.rebuild()
+					.operations.get(JSON.stringify([parent.sessionId, identity.assignmentId, identity.operationId]));
+				// Only the exact deleted durable incarnation is discardable. A replacement
+				// selector assignment remains unrelated and cannot suppress this record.
+				if (operation?.lifecycle === "deleted") {
+					store.markDiscardedDelivery({
+						parentSessionId: parent.sessionId,
+						assignmentId: identity.assignmentId,
+						operationId: identity.operationId,
+						deliveryId: identity.deliveryId,
+						reason: "deleted",
+					});
+					continue;
+				}
+				if (!current()) return;
+				await parent.appendDurableRlmTerminalMessage(inbox.message, inbox.deliveryId);
+				if (!current()) return;
+				store.markMaterializedDelivery({
+					parentSessionId: parent.sessionId,
+					assignmentId: identity.assignmentId,
+					operationId: identity.operationId,
+					deliveryId: identity.deliveryId,
+					sessionMessageId: materializedTerminalMessageId(identity.deliveryId),
+				});
+			}
+		})();
+		joins.set(key, work);
+		void work.catch(() => undefined);
+		void work
+			.finally(() => {
+				if (joins?.get(key) === work) joins.delete(key);
+			})
+			.catch(() => undefined);
+		return work;
+	}
+
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
+		// Some legacy host-only tests construct no real parent session. Such a host
+		// remains C03-incapable; every durable seam below rejects before mutation.
+		const parent = parentState.runtime.session;
+		// C03 must remain ABI-compatible with legacy host-only embeddings whose
+		// session manager exposes neither persisted-artifact accessor. Feature-test
+		// the methods themselves before a durable seam can use their result.
+		const parentFile = parent?.sessionManager?.getSessionFile?.();
+		const parentArtifactDir = parent?.sessionManager?.getSessionArtifactDir?.();
+		const parentGeneration = parentState.eventGeneration;
+		let parentStore: ReturnType<typeof openRlmDurableOperationStore> | undefined;
+		const durableStore = () => {
+			if (!parentFile || !parentArtifactDir)
+				throw new Error("Durable RLM requires a persisted parent session/artifact");
+			// A parent host owns one store instance. Its in-process materialization
+			// bindings are manager-originated and survive all terminal/import calls;
+			// do not reopen a ledger and use its own child paths as authority.
+			if (parentStore) return parentStore;
+			parentStore = openRlmDurableOperationStore(parentArtifactDir, {
+				trustedChildRecoveryRoots: (operation) => {
+					const state = [...this.sessions.values()].find(
+						(candidate) =>
+							candidate.runtime.metadata.kind === "subagent" &&
+							candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+							candidate.runtime.metadata.assignmentId === operation.assignmentId &&
+							candidate.runtime.metadata.operationId === operation.operationId,
+					);
+					if (!state) return undefined;
+					const child = state.runtime.session;
+					const childFile = child.sessionManager.getSessionFile?.();
+					const childArtifactDir = child.sessionManager.getSessionArtifactDir?.();
+					if (!childFile || !childArtifactDir) return undefined;
+					return {
+						childSessionId: child.sessionId,
+						childSessionFile: childFile,
+						childSessionRoot: dirname(childFile),
+						childArtifactDir,
+						childArtifactRoot: dirname(childArtifactDir),
+					};
+				},
+			});
+			return parentStore;
+		};
+		const current = (options: CreateRlmSubagentRuntimeOptions, runtime?: RlmSubagentRuntime) =>
+			this.sessions.get(parentState.activeSessionId) === parentState &&
+			parentState.eventGeneration === parentGeneration &&
+			options.parentSession === parent &&
+			!!options.assignmentId &&
+			!!options.operationId &&
+			!!options.deliveryId &&
+			(!runtime ||
+				(runtime.assignmentId === options.assignmentId &&
+					runtime.operationId === options.operationId &&
+					runtime.deliveryId === options.deliveryId &&
+					[...this.sessions.values()].some(
+						(state) =>
+							state.runtime.metadata.kind === "subagent" &&
+							state.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+							state.runtime.metadata.rlmChildId === options.id &&
+							state.runtime.metadata.assignmentId === options.assignmentId &&
+							state.runtime.metadata.operationId === options.operationId &&
+							state.runtime.metadata.deliveryId === options.deliveryId &&
+							state.runtime.session === runtime.session,
+					)));
+
 		return {
 			assignmentIdentityFenced: true,
+			admitRlmSubagentOperation: (options) => {
+				if (!current(options) || !parentFile || !parentArtifactDir)
+					throw new Error("Stale or unpersisted durable RLM admission");
+				durableStore().admit({
+					parentSessionId: parent.sessionId,
+					parentSessionFile: parentFile,
+					parentSessionRoot: dirname(parentFile),
+					parentArtifactRoot: dirname(parentArtifactDir),
+					childId: options.id,
+					assignmentId: options.assignmentId!,
+					operationId: options.operationId!,
+					deliveryId: options.deliveryId!,
+					childSessionDir: options.sessionDir,
+					requestedModel: { provider: options.model.provider, modelId: options.model.id },
+					rlmDepth: options.rlmDepth,
+					rlmMaxDepth: options.rlmMaxDepth,
+				});
+			},
+			deliverRlmSubagentTerminal: async (runtime, options, terminal, message) => {
+				if (
+					!current(options, runtime) ||
+					!parentFile ||
+					!parentArtifactDir ||
+					!options.assignmentId ||
+					!options.operationId ||
+					!options.deliveryId
+				)
+					return;
+				const child = runtime.session;
+				const childFile = child.sessionManager.getSessionFile?.();
+				const childArtifactDir = child.sessionManager.getSessionArtifactDir?.();
+				if (!childFile || !childArtifactDir) return;
+				const outbox: RlmTerminalOutbox = {
+					parentSessionId: parent.sessionId,
+					parentSessionFile: parentFile,
+					parentSessionRoot: dirname(parentFile),
+					parentArtifactRoot: dirname(parentArtifactDir),
+					childSessionId: child.sessionId,
+					childSessionFile: childFile,
+					childSessionRoot: dirname(childFile),
+					childArtifactDir,
+					childArtifactRoot: dirname(childArtifactDir),
+					childId: options.id,
+					assignmentId: options.assignmentId,
+					operationId: options.operationId,
+					deliveryId: options.deliveryId,
+					terminal,
+					message,
+				};
+				const store = durableStore();
+				store.appendOutbox(outbox); // child outbox fsync happens before parent ledger.
+				if (
+					!store.recordTerminal({
+						parentSessionId: parent.sessionId,
+						assignmentId: options.assignmentId,
+						operationId: options.operationId,
+						deliveryId: options.deliveryId,
+						terminal,
+					})
+				)
+					return;
+				if (!current(options, runtime)) return;
+				// The owner-local join imports the fsynced outbox, then performs the
+				// normal no-turn transcript append before the consumed fsync.
+				await this.importBoundRlmTerminalInbox(
+					parentState,
+					runtime,
+					{
+						childId: options.id,
+						assignmentId: options.assignmentId,
+						operationId: options.operationId,
+						deliveryId: options.deliveryId,
+					},
+					store,
+				);
+				if (!current(options, runtime)) return;
+			},
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
-			completeRlmSubagentRuntime: (childId, childSession, assignmentId) => {
+			completeRlmSubagentRuntime: (childId, childSession, assignmentId, operationId) => {
 				if (!assignmentId || !childSession) return false;
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
@@ -2337,6 +2573,12 @@ export class AgentDaemon {
 						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 						candidate.runtime.metadata.rlmChildId === childId &&
 						candidate.runtime.metadata.assignmentId === assignmentId &&
+						// Fresh C03 runtimes must carry the exact durable operation. Only a
+						// genuinely pre-C03 metadata record (no operation at all) may use
+						// the C01 assignment fence for host ABI compatibility.
+						(operationId !== undefined
+							? candidate.runtime.metadata.operationId === operationId
+							: candidate.runtime.metadata.operationId === undefined) &&
 						candidate.runtime.session === childSession,
 				);
 				if (!state?.runtime.session.sessionFile || this.sessions.get(parentState.activeSessionId) !== parentState)
@@ -2347,6 +2589,8 @@ export class AgentDaemon {
 				return this.recordRlmSubagentRegistryEntry(parentState, {
 					childId,
 					assignmentId,
+					operationId,
+					deliveryId: metadata.deliveryId,
 					sessionName: childSession.sessionName ?? childId,
 					sessionDir: metadata.sessionDir ?? dirname(state.runtime.session.sessionFile),
 					sessionFile: state.runtime.session.sessionFile,
@@ -2362,11 +2606,31 @@ export class AgentDaemon {
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				const assignmentId = runtime.assignmentId ?? options.assignmentId;
+				const operationId = runtime.operationId ?? options.operationId;
 				// A callback without an assignment is a legacy display path and may only
-				// dispose its own unpublished runtime, never mutate daemon state.
-				if (!assignmentId || this.sessions.get(parentState.activeSessionId) !== parentState) {
-					await runtime.session.disposeAsync();
+				// dispose its own unpublished runtime, never mutate daemon state.  Both
+				// durable identifiers must agree: a held A continuation must never acquire
+				// B merely because the public selector was reused.
+				const identityMismatch =
+					(runtime.assignmentId !== undefined && runtime.assignmentId !== options.assignmentId) ||
+					(runtime.operationId !== undefined && runtime.operationId !== options.operationId);
+				if (!assignmentId || identityMismatch || this.sessions.get(parentState.activeSessionId) !== parentState) {
+					const resident = [...this.sessions.values()].some((state) => state.runtime.session === runtime.session);
+					// A failed/unpublished A still owns its local runtime and can clean it up;
+					// never dispose a resident B supplied by a stale/malformed continuation.
+					if (!resident) await runtime.session.disposeAsync();
 					return;
+				}
+				// Lifecycle facts are exact operation keyed. A stale A cannot release B.
+				if (operationId && options.deliveryId && current(options, runtime)) {
+					const parentArtifactDir = parent.sessionManager.getSessionArtifactDir?.();
+					if (parentArtifactDir) {
+						const store = durableStore();
+						if (status === "cancelled")
+							store.recordRelease({ parentSessionId: parent.sessionId, assignmentId, operationId }, "deleted");
+						else
+							store.recordRelease({ parentSessionId: parent.sessionId, assignmentId, operationId }, "released");
+					}
 				}
 				// Persist the deletion boundary first, but never let a registry failure
 				// strand the cancelled child as a stale resident session.
@@ -2393,7 +2657,7 @@ export class AgentDaemon {
 				}
 				if (deletionError !== undefined) throw deletionError;
 			},
-			deleteRlmSubagentRuntime: async (childId, childSession, requestedAssignmentId) => {
+			deleteRlmSubagentRuntime: async (childId, childSession, requestedAssignmentId, requestedOperationId) => {
 				// Public catalog entries intentionally hide assignment IDs. An explicit
 				// delete is therefore the one legacy operation permitted to resolve its
 				// durable row internally. A missing legacy ID is rebound *before* delete;
@@ -2437,6 +2701,14 @@ export class AgentDaemon {
 							throw new Error(`Failed to bind legacy RLM subagent ${childId} for deletion`);
 						persisted = { ...persisted, assignmentId };
 					} else assignmentId = persisted.assignmentId;
+				}
+				// Callback cleanup carries an operation; it is never a selector or
+				// assignment-only capability.  A legacy explicit delete has no operation
+				// and intentionally retains its historical catalog behavior.
+				if (requestedOperationId && persisted?.operationId !== requestedOperationId) {
+					const resident = [...this.sessions.values()].some((state) => state.runtime.session === childSession);
+					if (!resident) await childSession?.disposeAsync();
+					return;
 				}
 				// Assignment-less resident children are old host data. They remain
 				// deletable only by this explicit (not callback) path; do not invent a
@@ -2487,12 +2759,27 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
-		// Assignment is mandatory authority for every daemon-hosted incarnation.
-		// Legacy callers that omit it are adapted by minting here; untrusted values
-		// are never written because readers correctly reject them.
+		// C03 creation is all-or-nothing: the parent mints all opaque identities
+		// before admission. The old assignment-only compatibility path has no C03
+		// authority and never acquires an operation/delivery here.
+		const hasDurableIdentity = options.operationId !== undefined || options.deliveryId !== undefined;
+		if (
+			hasDurableIdentity &&
+			(!assertFreshUuid(options.assignmentId) ||
+				!assertFreshUuid(options.operationId) ||
+				!assertFreshUuid(options.deliveryId))
+		) {
+			throw new Error("Daemon C03 child creation requires parent-minted durable identities");
+		}
 		const assignmentId = assertFreshUuid(options.assignmentId) ? options.assignmentId : randomUUID();
 		const assignedOptions = assignmentId === options.assignmentId ? options : { ...options, assignmentId };
 		options = assignedOptions;
+		const parent = parentState.runtime.session;
+		const parentArtifactDir = options.operationId ? parent.sessionManager.getSessionArtifactDir?.() : undefined;
+		const durableStore = () => {
+			if (!parentArtifactDir) throw new Error("Durable RLM requires a persisted parent artifact");
+			return openRlmDurableOperationStore(parentArtifactDir);
+		};
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
@@ -2559,6 +2846,8 @@ export class AgentDaemon {
 					parentSessionFile: options.parentSession.sessionFile,
 					rlmChildId: options.id,
 					assignmentId: options.assignmentId,
+					operationId: options.operationId,
+					deliveryId: options.deliveryId,
 					rlmParentNodeId: options.rlmParentNodeId,
 					prompt: options.prompt,
 					spawnCode: options.spawnCode,
@@ -2579,9 +2868,31 @@ export class AgentDaemon {
 					runtime.session.setSessionName(options.sessionName);
 				}
 				if (runtime.session.sessionFile) {
+					// Only C03-admitted children carry the opaque operation. Legacy rows stay
+					// display-compatible and deliberately acquire no durable delivery authority.
+					if (options.operationId) {
+						const artifactDir = runtime.session.sessionManager.getSessionArtifactDir();
+						if (!artifactDir || !options.assignmentId || !parentArtifactDir)
+							throw new Error("RLM child lacks durable artifact identity");
+						if (
+							!durableStore().markMaterialized({
+								parentSessionId: parent.sessionId,
+								assignmentId: options.assignmentId,
+								operationId: options.operationId,
+								childSessionId: runtime.session.sessionId,
+								childSessionFile: runtime.session.sessionFile,
+								childSessionRoot: dirname(runtime.session.sessionFile),
+								childArtifactDir: artifactDir,
+								childArtifactRoot: dirname(artifactDir),
+							})
+						)
+							throw new Error("Failed durable RLM child materialization");
+					}
 					this.recordRlmSubagentRegistryEntry(parentState, {
 						childId: options.id,
 						assignmentId,
+						operationId: options.operationId,
+						deliveryId: options.deliveryId,
 						sessionName: options.sessionName,
 						sessionDir: options.sessionDir,
 						sessionFile: runtime.session.sessionFile,
@@ -3028,6 +3339,8 @@ export class AgentDaemon {
 							: {}),
 						rlmChildId: entry.childId,
 						assignmentId: entry.assignmentId,
+						operationId: entry.operationId,
+						deliveryId: entry.deliveryId,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
 						rehydratedCompleted: true,
 						...(entry.prompt ? { prompt: entry.prompt } : {}),
@@ -3068,6 +3381,47 @@ export class AgentDaemon {
 			if (!registered || assignmentBound === false) {
 				await this.closeSession(state, "replaced");
 				throw new RuntimeOpenCancelledError();
+			}
+			// Hydration is the sole restart join. It binds the exact registry incarnation
+			// before reading a child outbox and never starts prompt/task work.
+			if (entry.operationId && entry.deliveryId && entry.assignmentId) {
+				const parent = parentState.runtime.session;
+				const parentArtifactDir = parent.sessionManager.getSessionArtifactDir();
+				const parentFile = parent.sessionManager.getSessionFile();
+				const childFile = runtime.session.sessionManager.getSessionFile();
+				const childArtifactDir = runtime.session.sessionManager.getSessionArtifactDir();
+				if (parentArtifactDir && parentFile && childFile && childArtifactDir) {
+					const store = openRlmDurableOperationStore(parentArtifactDir, {
+						trustedChildRecoveryRoots: (operation) =>
+							operation.parentSessionId === parent.sessionId &&
+							operation.assignmentId === entry.assignmentId &&
+							operation.operationId === entry.operationId
+								? {
+										childSessionId: runtime!.session.sessionId,
+										childSessionFile: childFile,
+										childSessionRoot: dirname(childFile),
+										childArtifactDir,
+										childArtifactRoot: dirname(childArtifactDir),
+									}
+								: undefined,
+					});
+					await this.importBoundRlmTerminalInbox(
+						parentState,
+						{
+							session: runtime.session,
+							assignmentId: entry.assignmentId,
+							operationId: entry.operationId,
+							deliveryId: entry.deliveryId,
+						},
+						{
+							childId: entry.childId,
+							assignmentId: entry.assignmentId,
+							operationId: entry.operationId,
+							deliveryId: entry.deliveryId,
+						},
+						store,
+					);
+				}
 			}
 			if (
 				this.sessions.get(parentState.activeSessionId) !== parentState ||
