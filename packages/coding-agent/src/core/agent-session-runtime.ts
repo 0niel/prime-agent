@@ -100,6 +100,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
 	/** Assignment currently owning each compatibility child-id map entry. */
 	private subagentRuntimeAssignments = new Map<string, string>();
+	/** C03 operation companion for each compatibility child-id map entry. */
+	private subagentRuntimeOperations = new Map<string, string | undefined>();
 	private disposePromise?: Promise<void>;
 
 	constructor(
@@ -309,6 +311,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const runtimes = [...this.subagentRuntimes.values()];
 		this.subagentRuntimes.clear();
 		this.subagentRuntimeAssignments.clear();
+		this.subagentRuntimeOperations.clear();
 		let disposeError: unknown;
 		for (const runtime of runtimes) {
 			try {
@@ -341,6 +344,19 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	listSubagentRuntimes(): readonly AgentSessionRuntime[] {
 		return [...this.subagentRuntimes.values()];
+	}
+
+	private ownsSubagentRuntime(
+		childId: string,
+		runtime: AgentSessionRuntime,
+		assignmentId: string,
+		operationId: string | undefined,
+	): boolean {
+		return (
+			this.subagentRuntimes.get(childId) === runtime &&
+			this.subagentRuntimeAssignments.get(childId) === assignmentId &&
+			this.subagentRuntimeOperations.get(childId) === operationId
+		);
 	}
 
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
@@ -393,10 +409,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		);
 		this.subagentRuntimes.set(options.id, runtime);
 		this.subagentRuntimeAssignments.set(options.id, assignmentId);
+		this.subagentRuntimeOperations.set(options.id, options.operationId);
 		try {
 			await runtime.session.bindExtensions({});
 			if (
-				this.subagentRuntimeAssignments.get(options.id) !== assignmentId ||
+				!this.ownsSubagentRuntime(options.id, runtime, assignmentId, options.operationId) ||
 				options.parentSession.getRlmChildRunStatus(options.id) === "cancelled"
 			) {
 				throw new Error("RLM subagent startup was cancelled");
@@ -406,12 +423,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			}
 			options.onSessionPublished?.(runtime.session);
 		} catch (error) {
-			if (
-				this.subagentRuntimes.get(options.id) === runtime &&
-				this.subagentRuntimeAssignments.get(options.id) === assignmentId
-			) {
+			if (this.ownsSubagentRuntime(options.id, runtime, assignmentId, options.operationId)) {
 				this.subagentRuntimes.delete(options.id);
 				this.subagentRuntimeAssignments.delete(options.id);
+				this.subagentRuntimeOperations.delete(options.id);
 			}
 			await runtime.dispose();
 			throw error;
@@ -432,18 +447,21 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	): Promise<void> {
 		const runtime = this.subagentRuntimes.get(childId);
 		const currentAssignment = this.subagentRuntimeAssignments.get(childId);
+		const currentOperation = this.subagentRuntimeOperations.get(childId);
 		// Inline runtimes have no durable daemon registry. Preserve direct delete
-		// compatibility, but a named C01 assignment fences stale callbacks.
+		// compatibility only when both sides lack C03 operation identity; otherwise
+		// a named C01 assignment and C03 operation fence stale callbacks.
 		if (
 			!runtime ||
 			(assignmentId !== undefined && currentAssignment !== assignmentId) ||
-			(operationId !== undefined && runtime.metadata.operationId !== operationId)
+			((operationId !== undefined || currentOperation !== undefined) && currentOperation !== operationId)
 		) {
 			await childSession?.disposeAsync();
 			return;
 		}
 		this.subagentRuntimes.delete(childId);
 		this.subagentRuntimeAssignments.delete(childId);
+		this.subagentRuntimeOperations.delete(childId);
 		const shouldDisposeStaleSession = !!childSession && runtime.session !== childSession;
 		try {
 			await runtime.dispose();

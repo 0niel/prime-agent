@@ -21,7 +21,7 @@ function session(id: string, name: string | undefined, path: string): SessionInf
 }
 
 describe("daemon catalog selector resolution", () => {
-	it("reads only a saved child's persisted sibling set", async () => {
+	it("keeps canonical C01 assignment-only and assignment-less legacy rows displayable", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-siblings-"));
 		const sessionDir = join(root, "sessions");
 		const parent = SessionManager.create(root, sessionDir);
@@ -38,7 +38,13 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(
 			registry,
 			[
-				{ type: "rlm_subagent", childId: "first", sessionFile: first.getSessionFile(), status: "completed" },
+				{
+					type: "rlm_subagent",
+					childId: "first",
+					assignmentId: "11111111-1111-4111-8111-111111111111",
+					sessionFile: first.getSessionFile(),
+					status: "completed",
+				},
 				{ type: "rlm_subagent", childId: "second", sessionFile: second.getSessionFile(), status: "completed" },
 			]
 				.map((entry) => JSON.stringify(entry))
@@ -100,6 +106,50 @@ describe("daemon catalog selector resolution", () => {
 		]);
 	});
 
+	it("does not let late display-only legacy history displace a canonical C03 incarnation", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-c03-over-legacy-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession();
+		parent.appendSessionInfo("parent");
+		const first = SessionManager.create(root, join(root, "first"));
+		first.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		first.appendSessionInfo("first");
+		const second = SessionManager.create(root, join(root, "second"));
+		second.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		second.appendSessionInfo("second");
+		const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
+		mkdirSync(dirname(registry), { recursive: true });
+		writeFileSync(
+			registry,
+			[
+				{
+					type: "rlm_subagent",
+					childId: "reused",
+					assignmentId: "11111111-1111-4111-8111-111111111111",
+					operationId: "22222222-2222-4222-8222-222222222222",
+					deliveryId: "33333333-3333-4333-8333-333333333333",
+					sessionFile: second.getSessionFile(),
+					status: "completed",
+				},
+				{
+					type: "rlm_subagent",
+					childId: "reused",
+					assignmentId: "44444444-4444-4444-8444-444444444444",
+					sessionFile: first.getSessionFile(),
+					status: "completed",
+				},
+			]
+				.map((entry) => JSON.stringify(entry))
+				.join("\n"),
+		);
+
+		await expect(listSavedSessionSiblings(first.getSessionFile()!)).resolves.toEqual([
+			expect.objectContaining({ id: first.getSessionId(), name: "first" }),
+			expect.objectContaining({ id: second.getSessionId(), name: "second" }),
+		]);
+	});
+
 	it("resolves relative parent headers from each child session directory", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-relative-siblings-"));
 		const sessionDir = join(root, "sessions");
@@ -120,7 +170,13 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(
 			registry,
 			[
-				{ type: "rlm_subagent", childId: "first", sessionFile: first.getSessionFile(), status: "completed" },
+				{
+					type: "rlm_subagent",
+					childId: "first",
+					assignmentId: "11111111-1111-4111-8111-111111111111",
+					sessionFile: first.getSessionFile(),
+					status: "completed",
+				},
 				{ type: "rlm_subagent", childId: "second", sessionFile: second.getSessionFile(), status: "completed" },
 			]
 				.map((entry) => JSON.stringify(entry))

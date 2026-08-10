@@ -70,19 +70,24 @@ interface SavedRlmSubagentRegistryEntry {
 	status?: unknown;
 }
 
+function hasCanonicalC03Identity(entry: SavedRlmSubagentRegistryEntry): boolean {
+	return (
+		assertFreshUuid(entry.assignmentId) && assertFreshUuid(entry.operationId) && assertFreshUuid(entry.deliveryId)
+	);
+}
+
 /** Read-only, private registry incarnation key. Legacy rows remain display-only. */
 function savedRlmIncarnationKey(entry: SavedRlmSubagentRegistryEntry): string | undefined {
 	if (typeof entry.childId !== "string") return undefined;
 	if (entry.assignmentId === undefined && entry.operationId === undefined && entry.deliveryId === undefined)
 		return `${entry.childId}\0legacy`;
+	// Pre-C03 C01 rows have a canonical assignment but no durable operation or
+	// delivery. Keep those as display-only history with their own incarnation key.
+	if (entry.operationId === undefined && entry.deliveryId === undefined && assertFreshUuid(entry.assignmentId))
+		return `${entry.childId}\0legacy-assignment\0${entry.assignmentId}`;
 	// C03 durable identities are opaque canonical UUIDs. Any partial or malformed
 	// triple is untrusted registry history, not an alternative current incarnation.
-	if (
-		!assertFreshUuid(entry.assignmentId) ||
-		!assertFreshUuid(entry.operationId) ||
-		!assertFreshUuid(entry.deliveryId)
-	)
-		return undefined;
+	if (!hasCanonicalC03Identity(entry)) return undefined;
 	return `${entry.childId}\0${entry.assignmentId}\0${entry.operationId}\0${entry.deliveryId}`;
 }
 
@@ -117,10 +122,18 @@ export async function listSavedSessionSiblings(sessionPath: string): Promise<Ses
 			// Ignore malformed registry history just like the owning worker does.
 		}
 	}
-	const newestBySelector = new Map<string, SavedRlmSubagentRegistryEntry>();
+	const newestLegacyBySelector = new Map<string, SavedRlmSubagentRegistryEntry>();
+	const newestC03BySelector = new Map<string, SavedRlmSubagentRegistryEntry>();
 	for (const entry of latestByIncarnation.values()) {
-		if (typeof entry.childId === "string") newestBySelector.set(entry.childId, entry);
+		if (typeof entry.childId !== "string") continue;
+		// Only a canonical full triple may select a current C03 incarnation. A
+		// display-only pre-C03 row cannot displace it, even if its old lifecycle
+		// update is appended after a C03 entry.
+		if (hasCanonicalC03Identity(entry)) newestC03BySelector.set(entry.childId, entry);
+		else newestLegacyBySelector.set(entry.childId, entry);
 	}
+	const newestBySelector = new Map(newestLegacyBySelector);
+	for (const [childId, entry] of newestC03BySelector) newestBySelector.set(childId, entry);
 	const siblingPaths = new Set<string>([resolve(target.path)]);
 	for (const entry of newestBySelector.values()) {
 		if (entry.status !== "deleted" && typeof entry.sessionFile === "string")
