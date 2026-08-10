@@ -106,17 +106,34 @@ function isRetryableError(status: number, errorText: string): boolean {
 	return /rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused/i.test(errorText);
 }
 
+function createAbortError(): Error {
+	const error = new Error("Request was aborted");
+	error.name = "AbortError";
+	return error;
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof Error && (error.name === "AbortError" || error.message === "Request was aborted");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw createAbortError();
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("Request was aborted"));
-			return;
-		}
-		const timeout = setTimeout(resolve, ms);
-		signal?.addEventListener("abort", () => {
+		throwIfAborted(signal);
+		const cleanup = () => signal?.removeEventListener("abort", onAbort);
+		const timeout = setTimeout(() => {
+			cleanup();
+			resolve();
+		}, ms);
+		const onAbort = () => {
 			clearTimeout(timeout);
-			reject(new Error("Request was aborted"));
-		});
+			cleanup();
+			reject(createAbortError());
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
 	});
 }
 
@@ -151,6 +168,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 		};
 
 		try {
+			throwIfAborted(options?.signal);
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			if (!apiKey) {
 				throw new Error(`No API key for provider: ${model.provider}`);
@@ -194,9 +212,6 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						options,
 					);
 
-					if (options?.signal?.aborted) {
-						throw new Error("Request was aborted");
-					}
 					stream.push({
 						type: "done",
 						reason: output.stopReason as "stop" | "length" | "toolUse",
@@ -205,8 +220,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					stream.end();
 					return;
 				} catch (error) {
-					const aborted = options?.signal?.aborted;
-					if (aborted || isCodexNonTransportError(error)) {
+					if (isAbortError(error) || options?.signal?.aborted || isCodexNonTransportError(error)) {
 						throw error;
 					}
 					appendAssistantMessageDiagnostic(
@@ -232,9 +246,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			let lastError: Error | undefined;
 
 			for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-				if (options?.signal?.aborted) {
-					throw new Error("Request was aborted");
-				}
+				throwIfAborted(options?.signal);
 
 				try {
 					response = await fetch(resolveCodexUrl(model.baseUrl), {
@@ -267,10 +279,8 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					const info = await parseErrorResponse(fakeResponse);
 					throw new Error(info.friendlyMessage || info.message);
 				} catch (error) {
-					if (error instanceof Error) {
-						if (error.name === "AbortError" || error.message === "Request was aborted") {
-							throw new Error("Request was aborted");
-						}
+					if (isAbortError(error) || options?.signal?.aborted) {
+						throw createAbortError();
 					}
 					lastError = error instanceof Error ? error : new Error(String(error));
 					// Network errors are retryable
@@ -294,9 +304,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			stream.push({ type: "start", partial: output });
 			await processStream(response, output, stream, model, options);
 
-			if (options?.signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
+			throwIfAborted(options?.signal);
 
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
@@ -305,8 +313,13 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as { partialJson?: string }).partialJson;
 			}
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : String(error);
+			const aborted = isAbortError(error) || options?.signal?.aborted;
+			output.stopReason = aborted ? "aborted" : "error";
+			output.errorMessage = aborted
+				? createAbortError().message
+				: error instanceof Error
+					? error.message
+					: String(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -454,7 +467,7 @@ async function processStream(
 	model: Model<"openai-codex-responses">,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	await processResponsesStream(mapCodexEvents(parseSSE(response)), output, stream, model, {
+	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal)), output, stream, model, {
 		serviceTier: options?.serviceTier,
 		resolveServiceTier: resolveCodexServiceTier,
 		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
@@ -532,45 +545,89 @@ function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined 
 // SSE Parsing
 // ============================================================================
 
-async function* parseSSE(response: Response): AsyncGenerator<Record<string, unknown>> {
+class CodexSSEDecoder {
+	private readonly decoder = new TextDecoder();
+	private buffer = "";
+	private dataLines: string[] = [];
+
+	push(value?: Uint8Array, final = false): string[] {
+		if (value) this.buffer += this.decoder.decode(value, { stream: !final });
+		if (final) this.buffer += this.decoder.decode();
+
+		const events: string[] = [];
+		while (true) {
+			const newline = this.buffer.search(/[\r\n]/);
+			if (newline < 0) break;
+
+			const delimiter = this.buffer[newline];
+			if (delimiter === "\r" && newline === this.buffer.length - 1 && !final) break;
+			const width = delimiter === "\r" && this.buffer[newline + 1] === "\n" ? 2 : 1;
+			const line = this.buffer.slice(0, newline);
+			this.buffer = this.buffer.slice(newline + width);
+			this.processLine(line, events);
+		}
+
+		if (final) {
+			if (this.buffer.length > 0) this.processLine(this.buffer, events);
+			this.buffer = "";
+			this.dispatch(events);
+		}
+		return events;
+	}
+
+	private processLine(line: string, events: string[]): void {
+		if (line.length === 0) {
+			this.dispatch(events);
+			return;
+		}
+		if (line.startsWith(":")) return;
+
+		const colon = line.indexOf(":");
+		const field = colon < 0 ? line : line.slice(0, colon);
+		let value = colon < 0 ? "" : line.slice(colon + 1);
+		if (value.startsWith(" ")) value = value.slice(1);
+		if (field === "data") this.dataLines.push(value);
+	}
+
+	private dispatch(events: string[]): void {
+		if (this.dataLines.length === 0) return;
+		events.push(this.dataLines.join("\n"));
+		this.dataLines = [];
+	}
+}
+
+async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
 	if (!response.body) return;
+	throwIfAborted(signal);
 
 	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
+	const decoder = new CodexSSEDecoder();
+	const onAbort = () => {
+		void reader.cancel(createAbortError()).catch(() => {});
+	};
+	signal?.addEventListener("abort", onAbort, { once: true });
 
 	try {
 		while (true) {
+			throwIfAborted(signal);
 			const { done, value } = await reader.read();
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-
-			let idx = buffer.indexOf("\n\n");
-			while (idx !== -1) {
-				const chunk = buffer.slice(0, idx);
-				buffer = buffer.slice(idx + 2);
-
-				const dataLines = chunk
-					.split("\n")
-					.filter((l) => l.startsWith("data:"))
-					.map((l) => l.slice(5).trim());
-				if (dataLines.length > 0) {
-					const data = dataLines.join("\n").trim();
-					if (data && data !== "[DONE]") {
-						try {
-							yield JSON.parse(data) as Record<string, unknown>;
-						} catch (cause) {
-							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
-								cause,
-								payload: data,
-							});
-						}
-					}
+			throwIfAborted(signal);
+			for (const data of decoder.push(value, done)) {
+				const payload = data.trim();
+				if (!payload || payload === "[DONE]") continue;
+				try {
+					yield JSON.parse(payload) as Record<string, unknown>;
+				} catch (cause) {
+					throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
+						cause,
+						payload: data,
+					});
 				}
-				idx = buffer.indexOf("\n\n");
 			}
+			if (done) break;
 		}
 	} finally {
+		signal?.removeEventListener("abort", onAbort);
 		// Best-effort stream teardown: the reader may already be closed or errored.
 		try {
 			await reader.cancel();
@@ -760,13 +817,14 @@ function scheduleSessionWebSocketExpiry(sessionId: string, entry: CachedWebSocke
 		clearTimeout(entry.idleTimer);
 	}
 	entry.idleTimer = setTimeout(() => {
-		if (entry.busy) return;
+		if (entry.busy || websocketSessionCache.get(sessionId) !== entry) return;
 		closeWebSocketSilently(entry.socket, 1000, "idle_timeout");
 		websocketSessionCache.delete(sessionId);
 	}, SESSION_WEBSOCKET_CACHE_TTL_MS);
 }
 
 async function connectWebSocket(url: string, headers: Headers, signal?: AbortSignal): Promise<WebSocketLike> {
+	throwIfAborted(signal);
 	const WebSocketCtor = getWebSocketConstructor();
 	if (!WebSocketCtor) {
 		throw new Error("WebSocket transport is not available in this runtime");
@@ -797,6 +855,7 @@ async function connectWebSocket(url: string, headers: Headers, signal?: AbortSig
 			if (settled) return;
 			settled = true;
 			cleanup();
+			closeWebSocketSilently(socket, 1000, "connection_error");
 			reject(error);
 		};
 		const onClose: WebSocketListener = (event) => {
@@ -810,8 +869,8 @@ async function connectWebSocket(url: string, headers: Headers, signal?: AbortSig
 			if (settled) return;
 			settled = true;
 			cleanup();
-			socket.close(1000, "aborted");
-			reject(new Error("Request was aborted"));
+			closeWebSocketSilently(socket, 1000, "aborted");
+			reject(createAbortError());
 		};
 
 		const cleanup = () => {
@@ -824,8 +883,15 @@ async function connectWebSocket(url: string, headers: Headers, signal?: AbortSig
 		socket.addEventListener("open", onOpen);
 		socket.addEventListener("error", onError);
 		socket.addEventListener("close", onClose);
-		signal?.addEventListener("abort", onAbort);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
 	});
+}
+
+function rejectAbortedConnectedSocket(socket: WebSocketLike, signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	closeWebSocketSilently(socket, 1000, "aborted");
+	throw createAbortError();
 }
 
 async function acquireWebSocket(
@@ -839,8 +905,10 @@ async function acquireWebSocket(
 	reused: boolean;
 	release: (options?: { keep?: boolean }) => void;
 }> {
+	throwIfAborted(signal);
 	if (!sessionId) {
 		const socket = await connectWebSocket(url, headers, signal);
+		rejectAbortedConnectedSocket(socket, signal);
 		return {
 			socket,
 			reused: false,
@@ -867,6 +935,10 @@ async function acquireWebSocket(
 				entry: cached,
 				reused: true,
 				release: ({ keep } = {}) => {
+					if (websocketSessionCache.get(sessionId) !== cached) {
+						closeWebSocketSilently(cached.socket);
+						return;
+					}
 					if (!keep || !isWebSocketReusable(cached.socket)) {
 						closeWebSocketSilently(cached.socket);
 						websocketSessionCache.delete(sessionId);
@@ -879,6 +951,7 @@ async function acquireWebSocket(
 		}
 		if (cached.busy) {
 			const socket = await connectWebSocket(url, headers, signal);
+			rejectAbortedConnectedSocket(socket, signal);
 			return {
 				socket,
 				reused: false,
@@ -894,6 +967,7 @@ async function acquireWebSocket(
 	}
 
 	const socket = await connectWebSocket(url, headers, signal);
+	rejectAbortedConnectedSocket(socket, signal);
 	const entry: CachedWebSocketConnection = { socket, busy: true };
 	websocketSessionCache.set(sessionId, entry);
 	return {
@@ -901,6 +975,10 @@ async function acquireWebSocket(
 		entry,
 		reused: false,
 		release: ({ keep } = {}) => {
+			if (websocketSessionCache.get(sessionId) !== entry) {
+				closeWebSocketSilently(entry.socket);
+				return;
+			}
 			if (!keep || !isWebSocketReusable(entry.socket)) {
 				closeWebSocketSilently(entry.socket);
 				if (entry.idleTimer) clearTimeout(entry.idleTimer);
@@ -972,12 +1050,18 @@ async function decodeWebSocketData(data: unknown): Promise<string | null> {
 	return null;
 }
 
-async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+function createWebSocketEventStream(
+	socket: WebSocketLike,
+	signal?: AbortSignal,
+): { events: AsyncIterable<Record<string, unknown>>; dispose: () => void } {
+	throwIfAborted(signal);
 	const queue: Record<string, unknown>[] = [];
 	let pending: (() => void) | null = null;
 	let done = false;
+	let disposed = false;
 	let failed: Error | null = null;
 	let sawCompletion = false;
+	let processing = Promise.resolve();
 
 	const wake = () => {
 		if (!pending) return;
@@ -986,89 +1070,108 @@ async function* parseWebSocket(socket: WebSocketLike, signal?: AbortSignal): Asy
 		resolve();
 	};
 
+	const cleanup = () => {
+		if (disposed) return;
+		disposed = true;
+		socket.removeEventListener("message", onMessage);
+		socket.removeEventListener("error", onError);
+		socket.removeEventListener("close", onClose);
+		signal?.removeEventListener("abort", onAbort);
+	};
+
+	const finish = (error?: Error) => {
+		if (done) return;
+		if (error) failed = error;
+		done = true;
+		wake();
+	};
+
+	const enqueue = (task: () => Promise<void> | void) => {
+		processing = processing.then(task).catch((cause) => {
+			finish(cause instanceof Error ? cause : new Error(String(cause)));
+		});
+	};
+
 	const onMessage: WebSocketListener = (event) => {
-		void (async () => {
+		enqueue(async () => {
+			if (done || !event || typeof event !== "object" || !("data" in event)) return;
 			let text: string | null = null;
 			try {
-				if (!event || typeof event !== "object" || !("data" in event)) return;
 				text = await decodeWebSocketData((event as { data?: unknown }).data);
-				if (!text) return;
+				if (!text || done) return;
 				const parsed = JSON.parse(text) as Record<string, unknown>;
+				queue.push(parsed);
 				const type = typeof parsed.type === "string" ? parsed.type : "";
 				if (type === "response.completed" || type === "response.done" || type === "response.incomplete") {
 					sawCompletion = true;
-					done = true;
+					finish();
+				} else {
+					wake();
 				}
-				queue.push(parsed);
-				wake();
 			} catch (cause) {
-				failed = new CodexProtocolError(`Invalid Codex WebSocket JSON: ${formatThrownValue(cause)}`, {
-					cause,
-					payload: text,
-				});
-				done = true;
-				wake();
+				finish(
+					new CodexProtocolError(`Invalid Codex WebSocket JSON: ${formatThrownValue(cause)}`, {
+						cause,
+						payload: text,
+					}),
+				);
 			}
-		})();
+		});
 	};
 
 	const onError: WebSocketListener = (event) => {
-		failed = extractWebSocketError(event);
-		done = true;
-		wake();
+		enqueue(() => finish(extractWebSocketError(event)));
 	};
 
 	const onClose: WebSocketListener = (event) => {
-		if (sawCompletion) {
-			done = true;
-			wake();
-			return;
-		}
-		if (!failed) {
-			failed = extractWebSocketCloseError(event);
-		}
-		done = true;
-		wake();
+		enqueue(() => {
+			if (sawCompletion) finish();
+			else finish(extractWebSocketCloseError(event));
+		});
 	};
 
 	const onAbort = () => {
-		failed = new Error("Request was aborted");
-		done = true;
-		wake();
+		finish(createAbortError());
+		closeWebSocketSilently(socket, 1000, "aborted");
+		cleanup();
 	};
 
 	socket.addEventListener("message", onMessage);
 	socket.addEventListener("error", onError);
 	socket.addEventListener("close", onClose);
-	signal?.addEventListener("abort", onAbort);
+	signal?.addEventListener("abort", onAbort, { once: true });
+	if (signal?.aborted) onAbort();
 
-	try {
-		while (true) {
-			if (signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-			if (queue.length > 0) {
-				yield queue.shift()!;
-				continue;
-			}
-			if (done) break;
-			await new Promise<void>((resolve) => {
-				pending = resolve;
-			});
-		}
+	const events: AsyncIterable<Record<string, unknown>> = {
+		async *[Symbol.asyncIterator]() {
+			try {
+				while (true) {
+					throwIfAborted(signal);
+					if (queue.length > 0) {
+						yield queue.shift()!;
+						continue;
+					}
+					if (done) break;
+					await new Promise<void>((resolve) => {
+						pending = resolve;
+					});
+				}
 
-		if (failed) {
-			throw failed;
-		}
-		if (!sawCompletion) {
-			throw new Error("WebSocket stream closed before response.completed");
-		}
-	} finally {
-		socket.removeEventListener("message", onMessage);
-		socket.removeEventListener("error", onError);
-		socket.removeEventListener("close", onClose);
-		signal?.removeEventListener("abort", onAbort);
-	}
+				if (failed) throw failed;
+				if (!sawCompletion) throw new Error("WebSocket stream closed before response.completed");
+			} finally {
+				cleanup();
+			}
+		},
+	};
+
+	return {
+		events,
+		dispose: () => {
+			finish();
+			cleanup();
+		},
+	};
 }
 
 function requestBodyWithoutInput(body: RequestBody): RequestBody {
@@ -1153,7 +1256,7 @@ async function processWebSocketStream(
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
 	const { socket, entry, reused, release } = await acquireWebSocket(url, headers, options?.sessionId, options?.signal);
-	let keepConnection = true;
+	let keepConnection = false;
 	const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
 	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
 	// WebSocket continuation still works via connection-scoped previous_response_id state.
@@ -1177,15 +1280,14 @@ async function processWebSocketStream(
 			stats.lastPreviousResponseId = undefined;
 		}
 	}
+	let websocketStream: ReturnType<typeof createWebSocketEventStream> | undefined;
 	try {
+		throwIfAborted(options?.signal);
+		websocketStream = createWebSocketEventStream(socket, options?.signal);
+		throwIfAborted(options?.signal);
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
-			startWebSocketOutputOnFirstEvent(
-				mapCodexEvents(parseWebSocket(socket, options?.signal)),
-				output,
-				stream,
-				onStart,
-			),
+			startWebSocketOutputOnFirstEvent(mapCodexEvents(websocketStream.events), output, stream, onStart),
 			output,
 			stream,
 			model,
@@ -1195,9 +1297,8 @@ async function processWebSocketStream(
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			},
 		);
-		if (options?.signal?.aborted) {
-			keepConnection = false;
-		} else if (useCachedContext && entry && output.responseId) {
+		throwIfAborted(options?.signal);
+		if (useCachedContext && entry && output.responseId) {
 			const responseItems = convertResponsesMessages(model, { messages: [output] }, CODEX_TOOL_CALL_PROVIDERS, {
 				includeSystemPrompt: false,
 			}).filter((item) => item.type !== "function_call_output");
@@ -1207,6 +1308,7 @@ async function processWebSocketStream(
 				lastResponseItems: responseItems,
 			};
 		}
+		keepConnection = true;
 	} catch (error) {
 		if (entry) {
 			entry.continuation = undefined;
@@ -1214,6 +1316,7 @@ async function processWebSocketStream(
 		keepConnection = false;
 		throw error;
 	} finally {
+		websocketStream?.dispose();
 		release({ keep: keepConnection });
 	}
 }
