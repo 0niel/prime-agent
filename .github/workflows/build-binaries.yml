@@ -351,6 +351,79 @@ jobs:
           fs.writeFileSync("/tmp/prime-agent-install-beta.sh", renderInstaller("beta"));
           NODE
 
+      # Immutable release objects are write-once. A conditional PUT wins only
+      # when absent; every error path is treated as a possible collision and is
+      # accepted solely after downloading and hashing the existing object.
+      - name: Prepare immutable publication helpers
+        run: |
+          cat > /tmp/release-publication-helpers.sh <<'SH'
+          create_or_verify_immutable_r2_object() {
+            local_file="$1"
+            object_key="$2"
+            content_type="$3"
+            test -f "$local_file"
+            expected_sha=$(sha256sum "$local_file" | awk '{print $1}')
+            remote_uri="s3://${R2_BUCKET}/${object_key}"
+
+            if aws s3api put-object \
+                --bucket "$R2_BUCKET" \
+                --key "$object_key" \
+                --body "$local_file" \
+                --if-none-match '*' \
+                --content-type "$content_type" \
+                --cache-control 'public, max-age=31536000, immutable' \
+                --metadata "sha256=$expected_sha" \
+                --endpoint-url "$R2_ENDPOINT_URL" >/dev/null; then
+              echo "Created immutable object ${remote_uri} (${expected_sha})."
+              return 0
+            fi
+
+            collision_file=$(mktemp)
+            trap 'rm -f "$collision_file"' RETURN
+            aws s3api get-object \
+              --bucket "$R2_BUCKET" \
+              --key "$object_key" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              "$collision_file" >/dev/null
+            actual_sha=$(sha256sum "$collision_file" | awk '{print $1}')
+            if [ "$actual_sha" != "$expected_sha" ]; then
+              echo "Immutable object collision at ${remote_uri}: expected ${expected_sha}, found ${actual_sha}." >&2
+              return 1
+            fi
+            echo "Verified existing immutable object ${remote_uri} (${expected_sha})."
+          }
+
+          attach_or_verify_immutable_release_asset() {
+            release_tag="$1"
+            local_file="$2"
+            asset_name=$(basename "$local_file")
+            expected_sha=$(sha256sum "$local_file" | awk '{print $1}')
+            release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}" --jq .id)
+            asset_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --paginate \
+              --jq ".[] | select(.name == \"${asset_name}\") | .id" | head -n 1 || true)
+            if [ -z "$asset_id" ]; then
+              # Never clobber: a concurrent uploader is verified below instead.
+              gh release upload "$release_tag" "$local_file" || true
+              asset_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --paginate \
+                --jq ".[] | select(.name == \"${asset_name}\") | .id" | head -n 1 || true)
+            fi
+            if [ -z "$asset_id" ]; then
+              echo "Release asset ${asset_name} was not created." >&2
+              return 1
+            fi
+            collision_file=$(mktemp)
+            trap 'rm -f "$collision_file"' RETURN
+            gh api --header 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "$collision_file"
+            actual_sha=$(sha256sum "$collision_file" | awk '{print $1}')
+            if [ "$actual_sha" != "$expected_sha" ]; then
+              echo "Immutable release asset collision for ${release_tag}/${asset_name}: expected ${expected_sha}, found ${actual_sha}." >&2
+              return 1
+            fi
+            echo "Verified release asset ${release_tag}/${asset_name} (${expected_sha})."
+          }
+          SH
+
       - name: Extract production release notes
         if: env.PUBLISH_PRODUCTION == 'true'
         run: |
@@ -359,12 +432,12 @@ jobs:
             echo "Release v${PRODUCTION_VERSION}" > /tmp/release-notes.md
           fi
 
-      - name: Publish production channel to R2
+      - name: Publish immutable production artifacts to R2
         if: env.PUBLISH_PRODUCTION == 'true'
         run: |
+          . /tmp/release-publication-helpers.sh
           PRODUCTION_DIR=release-artifacts/production
           RELEASE_PREFIX="releases/v${PRODUCTION_VERSION}"
-          TARBALL="$PRODUCTION_DIR/prime-agent-${PRODUCTION_VERSION}.tgz"
 
           npm run release:verify -- \
             --artifact-dir "$PRODUCTION_DIR" \
@@ -372,60 +445,26 @@ jobs:
             --version "$PRODUCTION_VERSION" \
             --commit "$SOURCE_COMMIT" \
             --dry-run
-          test -f "$TARBALL"
+          test -f "$PRODUCTION_DIR/prime-agent-${PRODUCTION_VERSION}.tgz"
           test -f "$PRODUCTION_DIR/SHA256SUMS"
-          test -f "$PRODUCTION_DIR/stable"
           test -f "$PRODUCTION_DIR/latest.json"
           test -n "$R2_BUCKET"
           test -n "$R2_ENDPOINT_URL"
 
+          # The versioned prefix has only canonical, immutable release evidence:
+          # the four tarballs, their checksum file, and the JSON manifest.
           for artifact in "$PRODUCTION_DIR"/*.tgz; do
-            aws s3 cp "$artifact" "s3://${R2_BUCKET}/${RELEASE_PREFIX}/$(basename "$artifact")" \
-              --endpoint-url "$R2_ENDPOINT_URL" \
-              --content-type application/gzip \
-              --cache-control 'public, max-age=31536000, immutable'
+            create_or_verify_immutable_r2_object "$artifact" "$RELEASE_PREFIX/$(basename "$artifact")" application/gzip
           done
+          create_or_verify_immutable_r2_object "$PRODUCTION_DIR/SHA256SUMS" "$RELEASE_PREFIX/SHA256SUMS" text/plain
+          create_or_verify_immutable_r2_object "$PRODUCTION_DIR/latest.json" "$RELEASE_PREFIX/latest.json" application/json
 
-          aws s3 cp "$PRODUCTION_DIR/SHA256SUMS" "s3://${R2_BUCKET}/${RELEASE_PREFIX}/SHA256SUMS" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/plain \
-            --cache-control 'public, max-age=31536000, immutable'
-
-          # Re-fetch at the stable-pointer boundary so a moved/replaced remote tag can
-          # never publish a stable pointer or GitHub release for another commit.
-          RELEASE_TAG="v${PRODUCTION_VERSION}"
-          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
-          if [ "$tagged_sha" != "$SOURCE_SHA" ]; then
-            echo "Protected release tag $RELEASE_TAG peels to $tagged_sha, not $SOURCE_SHA." >&2
-            exit 1
-          fi
-
-          aws s3 cp "$PRODUCTION_DIR/latest.json" "s3://${R2_BUCKET}/latest.json" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type application/json \
-            --cache-control no-cache
-
-          aws s3 cp "$PRODUCTION_DIR/stable" "s3://${R2_BUCKET}/stable" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/plain \
-            --cache-control no-cache
-
-          aws s3 cp /tmp/prime-agent-install.sh "s3://${R2_BUCKET}/install.sh" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/x-shellscript \
-            --cache-control no-cache
-
-          aws s3 cp /tmp/prime-agent-install-beta.sh "s3://${R2_BUCKET}/install-beta.sh" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/x-shellscript \
-            --cache-control no-cache
-
-      - name: Create production GitHub release
+      - name: Create or verify immutable production GitHub release and assets
         if: env.PUBLISH_PRODUCTION == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          . /tmp/release-publication-helpers.sh
           RELEASE_TAG="v${PRODUCTION_VERSION}"
           PRODUCTION_DIR=release-artifacts/production
           git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
@@ -434,15 +473,18 @@ jobs:
             echo "Protected release tag $RELEASE_TAG peels to $tagged_sha, not $SOURCE_SHA." >&2
             exit 1
           fi
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$PRODUCTION_DIR"/* --clobber
-          else
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # A losing concurrent creator is acceptable only when the tag-bound
+            # release becomes visible and each asset verifies below.
             gh release create "$RELEASE_TAG" \
               --title "$RELEASE_TAG" \
               --target "$SOURCE_SHA" \
-              --notes-file /tmp/release-notes.md \
-              "$PRODUCTION_DIR"/*
+              --notes-file /tmp/release-notes.md || true
           fi
+          gh release view "$RELEASE_TAG" >/dev/null
+          for artifact in "$PRODUCTION_DIR"/*.tgz "$PRODUCTION_DIR/SHA256SUMS" "$PRODUCTION_DIR/latest.json"; do
+            attach_or_verify_immutable_release_asset "$RELEASE_TAG" "$artifact"
+          done
           git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
           if [ "$tagged_sha" != "$SOURCE_SHA" ]; then
@@ -450,12 +492,59 @@ jobs:
             exit 1
           fi
 
+      - name: Advance production root pointers after immutable release publication
+        if: env.PUBLISH_PRODUCTION == 'true'
+        run: |
+          PRODUCTION_DIR=release-artifacts/production
+          RELEASE_TAG="v${PRODUCTION_VERSION}"
+          # Re-fetch at the stable-pointer boundary so a moved/replaced remote tag can
+          # never publish stable after another release identity took its place.
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [ "$tagged_sha" != "$SOURCE_SHA" ]; then
+            echo "Protected release tag $RELEASE_TAG peels to $tagged_sha, not $SOURCE_SHA." >&2
+            exit 1
+          fi
+          aws s3 cp "$PRODUCTION_DIR/latest.json" "s3://${R2_BUCKET}/latest.json" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type application/json --cache-control no-cache
+          aws s3 cp /tmp/prime-agent-install.sh "s3://${R2_BUCKET}/install.sh" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/x-shellscript --cache-control no-cache
+          aws s3 cp /tmp/prime-agent-install-beta.sh "s3://${R2_BUCKET}/install-beta.sh" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/x-shellscript --cache-control no-cache
+          # stable is the final mutable commitment, after tag, immutable R2, release,
+          # assets, and all other root documents are durably available.
+          aws s3 cp "$PRODUCTION_DIR/stable" "s3://${R2_BUCKET}/stable" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/plain --cache-control no-cache
+
+      # Unlike the moving beta convenience ref, each beta build has a unique,
+      # immutable tag and release identity. The mutable beta root pointers advance
+      # only after the same create-or-verify publication sequence completes.
+      - name: Create or verify immutable beta tag
+        if: env.PUBLISH_BETA == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="v${BETA_VERSION}"
+          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "Using existing immutable beta tag $RELEASE_TAG."
+          elif ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" \
+              -f "sha=$SOURCE_SHA" >/dev/null; then
+            echo "Beta-tag creation raced; verifying the existing immutable tag."
+          fi
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [ "$tagged_sha" != "$SOURCE_SHA" ]; then
+            echo "Immutable beta tag $RELEASE_TAG peels to $tagged_sha, not $SOURCE_SHA." >&2
+            exit 1
+          fi
+
       - name: Publish immutable beta artifacts to R2
         if: env.PUBLISH_BETA == 'true'
         run: |
+          . /tmp/release-publication-helpers.sh
           BETA_DIR=release-artifacts/beta
           RELEASE_PREFIX="releases/v${BETA_VERSION}"
-          TARBALL="$BETA_DIR/prime-agent-${BETA_VERSION}.tgz"
 
           npm run release:verify -- \
             --artifact-dir "$BETA_DIR" \
@@ -463,90 +552,62 @@ jobs:
             --version "$BETA_VERSION" \
             --commit "$SOURCE_COMMIT" \
             --dry-run
-          test -f "$TARBALL"
+          test -f "$BETA_DIR/prime-agent-${BETA_VERSION}.tgz"
           test -f "$BETA_DIR/SHA256SUMS"
-          test -f "$BETA_DIR/beta"
           test -f "$BETA_DIR/beta.json"
           test -n "$R2_BUCKET"
           test -n "$R2_ENDPOINT_URL"
-
           for artifact in "$BETA_DIR"/*.tgz; do
-            aws s3 cp "$artifact" "s3://${R2_BUCKET}/${RELEASE_PREFIX}/$(basename "$artifact")" \
-              --endpoint-url "$R2_ENDPOINT_URL" \
-              --content-type application/gzip \
-              --cache-control 'public, max-age=31536000, immutable'
+            create_or_verify_immutable_r2_object "$artifact" "$RELEASE_PREFIX/$(basename "$artifact")" application/gzip
           done
+          create_or_verify_immutable_r2_object "$BETA_DIR/SHA256SUMS" "$RELEASE_PREFIX/SHA256SUMS" text/plain
+          create_or_verify_immutable_r2_object "$BETA_DIR/beta.json" "$RELEASE_PREFIX/beta.json" application/json
 
-          aws s3 cp "$BETA_DIR/SHA256SUMS" "s3://${R2_BUCKET}/${RELEASE_PREFIX}/SHA256SUMS" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/plain \
-            --cache-control 'public, max-age=31536000, immutable'
+      - name: Create or verify immutable beta GitHub release and assets
+        if: env.PUBLISH_BETA == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          . /tmp/release-publication-helpers.sh
+          RELEASE_TAG="v${BETA_VERSION}"
+          BETA_DIR=release-artifacts/beta
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          test "$tagged_sha" = "$SOURCE_SHA"
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --target "$SOURCE_SHA" \
+              --notes "Automated immutable beta build from ${SOURCE_SHA}." \
+              --prerelease || true
+          fi
+          gh release view "$RELEASE_TAG" >/dev/null
+          for artifact in "$BETA_DIR"/*.tgz "$BETA_DIR/SHA256SUMS" "$BETA_DIR/beta.json"; do
+            attach_or_verify_immutable_release_asset "$RELEASE_TAG" "$artifact"
+          done
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          test "$tagged_sha" = "$SOURCE_SHA"
 
-      - name: Advance beta release
+      - name: Advance beta root pointers after immutable release publication
         if: env.PUBLISH_BETA == 'true'
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # DEFAULT_BRANCH is a Git ref, not an already-safe URL path. Encode it as
-          # one segment so slashes, fragments, queries, and control characters cannot
-          # change the commits API path.
+          # Do not allow an older build to move any mutable beta root pointer.
           encoded_default_branch=$(node scripts/encode-github-api-path-segment.mjs "$DEFAULT_BRANCH")
           latest_main_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${encoded_default_branch}" --jq .sha)
           if [ "$latest_main_sha" != "$SOURCE_SHA" ]; then
             echo "A newer main commit exists; keeping its beta pointers in place."
             exit 0
           fi
-
           BETA_DIR=release-artifacts/beta
           aws s3 cp "$BETA_DIR/beta.json" "s3://${R2_BUCKET}/beta.json" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type application/json \
-            --cache-control no-cache
-
-          aws s3 cp "$BETA_DIR/beta" "s3://${R2_BUCKET}/beta" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/plain \
-            --cache-control no-cache
-
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type application/json --cache-control no-cache
           aws s3 cp /tmp/prime-agent-install.sh "s3://${R2_BUCKET}/install.sh" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/x-shellscript \
-            --cache-control no-cache
-
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/x-shellscript --cache-control no-cache
           aws s3 cp /tmp/prime-agent-install-beta.sh "s3://${R2_BUCKET}/install-beta.sh" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/x-shellscript \
-            --cache-control no-cache
-
-          printf 'Automated beta build from `%s` (`%s`).\n' "$DEFAULT_BRANCH" "$SOURCE_SHA" > /tmp/beta-release-notes.md
-
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/beta" >/dev/null 2>&1; then
-            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/beta" \
-              -F sha="$SOURCE_SHA" \
-              -F force=true >/dev/null
-          else
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref=refs/tags/beta \
-              -f sha="$SOURCE_SHA" >/dev/null
-          fi
-
-          if release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/beta" --jq .id 2>/dev/null); then
-            gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" --jq '.[].id' | while read -r asset_id; do
-              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
-            done
-            gh release edit beta \
-              --title "Beta (v${BETA_VERSION})" \
-              --target "$SOURCE_SHA" \
-              --notes-file /tmp/beta-release-notes.md \
-              --prerelease
-          else
-            gh release create beta \
-              --title "Beta (v${BETA_VERSION})" \
-              --target "$SOURCE_SHA" \
-              --notes-file /tmp/beta-release-notes.md \
-              --prerelease
-          fi
-
-          gh release upload beta "$BETA_DIR"/* --clobber
-          echo "Beta installer: ${R2_PUBLIC_BASE_URL%/}/install-beta.sh"
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/x-shellscript --cache-control no-cache
+          aws s3 cp "$BETA_DIR/beta" "s3://${R2_BUCKET}/beta" \
+            --endpoint-url "$R2_ENDPOINT_URL" --content-type text/plain --cache-control no-cache
