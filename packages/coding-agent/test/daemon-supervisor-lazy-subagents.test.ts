@@ -29,6 +29,7 @@ interface SupervisorInternals {
 		name: string,
 	): void;
 	familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry;
+	familyCatalogEntries(): Promise<readonly AgentFamilyCatalogEntry[]>;
 	handleCommand(client: object, command: Record<string, unknown>): Promise<unknown>;
 }
 
@@ -642,6 +643,34 @@ describe("daemon supervisor passive subagent topology", () => {
 		).rejects.toThrow("an agent of that name already exists at depth 1 under this parent");
 		releaseLaunch();
 		await expect(first).resolves.toBe(launched);
+	});
+
+	it("keeps inactive depth-one parents in the supervisor authorization topology", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-deep-passive-acl-"));
+		tempDirs.push(directory);
+		const parentPath = join(directory, "parent.jsonl");
+		const intermediatePath = join(directory, "intermediate.jsonl");
+		const firstPath = join(directory, "first.jsonl");
+		const secondPath = join(directory, "second.jsonl");
+		const base = { cwd: directory, created: new Date(0), modified: new Date(0), messageCount: 0, firstMessage: "", allMessagesText: "" };
+		const saved = [
+			{ ...base, id: "root", path: parentPath, rlmDepth: 0 },
+			{ ...base, id: "intermediate", path: intermediatePath, parentSessionPath: parentPath, rlmDepth: 1 },
+			{ ...base, id: "first", path: firstPath, parentSessionPath: intermediatePath, rlmDepth: 2 },
+			{ ...base, id: "second", path: secondPath, parentSessionPath: intermediatePath, rlmDepth: 2 },
+		];
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory }, descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		Object.assign(supervisor, { catalog: { list: vi.fn(async () => saved) } });
+		const catalog = await supervisor.familyCatalogEntries();
+		const first = catalog.find((entry) => entry.id === "first");
+		const second = catalog.find((entry) => entry.id === "second");
+		expect(catalog).toContainEqual(expect.objectContaining({ id: "intermediate", depth: 1 }));
+		expect(assertAgentFamilyReach(first!, second!, catalog)).toBe("sibling");
+		expect(() => assertAgentFamilyReach(
+			{ ...first!, parentSessionPath: parentPath }, { ...second!, parentSessionPath: parentPath }, catalog,
+		)).toThrow("Agent reach is limited to parent, siblings, and children");
 	});
 
 	it("retains passive worker summaries but syncs only roots to cross-worker peer maps", async () => {

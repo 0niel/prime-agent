@@ -1798,6 +1798,8 @@ export class DaemonSupervisor {
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
 				: undefined;
+			// Hold this persisted topology through pre-wake and post-wake checks.
+			const familyCatalog = source && command.agentOrigin === true ? await this.familyCatalogEntries() : undefined;
 			let target: WorkerMatch;
 			try {
 				target = await this.findWorkerForClient(client, command.targetActiveSessionId);
@@ -1825,7 +1827,7 @@ export class DaemonSupervisor {
 					assertAgentFamilyReach(
 						this.familyCatalogEntry(source.summary),
 						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
-						await this.familyCatalogEntries(),
+						familyCatalog!,
 					);
 				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
@@ -1844,7 +1846,7 @@ export class DaemonSupervisor {
 				assertAgentFamilyReach(
 					this.familyCatalogEntry(source.summary),
 					this.familyCatalogEntry(target.summary),
-					await this.familyCatalogEntries(),
+					familyCatalog!,
 				);
 			}
 			if (source) {
@@ -3031,19 +3033,18 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async familyCatalogEntries(): Promise<AgentFamilyCatalogEntry[]> {
+	/** Immutable authorization topology: active summaries plus every persisted descendant. */
+	private async familyCatalogEntries(): Promise<readonly AgentFamilyCatalogEntry[]> {
 		const active = [...this.workers.values()].flatMap((worker) => [...worker.summaries.values()]);
 		const activePaths = new Set(
 			active.flatMap((summary) => (summary.sessionFile ? [canonicalSessionPath(summary.sessionFile)] : [])),
 		);
-		const savedRoots = (await this.catalog.list()).filter(
-			(info) =>
-				(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
-				!activePaths.has(canonicalSessionPath(info.path)),
-		);
-		return [...active, ...savedRoots.map((info) => summaryForInactiveSession(info))].map((summary) =>
-			this.familyCatalogEntry(summary),
-		);
+		const entries = new Map<string, AgentFamilyCatalogEntry>();
+		for (const info of await this.catalog.list()) {
+			if (!activePaths.has(canonicalSessionPath(info.path))) entries.set(info.id, this.familyCatalogEntry(summaryForInactiveSession(info)));
+		}
+		for (const summary of active) entries.set(summary.sessionId, this.familyCatalogEntry(summary));
+		return Object.freeze([...entries.values()]);
 	}
 
 	private async withSessionNameReservation<T>(

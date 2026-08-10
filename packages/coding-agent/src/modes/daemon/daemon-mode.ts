@@ -2872,22 +2872,26 @@ export class AgentDaemon {
 	}
 
 	private async createAgentObserveListResult(currentState: ActiveSessionState): Promise<AgentObserveListResult> {
+		const catalog = await this.agentFamilyCatalogEntries();
 		const agents = this.listTargetableSessionStates(currentState)
-			.filter(
-				(state) =>
-					state.activeSessionId === currentState.activeSessionId ||
-					this.isAgentFamilyReachable(currentState, state),
-			)
+			.filter((state) => {
+				if (state.activeSessionId === currentState.activeSessionId) return true;
+				try {
+					assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.agentFamilyEntry(state), catalog);
+					return true;
+				} catch (error) {
+					if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) return false;
+					throw error;
+				}
+			})
 			.map((state) => this.createAgentObserveSummary(state, currentState));
 		const residentIds = new Set(agents.map((agent) => agent.activeSessionId));
 		for (const passive of await this.listPassiveRlmSubagents()) {
 			if (residentIds.has(passive.info.id)) continue;
 			try {
-				assertAgentFamilyReach(
-					this.agentFamilyEntry(currentState),
-					this.passiveAgentFamilyEntry(passive),
-					this.agentFamilyCatalogEntries(),
-				);
+				const passiveEntry = catalog.find((entry) => entry.id === passive.info.id);
+				if (!passiveEntry) continue;
+				assertAgentFamilyReach(this.authoritativeAgentFamilyEntry(currentState, catalog), passiveEntry, catalog);
 			} catch (error) {
 				if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) continue;
 				throw error;
@@ -2926,8 +2930,8 @@ export class AgentDaemon {
 		currentState: ActiveSessionState,
 		target: string,
 	): Promise<AgentObserveAgentSnapshot> {
-		const targetState = await this.getOrHydrateAuthorizedAgentFamilyTarget(currentState, target);
-		this.assertAgentFamilyReachable(currentState, targetState);
+		const { targetState, catalog } = await this.getOrHydrateAuthorizedAgentFamilyTarget(currentState, target);
+		this.assertAgentFamilyReachable(currentState, targetState, catalog);
 		return {
 			agent: this.createAgentObserveSummary(targetState, currentState),
 		};
@@ -2937,8 +2941,8 @@ export class AgentDaemon {
 		currentState: ActiveSessionState,
 		input: AgentObserveRecentMessagesInput,
 	): Promise<AgentObserveRecentMessagesResult> {
-		const targetState = await this.getOrHydrateAuthorizedAgentFamilyTarget(currentState, input.target);
-		this.assertAgentFamilyReachable(currentState, targetState);
+		const { targetState, catalog } = await this.getOrHydrateAuthorizedAgentFamilyTarget(currentState, input.target);
+		this.assertAgentFamilyReachable(currentState, targetState, catalog);
 		const limit = normalizeObserveLimit(input.limit);
 		const maxChars = normalizeObserveMaxChars(input.maxChars);
 		const messages = targetState.runtime.session.messages;
@@ -5260,8 +5264,30 @@ export class AgentDaemon {
 		};
 	}
 
-	private agentFamilyCatalogEntries(): AgentFamilyCatalogEntry[] {
-		return [...this.sessions.values()].map((state) => this.agentFamilyEntry(state));
+	/** Capture persisted topology once for an authorization decision. */
+	private async agentFamilyCatalogEntries(): Promise<readonly AgentFamilyCatalogEntry[]> {
+		const entries = new Map<string, AgentFamilyCatalogEntry>();
+		const add = (entry: AgentFamilyCatalogEntry) => entries.set(entry.id, entry);
+		const saved = await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir);
+		for (const info of saved) {
+			const depth = info.rlmDepth ?? (info.parentSessionPath ? 1 : 0);
+			add({
+				id: info.id,
+				...(info.name ? { name: info.name } : {}),
+				depth,
+				status: "inactive",
+				...(depth > 0 && info.parentSessionPath
+					? { parentSessionPath: canonicalSessionPath(info.parentSessionPath) }
+					: {}),
+				sessionPath: canonicalSessionPath(info.path),
+			});
+		}
+		// Artifact-resident descendants are absent from the saved-session scan.
+		// Read the authoritative registry tree, including passive direct parents.
+		for (const passive of await this.listPassiveRlmSubagents(saved, true)) add(this.passiveAgentFamilyEntry(passive));
+		// Resident metadata wins over a stale durable snapshot.
+		for (const state of this.sessions.values()) add(this.agentFamilyEntry(state));
+		return Object.freeze([...entries.values()]);
 	}
 
 	private passiveAgentFamilyEntry(passive: PassiveRlmSubagent): AgentFamilyCatalogEntry {
@@ -5288,34 +5314,34 @@ export class AgentDaemon {
 	private async getOrHydrateAuthorizedAgentFamilyTarget(
 		currentState: ActiveSessionState,
 		target: string,
-	): Promise<ActiveSessionState> {
+	): Promise<{ targetState: ActiveSessionState; catalog: readonly AgentFamilyCatalogEntry[] }> {
+		const catalog = await this.agentFamilyCatalogEntries();
 		try {
-			return this.getBoundSessionState(target);
+			return { targetState: this.getBoundSessionState(target), catalog };
 		} catch (error) {
 			if (error instanceof BoundSessionUnavailableError) {
 				const targetState = this.getSessionState(target);
-				this.assertAgentFamilyReachable(currentState, targetState);
-				return this.getOrHydrateBoundSessionState(target);
+				this.assertAgentFamilyReachable(currentState, targetState, catalog);
+				return { targetState: await this.getOrHydrateBoundSessionState(target), catalog };
 			}
 			if (error instanceof AmbiguousActiveSessionError) {
-				const targetState = this.resolveAgentFamilySessionName(currentState, target, error);
-				return this.getOrHydrateBoundSessionState(targetState.activeSessionId);
+				const targetState = this.resolveAgentFamilySessionName(currentState, target, error, catalog);
+				return { targetState: await this.getOrHydrateBoundSessionState(targetState.activeSessionId), catalog };
 			}
 		}
 		const passive = await this.findPassiveRlmSubagent(target);
-		if (!passive) return this.getOrHydrateBoundSessionState(target);
-		assertAgentFamilyReach(
-			this.agentFamilyEntry(currentState),
-			this.passiveAgentFamilyEntry(passive),
-			this.agentFamilyCatalogEntries(),
-		);
-		return this.hydratePassiveRlmSubagent(passive);
+		if (!passive) return { targetState: await this.getOrHydrateBoundSessionState(target), catalog };
+		const passiveEntry = catalog.find((entry) => entry.id === passive.info.id);
+		if (!passiveEntry) throw new Error(AGENT_FAMILY_REACH_ERROR);
+		assertAgentFamilyReach(this.authoritativeAgentFamilyEntry(currentState, catalog), passiveEntry, catalog);
+		return { targetState: await this.hydratePassiveRlmSubagent(passive), catalog };
 	}
 
 	private resolveAgentFamilySessionName(
 		currentState: ActiveSessionState,
 		target: string,
 		ambiguity: AmbiguousActiveSessionError,
+		catalog: readonly AgentFamilyCatalogEntry[],
 	): ActiveSessionState {
 		const reachableMatches = new Map(
 			[...this.sessions.values()]
@@ -5324,7 +5350,7 @@ export class AgentDaemon {
 					return (
 						(session.sessionId === target || session.sessionName === target) &&
 						(state.activeSessionId === currentState.activeSessionId ||
-							this.isAgentFamilyReachable(currentState, state))
+							this.isAgentFamilyReachable(currentState, state, catalog))
 					);
 				})
 				.map((state) => [state.activeSessionId, state]),
@@ -5334,12 +5360,25 @@ export class AgentDaemon {
 		return matches[0]!;
 	}
 
-	private isAgentFamilyReachable(currentState: ActiveSessionState, targetState: ActiveSessionState): boolean {
+	private authoritativeAgentFamilyEntry(
+		state: ActiveSessionState,
+		catalog: readonly AgentFamilyCatalogEntry[],
+	): AgentFamilyCatalogEntry {
+		const entry = catalog.find((candidate) => candidate.id === state.runtime.session.sessionId);
+		if (!entry) throw new Error(AGENT_FAMILY_REACH_ERROR);
+		return entry;
+	}
+
+	private isAgentFamilyReachable(
+		currentState: ActiveSessionState,
+		targetState: ActiveSessionState,
+		catalog: readonly AgentFamilyCatalogEntry[] = [this.agentFamilyEntry(currentState), this.agentFamilyEntry(targetState)],
+	): boolean {
 		try {
 			assertAgentFamilyReach(
-				this.agentFamilyEntry(currentState),
-				this.agentFamilyEntry(targetState),
-				this.agentFamilyCatalogEntries(),
+				this.authoritativeAgentFamilyEntry(currentState, catalog),
+				this.authoritativeAgentFamilyEntry(targetState, catalog),
+				catalog,
 			);
 			return true;
 		} catch (error) {
@@ -5348,24 +5387,29 @@ export class AgentDaemon {
 		}
 	}
 
-	private assertAgentFamilyReachable(currentState: ActiveSessionState, targetState: ActiveSessionState): void {
+	private assertAgentFamilyReachable(
+		currentState: ActiveSessionState,
+		targetState: ActiveSessionState,
+		catalog: readonly AgentFamilyCatalogEntry[] = [this.agentFamilyEntry(currentState), this.agentFamilyEntry(targetState)],
+	): void {
 		if (currentState.activeSessionId === targetState.activeSessionId) return;
 		assertAgentFamilyReach(
-			this.agentFamilyEntry(currentState),
-			this.agentFamilyEntry(targetState),
-			this.agentFamilyCatalogEntries(),
-		);
+				this.authoritativeAgentFamilyEntry(currentState, catalog),
+				this.authoritativeAgentFamilyEntry(targetState, catalog),
+				catalog,
+			);
 	}
 
 	private agentMessageRelationship(
 		fromState: ActiveSessionState | undefined,
 		targetState: ActiveSessionState,
+		catalog: readonly AgentFamilyCatalogEntry[] = [this.agentFamilyEntry(targetState), ...(fromState ? [this.agentFamilyEntry(fromState)] : [])],
 	): AgentFamilyRelationship | undefined {
 		if (!fromState) return undefined;
 		return agentFamilyRelationship(
-			this.agentFamilyEntry(targetState),
-			this.agentFamilyEntry(fromState),
-			this.agentFamilyCatalogEntries(),
+			this.authoritativeAgentFamilyEntry(targetState, catalog),
+			this.authoritativeAgentFamilyEntry(fromState, catalog),
+		catalog,
 		);
 	}
 
@@ -5383,29 +5427,29 @@ export class AgentDaemon {
 		}
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
+		// Use one immutable persisted topology through selector resolution, wake, and delivery.
+		const catalog = options.origin === "agent" && options.fromState ? await this.agentFamilyCatalogEntries() : undefined;
 		let targetState: ActiveSessionState;
 		try {
 			targetState = this.getBoundSessionState(targetSelector);
 		} catch (error) {
 			if (error instanceof BoundSessionUnavailableError) {
 				if (options.origin === "agent" && options.fromState) {
-					this.assertAgentFamilyReachable(options.fromState, this.getSessionState(targetSelector));
+					this.assertAgentFamilyReachable(options.fromState, this.getSessionState(targetSelector), catalog!);
 				}
 				targetState = await this.getOrHydrateBoundSessionState(targetSelector);
 			} else {
 				if (error instanceof AmbiguousActiveSessionError) {
 					if (options.origin !== "agent" || !options.fromState) throw error;
-					const resolved = this.resolveAgentFamilySessionName(options.fromState, targetSelector, error);
+					const resolved = this.resolveAgentFamilySessionName(options.fromState, targetSelector, error, catalog!);
 					targetState = await this.getOrHydrateBoundSessionState(resolved.activeSessionId);
 				} else {
 					const passiveSubagent = await this.findPassiveRlmSubagent(targetSelector);
 					if (passiveSubagent) {
 						if (options.origin === "agent" && options.fromState) {
-							assertAgentFamilyReach(
-								this.agentFamilyEntry(options.fromState),
-								this.passiveAgentFamilyEntry(passiveSubagent),
-								this.agentFamilyCatalogEntries(),
-							);
+							const passiveEntry = catalog!.find((entry) => entry.id === passiveSubagent.info.id);
+							if (!passiveEntry) throw new Error(AGENT_FAMILY_REACH_ERROR);
+							assertAgentFamilyReach(this.authoritativeAgentFamilyEntry(options.fromState, catalog!), passiveEntry, catalog!);
 						}
 						targetState = await this.hydratePassiveRlmSubagent(passiveSubagent);
 					} else {
@@ -5431,7 +5475,7 @@ export class AgentDaemon {
 			throw new Error("Agent messaging cannot target the sending session");
 		}
 		if (options.origin === "agent" && options.fromState) {
-			this.assertAgentFamilyReachable(options.fromState, targetState);
+			this.assertAgentFamilyReachable(options.fromState, targetState, catalog!);
 		}
 		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
 		const senderKey =
@@ -5449,7 +5493,7 @@ export class AgentDaemon {
 			from:
 				options.sender ??
 				this.createAgentSessionMessageSender(options.fromState, options.clientId ?? options.origin),
-			fromRelationship: this.agentMessageRelationship(options.fromState, targetState),
+			fromRelationship: this.agentMessageRelationship(options.fromState, targetState, catalog ?? []),
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {

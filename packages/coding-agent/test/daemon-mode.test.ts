@@ -7,6 +7,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import {
 	AGENT_FAMILY_REACH_ERROR,
+	assertAgentFamilyReach,
 	type AgentSessionMessageController,
 	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
 	sessionNameReservationKey,
@@ -2624,6 +2625,52 @@ describe("daemon mode helpers", () => {
 
 		expect(internals.agentMessageRelationship(child, parent)).toBe("child");
 		expect(internals.agentMessageRelationship(parent, child)).toBe("parent");
+	});
+
+	it("authorizes depth-two passive siblings only from the persisted daemon topology", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-deep-passive-acl-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const secondGrandchildDir = join(fixture.childSessionDir, "sibling-grandchild");
+			const secondGrandchild = SessionManager.create(tempDir, secondGrandchildDir);
+			secondGrandchild.newSession({ parentSession: fixture.childSessionFile, rlmDepth: 2 });
+			secondGrandchild.flushNow();
+			const secondGrandchildFile = secondGrandchild.getSessionFile();
+			if (!secondGrandchildFile) throw new Error("Missing sibling grandchild session");
+			const childRegistry = join(fixture.childArtifactDir, "rlm-subagents.jsonl");
+			writeFileSync(
+				childRegistry,
+				`${readFileSync(childRegistry, "utf8")}${JSON.stringify({
+					type: "rlm_subagent", childId: "sibling-grandchild", sessionName: "sibling-grandchild",
+					sessionDir: secondGrandchildDir, sessionFile: secondGrandchildFile,
+					parentSessionId: fixture.childSessionId, parentSessionFile: fixture.childSessionFile,
+					rlmDepth: 2, status: "completed", createdAt: 2, updatedAt: "2026-01-01T00:00:02.000Z",
+				})}\n`,
+			);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				agentFamilyCatalogEntries(): Promise<readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]>;
+			};
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const catalog = await internals.agentFamilyCatalogEntries();
+			const first = catalog.find((entry) => entry.id === fixture.grandchildSessionId);
+			const second = catalog.find((entry) => entry.id === secondGrandchild.getSessionId());
+			expect(first).toBeDefined();
+			expect(second).toBeDefined();
+			expect(catalog).toContainEqual(expect.objectContaining({ id: fixture.childSessionId, depth: 1 }));
+			expect(assertAgentFamilyReach(first!, second!, catalog)).toBe("sibling");
+
+			// A depth-two pair claiming the root cannot manufacture the missing depth-one edge.
+			expect(() =>
+				assertAgentFamilyReach(
+					{ ...first!, parentSessionId: fixture.parentSessionId, parentSessionPath: fixture.parentSessionFile },
+					{ ...second!, parentSessionId: fixture.parentSessionId, parentSessionPath: fixture.parentSessionFile },
+					catalog,
+				),
+			).toThrow(AGENT_FAMILY_REACH_ERROR);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("limits agent send and observation to the nuclear family", async () => {
@@ -9872,7 +9919,10 @@ function makePersistedRlmDaemonFixture(
 		childId,
 		childSessionFile,
 		childSessionDir,
+		childArtifactDir,
+		childSessionId: childManager.getSessionId(),
 		grandchildId,
+		grandchildSessionId: grandchildManager.getSessionId(),
 		grandchildSessionFile,
 	};
 }
