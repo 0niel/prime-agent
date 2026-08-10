@@ -10354,7 +10354,12 @@ export class AgentSession {
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
-							.catch(() => void child.disposeAsync().catch(() => undefined));
+							.catch((error) => {
+								// The fenced daemon owns C03 release authority. It must not
+								// be bypassed by this legacy best-effort local fallback.
+								if (this._subagentRuntimeHost?.assignmentIdentityFenced) throw error;
+								return child.disposeAsync().catch(() => undefined);
+							});
 					} else {
 						await child.disposeAsync().catch(() => undefined);
 					}
@@ -10417,7 +10422,11 @@ export class AgentSession {
 								this._removeRlmSubagentTracking(run.id, run, run.assignmentId);
 							}
 						}
-					} catch {
+					} catch (error) {
+						// A fenced C03 release failed before its authoritative deletion.
+						// Preserve the session for the daemon-owned retry rather than
+						// silently disposing it through the generic legacy fallback.
+						if (this._subagentRuntimeHost?.assignmentIdentityFenced) throw error;
 						await childSession?.disposeAsync().catch(() => undefined);
 					}
 				} else if (!run.detachedDeletion) {

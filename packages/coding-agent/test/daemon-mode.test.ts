@@ -35,6 +35,7 @@ import {
 	finishClientSnapshotStreaming,
 	getChildActiveSessionStates,
 	markClientSnapshotStreaming,
+	RlmRegistryAuthorityError,
 	setDaemonClientSessionCapabilities,
 	shouldSendDaemonOutboundToClient,
 } from "../src/modes/daemon/daemon-mode.js";
@@ -1341,7 +1342,8 @@ describe("daemon mode helpers", () => {
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 
-		// A registry failure must not strand the cancelled child as a stale resident session.
+		// An authoritative deletion failure leaves the child intact for retry; it
+		// must not be converted into an in-memory cancellation cleanup.
 		internals.sessions.set(childState.activeSessionId, childState);
 		internals.recordRlmSubagentDeletion = vi.fn(async () => {
 			throw new Error("registry write failed");
@@ -1356,7 +1358,7 @@ describe("daemon mode helpers", () => {
 				),
 		).rejects.toThrow("registry write failed");
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
-		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
+		expect(internals.sessions.has(childState.activeSessionId)).toBe(true);
 	});
 
 	it("fences stale assignment completion and deletion when a child selector is reused", async () => {
@@ -11133,6 +11135,128 @@ describe("C03 durable daemon publication", () => {
 		await expect(roster.createAgentFamilyRoster(parent)).resolves.toMatchObject({
 			current: { id: parentSession.sessionId },
 		});
+	});
+
+	it("never locally cleans an exact release when its registry deletion fails across a replacement interleave", async () => {
+		const assignmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+		const operationId = "aaaaaaaa-aaaa-4aaa-8aaa-000000000010";
+		const deliveryId = "aaaaaaaa-aaaa-4aaa-8aaa-000000000020";
+		const daemon = new AgentDaemon("/tmp/prime-agent-c03-release-authority.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeState("release-parent");
+		const parentSession = {
+			sessionId: "release-parent-session",
+			sessionName: "release-parent",
+			sessionManager: { getCwd: () => "/tmp" },
+			rlmDepth: 0,
+			rlmMaxDepth: 4,
+		} as ActiveSessionState["runtime"]["session"];
+		parent.runtime = {
+			...parent.runtime,
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: parentSession,
+		} as ActiveSessionState["runtime"];
+		const childSession = {
+			disposeAsync: vi.fn(async () => {}),
+		} as unknown as ActiveSessionState["runtime"]["session"];
+		const child = makeState("release-child", parent.activeSessionId);
+		child.runtime = {
+			...child.runtime,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: parent.activeSessionId,
+				rlmChildId: "release-child",
+				assignmentId,
+				operationId,
+				deliveryId,
+			},
+			session: childSession,
+		} as ActiveSessionState["runtime"];
+		const options = {
+			parentSession,
+			id: "release-child",
+			assignmentId,
+			operationId,
+			deliveryId,
+		} as CreateRlmSubagentRuntimeOptions;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closeSession: ReturnType<typeof vi.fn>;
+			recordRlmSubagentDeletion: ReturnType<typeof vi.fn>;
+			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+		};
+		const closeSession = vi.fn(async (state: ActiveSessionState) => {
+			internals.sessions.delete(state.activeSessionId);
+		});
+		internals.closeSession = closeSession;
+		internals.sessions.set(parent.activeSessionId, parent);
+		internals.sessions.set(child.activeSessionId, child);
+
+		// No artifact is an authority failure even when this exact child remains current.
+		const currentHost = internals.createSubagentRuntimeHost(parent);
+		await expect(
+			currentHost.releaseRlmSubagentRuntime?.(
+				{ session: childSession, assignmentId, operationId, deliveryId },
+				options,
+				"cancelled",
+			),
+		).rejects.toBeInstanceOf(RlmRegistryAuthorityError);
+		expect(closeSession).not.toHaveBeenCalled();
+		expect(childSession.disposeAsync).not.toHaveBeenCalled();
+		expect(internals.sessions.get(child.activeSessionId)).toBe(child);
+
+		// Force the await boundary to supersede A with B before A's deletion rejects.
+		// The deletion error must win instead of the stale-current early return.
+		const replacement = makeState("release-child-b", parent.activeSessionId);
+		const replacementSession = {
+			disposeAsync: vi.fn(async () => {}),
+		} as unknown as ActiveSessionState["runtime"]["session"];
+		replacement.runtime = {
+			...replacement.runtime,
+			metadata: {
+				kind: "subagent",
+				createdAt: 2,
+				parentActiveSessionId: parent.activeSessionId,
+				rlmChildId: "release-child",
+				assignmentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+				operationId: "bbbbbbbb-bbbb-4bbb-8bbb-000000000010",
+				deliveryId: "bbbbbbbb-bbbb-4bbb-8bbb-000000000020",
+			},
+			session: replacementSession,
+		} as ActiveSessionState["runtime"];
+		internals.recordRlmSubagentDeletion = vi.fn(async () => {
+			internals.sessions.delete(child.activeSessionId);
+			internals.sessions.set(replacement.activeSessionId, replacement);
+			throw new RlmRegistryAuthorityError("missing registry during exact deletion");
+		});
+		const staleHost = internals.createSubagentRuntimeHost(parent);
+		await expect(
+			staleHost.releaseRlmSubagentRuntime?.(
+				{ session: childSession, assignmentId, operationId, deliveryId },
+				options,
+				"cancelled",
+			),
+		).rejects.toBeInstanceOf(RlmRegistryAuthorityError);
+		expect(closeSession).not.toHaveBeenCalled();
+		expect(childSession.disposeAsync).not.toHaveBeenCalled();
+		expect(replacementSession.disposeAsync).not.toHaveBeenCalled();
+		expect(internals.sessions.get(replacement.activeSessionId)).toBe(replacement);
+
+		// Once the exact deletion succeeds, its own current resident closes normally.
+		internals.sessions.delete(replacement.activeSessionId);
+		internals.sessions.set(child.activeSessionId, child);
+		internals.recordRlmSubagentDeletion = vi.fn(async () => {});
+		await internals
+			.createSubagentRuntimeHost(parent)
+			.releaseRlmSubagentRuntime?.(
+				{ session: childSession, assignmentId, operationId, deliveryId },
+				options,
+				"cancelled",
+			);
+		expect(closeSession).toHaveBeenCalledWith(child, "killed");
 	});
 
 	it("fsyncs admission before factory work, materializes before registry/publication, and leaves a failed child pending", async () => {

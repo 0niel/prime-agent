@@ -425,7 +425,7 @@ class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
 /** A C03 lifecycle boundary cannot proceed without its parent-owned registry. */
-class RlmRegistryAuthorityError extends Error {}
+export class RlmRegistryAuthorityError extends Error {}
 
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = options.socketPath ?? defaultDaemonSocketPath();
@@ -2704,17 +2704,15 @@ export class AgentDaemon {
 						);
 					}
 				}
-				// Persist the deletion boundary first, but never let a registry failure
-				// strand the cancelled child as a stale resident session.
-				let deletionError: unknown;
+				// A C03 cancellation may close only after its exact registry tombstone is
+				// durable.  In particular, do not turn an authority/write failure into a
+				// local cleanup success: the child must remain wholly untouched for a retry.
+				// Awaiting this can interleave a replacement, but a deletion failure still
+				// wins over that later stale observation.
 				if (status === "cancelled") {
-					try {
-						if (operationId)
-							await this.recordRlmSubagentDeletion(parentState, options.id, assignmentId, operationId);
-						else await this.recordRlmSubagentDeletion(parentState, options.id, assignmentId);
-					} catch (error) {
-						deletionError = error;
-					}
+					if (operationId)
+						await this.recordRlmSubagentDeletion(parentState, options.id, assignmentId, operationId);
+					else await this.recordRlmSubagentDeletion(parentState, options.id, assignmentId);
 				}
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
@@ -2733,7 +2731,6 @@ export class AgentDaemon {
 				} else {
 					await runtime.session.disposeAsync();
 				}
-				if (deletionError !== undefined) throw deletionError;
 			},
 			deleteRlmSubagentRuntime: async (childId, childSession, requestedAssignmentId, requestedOperationId) => {
 				// An operation-bearing request is C03 authority. Never convert a missing
