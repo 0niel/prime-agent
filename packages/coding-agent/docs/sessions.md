@@ -9,7 +9,7 @@ Sessions auto-save to `~/.prime/agent/sessions/`. Each session is a JSONL file w
 ```bash
 prime-agent --continue          # Continue the most recent session
 prime-agent --resume [path|id]  # Browse past sessions or resume one directly
-prime-agent --no-session        # Do not persist this session transcript or artifacts
+prime-agent --no-session        # Do not persist root or RLM descendant session transcripts/artifacts
 prime-agent --fork <path|id>    # Fork a session file or partial session ID into a new session
 ```
 

@@ -12,7 +12,7 @@ Prime Agent provides controls that reduce exposure, but none confines IPython to
 - `--no-extensions`, `--no-skills`, `--no-prompt-templates`, and `--no-context-files` disable resource discovery. Use them when the repository or installed resources are not trusted.
 - Autonomous continuation, turn, token, and elapsed-time budgets bound host-managed continuations. The elapsed-time limit is checked between operations; it is not a hard kill deadline for arbitrary code already running.
 - `--autonomous-gate-timeout-ms` bounds each quality-gate process and Prime Agent stops its process tree on timeout. Gates decide whether work satisfies a check; they do not isolate the agent.
-- `--no-session` prevents persistence of the session transcript and its session-artifact directory. It is not a stateless or sandbox mode.
+- `--no-session` prevents normal session transcript and artifact persistence for the root run and its RLM descendants. It is not a stateless or sandbox mode.
 
 The built-in `ipython` tool can execute Python, shell commands, and subprocesses and can access absolute paths, inherited environment variables, and the network. Allowlisting only `ipython` therefore does not create a command or filesystem allowlist. Prime Agent currently has no built-in per-command approval policy or complete filesystem/network sandbox.
 
@@ -69,7 +69,7 @@ Commands and third-party resources can write anywhere permitted by the operating
 
 ### What `--no-session` does
 
-`--no-session` uses an in-memory session manager, so Prime Agent does not create the normal session JSONL or per-session artifact directory for that run. It still reads global/project configuration and resources. Logs, authentication state, the kernel environment, package caches, temporary files, telemetry state, and files created by commands may still be read or written.
+`--no-session` uses in-memory session managers for the root run and every RLM descendant, so none of them creates a normal persisted session JSONL or per-session artifact tree. RLM execution can still create private temporary working directories for kernel snapshots and local harness state; Prime Agent removes them during orderly teardown, but they can remain after a crash or forced termination. The process still reads global/project configuration and resources. Logs, authentication state, the kernel environment, package caches, other temporary files, telemetry state, and files created by commands may still be read or written.
 
 For disposable behavior, use a fresh container or VM with an ephemeral `HOME` and XDG config/cache/state directories. Redirecting `PRIME_AGENT_CODING_AGENT_DIR` can isolate the Prime Agent config directory, but it does not redirect every third-party cache or command output.
 

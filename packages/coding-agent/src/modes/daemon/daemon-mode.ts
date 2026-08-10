@@ -2305,11 +2305,16 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
-		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
-		sessionManager.newSession({
-			parentSession: options.parentSession.sessionFile,
-			rlmDepth: options.rlmDepth,
-		});
+		const childCwd = options.parentSession.sessionManager.getCwd();
+		const sessionManager = options.parentSession.sessionManager.isPersisted()
+			? SessionManager.create(childCwd, options.sessionDir)
+			: SessionManager.inMemory(childCwd, options.sessionDir);
+		if (options.parentSession.sessionFile) {
+			sessionManager.newSession({
+				parentSession: options.parentSession.sessionFile,
+				rlmDepth: options.rlmDepth,
+			});
+		}
 		let stateRef: ActiveSessionState | undefined;
 		// Subagents inherit the parent's client env (e.g. herdr pane identity).
 		const runtime = await withClientEnv(parentState.clientEnv, () =>
