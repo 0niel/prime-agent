@@ -11,6 +11,7 @@
 - Fixed concurrent settings and credential updates losing unrelated configuration on all platforms, added fsync-backed POSIX write durability and private permissions, and made legacy auth migration commit credentials before best-effort cleanup ([#983](https://github.com/PrimeIntellect-ai/prime-agent/issues/983)).
 - Fixed exited or failed session workers blocking global heartbeat listings after PID reuse ([#1045](https://github.com/PrimeIntellect-ai/prime-agent/issues/1045)).
 - Fixed orphaned supervisor launch locks permanently blocking daemon recovery ([#1131](https://github.com/PrimeIntellect-ai/prime-agent/issues/1131)).
+- Fixed long-running supervisors permanently rejecting commands after temporary registry pruning ([#1148](https://github.com/PrimeIntellect-ai/prime-agent/issues/1148)).
 - Added a configurable copy action to login dialogs so raw sign-in URLs can be copied without selecting wrapped text ([#643](https://github.com/PrimeIntellect-ai/prime-agent/issues/643)).
 - Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.
