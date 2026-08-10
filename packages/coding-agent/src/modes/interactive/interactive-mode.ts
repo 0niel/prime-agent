@@ -928,12 +928,12 @@ export class InteractiveMode {
 	// Serializes session event handling; see subscribeToAgent
 	private sessionEventQueue: Promise<void> = Promise.resolve();
 	private sessionEventGeneration = 0;
-	// Streaming progress is replaceable: retain only the newest update until the
-	// next turn, but always put it back on the normal event tail before a
-	// structural transition.
+	// Streaming progress is replaceable per UI entity: retain each entity's newest
+	// update until the next turn, but always put retained work back on the normal
+	// event tail before a structural transition.
 	private progressFlushTimer?: ReturnType<typeof setTimeout>;
 	private progressFlushGeneration = 0;
-	private pendingProgressEvent?: AgentConnectionSessionEvent;
+	private pendingProgressEvents = new Map<string, AgentConnectionSessionEvent>();
 	private progressFlushStopped = false;
 	private readonly progressChildStatuses = new Map<string, AgentConnectionRlmChildAgentSnapshot["status"]>();
 	private fastModeToggleQueue: Promise<void> = Promise.resolve();
@@ -5055,6 +5055,18 @@ export class InteractiveMode {
 		return previous === status;
 	}
 
+	/** Return a stable key for each independently replaceable progress entity. */
+	private getProgressEventKey(event: AgentConnectionSessionEvent): string | undefined {
+		if (event.type === "message_update" && event.message.role === "assistant") {
+			// responseId is the only message identity exposed by AssistantMessage. A
+			// session can have only one active assistant stream when it is absent.
+			return `assistant:${event.message.responseId ?? "active"}`;
+		}
+		if (event.type === "tool_execution_update") return `tool:${event.toolCallId}`;
+		if (event.type === "rlm_child_update") return `rlm-child:${event.child.id}`;
+		return undefined;
+	}
+
 	/** Add work to the one UI-owned event tail, and keep that tail usable after errors. */
 	private enqueueSessionEvent(
 		event: AgentConnectionSessionEvent,
@@ -5074,13 +5086,50 @@ export class InteractiveMode {
 		return run;
 	}
 
+	private reportProgressFlushError(error: unknown): void {
+		// Keep the error surface consistent with the subscription's outer catch.
+		this.showError(error instanceof Error ? error.message : String(error));
+	}
+
+	private pendingProgress(): Map<string, AgentConnectionSessionEvent> {
+		// Prototype-based focused harnesses deliberately only supply the state they
+		// exercise. Lazily initializing here also keeps this UI-only queue resilient.
+		if (!this.pendingProgressEvents) this.pendingProgressEvents = new Map();
+		return this.pendingProgressEvents;
+	}
+
+	private drainPendingProgressEvents(): AgentConnectionSessionEvent[] {
+		const pending = [...this.pendingProgress().values()];
+		this.pendingProgress().clear();
+		return pending;
+	}
+
+	private enqueueFlushedProgress(
+		events: readonly AgentConnectionSessionEvent[],
+		generation: number,
+		options: { preserveAcrossReplacement?: boolean } = {},
+	): void {
+		for (const event of events) {
+			void this.enqueueSessionEvent(event, generation, options).catch((error) =>
+				this.reportProgressFlushError(error),
+			);
+		}
+	}
+
 	/**
-	 * Apply the latest replaceable progress update on a later turn. This is UI
-	 * work only; it neither delays nor limits agent/provider work.
+	 * Apply replaceable progress updates on a later turn. This is UI work only;
+	 * it neither delays nor limits agent/provider work.
 	 */
 	private queueProgressEvent(event: AgentConnectionSessionEvent, sessionGeneration: number): void {
 		if (this.progressFlushStopped || sessionGeneration !== this.sessionEventGeneration) return;
-		this.pendingProgressEvent = event;
+		const key = this.getProgressEventKey(event);
+		if (!key) return;
+
+		const pending = this.pendingProgress();
+		// A replacement is a later event, so move it to the tail to preserve event
+		// order among the newest retained snapshots.
+		if (pending.has(key)) pending.delete(key);
+		pending.set(key, event);
 		if (this.progressFlushTimer) return;
 
 		const progressGeneration = this.progressFlushGeneration;
@@ -5093,11 +5142,7 @@ export class InteractiveMode {
 			) {
 				return;
 			}
-			const pending = this.pendingProgressEvent;
-			this.pendingProgressEvent = undefined;
-			if (pending) {
-				void this.enqueueSessionEvent(pending, sessionGeneration).catch(() => {});
-			}
+			this.enqueueFlushedProgress(this.drainPendingProgressEvents(), sessionGeneration);
 		}, 0);
 	}
 
@@ -5107,15 +5152,12 @@ export class InteractiveMode {
 			clearTimeout(this.progressFlushTimer);
 			this.progressFlushTimer = undefined;
 		}
-		const pending = this.pendingProgressEvent;
-		this.pendingProgressEvent = undefined;
-		if (pending && !this.progressFlushStopped) {
-			// A replacement advances sessionEventGeneration synchronously. This event
-			// was already received by the old UI and is deliberately ordered before
-			// that replacement, so it must not be discarded by that advance.
-			void this.enqueueSessionEvent(pending, this.sessionEventGeneration, { preserveAcrossReplacement: true }).catch(
-				() => {},
-			);
+		if (!this.progressFlushStopped) {
+			// A replacement advances sessionEventGeneration synchronously. These events
+			// were received by the old UI and are deliberately ordered before it.
+			this.enqueueFlushedProgress(this.drainPendingProgressEvents(), this.sessionEventGeneration, {
+				preserveAcrossReplacement: true,
+			});
 		}
 	}
 
@@ -5126,7 +5168,7 @@ export class InteractiveMode {
 			clearTimeout(this.progressFlushTimer);
 			this.progressFlushTimer = undefined;
 		}
-		this.pendingProgressEvent = undefined;
+		this.pendingProgress()?.clear();
 		this.progressChildStatuses?.clear();
 	}
 

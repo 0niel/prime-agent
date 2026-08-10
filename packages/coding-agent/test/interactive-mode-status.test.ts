@@ -1647,8 +1647,11 @@ describe("InteractiveMode connection events", () => {
 			progress("latest");
 			expect(vi.getTimerCount()).toBe(1);
 			expect(
-				(fakeThis as unknown as { pendingProgressEvent?: { partialResult?: { content: string[] } } })
-					.pendingProgressEvent,
+				(
+					fakeThis as unknown as {
+						pendingProgressEvents?: Map<string, { partialResult?: { content: string[] } }>;
+					}
+				).pendingProgressEvents?.get("tool:tool-1"),
 			).toMatchObject({ partialResult: { content: ["latest"] } });
 
 			const terminal = listener?.({
@@ -1657,6 +1660,118 @@ describe("InteractiveMode connection events", () => {
 			});
 			await terminal;
 			expect(handled).toEqual(["latest", "agent_end"]);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("retains independent progress entities, coalesces by key, and flushes retained event order", async () => {
+		vi.useFakeTimers();
+		try {
+			type Event = { type: "session_event"; event: AgentConnectionSessionEvent };
+			let listener: ((event: Event) => Promise<void>) | undefined;
+			const handled: string[] = [];
+			const fakeThis = {
+				agentConnection: {
+					subscribe: (callback: (event: Event) => Promise<void>) => {
+						listener = callback;
+						return vi.fn();
+					},
+				},
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				progressFlushGeneration: 0,
+				progressFlushStopped: false,
+				handleEvent: vi.fn(
+					async (event: { type: string; toolCallId?: string; partialResult?: { content: string[] } }) => {
+						handled.push(
+							event.type === "tool_execution_update"
+								? `${event.toolCallId}:${event.partialResult?.content[0]}`
+								: event.type,
+						);
+					},
+				),
+				showError: vi.fn(),
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			(
+				InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }
+			).subscribeToAgent.call(fakeThis);
+
+			const progress = (toolCallId: string, value: string) =>
+				listener?.({
+					type: "session_event",
+					event: {
+						type: "tool_execution_update",
+						toolCallId,
+						partialResult: { content: [value] },
+					},
+				} as unknown as Event);
+			progress("tool-a", "first");
+			progress("tool-b", "only");
+			progress("tool-a", "latest");
+
+			expect([
+				...(fakeThis as unknown as { pendingProgressEvents: Map<string, unknown> }).pendingProgressEvents.keys(),
+			]).toEqual(["tool:tool-b", "tool:tool-a"]);
+			await listener?.({ type: "session_event", event: { type: "agent_end" } as AgentConnectionSessionEvent });
+			expect(handled).toEqual(["tool-b:only", "tool-a:latest", "agent_end"]);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("surfaces timer and explicit progress flush failures while recovering the queue", async () => {
+		vi.useFakeTimers();
+		try {
+			type Event = { type: "session_event"; event: AgentConnectionSessionEvent };
+			let listener: ((event: Event) => Promise<void>) | undefined;
+			const showError = vi.fn();
+			const handled: string[] = [];
+			const fakeThis = {
+				agentConnection: {
+					subscribe: (callback: (event: Event) => Promise<void>) => {
+						listener = callback;
+						return vi.fn();
+					},
+				},
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				progressFlushGeneration: 0,
+				progressFlushStopped: false,
+				handleEvent: vi.fn(async (event: { type: string; toolCallId?: string }) => {
+					if (event.toolCallId === "timer-failure") throw new Error("timer flush failed");
+					if (event.toolCallId === "explicit-failure") throw new Error("explicit flush failed");
+					handled.push(event.toolCallId ?? event.type);
+				}),
+				showError,
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			(
+				InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }
+			).subscribeToAgent.call(fakeThis);
+			const progress = (toolCallId: string) =>
+				listener?.({
+					type: "session_event",
+					event: { type: "tool_execution_update", toolCallId, partialResult: { content: [] } },
+				} as unknown as Event);
+
+			progress("timer-failure");
+			await vi.runAllTimersAsync();
+			await (fakeThis as unknown as { sessionEventQueue: Promise<void> }).sessionEventQueue;
+			expect(showError).toHaveBeenCalledWith("timer flush failed");
+
+			progress("explicit-failure");
+			await listener?.({ type: "session_event", event: { type: "agent_end" } as AgentConnectionSessionEvent });
+			expect(showError).toHaveBeenCalledWith("explicit flush failed");
+			expect(handled).toEqual(["agent_end"]);
+
+			progress("recovered");
+			await vi.runAllTimersAsync();
+			await (fakeThis as unknown as { sessionEventQueue: Promise<void> }).sessionEventQueue;
+			expect(handled).toEqual(["agent_end", "recovered"]);
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
 			vi.useRealTimers();
@@ -1751,7 +1866,9 @@ describe("InteractiveMode connection events", () => {
 			await listener?.({ type: "session_replaced", state: createConnectionState() });
 			await vi.runAllTimersAsync();
 			expect(handled).toEqual(["old"]);
-			expect((fakeThis as unknown as { pendingProgressEvent?: unknown }).pendingProgressEvent).toBeUndefined();
+			expect(
+				(fakeThis as unknown as { pendingProgressEvents?: Map<unknown, unknown> }).pendingProgressEvents?.size ?? 0,
+			).toBe(0);
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
 			vi.useRealTimers();

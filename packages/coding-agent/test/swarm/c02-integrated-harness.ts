@@ -169,22 +169,33 @@ async function exerciseAttachments(): Promise<
 	let timersFired = 0;
 	const realSchedule = internals.scheduleClientCatchup.bind(supervisor);
 	const realCancel = internals.cancelClientCatchup.bind(supervisor);
-	const realCatchUp = internals.catchUpClient.bind(supervisor);
 	const realDrain = internals.drainClientCatchups.bind(supervisor);
-	// These probes only observe the production scheduler's own client/timer state.
+	const realTimerDelete = internals.catchupDrainTimers.delete.bind(internals.catchupDrainTimers);
+	let cancellingTimer = false;
+	// Observe removal at the production timer map. A callback deletes itself before
+	// deciding whether its client is still live, while cancelClientCatchup deletes
+	// the same entry as part of real socket cleanup. This accounts for both paths
+	// exactly once, including an inert callback that observes a closing socket.
+	internals.catchupDrainTimers.delete = (client) => {
+		const removed = realTimerDelete(client);
+		if (removed) {
+			if (cancellingTimer) timersCancelled++;
+			else timersFired++;
+		}
+		return removed;
+	};
 	internals.scheduleClientCatchup = (client) => {
 		const scheduledBefore = internals.catchupDrainTimers.has(client);
 		realSchedule(client);
 		if (!scheduledBefore && internals.catchupDrainTimers.has(client)) timersScheduled++;
 	};
 	internals.cancelClientCatchup = (client) => {
-		const scheduledBefore = internals.catchupDrainTimers.has(client);
-		realCancel(client);
-		if (scheduledBefore && !internals.catchupDrainTimers.has(client)) timersCancelled++;
-	};
-	internals.catchUpClient = async (client) => {
-		timersFired++;
-		return realCatchUp(client);
+		cancellingTimer = true;
+		try {
+			realCancel(client);
+		} finally {
+			cancellingTimer = false;
+		}
 	};
 	// Replace only the worker request body. Queue ownership, immediate callback,
 	// latch, backpressure conditions, and socket-close cleanup stay production code.
@@ -223,13 +234,9 @@ async function exerciseAttachments(): Promise<
 		internals.queueCatchup(slow, "c02-replacement", "replacement");
 		internals.scheduleClientCatchup(slow);
 		requireInvariant(slow.catchupPurposes?.get("c02-replacement") === "replacement", "replacement queued");
-		// The production socket cleanup invokes cancelClientCatchup. Instrument it
-		// before the close so cancellation is observed rather than inferred.
-		const replacementScheduled = internals.catchupDrainTimers.has(slow);
+		// The production socket cleanup invokes the instrumented cancelClientCatchup
+		// wrapper, which observes this callback's real removal exactly once.
 		await slowConnection.close();
-		// Count the observable production-state transition performed by the actual
-		// socket close listener, rather than manufacturing a cancellation result.
-		timersCancelled += Number(replacementScheduled && !internals.catchupDrainTimers.has(slow));
 		await afterMacrotask();
 		requireInvariant(!internals.clients.has(slow), "closed attachment removed from daemon");
 		requireInvariant(!internals.catchupDrainTimers.has(slow), "closed socket owns no callback");
@@ -251,7 +258,7 @@ async function exerciseAttachments(): Promise<
 	} finally {
 		releaseSlow();
 		internals.drainClientCatchups = realDrain;
-		internals.catchUpClient = realCatchUp;
+		internals.catchupDrainTimers.delete = realTimerDelete;
 		internals.scheduleClientCatchup = realSchedule;
 		internals.cancelClientCatchup = realCancel;
 		await slowConnection.close();
@@ -297,7 +304,8 @@ async function exerciseInteractive(): Promise<
 		});
 		pendingHighWater = Math.max(
 			pendingHighWater,
-			Number((harness as typeof harness & { pendingProgressEvent?: unknown }).pendingProgressEvent !== undefined),
+			(harness as typeof harness & { pendingProgressEvents?: Map<unknown, unknown> }).pendingProgressEvents?.size ??
+				0,
 		);
 	}
 	await listener?.({ type: "session_event", event: { type: "agent_end" } });
@@ -307,7 +315,8 @@ async function exerciseInteractive(): Promise<
 		"UI flushes latest progress before terminal",
 	);
 	requireInvariant(
-		(harness as typeof harness & { pendingProgressEvent?: unknown }).pendingProgressEvent === undefined,
+		((harness as typeof harness & { pendingProgressEvents?: Map<unknown, unknown> }).pendingProgressEvents?.size ??
+			0) === 0,
 		"UI retains no progress after terminal",
 	);
 	return { uiPendingHighWater: pendingHighWater, droppedReplaceableProgress: C02_FANOUT - progressDelivered };

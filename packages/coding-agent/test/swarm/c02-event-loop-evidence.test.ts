@@ -59,6 +59,7 @@ describe("C02 integrated event-loop evidence", () => {
 			expect(repetition.slowCatchupPendingHighWater).toBe(1);
 			expect(repetition.slowCatchupScheduleHighWater).toBe(1);
 			expect(repetition.slowCatchupPromiseHighWater).toBe(1);
+			expect(repetition.timersScheduled).toBe(repetition.timersCancelled + repetition.timersFired);
 			expect(repetition.terminalDeliveries).toBe(C02_FANOUT);
 			expect(repetition.healthyAttachmentLive).toBe(1);
 			expect(repetition.hookErrors).toBe(1);
