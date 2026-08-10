@@ -120,7 +120,8 @@ test("release verifier retains hash tamper protection", () => {
 test("workflow resolves once then only checks out and verifies immutable source_sha", () => {
 	const source = readFileSync(workflow, "utf8");
 	assert.match(source, /source_sha: \$\{\{ steps\.context\.outputs\.source_sha \}\}/);
-	assert.match(source, /source_sha=\$\(git rev-parse "refs\/tags\/\$INPUT_RELEASE_TAG\^\{commit\}"\)/);
+	assert.match(source, /source_sha=\$\(git rev-parse "\$\{GITHUB_SHA_VALUE\}\^\{commit\}"\)/);
+	assert.match(source, /tagged_commit=\$\(git rev-parse "refs\/tags\/\$INPUT_RELEASE_TAG\^\{commit\}"\)/);
 	assert.match(source, /source_sha="\$GITHUB_SHA_VALUE"/);
 	assert.match(source, /ref: \$\{\{ env\.SOURCE_SHA \}\}/);
 	assert.match(source, /test "\$\(git rev-parse HEAD\)" = "\$SOURCE_SHA"/);
@@ -128,4 +129,34 @@ test("workflow resolves once then only checks out and verifies immutable source_
 	assert.match(source, /--target "\$SOURCE_SHA"/);
 	assert.doesNotMatch(source, /BUILD_REF/);
 	assert.doesNotMatch(source, /ref: \$\{\{ env\.BUILD_REF \}\}/);
+});
+
+
+test("workflow peels annotated tags and only creates protected production tags once", () => {
+	const source = readFileSync(workflow, "utf8");
+	assert.match(source, /fetch-depth: 0/);
+	assert.match(source, /fetch-tags: true/);
+	assert.match(source, /source_sha=\$\(git rev-parse "refs\/tags\/\$REF_NAME\^\{commit\}"\)/);
+	assert.match(source, /tagged_commit=\$\(git rev-parse "refs\/tags\/\$INPUT_RELEASE_TAG\^\{commit\}"\)/);
+	assert.match(source, /tagged_commit=\$\(git rev-parse "refs\/tags\/v\$\{production_version\}\^\{commit\}"\)/);
+	assert.match(source, /Manual release will create immutable production tag \$INPUT_RELEASE_TAG for \$source_sha\./);
+	assert.match(source, /Manual release tag \$INPUT_RELEASE_TAG resolves to \$tagged_commit, not the selected immutable default-branch commit \$source_sha\./);
+	assert.match(source, /gh api --method POST "repos\/\$\{GITHUB_REPOSITORY\}\/git\/refs"/);
+	assert.match(source, /-f "ref=refs\/tags\/\$RELEASE_TAG"/);
+	assert.match(source, /-f "sha=\$SOURCE_SHA"/);
+	const productionTagStep = source.slice(source.indexOf("- name: Create or verify immutable production tag"), source.indexOf("- name: Prepare installer"));
+	assert.doesNotMatch(productionTagStep, /force=/);
+	assert.doesNotMatch(source, /create or update/i);
+});
+
+test("workflow rechecks the remote protected tag before stable pointers and after release upload", () => {
+	const source = readFileSync(workflow, "utf8");
+	const rechecks = source.match(/git fetch --no-tags origin "refs\/tags\/\$RELEASE_TAG:refs\/tags\/\$RELEASE_TAG"/g) ?? [];
+	assert.ok(rechecks.length >= 4, "expected remote tag checks after creation, before stable pointers, and around release upload");
+	const peels = source.match(/git rev-parse "refs\/tags\/\$RELEASE_TAG\^\{commit\}"/g) ?? [];
+	assert.ok(peels.length >= 4, "expected each remote tag check to peel annotated tags");
+	assert.match(source, /# Production tags are protected immutable release identities\./);
+	assert.match(source, /# Re-fetch at the stable-pointer boundary/);
+	assert.match(source, /changed during release publication/);
+	assert.doesNotMatch(source, /^\s*queue:/m);
 });

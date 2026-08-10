@@ -9,14 +9,13 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Production release tag to create or update (e.g., v0.0.1)'
+        description: 'Production release tag to create if absent, or verify if it already exists (e.g., v0.0.1)'
         required: true
         type: string
 
 concurrency:
   group: release-prime-agent
   cancel-in-progress: false
-  queue: max
 
 permissions:
   contents: read
@@ -68,20 +67,31 @@ jobs:
               echo "release_tag must be a production tag like v0.0.1." >&2
               exit 1
             fi
-            if ! git show-ref --verify --quiet "refs/tags/$INPUT_RELEASE_TAG"; then
-              echo "Manual release tag $INPUT_RELEASE_TAG does not exist." >&2
-              exit 1
-            fi
-            source_sha=$(git rev-parse "refs/tags/$INPUT_RELEASE_TAG^{commit}")
-            if [ "$source_sha" != "$GITHUB_SHA_VALUE" ]; then
-              echo "Manual release tag $INPUT_RELEASE_TAG resolves to $source_sha, not the selected default-branch commit $GITHUB_SHA_VALUE." >&2
-              exit 1
+            source_sha=$(git rev-parse "${GITHUB_SHA_VALUE}^{commit}")
+            if git show-ref --verify --quiet "refs/tags/$INPUT_RELEASE_TAG"; then
+              tagged_commit=$(git rev-parse "refs/tags/$INPUT_RELEASE_TAG^{commit}")
+              if [ "$tagged_commit" != "$source_sha" ]; then
+                echo "Manual release tag $INPUT_RELEASE_TAG resolves to $tagged_commit, not the selected immutable default-branch commit $source_sha." >&2
+                exit 1
+              fi
+              echo "Retrying immutable production tag $INPUT_RELEASE_TAG for $source_sha."
+            else
+              echo "Manual release will create immutable production tag $INPUT_RELEASE_TAG for $source_sha."
             fi
             production_version="${INPUT_RELEASE_TAG#v}"
             publish_production=true
           elif [ "$REF_TYPE" = tag ]; then
+            if ! printf '%s\n' "$REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Production tag must be plain semver like v0.0.1: $REF_NAME" >&2
+              exit 1
+            fi
+            source_sha=$(git rev-parse "refs/tags/$REF_NAME^{commit}")
+            event_commit=$(git rev-parse "${GITHUB_SHA_VALUE}^{commit}")
+            if [ "$source_sha" != "$event_commit" ]; then
+              echo "Tag $REF_NAME peels to $source_sha, not event commit $event_commit." >&2
+              exit 1
+            fi
             production_version="${REF_NAME#v}"
-            source_sha="$GITHUB_SHA_VALUE"
             publish_production=true
           else
             production_version=$(node -p "require('./package.json').version")
@@ -97,7 +107,7 @@ jobs:
 
             if [ -z "$previous_version" ] || [ "$production_version" != "$previous_version" ]; then
               if git show-ref --verify --quiet "refs/tags/v${production_version}"; then
-                tagged_commit=$(git rev-list -n 1 "v${production_version}")
+                tagged_commit=$(git rev-parse "refs/tags/v${production_version}^{commit}")
                 if [ "$tagged_commit" != "$source_sha" ]; then
                   echo "Production v${production_version} already points to ${tagged_commit}, not ${source_sha}." >&2
                   exit 1
@@ -268,6 +278,31 @@ jobs:
           test "$SOURCE_COMMIT" = "$SOURCE_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
+      # Production tags are protected immutable release identities. This workflow never
+      # moves one: an existing tag must peel to SOURCE_SHA and a missing tag is created
+      # exactly once using GitHub's non-force ref API.
+      - name: Create or verify immutable production tag
+        if: env.PUBLISH_PRODUCTION == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="v${PRODUCTION_VERSION}"
+          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "Using existing protected release tag $RELEASE_TAG."
+          elif ! gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" \
+              -f "sha=$SOURCE_SHA" >/dev/null; then
+            # A competing creator is safe only if the recheck below finds the exact
+            # immutable source commit. Any other API failure still fails at recheck.
+            echo "Release-tag creation raced; verifying the existing protected tag."
+          fi
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [ "$tagged_sha" != "$SOURCE_SHA" ]; then
+            echo "Protected release tag $RELEASE_TAG peels to $tagged_sha, not $SOURCE_SHA." >&2
+            exit 1
+          fi
+
       - name: Prepare installer
         run: |
           INSTALL_BASE_URL="${R2_PUBLIC_BASE_URL%/}"
@@ -326,6 +361,16 @@ jobs:
             --content-type text/plain \
             --cache-control 'public, max-age=31536000, immutable'
 
+          # Re-fetch at the stable-pointer boundary so a moved/replaced remote tag can
+          # never publish a stable pointer or GitHub release for another commit.
+          RELEASE_TAG="v${PRODUCTION_VERSION}"
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [ "$tagged_sha" != "$SOURCE_SHA" ]; then
+            echo "Protected release tag $RELEASE_TAG peels to $tagged_sha, not $SOURCE_SHA." >&2
+            exit 1
+          fi
+
           aws s3 cp "$PRODUCTION_DIR/latest.json" "s3://${R2_BUCKET}/latest.json" \
             --endpoint-url "$R2_ENDPOINT_URL" \
             --content-type application/json \
@@ -353,6 +398,12 @@ jobs:
         run: |
           RELEASE_TAG="v${PRODUCTION_VERSION}"
           PRODUCTION_DIR=release-artifacts/production
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [ "$tagged_sha" != "$SOURCE_SHA" ]; then
+            echo "Protected release tag $RELEASE_TAG peels to $tagged_sha, not $SOURCE_SHA." >&2
+            exit 1
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "$PRODUCTION_DIR"/* --clobber
           else
@@ -361,6 +412,12 @@ jobs:
               --target "$SOURCE_SHA" \
               --notes-file /tmp/release-notes.md \
               "$PRODUCTION_DIR"/*
+          fi
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tagged_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [ "$tagged_sha" != "$SOURCE_SHA" ]; then
+            echo "Protected release tag $RELEASE_TAG changed during release publication." >&2
+            exit 1
           fi
 
       - name: Publish immutable beta artifacts to R2

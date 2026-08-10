@@ -206,6 +206,10 @@ Create provider file exporting:
 
 The script handles: version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
 
+### Production release tags
+
+Production `vX.Y.Z` tags are protected, immutable release identities. The release workflow peels every tag to its commit (including annotated tags) and accepts an existing tag only when it peels exactly to the selected source SHA. A manual production release may create a missing valid tag with GitHub's non-force ref API; it never updates, moves, or force-pushes an existing release tag. Repository protection must prohibit release-tag mutation and deletion for the release workflow credential. The workflow re-fetches and rechecks the remote tag immediately before advancing stable pointers and again after GitHub release publication; it fails on any mismatch.
+
 ## **CRITICAL** Git Rules for Parallel Agents **CRITICAL**
 
 Multiple agents may work on different files in the same worktree simultaneously. You MUST follow these rules:
