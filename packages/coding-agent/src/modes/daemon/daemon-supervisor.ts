@@ -4780,7 +4780,7 @@ export class DaemonSupervisor {
 		// Do not coalesce stop calls. Their remove/force/archive/recovery/direct-child
 		// arguments are intentional and a later caller must not silently inherit the
 		// first caller's policy. The set is only a fence for a stale passive wake.
-		if (worker.stopFinalized && !(removeDescriptor && archiveSession && !worker.archiveFinalization)) {
+		if (worker.stopFinalized && !(removeDescriptor && archiveSession)) {
 			throw new Error(`Session worker ${worker.descriptor.workerId} was stopped`);
 		}
 		// Defer entry one microtask so every stop dispatched in the same turn records
@@ -4788,7 +4788,11 @@ export class DaemonSupervisor {
 		const stop = Promise.resolve().then(() =>
 			this.stopWorkerOnce(worker, removeDescriptor, force, archiveSession, recoveryCleanup, directChild),
 		);
-		const finalizations = worker.stopFinalizations ??= new Set();
+		let finalizations = worker.stopFinalizations;
+		if (!finalizations) {
+			finalizations = new Set();
+			worker.stopFinalizations = finalizations;
+		}
 		finalizations.add(stop);
 		try {
 			await stop;
@@ -4836,9 +4840,14 @@ export class DaemonSupervisor {
 		// stopped twice, but a later archive request is still actionable from the
 		// retained descriptor context and must not be silently lost.
 		if (worker.stopFinalized) {
-			if (removeDescriptor && archiveSession && !worker.archiveFinalization) {
-				worker.archiveFinalization = this.finalizeArchivedWorkerStop(worker);
-				await worker.archiveFinalization;
+			if (removeDescriptor && archiveSession) {
+				// A prior non-removing stop retains a recovering descriptor for hand-off.
+				// A later explicit archive/delete stop must durably tombstone it before
+				// archiving, then remove it so restart cannot recover stale work.
+				this.persistWorkerStopTombstone(worker, true);
+				await this.finalizeArchivedWorkerStopOnce(worker);
+				this.workers.delete(worker.descriptor.workerId);
+				this.deleteWorkerDescriptor(worker);
 			}
 			return;
 		}
@@ -4937,8 +4946,7 @@ export class DaemonSupervisor {
 			}
 			// Archive is the one destructive side effect that may be shared. This does
 			// not share stop results: every caller still performed its own policy above.
-			worker.archiveFinalization ??= this.finalizeArchivedWorkerStop(worker);
-			await worker.archiveFinalization;
+			await this.finalizeArchivedWorkerStopOnce(worker);
 		}
 		// A stopped resident is never routable again. Keep its descriptor only for a
 		// replacement supervisor/update hand-off, not as a stale in-memory route.
@@ -4950,6 +4958,24 @@ export class DaemonSupervisor {
 		if (!this.shuttingDown) {
 			void this.syncAgentPeers().catch(() => undefined);
 			this.broadcastHeartbeatsChanged();
+		}
+	}
+
+	private async finalizeArchivedWorkerStopOnce(worker: ResidentWorker): Promise<void> {
+		let archiveFinalization = worker.archiveFinalization;
+		if (!archiveFinalization) {
+			archiveFinalization = this.finalizeArchivedWorkerStop(worker);
+			worker.archiveFinalization = archiveFinalization;
+		}
+		try {
+			await archiveFinalization;
+		} catch (error) {
+			// Preserve successful finalization for concurrent callers, but let an
+			// explicit later archive stop retry a failed finalization.
+			if (worker.archiveFinalization === archiveFinalization) {
+				worker.archiveFinalization = undefined;
+			}
+			throw error;
 		}
 	}
 

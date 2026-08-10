@@ -537,7 +537,11 @@ describe("daemon supervisor restart passivation", () => {
 		}) as unknown as SupervisorInternals;
 		const worker = {
 			descriptor: (() => {
-				const { pid: _pid, processStartId: _processStartId, ...passivated } = descriptor(fixture, "stop-wake-race", session);
+				const {
+					pid: _pid,
+					processStartId: _processStartId,
+					...passivated
+				} = descriptor(fixture, "stop-wake-race", session);
 				return { ...passivated, lifecycle: "passivated" as const };
 			})(),
 			descriptorPath: join(fixture.descriptorDir, "stop-wake-race.json"),
@@ -582,7 +586,6 @@ describe("daemon supervisor restart passivation", () => {
 		expect(() => readFileSync(worker.descriptorPath)).toThrow();
 	});
 
-
 	it("keeps concurrent stop options independent while sharing only archive finalization", async () => {
 		const fixture = fixtureRoot();
 		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
@@ -592,13 +595,20 @@ describe("daemon supervisor restart passivation", () => {
 		}) as unknown as SupervisorInternals;
 		const worker = {
 			descriptor: { ...descriptor(fixture, "options", session), lifecycle: "passivated" as const },
-			descriptorPath: join(fixture.descriptorDir, "options.json"), summaries: new Map(),
-			snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(),
-			intentionalStop: false, stopRevision: 0,
+			descriptorPath: join(fixture.descriptorDir, "options.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
 		};
 		supervisor.workers.set("options", worker);
 		const calls: unknown[][] = [];
-		supervisor.stopWorkerOnce = vi.fn(async (...args: unknown[]) => { calls.push(args); });
+		supervisor.stopWorkerOnce = vi.fn(async (...args: unknown[]) => {
+			calls.push(args);
+		});
 
 		await Promise.all([
 			supervisor.stopWorker(worker, false, false, false),
@@ -612,7 +622,6 @@ describe("daemon supervisor restart passivation", () => {
 		]);
 	});
 
-
 	it("honors a concurrent force/archive/remove stop while an update stop is still graceful", async () => {
 		const fixture = fixtureRoot();
 		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
@@ -622,15 +631,22 @@ describe("daemon supervisor restart passivation", () => {
 		}) as unknown as SupervisorInternals;
 		const worker = {
 			descriptor: { ...descriptor(fixture, "force", session), lifecycle: "ready" as const },
-			descriptorPath: join(fixture.descriptorDir, "force.json"), summaries: new Map(),
-			snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(),
-			intentionalStop: false, stopRevision: 0,
+			descriptorPath: join(fixture.descriptorDir, "force.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
 		};
 		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
 		supervisor.workers.set("force", worker);
 		supervisor.catalog.archive = vi.fn(async () => undefined);
 		let signalTerm: () => void = () => undefined;
-		const termSignaled = new Promise<void>((resolve) => { signalTerm = resolve; });
+		const termSignaled = new Promise<void>((resolve) => {
+			signalTerm = resolve;
+		});
 		const signals: string[] = [];
 		const child = {
 			exitCode: null as number | null,
@@ -663,15 +679,22 @@ describe("daemon supervisor restart passivation", () => {
 		}) as unknown as SupervisorInternals;
 		const worker = {
 			descriptor: { ...descriptor(fixture, "recovery-collision", session), lifecycle: "ready" as const },
-			descriptorPath: join(fixture.descriptorDir, "recovery-collision.json"), summaries: new Map(),
-			snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(),
-			intentionalStop: false, stopRevision: 0,
+			descriptorPath: join(fixture.descriptorDir, "recovery-collision.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
 		};
 		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
 		supervisor.workers.set("recovery-collision", worker);
 		supervisor.catalog.archive = vi.fn(async () => undefined);
 		let releaseChild: () => void = () => undefined;
-		const childClosed = new Promise<void>((resolve) => { releaseChild = resolve; });
+		const childClosed = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
 		const child = { exitCode: 0, signalCode: null, kill: vi.fn(() => true) };
 		const recoveryCleanup = supervisor.stopWorker(worker, false, true, false, true, { child, closed: childClosed });
 		await Promise.resolve();
@@ -692,10 +715,18 @@ describe("daemon supervisor restart passivation", () => {
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
 		const worker = {
-			descriptor: (() => { const { pid: _pid, processStartId: _start, ...passive } = descriptor(fixture, "update-stop", session); return { ...passive, lifecycle: "passivated" as const }; })(),
-			descriptorPath: join(fixture.descriptorDir, "update-stop.json"), summaries: new Map(),
-			snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(),
-			intentionalStop: false, stopRevision: 0,
+			descriptor: (() => {
+				const { pid: _pid, processStartId: _start, ...passive } = descriptor(fixture, "update-stop", session);
+				return { ...passive, lifecycle: "passivated" as const };
+			})(),
+			descriptorPath: join(fixture.descriptorDir, "update-stop.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
 		};
 		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
 		supervisor.workers.set("update-stop", worker);
@@ -703,6 +734,95 @@ describe("daemon supervisor restart passivation", () => {
 		await supervisor.stopWorker(worker, false);
 		expect(supervisor.workers.has("update-stop")).toBe(false);
 		expect(JSON.parse(readFileSync(worker.descriptorPath, "utf8"))).toMatchObject({ lifecycle: "recovering" });
+	});
+
+	it("late archive deletion removes a retained recovering descriptor before restart", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const worker = {
+			descriptor: (() => {
+				const {
+					pid: _pid,
+					processStartId: _processStartId,
+					...passivated
+				} = descriptor(fixture, "late-archive-delete", session);
+				return { ...passivated, lifecycle: "passivated" as const };
+			})(),
+			descriptorPath: join(fixture.descriptorDir, "late-archive-delete.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopFinalized: false,
+			stopRevision: 0,
+		};
+		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
+		supervisor.workers.set("late-archive-delete", worker);
+		supervisor.catalog.archive = vi.fn(async () => undefined);
+
+		await supervisor.stopWorker(worker, false);
+		expect(JSON.parse(readFileSync(worker.descriptorPath, "utf8"))).toMatchObject({ lifecycle: "recovering" });
+		await supervisor.stopWorker(worker, true, false, true);
+
+		expect(supervisor.catalog.archive).toHaveBeenCalledTimes(1);
+		expect(worker.stopFinalized).toBe(true);
+		expect(supervisor.workers.has("late-archive-delete")).toBe(false);
+		expect(() => readFileSync(worker.descriptorPath)).toThrow();
+
+		const restarted = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		await restarted.loadWorkerDescriptors();
+		expect(restarted.workers.has("late-archive-delete")).toBe(false);
+	});
+
+	it("retries a rejected archive finalization on a later explicit archive stop", async () => {
+		const fixture = fixtureRoot();
+		const session = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		const worker = {
+			descriptor: (() => {
+				const {
+					pid: _pid,
+					processStartId: _processStartId,
+					...passivated
+				} = descriptor(fixture, "archive-retry", session);
+				return { ...passivated, lifecycle: "passivated" as const };
+			})(),
+			descriptorPath: join(fixture.descriptorDir, "archive-retry.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopFinalized: false,
+			stopRevision: 0,
+		};
+		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
+		supervisor.workers.set("archive-retry", worker);
+		supervisor.catalog.archive = vi
+			.fn<SupervisorInternals["catalog"]["archive"]>()
+			.mockRejectedValueOnce(new Error("archive failed"))
+			.mockResolvedValueOnce(undefined);
+
+		await expect(supervisor.stopWorker(worker, true, false, true)).rejects.toThrow("archive failed");
+		await expect(supervisor.stopWorker(worker, true, false, true)).resolves.toBeUndefined();
+
+		expect(supervisor.catalog.archive).toHaveBeenCalledTimes(2);
+		expect(worker.stopFinalized).toBe(true);
+		expect(supervisor.workers.has("archive-retry")).toBe(false);
+		expect(() => readFileSync(worker.descriptorPath)).toThrow();
 	});
 
 	it("blocks ordinary wake after a failed stop until explicit retry resets its tombstone", async () => {
@@ -713,22 +833,38 @@ describe("daemon supervisor restart passivation", () => {
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
 		const worker = {
-			descriptor: (() => { const { pid: _pid, processStartId: _start, ...passive } = descriptor(fixture, "failed-stop", session); return { ...passive, lifecycle: "passivated" as const }; })(),
-			descriptorPath: join(fixture.descriptorDir, "failed-stop.json"), summaries: new Map(),
-			snapshotCache: new Map(), transcriptCaches: new Map(), snapshotGenerations: new Map(), snapshotLoads: new Map(),
-			intentionalStop: false, stopRevision: 0,
+			descriptor: (() => {
+				const { pid: _pid, processStartId: _start, ...passive } = descriptor(fixture, "failed-stop", session);
+				return { ...passive, lifecycle: "passivated" as const };
+			})(),
+			descriptorPath: join(fixture.descriptorDir, "failed-stop.json"),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
 		};
 		supervisor.workers.set("failed-stop", worker);
 		supervisor.recoverWorker = vi.fn();
-		supervisor.catalog.archive = vi.fn(async () => { throw new Error("archive failed"); });
+		supervisor.catalog.archive = vi.fn(async () => {
+			throw new Error("archive failed");
+		});
 		await expect(supervisor.stopWorker(worker, true, false, true)).rejects.toThrow("archive failed");
 		await expect(supervisor.wakePassivatedWorker(worker)).rejects.toThrow("was stopped");
 		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
 		// Direct retry is the explicit reset route; its recovery is mocked only to
 		// prove it is admitted after the persisted failure fence.
-		supervisor.recoverWorker = vi.fn(async () => { worker.descriptor.lifecycle = "ready"; worker.client = {}; });
-		const retried = (supervisor as unknown as { handleCommand(client: object, command: object): Promise<unknown> }).handleCommand(
-			{ id: "client" }, { id: "retry", type: "retry_worker", activeSessionId: worker.descriptor.rootActiveSessionId },
+		supervisor.recoverWorker = vi.fn(async () => {
+			worker.descriptor.lifecycle = "ready";
+			worker.client = {};
+		});
+		const retried = (
+			supervisor as unknown as { handleCommand(client: object, command: object): Promise<unknown> }
+		).handleCommand(
+			{ id: "client" },
+			{ id: "retry", type: "retry_worker", activeSessionId: worker.descriptor.rootActiveSessionId },
 		);
 		await expect(retried).resolves.toBeDefined();
 		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
@@ -810,7 +946,14 @@ describe("daemon supervisor restart passivation", () => {
 		// A top-level array is corrupt artifact state, so fail closed rather than
 		// passivating a root whose scheduled work cannot be reconstructed.
 		expect(supervisor.workers.get("corrupt-array-artifact")?.descriptor.lifecycle).toBe("recovering");
-		for (const workerId of ["malformed", "stale", "invalid-lifecycle", "truncated-lifecycle", "oversized-verdict", "corrupt-array-artifact"]) {
+		for (const workerId of [
+			"malformed",
+			"stale",
+			"invalid-lifecycle",
+			"truncated-lifecycle",
+			"oversized-verdict",
+			"corrupt-array-artifact",
+		]) {
 			const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
 			expect(persisted.pid).toBe(999_999_999);
 		}
