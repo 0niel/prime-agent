@@ -80,22 +80,30 @@ function descriptor(
 }
 
 describe("daemon supervisor restart passivation", () => {
-	it("keeps completed and needs-input roots metadata-only, while preserving scheduled and unjudged recovery", async () => {
+	it("keeps 160 dead terminal roots metadata-only, while preserving scheduled and unjudged recovery", async () => {
 		const fixture = fixtureRoot();
-		const completed = persistSession(fixture.sessionDir, fixture.root, "completed");
-		const needsInput = persistSession(fixture.sessionDir, fixture.root, "needs_input");
+		const terminalRoots = (
+			[
+				["completed", "completed"],
+				["needs-input", "needs_input"],
+			] as const
+		).flatMap(([prefix, taskState]) =>
+			Array.from({ length: 80 }, (_, index) => {
+				const session = persistSession(fixture.sessionDir, fixture.root, taskState);
+				return descriptor(fixture, `${prefix}-${index}`, session);
+			}),
+		);
 		const scheduled = persistSession(fixture.sessionDir, fixture.root, "completed");
-		const active = SessionManager.create(fixture.root, fixture.sessionDir);
-		active.appendMessage({ role: "user", content: "in progress", timestamp: 1 });
-		active.flushNow();
-		const activeFile = active.getSessionFile();
-		if (!activeFile) throw new Error("fixture did not persist active session");
-		const entries = [
-			descriptor(fixture, "completed", completed),
-			descriptor(fixture, "needs-input", needsInput),
-			descriptor(fixture, "scheduled", scheduled),
-			descriptor(fixture, "active", { id: active.getSessionId(), sessionFile: activeFile }),
-		];
+		const unjudged = SessionManager.create(fixture.root, fixture.sessionDir);
+		unjudged.appendMessage({ role: "user", content: "in progress", timestamp: 1 });
+		unjudged.flushNow();
+		const unjudgedFile = unjudged.getSessionFile();
+		if (!unjudgedFile) throw new Error("fixture did not persist unjudged session");
+		const scheduledEntry = descriptor(fixture, "scheduled", scheduled);
+		const unjudgedEntry = descriptor(fixture, "unjudged", {
+			id: unjudged.getSessionId(),
+			sessionFile: unjudgedFile,
+		});
 		const scheduledArtifact = join(fixture.agentDir, "session-artifacts", scheduled.id);
 		mkdirSync(scheduledArtifact, { recursive: true });
 		writeFileSync(
@@ -121,6 +129,7 @@ describe("daemon supervisor restart passivation", () => {
 				dispatches: [],
 			}),
 		);
+		const entries = [...terminalRoots, scheduledEntry, unjudgedEntry];
 		for (const entry of entries)
 			writeFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), JSON.stringify(entry));
 
@@ -128,21 +137,27 @@ describe("daemon supervisor restart passivation", () => {
 			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
 			descriptorDir: fixture.descriptorDir,
 		}) as unknown as SupervisorInternals;
+		supervisor.recoverWorker = vi.fn();
 		await supervisor.loadWorkerDescriptors();
 
-		expect(
-			[...supervisor.workers.values()].filter((worker) => worker.descriptor.lifecycle === "passivated"),
-		).toHaveLength(2);
-		expect(supervisor.workers.get("completed")?.summaries.size).toBe(1);
-		expect(supervisor.workers.get("needs-input")?.summaries.size).toBe(1);
-		for (const workerId of ["completed", "needs-input"]) {
-			const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
+		const passivated = [...supervisor.workers.values()].filter(
+			(worker) => worker.descriptor.lifecycle === "passivated",
+		);
+		expect(passivated).toHaveLength(160);
+		expect(supervisor.workers).toHaveLength(162);
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+		for (const entry of terminalRoots) {
+			const worker = supervisor.workers.get(entry.workerId);
+			expect(worker?.descriptor.lifecycle).toBe("passivated");
+			expect(worker?.client).toBeUndefined();
+			expect(worker?.summaries.size).toBe(1);
+			const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${entry.workerId}.json`), "utf8"));
 			expect(persisted.lifecycle).toBe("passivated");
 			expect(persisted).not.toHaveProperty("pid");
 			expect(persisted).not.toHaveProperty("processStartId");
 		}
 		expect(supervisor.workers.get("scheduled")?.descriptor.lifecycle).toBe("recovering");
-		expect(supervisor.workers.get("active")?.descriptor.lifecycle).toBe("recovering");
+		expect(supervisor.workers.get("unjudged")?.descriptor.lifecycle).toBe("recovering");
 	});
 
 	it("single-flights an explicit wake and does not revive passivated records by itself", async () => {
