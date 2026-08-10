@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { cpus, platform, release, totalmem } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	DEFAULT_RSS_REQUESTED_PERIOD_MS,
 	MAX_RSS_SAMPLE_GAP_MS,
@@ -22,6 +23,7 @@ import { RSS_SCAN_RETRY_DELAY_MS, RSS_SCAN_RETRY_WINDOW_MS, retryUnavailableSnap
 
 const FANOUTS = [1, 4, 16, 64] as const;
 const WORKER = new URL("./rss-campaign-worker.ts", import.meta.url);
+const WORKER_PATH = fileURLToPath(WORKER);
 const DEFAULT_TIMEOUT_MS = 60_000;
 const REAP_GRACE_MS = 250;
 const REAP_VERIFY_MS = 1_000;
@@ -371,7 +373,7 @@ function workerArguments(settings: Config, fanout: number, scratch: string): str
 	const args = [
 		"--expose-gc",
 		...childExecArgsWithTsxImport(process.execArgv),
-		WORKER.pathname,
+		WORKER_PATH,
 		"--fanout",
 		String(fanout),
 		"--allocation-mib",
