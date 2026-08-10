@@ -1,41 +1,51 @@
-# PR-B00 local swarm rehearsal
+# PR-B00A deterministic local swarm evidence
 
-This directory is **test-only** evidence infrastructure. It has no import path from
-production runtime code, does not contact a provider, and does not modify production
-agent admission, retries, limits, or scheduling.
+This directory is **test-only deterministic local evidence infrastructure**. It
+has no production import path, does not contact a provider, and makes no change
+to agent admission, retries, limits, scheduling, daemon protocol, or CLI output.
+It is a B00A prerequisite only. **B00B production-path/RSS integration remains
+required** before PR-B00 can be considered complete.
 
-Run every supported breadth locally:
+Run the inexpensive fixture rehearsal:
 
 ```sh
-(cd packages/coding-agent && npx tsx test/swarm/rehearsal-bench.ts -- --fanout 1,4,16,64 --output /tmp/prime-agent-b00)
+(cd packages/coding-agent && npx tsx test/swarm/rehearsal-bench.ts -- --fanout 1,4,16,64 --output /tmp/prime-agent-b00a --faults)
+(cd packages/coding-agent && npx vitest --run test/swarm/swarm-evidence.test.ts)
 ```
 
-Add `--faults` for a deterministic progress/delay/restart/completion schedule and a
-second-child failure when present. Each run writes separately inspectable redacted:
+Each fanout writes an owner-only (`0700` directory, `0600` files), canonical
+artifact set:
 
-- `manifest.json` — canonical scenario, exact requested/resolved role/model/revision/effort, fixed fault schedule, embedded price-card snapshot, SHA-256 fingerprint, and hash/byte-size index for every artifact;
-- `events.jsonl` — append-only canonical admission, fake-provider starts, progress, restart, failure,
-  terminal delivery, and cleanup facts (content-free);
-- `process-samples.json` — process-level samples and summed RSS (inject a sampler
-  from future supervised-worker campaigns);
-- `cost-attribution.json` — direct and downstream token/cost attribution by node;
-- `summary.json` — fanout, terminal accounting, cleanup, delivery, and independent-dispatch proof.
+- `manifest.json` — public/content-free schema input, recomputable fingerprint,
+  and fixed artifact hash/byte index;
+- `events.jsonl` — canonical runtime-timing evidence with stable `worker-NNNN`
+  and `request-NNNN` joins;
+- `oracle.jsonl` — exact logical event order and fields, deliberately excluding
+  nondeterministic elapsed timing, suitable for byte-identical repeated runs;
+- `process-samples.json` — injected sampler output and summed RSS;
+- `cost-attribution.json` — exact direct/downstream input/output/cost tree;
+- `summary.json` — terminal, delivery, cleanup, and fixture dispatch accounting.
 
-`runSwarmBenchmark()` calls each fake provider directly through `Promise.all`; it has
-no shared local admission queue, semaphore, synthetic 429, retry, or provider limit.
-The report marks independent dispatch only when every request-start event precedes the
-first terminal event. The fixture is deliberately minimal: it supplies evidence for
-later runtime integrations rather than pretending to exercise the production RLM path.
+Normal on-disk evidence is content-free. Arbitrary string values, including
+metadata, provider/model/error/progress text, filenames, paths, credentials,
+Unicode, and split chunks are replaced before serialization. Stable structural
+IDs, event type/order, counts, and numeric economics are retained. The writer
+verifies the artifact immediately; `verifySwarmEvidence()` fails closed on a
+missing/extra file, link, duplicate/unexpected index, non-canonical JSON/JSONL,
+hash/size mismatch, fingerprint mismatch, oracle/event mismatch, bad event
+identity/order, summary mismatch, or invalid cost-tree/economic invariant.
 
-The artifact writer recursively redacts sensitive field names, content-bearing fields,
-and common credential shapes before writing. It uses owner-only files and `verifySwarmEvidence()`
-fails closed on missing, out-of-tree, symlinked, size-mismatched, or hash-mismatched indexed artifacts.
-Do not use raw prompt/response secrets in future fault fixtures.
+`runSwarmBenchmark()` maps local fake assignments directly into `Promise.all`
+without a queue, semaphore, retry, local limiter, or synthetic 429. Its
+independent-dispatch bit is only a fixture admission assertion, not a claim
+about the production path.
 
-### Explicitly deferred gates
+## Explicit B00B requirements
 
-This narrow baseline does not claim to exercise production RLM workers, exact streamed provider
-payload order, provider retries, socket backpressure, or cross-platform worker supervision. Unix
-uses `ps` to sample the harness process tree; Windows emits an explicit unsupported sampler rather
-than a false zero. Future runtime campaigns must inject their supervisor-aware worker sampler, run
-warmups/repetitions, and add native Windows/Linux collection before asserting release thresholds.
+B00B must retain this scope boundary while adding real daemon/RLM/provider
+integration: scripted exact provider stream/raw-retention policy and adversarial
+canary/chunk coverage; two-model cache/tool/retry/error/abort decimal economics;
+barrier/slow-fast/cancellation/backpressure/genuine-provider-429 dispatch tests;
+and supervised fresh-process process-tree RSS baseline/peak/final/repetition
+campaigns with platform-qualified Linux/macOS/Windows collection. The Unix `ps`
+sampler here is only an injected local extension point, not a peak RSS claim.
