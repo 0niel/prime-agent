@@ -11,6 +11,7 @@ from typing import Any, Literal
 from IPython.display import display
 from rlm import host_request
 
+MessageMode = Literal["auto", "follow_up", "steer"]
 ReceiverRole = Literal["parent", "sibling", "child"]
 _MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json"
 
@@ -26,6 +27,7 @@ async def send(
     *,
     receiver_role: ReceiverRole | str | None = None,
     receiver_name: str | None = None,
+    mode: MessageMode = "auto",
 ) -> dict[str, Any]:
     """Send one direct role-addressed message or broadcast to ``"all"``."""
     roles = ("parent", "sibling", "child")
@@ -40,6 +42,7 @@ async def send(
         payload: dict[str, Any] = {
             "target": "all",
             "message": broadcast_message,
+            "mode": mode,
         }
     else:
         if receiver_role not in roles:
@@ -55,7 +58,10 @@ async def send(
             "message": message,
             "receiver_role": receiver_role,
             "receiver_name": receiver_name,
+            "mode": mode,
         }
+    if mode not in ("auto", "follow_up", "steer"):
+        raise ValueError('mode must be "auto", "follow_up", or "steer"')
     receipt = await host_request("agent_message.send", payload)
     receipts = receipt.get("receipts") if isinstance(receipt, dict) else None
     if isinstance(receipts, list):

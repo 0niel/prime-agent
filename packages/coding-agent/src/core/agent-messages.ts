@@ -14,7 +14,6 @@ export const DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION = 20;
 export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY = 3;
 export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS = 1000;
 
-/** Legacy daemon wire input accepted and ignored for compatibility. */
 export type AgentSessionMessageDeliveryMode = "auto" | "steer" | "follow_up";
 export type AgentSessionMessageDeliveryStatus = "delivered" | "queued";
 export type AgentSessionMessageRuntimeKind = "top-level" | "subagent";
@@ -117,6 +116,8 @@ export interface AgentSessionMessagePayload {
 	/** Sender relationship from the receiver's point of view. */
 	fromRelationship?: AgentFamilyRelationship;
 	target: AgentSessionMessageEndpoint;
+	/** Absent legacy payloads preserve automatic busy-target delivery. */
+	deliveryMode?: AgentSessionMessageDeliveryMode;
 }
 
 export interface AgentSessionMessageDetails {
@@ -145,12 +146,13 @@ export interface AgentSessionMessageReceipt {
 	deliveredAt?: string;
 	/** Present when deliveryStatus is "queued": the message waits behind the target's current work. */
 	queuedAt?: string;
-	deliveryMode?: "steer";
+	deliveryMode: AgentSessionMessageDeliveryMode;
 }
 
 export interface AgentSessionMessageSendInput {
 	target: string;
 	message: string;
+	deliveryMode?: AgentSessionMessageDeliveryMode;
 	receiverRole?: AgentFamilyRelationship;
 }
 
@@ -342,6 +344,16 @@ export function normalizeAgentSessionMessage(message: string, maxChars = DEFAULT
 	return trimmed;
 }
 
+export function normalizeAgentSessionMessageDeliveryMode(value: unknown): AgentSessionMessageDeliveryMode | undefined {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+	if (value === "auto" || value === "steer" || value === "follow_up") {
+		return value;
+	}
+	throw new Error('agent_message.send mode must be "auto", "steer", or "follow_up"');
+}
+
 export function assertDirectAgentMessageTarget(target: string): string {
 	const normalized = target.trim();
 	if (!normalized) {
@@ -362,6 +374,23 @@ export function assertAgentMessageQueueCapacity(
 			`Target session has too many pending messages: ${unfinishedActionCount} unfinished, limit is ${maxPending}`,
 		);
 	}
+}
+
+/** Resolve the wire selector to the delivery that will actually be used. */
+export function resolveAgentSessionMessageDeliveryMode(
+	deliveryMode: AgentSessionMessageDeliveryMode | undefined,
+): "steer" | "follow_up" {
+	return deliveryMode === "follow_up" ? "follow_up" : "steer";
+}
+
+export function resolveAgentSessionMessageStreamingBehavior(
+	isTargetStreaming: boolean,
+	deliveryMode: AgentSessionMessageDeliveryMode | undefined,
+): "steer" | "followUp" | undefined {
+	if (!isTargetStreaming) {
+		return undefined;
+	}
+	return resolveAgentSessionMessageDeliveryMode(deliveryMode) === "follow_up" ? "followUp" : "steer";
 }
 
 export function parseAgentSessionMessagePromptId(text: string): string | undefined {
@@ -441,6 +470,7 @@ export function createAgentSessionMessageReceipt(
 	payload: AgentSessionMessagePayload,
 	status: AgentSessionMessageDeliveryStatus,
 	at = new Date().toISOString(),
+	deliveryMode = resolveAgentSessionMessageDeliveryMode(payload.deliveryMode),
 ): AgentSessionMessageReceipt {
 	return {
 		id: payload.id,
@@ -450,7 +480,7 @@ export function createAgentSessionMessageReceipt(
 		message: payload.message,
 		deliveryStatus: status,
 		...(status === "delivered" ? { deliveredAt: at } : { queuedAt: at }),
-		deliveryMode: "steer",
+		deliveryMode,
 	};
 }
 
@@ -551,6 +581,7 @@ export function createAgentMessageHostHandlers(
 						controller.sendAgentMessage({
 							target: entry.id,
 							message: payload.message as string,
+							deliveryMode: normalizeAgentSessionMessageDeliveryMode(payload.mode),
 							receiverRole: entry.relationship,
 						}),
 					),
@@ -600,6 +631,7 @@ export function createAgentMessageHostHandlers(
 			return (await controller.sendAgentMessage({
 				target,
 				message: payload.message,
+				deliveryMode: normalizeAgentSessionMessageDeliveryMode(payload.mode),
 				receiverRole: payload.receiver_role as AgentFamilyRelationship,
 			})) as unknown as Record<string, unknown>;
 		},

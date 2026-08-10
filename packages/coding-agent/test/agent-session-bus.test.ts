@@ -11,7 +11,10 @@ import {
 	createAgentSessionMessagePrompt,
 	createAgentSessionMessageReceipt,
 	normalizeAgentSessionMessage,
+	normalizeAgentSessionMessageDeliveryMode,
 	parseAgentSessionMessagePromptId,
+	resolveAgentSessionMessageDeliveryMode,
+	resolveAgentSessionMessageStreamingBehavior,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
 
@@ -126,6 +129,7 @@ describe("agent session bus", () => {
 				activeSessionId: "target",
 				sessionId: "session-target",
 			},
+			deliveryMode: "follow_up",
 		} as const;
 		const receipt = createAgentSessionMessageReceipt(payload, "delivered", "2026-06-15T12:00:00.000Z");
 
@@ -141,7 +145,7 @@ describe("agent session bus", () => {
 			message: "hello from another session",
 			deliveryStatus: "delivered",
 			deliveredAt: "2026-06-15T12:00:00.000Z",
-			deliveryMode: "steer",
+			deliveryMode: "follow_up",
 		});
 		expect(createAgentSessionMessageReceipt(payload, "queued", "2026-06-15T12:00:00.000Z")).toMatchObject({
 			deliveryStatus: "queued",
@@ -150,6 +154,25 @@ describe("agent session bus", () => {
 		expect(createAgentSessionMessageReceipt(payload, "queued")).not.toHaveProperty("deliveredAt");
 		expect(() => normalizeAgentSessionMessage("  ")).toThrow("Agent session message cannot be empty");
 		expect(() => normalizeAgentSessionMessage("abcd", 3)).toThrow("Agent session message is too long");
+	});
+
+	it("normalizes delivery selectors and preserves omitted-message compatibility", () => {
+		expect(normalizeAgentSessionMessageDeliveryMode(undefined)).toBeUndefined();
+		expect(normalizeAgentSessionMessageDeliveryMode(null)).toBeUndefined();
+		expect(normalizeAgentSessionMessageDeliveryMode("auto")).toBe("auto");
+		expect(normalizeAgentSessionMessageDeliveryMode("steer")).toBe("steer");
+		expect(normalizeAgentSessionMessageDeliveryMode("follow_up")).toBe("follow_up");
+		expect(() => normalizeAgentSessionMessageDeliveryMode("later")).toThrow(
+			'mode must be "auto", "steer", or "follow_up"',
+		);
+		expect(resolveAgentSessionMessageDeliveryMode(undefined)).toBe("steer");
+		expect(resolveAgentSessionMessageDeliveryMode("auto")).toBe("steer");
+		expect(resolveAgentSessionMessageDeliveryMode("steer")).toBe("steer");
+		expect(resolveAgentSessionMessageDeliveryMode("follow_up")).toBe("follow_up");
+		expect(resolveAgentSessionMessageStreamingBehavior(false, undefined)).toBeUndefined();
+		expect(resolveAgentSessionMessageStreamingBehavior(true, undefined)).toBe("steer");
+		expect(resolveAgentSessionMessageStreamingBehavior(true, "steer")).toBe("steer");
+		expect(resolveAgentSessionMessageStreamingBehavior(true, "follow_up")).toBe("followUp");
 	});
 
 	it("rejects broadcast-style targets and full target queues", () => {

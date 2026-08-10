@@ -259,6 +259,109 @@ describe("daemon mode helpers", () => {
 		});
 	});
 
+	it.each([
+	["auto", "steer"],
+	["steer", "steer"],
+	["follow_up", "followUp"],
+	[undefined, "steer"],
+] as const)("uses %s selected delivery mode for a busy target", async (deliveryMode, expectedBehavior) => {
+	const daemon = new AgentDaemon("/tmp/prime-agent-delivery-mode-test.sock", {
+		defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+		createRuntime: async () => {
+			throw new Error("unexpected runtime creation");
+		},
+	});
+	const targetState = makeState("target");
+	const queueAgentMessagePrompt = vi.fn(async () => true);
+	targetState.runtime = {
+		...targetState.runtime,
+		cwd: "/tmp",
+		session: {
+			sessionId: "session-target",
+			sessionName: "Target",
+			isStreaming: true,
+			isCompacting: false,
+			isRetrying: false,
+			isBashRunning: false,
+			unfinishedActionCount: 0,
+			queueAgentMessagePrompt,
+		},
+	} as never;
+	const internals = daemon as unknown as {
+		sessions: Map<string, ActiveSessionState>;
+		handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+	};
+	internals.sessions.set(targetState.activeSessionId, targetState);
+
+	const response = await internals.handleCommand(makeClient("delivery-client", targetState.activeSessionId), {
+		type: "send_message",
+		targetActiveSessionId: targetState.activeSessionId,
+		message: "continue",
+		...(deliveryMode === undefined ? {} : { deliveryMode }),
+	});
+
+	expect(response).toMatchObject({
+		data: { deliveryStatus: "queued", deliveryMode: deliveryMode === "follow_up" ? "follow_up" : "steer" },
+	});
+	expect(queueAgentMessagePrompt).toHaveBeenCalledWith(
+		expect.stringContaining("continue"),
+		expectedBehavior,
+		expect.objectContaining({ customType: "agent_message" }),
+	);
+});
+
+	it.each([
+	["auto", "steer"],
+	["steer", "steer"],
+	["follow_up", "followUp"],
+	[undefined, "steer"],
+] as const)("keeps %s delivery selector observable for an idle target", async (deliveryMode, expectedBehavior) => {
+	const daemon = new AgentDaemon("/tmp/prime-agent-idle-delivery-mode-test.sock", {
+		defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+		createRuntime: async () => {
+			throw new Error("unexpected runtime creation");
+		},
+	});
+	const targetState = makeState("target");
+	const acceptAgentMessagePrompt = vi.fn(async (_message: string, options?: { preflightResult?: (ok: boolean, queued?: boolean) => void }) => {
+		options?.preflightResult?.(true, false);
+	});
+	targetState.runtime = {
+		...targetState.runtime,
+		cwd: "/tmp",
+		session: {
+			sessionId: "session-target",
+			sessionName: "Target",
+			isStreaming: false,
+			isCompacting: false,
+			isRetrying: false,
+			isBashRunning: false,
+			unfinishedActionCount: 0,
+			acceptAgentMessagePrompt,
+		},
+	} as never;
+	const internals = daemon as unknown as {
+		sessions: Map<string, ActiveSessionState>;
+		handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+	};
+	internals.sessions.set(targetState.activeSessionId, targetState);
+
+	const response = await internals.handleCommand(makeClient("idle-delivery-client", targetState.activeSessionId), {
+		type: "send_message",
+		targetActiveSessionId: targetState.activeSessionId,
+		message: "continue",
+		...(deliveryMode === undefined ? {} : { deliveryMode }),
+	});
+
+	expect(response).toMatchObject({
+		data: { deliveryStatus: "delivered", deliveryMode: deliveryMode === "follow_up" ? "follow_up" : "steer" },
+	});
+	expect(acceptAgentMessagePrompt).toHaveBeenCalledWith(
+		expect.stringContaining("continue"),
+		expect.objectContaining({ streamingBehavior: expectedBehavior }),
+	);
+});
+
 	it("classifies local roster status with heartbeat and running-child activity", () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-status-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
@@ -1746,7 +1849,7 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({ streamingBehavior: "steer" });
 	});
 
-	it("ignores a legacy follow-up mode and always steers agent messages", async () => {
+	it("preserves a legacy follow-up mode through daemon delivery", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -1782,10 +1885,10 @@ describe("daemon mode helpers", () => {
 			deliveryMode: "follow_up",
 		});
 
-		expect(response).toMatchObject({ data: { deliveryStatus: "queued", deliveryMode: "steer" } });
+		expect(response).toMatchObject({ data: { deliveryStatus: "queued", deliveryMode: "follow_up" } });
 		expect(queueAgentMessagePrompt).toHaveBeenCalledWith(
 			expect.stringContaining("do not defer"),
-			"steer",
+			"followUp",
 			expect.objectContaining({ customType: "agent_message" }),
 		);
 	});

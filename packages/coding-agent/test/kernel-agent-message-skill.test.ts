@@ -62,6 +62,7 @@ describe("agent-message skill over the kernel host bridge", () => {
 						message: payload.message,
 						deliveryStatus: "queued",
 						queuedAt: "2026-06-16T00:00:00.000Z",
+						deliveryMode: payload.mode,
 					};
 				},
 			},
@@ -72,7 +73,7 @@ describe("agent-message skill over the kernel host bridge", () => {
 import json
 agents = await agent_message.list_agents()
 receipt = await agent_message.send(
-    "hello beta", receiver_role="sibling", receiver_name="beta"
+    "hello beta", receiver_role="sibling", receiver_name="beta", mode="follow_up"
 )
 print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 `);
@@ -109,6 +110,7 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 				message: "hello beta",
 				receiver_role: "sibling",
 				receiver_name: "beta",
+				mode: "follow_up",
 			},
 		});
 		expect(requests[1].payload).not.toHaveProperty("from");
@@ -203,7 +205,7 @@ except TypeError as error:
 		);
 	});
 
-	it("does not expose a queueable delivery mode", async () => {
+	it("validates delivery mode before sending to the host", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],
 			hostHandlers: {
@@ -217,11 +219,11 @@ except TypeError as error:
 		const result = await manager.execute(`
 try:
     await agent_message.send("hello", receiver_role="sibling", receiver_name="beta", mode="broadcast")
-except TypeError as error:
-    print(f"TypeError: {error}")
+except ValueError as error:
+    print(f"ValueError: {error}")
 `);
 		expect(result.status).toBe("ok");
-		expect(result.stdout.trim()).toContain("TypeError: send() got an unexpected keyword argument 'mode'");
+		expect(result.stdout.trim()).toBe('ValueError: mode must be "auto", "follow_up", or "steer"');
 	});
 
 	it("captures sent messages from detached tasks after the cell is idle", async () => {

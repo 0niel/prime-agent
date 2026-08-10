@@ -31,21 +31,26 @@ if child is not None:
   for the current agent's parent, siblings, and children. It includes inactive
   family members and sorts parent, siblings by name, then children by name; it
   does not expose a global daemon session list.
-- `await agent_message.send(message, receiver_role="parent" | "sibling" | "child", receiver_name=None)` — sends one direct
-  text message to an active session. Sending to an idle completed subagent
-  starts an ordinary follow-up turn in that same child session and context.
-  The child remains available only until its parent session closes. The daemon
-  resolves `receiver_role` within the current agent family; `receiver_name` is
-  required for siblings and children and omitted for the unique parent.
-  `send("all", message)` broadcasts only to the family roster and returns
-  `{receipts: [...]}` in roster order; successful entries are ordinary receipts
-  and failed entries contain the target id and a short `error`. One failed delivery
-  does not reject successful deliveries. Messages always use steering delivery so
-  a busy target sees them during its active run. Returns a receipt with a
-  `deliveryStatus` field: `"delivered"` means the message reached an idle target's
-  context; `"queued"` means a steering message was accepted and will deliver when
-  the target's current work allows (`send` does not block waiting for that).
-  Delivered receipts carry `deliveredAt`, queued receipts carry `queuedAt`.
+- `await agent_message.send(message, receiver_role="parent" | "sibling" | "child", receiver_name=None, mode="auto")` — sends one direct
+  text message to an active session. `mode` is validated as exactly `"auto"`,
+  `"steer"`, or `"follow_up"`; it is sent as the daemon payload field `mode`.
+  Omission defaults to `"auto"`. For a busy target, `"auto"` and `"steer"`
+  use steering delivery, while `"follow_up"` waits behind the current turn.
+  An idle target receives an ordinary prompt regardless of selector. The receipt
+  returns the actual `deliveryMode`: `"steer"` for `"auto"` and `"steer"`, or
+  `"follow_up"` when that selector is used.
+  Sending to an idle completed subagent starts an ordinary follow-up turn in that
+  same child session and context. The child remains available only until its
+  parent session closes. The daemon resolves `receiver_role` within the current
+  agent family; `receiver_name` is required for siblings and children and omitted
+  for the unique parent. `send("all", message, mode="auto")` broadcasts only to
+  the family roster and returns `{receipts: [...]}` in roster order; successful
+  entries are ordinary receipts and failed entries contain the target id and a
+  short `error`. One failed delivery does not reject successful deliveries.
+  `deliveryStatus` is `"delivered"` when the message reached an idle target's
+  context and `"queued"` when accepted behind active work (`send` does not block
+  waiting for that). Delivered receipts carry `deliveredAt`, queued receipts carry
+  `queuedAt`.
 
 ## Safety
 
