@@ -61,7 +61,7 @@ import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-r
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
-import { assertFreshUuid, isCurrentProcessIdentity, type ProcessIdentity } from "./daemon-lifecycle-identity.js";
+import { assertFreshUuid, isCurrentProcessIdentity } from "./daemon-lifecycle-identity.js";
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
@@ -2864,12 +2864,7 @@ export class DaemonSupervisor {
 	private classifyWorkerProcessIdentity(worker: ResidentWorker): WorkerProcessIdentityState {
 		if (worker.quarantined) return "unreadable";
 		const identity = worker.descriptor.process;
-		if (
-			!identity ||
-			!Number.isInteger(identity.pid) ||
-			identity.pid <= 0 ||
-			!identity.processStartId
-		) {
+		if (!identity || !Number.isInteger(identity.pid) || identity.pid <= 0 || !identity.processStartId) {
 			return "unreadable";
 		}
 		let observedProcessStartId: string | undefined;

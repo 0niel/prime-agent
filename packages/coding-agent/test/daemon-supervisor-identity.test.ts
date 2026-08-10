@@ -16,9 +16,9 @@ vi.mock("../src/utils/child-process.js", async (importOriginal) => {
 	return {
 		...actual,
 		signalProcessGroupOrProcess: (pid: number, signal: NodeJS.Signals) => {
-		signals.push({ pid, signal });
-		if (processState.unreadableAfterSignal) processState.startId = undefined;
-	},
+			signals.push({ pid, signal });
+			if (processState.unreadableAfterSignal) processState.startId = undefined;
+		},
 	};
 });
 
