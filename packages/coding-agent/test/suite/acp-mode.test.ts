@@ -34,7 +34,7 @@ function fakeAcpConnection(
 		initialSnapshot?: () => Promise<any>;
 		finalSnapshot?: () => Promise<any>;
 		onInitialSnapshot?: (subscribed: boolean) => void;
-		onPromptAndWait?: () => void;
+		onPromptAndWait?: () => void | Promise<void>;
 		onUnsubscribe?: () => void;
 	} = {},
 ): any {
@@ -63,9 +63,10 @@ function fakeAcpConnection(
 			return snapshot;
 		},
 		promptAndWait: async () => {
-			options.onPromptAndWait?.();
+			await options.onPromptAndWait?.();
 		},
 		dispose: async () => {},
+		abort: async () => {},
 		waitForHeadlessCompletion: async () => ({
 			enabled: false,
 			continuationsUsed: 0,
@@ -193,7 +194,10 @@ describe("ACP mode end to end", () => {
 			prompt: [{ type: "text", text: "finish the parent turn" }],
 		});
 		const quiescence = updates.find((update) => update.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
-		expect(quiescence?.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence.outstandingSubagents).toBe(1);
+		const meta = quiescence?.update?._meta?.[PRIME_AGENT_META_NAMESPACE];
+		expect(meta?.quiescence.outstandingSubagents).toBe(1);
+		// Outstanding child work is truthful progress, never scoreable terminal quiescence.
+		expect(meta?.phase).toBe("event");
 
 		releaseChild();
 		await vi.waitFor(() => expect(harness.session.getRlmChildSnapshots()[0]?.status).toBe("done"));
@@ -345,7 +349,7 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
-	it("keeps a late child update on its originating prompt", async () => {
+	it("moves a retained child update after terminal to safe turn zero", async () => {
 		const child = { id: "child-1", label: "child", status: "running", sessionDir: "/tmp/child" };
 		let connection: any;
 		connection = fakeAcpConnection({
@@ -375,8 +379,60 @@ describe("ACP mode end to end", () => {
 		const childUpdates = updates
 			.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE])
 			.filter((meta) => meta?.subagents);
-		expect(childUpdates.map((meta) => meta.promptTurnId)).toEqual([1, 1]);
+		expect(childUpdates.map((meta) => meta.promptTurnId)).toEqual([1, 0]);
 		expect(childUpdates.map((meta) => meta.phase)).toEqual(["event", "event"]);
+		close();
+	});
+
+	it("makes a child first observed after terminal connection-scoped", async () => {
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "complete" }],
+		});
+		connection.emitChild({ id: "late", label: "late", status: "running", sessionDir: "/tmp/late" });
+		await vi.waitFor(() =>
+			expect(updates.some((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.subagents)).toBe(true),
+		);
+		const late = updates
+			.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE])
+			.find((meta) => meta?.subagents?.[0]?.id === "late");
+		expect(late).toMatchObject({ promptTurnId: 0, phase: "event" });
+		close();
+	});
+
+	it("cancels after prompt completion without emitting a result or terminal boundary", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const enteredPrompt = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const releasePrompt = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connection = fakeAcpConnection({
+			onPromptAndWait: async () => {
+				entered();
+				await releasePrompt;
+			},
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		const pending = client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "cancel" }],
+		});
+		await enteredPrompt;
+		await client.notify("session/cancel", { sessionId: session.sessionId });
+		release();
+		await expect(pending).resolves.toMatchObject({ stopReason: "cancelled" });
+		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(metadata.some((meta) => meta.phase === "responseBoundary" && meta.outcome === "result")).toBe(false);
+		expect(metadata.some((meta) => meta.phase === "terminalQuiescence")).toBe(false);
 		close();
 	});
 

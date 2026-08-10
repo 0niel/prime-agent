@@ -122,6 +122,7 @@ class AcpUpdateProducer {
 	private activePromptTurnId = 0;
 	private tail: Promise<void> = Promise.resolve();
 	private readonly childOriginTurnIds = new Map<string, number>();
+	private readonly terminalTurns = new Set<number>();
 
 	constructor(
 		private readonly sessionId: string,
@@ -137,10 +138,20 @@ class AcpUpdateProducer {
 		if (this.activePromptTurnId === turnId) this.activePromptTurnId = 0;
 	}
 
+	/**
+	 * Cut a scoreable terminal boundary before it is queued. A subscription
+	 * callback after this point is connection-scoped, never appended to a turn
+	 * that an evaluator may treat as terminal.
+	 */
+	sealTerminal(turnId: number): void {
+		this.terminalTurns.add(turnId);
+		this.finishPrompt(turnId);
+	}
+
 	turnForEvent(event: AgentConnectionSessionEvent): number {
 		if (event.type === "rlm_child_update") {
 			const known = this.childOriginTurnIds.get(event.child.id);
-			if (known !== undefined) return known;
+			if (known !== undefined) return this.terminalTurns.has(known) ? 0 : known;
 			// A child is first observed while its parent prompt is producing it.
 			// Remember that origin so a later child update cannot be relabelled by
 			// a subsequent prompt.
@@ -476,6 +487,12 @@ export async function runAcpModeWithConnection(
 				const { text, images } = promptContent(params.prompt);
 				const priorMessages = turnBoundary(await connection.getMessages());
 				await connection.promptAndWait(text, images.length > 0 ? { images } : undefined);
+				// Cancellation between model completion and boundary publication cannot
+				// claim a result or terminal state; it is a normal cancelled response.
+				if (abort.signal.aborted) {
+					await entry.producer.drain();
+					return { stopReason: "cancelled" satisfies AcpStopReason };
+				}
 				const failure = await turnFailure(connection, priorMessages);
 				if (failure && !abort.signal.aborted) {
 					await entry.producer.publish(
@@ -502,16 +519,19 @@ export async function runAcpModeWithConnection(
 					"result",
 				);
 				responseBoundaryEmitted = true;
+				const quiescence = quiescenceMeta(status, liveSnapshot.children);
+				const terminal = quiescence.outstandingSubagents === 0 && quiescence.remainingAutonomousContinuations === 0;
+				// Only zero work/budget is a scoreable terminal claim. When work is
+				// still outstanding, preserve the truthful snapshot as an ordinary
+				// event instead of declaring terminal quiescence.
+				if (terminal) entry.producer.sealTerminal(promptTurnId);
 				await entry.producer.publish(
 					{
 						sessionUpdate: "session_info_update",
-						_meta: primeAgentMeta({
-							...(autonomous ? { autonomous } : {}),
-							quiescence: quiescenceMeta(status, liveSnapshot.children),
-						}),
+						_meta: primeAgentMeta({ ...(autonomous ? { autonomous } : {}), quiescence }),
 					},
 					promptTurnId,
-					"terminalQuiescence",
+					terminal ? "terminalQuiescence" : "event",
 				);
 				await entry.producer.drain();
 				return { stopReason: acpStopReason({ cancelled: abort.signal.aborted, autonomous: status }) };
