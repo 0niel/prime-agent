@@ -3,7 +3,7 @@
  * It deliberately has no provider imports, network client, daemon listener, or
  * persistent state. The parent owns this process group and measures it.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +17,12 @@ interface WorkerOptions {
 }
 
 type WorkerMessage =
-	| { type: "boundary"; phase: "started" | "barrier-held" | "terminals" | "cleanup"; allocatedBytes: number; memberPids: readonly number[] }
+	| {
+			type: "boundary";
+			phase: "started" | "barrier-held" | "terminals" | "cleanup";
+			allocatedBytes: number;
+			memberPids: readonly number[];
+	  }
 	| { type: "result"; completed: number; failed: number; allocatedBytes: number };
 
 function option(name: string): string | undefined {
@@ -113,13 +118,24 @@ async function main(): Promise<void> {
 	for (let index = 0; index < allocation.length; index += 4096) allocation[index] = 1;
 	const runtimeRoot = await mkdtemp(join(config.scratch, "b00b-rss-"));
 	try {
-		await Promise.all([mkdir(join(runtimeRoot, "agent")), mkdir(join(runtimeRoot, "socket")), mkdir(join(runtimeRoot, "output"))]);
-		const fixtures = Array.from({ length: config.fanout }, (_, index) => launchFixture(config, index + 1, allocationBytes));
+		await Promise.all([
+			mkdir(join(runtimeRoot, "agent")),
+			mkdir(join(runtimeRoot, "socket")),
+			mkdir(join(runtimeRoot, "output")),
+		]);
+		const fixtures = Array.from({ length: config.fanout }, (_, index) =>
+			launchFixture(config, index + 1, allocationBytes),
+		);
 		const memberPids = fixtures.flatMap((fixture) => (fixture ? [fixture.pid] : []));
 		send({ type: "boundary", phase: "started", allocatedBytes: allocationBytes, memberPids });
 		// Every fixture is dispatched before this observation boundary. It is never
 		// a permit, queue, semaphore, or admission limiter.
-		send({ type: "boundary", phase: "barrier-held", allocatedBytes: allocationBytes * (config.fanout + 1), memberPids });
+		send({
+			type: "boundary",
+			phase: "barrier-held",
+			allocatedBytes: allocationBytes * (config.fanout + 1),
+			memberPids,
+		});
 		const results = await Promise.all(fixtures.map((fixture) => fixture?.exit ?? Promise.resolve(false)));
 		const completed = results.filter(Boolean).length;
 		send({ type: "boundary", phase: "terminals", allocatedBytes: allocationBytes * (config.fanout + 1), memberPids });
