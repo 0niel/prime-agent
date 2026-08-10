@@ -326,7 +326,7 @@ export interface SessionPassivationSnapshot extends SessionEvictionSnapshot {
 }
 
 export interface WorkerEvictionSnapshot {
-	lifecycle: "starting" | "ready" | "recovering" | "failed";
+	lifecycle: "starting" | "ready" | "recovering" | "failed" | "passivated";
 	isConnected: boolean;
 	isStopping: boolean;
 	hasOwnerClient: boolean;
