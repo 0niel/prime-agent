@@ -115,13 +115,7 @@ function exactSelector(value: unknown): string {
 	if (typeof value !== "string") fail("model profile model must be a string");
 	const selector = value.trim();
 	const slash = selector.indexOf("/");
-	if (
-		!selector ||
-		slash <= 0 ||
-		slash !== selector.lastIndexOf("/") ||
-		slash === selector.length - 1 ||
-		/\s/.test(selector)
-	)
+	if (!selector || slash <= 0 || slash === selector.length - 1 || /\s/.test(selector))
 		fail("model profile model must be an exact provider/model selector");
 	return selector;
 }
@@ -251,7 +245,7 @@ export function parseSwarmRolePolicy(value: unknown): SwarmRolePolicySnapshot {
 	for (const [id, role] of rawRoles) roles[id] = parseRole(role, id, profileIds);
 	for (const [id, role] of Object.entries(roles))
 		for (const target of role.delegableRoleIds ?? [])
-			if (!(target in roles)) fail(`roles.${id} delegates to an unknown role`);
+			if (!Object.hasOwn(roles, target)) fail(`roles.${id} delegates to an unknown role`);
 	const policy: SwarmRolePolicy = {
 		version: 1,
 		...(value.trustProjectPolicy === undefined ? {} : { trustProjectPolicy: value.trustProjectPolicy }),

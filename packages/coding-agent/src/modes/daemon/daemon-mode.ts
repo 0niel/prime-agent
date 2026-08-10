@@ -523,7 +523,7 @@ function decodePersistedSwarmRoleAssignment(
 	const modelProfile = persistedSwarmIdentifier(value.modelProfile, "modelProfile", true);
 	const model = persistedSwarmString(value.model, "model");
 	const slash = model.indexOf("/");
-	if (!model || slash <= 0 || slash !== model.lastIndexOf("/") || slash === model.length - 1 || /\s/.test(model))
+	if (!model || slash <= 0 || slash === model.length - 1 || /\s/.test(model))
 		throw new Error("invalid persisted swarm assignment model");
 	let thinkingLevel: SwarmRoleAssignment["thinkingLevel"];
 	if (value.thinkingLevel !== undefined) {

@@ -102,6 +102,24 @@ describe("swarm role policy", () => {
 		).toThrow("not delegable");
 	});
 
+	it("rejects inherited delegation targets and accepts exact selectors with slash-bearing model IDs", () => {
+		expect(() =>
+			parseSwarmRolePolicy({
+				...policy,
+				roles: {
+					...policy.roles,
+					reviewer_1: { ...policy.roles.reviewer_1, delegableRoleIds: ["constructor"] },
+				},
+			}),
+		).toThrow("delegates to an unknown role");
+		expect(
+			parseSwarmRolePolicy({
+				...policy,
+				modelProfiles: { neutral_profile: { model: "neutral/provider/model" } },
+			}).policy.modelProfiles.neutral_profile.model,
+		).toBe("neutral/provider/model");
+	});
+
 	it("rejects non-object bridge kwargs rather than silently treating them as legacy input", async () => {
 		const handler = createRlmRunHostHandler(async ({ prompt, kwargs }) => ({ prompt, kwargs }));
 		await expect(handler({ prompt: "task", kwargs: null })).rejects.toThrow("kwargs must be an object");
