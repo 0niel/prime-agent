@@ -154,6 +154,52 @@ describe("copyToClipboard", () => {
 		expect(osc52Writes()).toHaveLength(1);
 	});
 
+	test("falls back when wl-copy exits nonzero after accepting stdin", async () => {
+		mockedPlatform.mockReturnValue("linux");
+		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+		vi.stubEnv("DISPLAY", ":0");
+		mocks.isWaylandSession.mockReturnValue(true);
+		const child = new EventEmitter() as ReturnType<typeof spawn>;
+		child.stdin = new EventEmitter() as ReturnType<typeof spawn>["stdin"];
+		child.stdin!.end = vi.fn();
+		child.kill = vi.fn();
+		mockedSpawn.mockReturnValue(child);
+		mockedSpawnSync.mockReturnValue({ status: 0, signal: null } as ReturnType<typeof spawnSync>);
+
+		const copying = copyToClipboard("hello");
+		child.emit("spawn");
+		child.emit("close", 1, null);
+		await copying;
+
+		expect(child.stdin!.end).toHaveBeenCalledWith("hello");
+		expect(mockedSpawnSync).toHaveBeenCalledWith("xclip", ["-selection", "clipboard"], expect.any(Object));
+		expect(osc52Writes()).toHaveLength(0);
+	});
+
+	test("kills a hung wl-copy process and falls back after the timeout", async () => {
+		vi.useFakeTimers();
+		try {
+			mockedPlatform.mockReturnValue("linux");
+			vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+			mocks.isWaylandSession.mockReturnValue(true);
+			const child = new EventEmitter() as ReturnType<typeof spawn>;
+			child.stdin = new EventEmitter() as ReturnType<typeof spawn>["stdin"];
+			child.stdin!.end = vi.fn();
+			child.kill = vi.fn();
+			mockedSpawn.mockReturnValue(child);
+
+			const copying = copyToClipboard("hello");
+			child.emit("spawn");
+			await vi.advanceTimersByTimeAsync(5000);
+			await copying;
+
+			expect(child.kill).toHaveBeenCalledWith();
+			expect(osc52Writes()).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("passes hostile clipboard text only on stdin and falls back from xclip to xsel", async () => {
 		mockedPlatform.mockReturnValue("linux");
 		vi.stubEnv("DISPLAY", ":0");

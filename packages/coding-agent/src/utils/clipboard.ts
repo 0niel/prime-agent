@@ -21,26 +21,29 @@ function copyToX11Clipboard(options: NativeClipboardExecOptions): boolean {
 	);
 }
 
-function copyToWaylandClipboard(text: string): Promise<boolean> {
+function copyToWaylandClipboard(text: string, timeoutMs = 5000): Promise<boolean> {
 	return new Promise((resolve) => {
 		const proc = spawn("wl-copy", [], { shell: false, stdio: ["pipe", "ignore", "ignore"] });
 		let settled = false;
+		let timer: NodeJS.Timeout;
 		const finish = (success: boolean) => {
 			if (settled) return;
 			settled = true;
+			clearTimeout(timer);
 			resolve(success);
 		};
+		timer = setTimeout(() => {
+			proc.kill();
+			finish(false);
+		}, timeoutMs);
+		timer.unref();
 		proc.on("error", () => finish(false));
-		proc.stdin.on("error", () => finish(false));
-		proc.on("spawn", () => {
-			proc.stdin.end(text, () => {
-				proc.unref();
-				finish(true);
-			});
+		proc.stdin.on("error", () => {
+			proc.kill();
+			finish(false);
 		});
-		proc.on("close", (code) => {
-			if (code !== 0) finish(false);
-		});
+		proc.on("spawn", () => proc.stdin.end(text));
+		proc.on("close", (code, signal) => finish(code === 0 && signal === null));
 	});
 }
 
