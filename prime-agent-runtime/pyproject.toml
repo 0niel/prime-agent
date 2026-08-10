@@ -9,6 +9,16 @@ dependencies = [
   "tyro",
 ]
 
+[dependency-groups]
+dev = [
+  "httpx",
+  "mcp>=1.0",
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

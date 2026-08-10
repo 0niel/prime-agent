@@ -115,16 +115,48 @@ jobs:
         working-directory: ${{ matrix.package }}
         run: ${{ matrix.command }}
 
+  python-runtime:
+    name: Python runtime (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    defaults:
+      run:
+        working-directory: prime-agent-runtime
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Verify lockfile
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Test
+        run: uv run --locked pytest
+
   build-check-test:
     name: build-check-test
     if: always()
-    needs: [build-check, test]
+    needs: [build-check, test, python-runtime]
     runs-on: ubuntu-latest
     steps:
       - name: Verify CI results
         env:
           BUILD_CHECK_RESULT: ${{ needs.build-check.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          PYTHON_RUNTIME_RESULT: ${{ needs.python-runtime.result }}
         run: |
           test "$BUILD_CHECK_RESULT" = success
           test "$TEST_RESULT" = success
+          test "$PYTHON_RUNTIME_RESULT" = success
