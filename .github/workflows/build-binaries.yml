@@ -170,10 +170,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      # The checkout is the immutable source identity. Remove every ignored and
+      # untracked byte before dependencies or build products exist, so a runner
+      # workspace cannot supply package inputs while artifacts claim SOURCE_SHA.
+      - name: Clean immutable source checkout
+        run: git clean -ffdx
+
       - name: Verify immutable source checkout
         id: source-commit
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
           echo "commit=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
@@ -190,6 +197,17 @@ jobs:
 
       - name: Check
         run: npm run check
+
+      # Packer input is now exactly tracked HEAD plus these freshly built dist
+      # roots. Do not let installed dependencies or check byproducts coexist with
+      # the release packer, which rejects every other untracked/ignored path.
+      - name: Remove non-release build inputs
+        run: |
+          git clean -ffdx \
+            -e /packages/agent/dist/ \
+            -e /packages/ai/dist/ \
+            -e /packages/tui/dist/ \
+            -e /packages/coding-agent/dist/
 
       - name: Pack production release
         if: env.PUBLISH_PRODUCTION == 'true'

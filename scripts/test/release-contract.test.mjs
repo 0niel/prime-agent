@@ -74,6 +74,83 @@ test("packer refuses a tracked-dirty source checkout", () => {
 	} finally { cleanup(directory); }
 });
 
+function createPackerFixture() {
+	const directory = mkdtempSync(join(tmpdir(), "prime-agent-release-packer-"));
+	const scripts = join(directory, "scripts");
+	mkdirSync(scripts, { recursive: true });
+	copyFileSync(packer, join(scripts, "pack-prime-agent-release.mjs"));
+	copyFileSync(new URL("../prime-agent-release-components.mjs", import.meta.url), join(scripts, "prime-agent-release-components.mjs"));
+	for (const [component] of components) {
+		const packageDir = join(directory, "packages", component);
+		mkdirSync(join(packageDir, "dist"), { recursive: true });
+		writeFileSync(join(packageDir, "package.json"), JSON.stringify({ name: `@fixture/${component}`, version: "0.7.1" }));
+		writeFileSync(join(packageDir, "README.md"), `tracked ${component}\n`);
+		writeFileSync(join(packageDir, "dist", "index.js"), `generated ${component}\n`);
+	}
+	// Release source files are committed, while dist is deliberately ignored and
+	// recreated after checkout to model the CI build boundary.
+	writeFileSync(join(directory, ".gitignore"), "packages/*/dist/\npackages/coding-agent/release/\n");
+	execFileSync("git", ["init", "--quiet"], { cwd: directory });
+	execFileSync("git", ["add", "."], { cwd: directory });
+	execFileSync("git", ["-c", "commit.gpgSign=false", "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "initial"], { cwd: directory });
+	return directory;
+}
+
+function fixtureCommit(directory) {
+	return execFileSync("git", ["rev-parse", "HEAD"], { cwd: directory, encoding: "utf8" }).trim();
+}
+
+function packFixture(directory, outDir = "packages/coding-agent/release/fixture") {
+	return spawnSync(process.execPath, [join(directory, "scripts", "pack-prime-agent-release.mjs"), "--base-url", "https://release.invalid", "--commit", fixtureCommit(directory), "--version", version, "--out-dir", outDir], { cwd: directory, encoding: "utf8" });
+}
+
+test("packer rejects untracked skill, documentation, and source inputs before they can be packed", () => {
+	for (const [path, contents] of [
+		["packages/coding-agent/skills/untracked.md", "malicious skill\n"],
+		["packages/coding-agent/docs/untracked.md", "malicious doc\n"],
+		["packages/coding-agent/src/untracked.ts", "malicious source\n"],
+		["packages/coding-agent/docs/ignored.md", "ignored malicious doc\n"],
+	]) {
+		const directory = createPackerFixture();
+		try {
+			mkdirSync(join(directory, path, ".."), { recursive: true });
+			writeFileSync(join(directory, path), contents);
+			if (path.includes("ignored")) writeFileSync(join(directory, ".git", "info", "exclude"), "packages/coding-agent/docs/ignored.md\n");
+			const result = packFixture(directory);
+			assert.notEqual(result.status, 0, path);
+			assert.match(result.stderr, /untracked file outside fixed generated roots/);
+			assert.equal(result.stdout.includes(contents.trim()), false, path);
+		} finally { cleanup(directory); }
+	}
+});
+
+test("packer permits only generated dist overlays and packs immutable tracked package content", () => {
+	const directory = createPackerFixture();
+	try {
+		const result = packFixture(directory);
+		assert.equal(result.status, 0, result.stderr);
+		const tarball = join(directory, "packages/coding-agent/release/fixture/artifacts/prime-agent-0.7.1.tgz");
+		const listed = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" });
+		assert.match(listed, /package\/dist\/index\.js/);
+		assert.match(listed, /package\/README\.md/);
+		assert.doesNotMatch(listed, /untracked/);
+	} finally { cleanup(directory); }
+});
+
+test("release workflow clean boundary removes pre-existing untracked dist before install and build", () => {
+	const source = readFileSync(workflow, "utf8");
+	const checkout = source.indexOf("ref: ${{ env.SOURCE_SHA }}");
+	const clean = source.indexOf("git clean -ffdx", checkout);
+	const install = source.indexOf("run: npm ci", checkout);
+	const build = source.indexOf("run: npm run build", checkout);
+	const removeInputs = source.indexOf("Remove non-release build inputs", build);
+	assert.ok(clean > checkout, "release build must clean immediately after immutable checkout");
+	assert.ok(clean < install && clean < build, "clean must precede dependency installation and build");
+	assert.match(source.slice(clean, install), /git status --porcelain=v1 --untracked-files=all/);
+	assert.ok(removeInputs > build, "workflow must remove pre-clean untracked inputs before packing");
+	assert.match(source.slice(removeInputs), /git clean -ffdx[\s\S]*-e \/packages\/coding-agent\/dist\//);
+});
+
 test("release verifier accepts the exact fixed four-component inventory", () => {
 	const directory = createArtifacts();
 	try {
