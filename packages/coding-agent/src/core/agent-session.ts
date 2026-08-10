@@ -950,6 +950,14 @@ type AutonomousRuntimeSnapshot = Pick<
 	"continuationsUsed" | "gateAttempts" | "lastGateFailure" | "lastGateFailureSnapshot"
 >;
 
+type RlmChildUpdateEvent = Extract<AgentSessionEvent, { type: "rlm_child_update" }>;
+
+interface PendingRlmChildUpdate {
+	event: RlmChildUpdateEvent;
+	/** C01 assignment fence rechecked both at enqueue and publication. */
+	isCurrent: () => boolean;
+}
+
 interface RlmChildRun {
 	id: string;
 	/** UUID attempt fence, minted before this run is visible to any host. */
@@ -1120,6 +1128,12 @@ export class AgentSession {
 		followUps: [],
 	};
 	private _agentEventQueue: Promise<void> = Promise.resolve();
+	// Presentation-only, per-parent coalescing. This never gates child admission or model work.
+	private _rlmChildUpdateFlushTimer: ReturnType<typeof setTimeout> | undefined;
+	private _rlmChildUpdateGeneration = 0;
+	private readonly _pendingRlmChildUpdates = new Map<string, PendingRlmChildUpdate>();
+	private _observerFailureDiagnostics = 0;
+	private _afterToolHookFailureDiagnostics = 0;
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
@@ -1475,25 +1489,31 @@ export class AgentSession {
 				return undefined;
 			}
 
-			const hookResult = await runner.emitToolResult({
-				type: "tool_result",
-				toolName: toolCall.name,
-				toolCallId: toolCall.id,
-				input: args as Record<string, unknown>,
-				content: result.content,
-				details: result.details,
-				isError,
-			});
+			try {
+				const hookResult = await runner.emitToolResult({
+					type: "tool_result",
+					toolName: toolCall.name,
+					toolCallId: toolCall.id,
+					input: args as Record<string, unknown>,
+					content: result.content,
+					details: result.details,
+					isError,
+				});
 
-			if (!hookResult) {
+				if (!hookResult) {
+					return undefined;
+				}
+
+				return {
+					content: hookResult.content,
+					details: hookResult.details,
+					isError: hookResult.isError ?? isError,
+				};
+			} catch (error) {
+				// Result hooks observe completed work; unlike beforeToolCall they are not a veto.
+				this._recordBoundedDiagnostic("after-tool-hook", error);
 				return undefined;
 			}
-
-			return {
-				content: hookResult.content,
-				details: hookResult.details,
-				isError: hookResult.isError ?? isError,
-			};
 		};
 	}
 
@@ -1510,16 +1530,86 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
+	private _recordBoundedDiagnostic(kind: "observer" | "after-tool-hook", error: unknown): void {
+		const count = kind === "observer" ? ++this._observerFailureDiagnostics : ++this._afterToolHookFailureDiagnostics;
+		// Diagnostics deliberately exclude event, hook, tool, prompt, result, and stack content.
+		if (count <= 10) {
+			const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+			console.warn(`AgentSession ${kind} failure (${errorClass})`);
+		}
+	}
+
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
+		const terminalChildUpdate =
+			event.type === "rlm_child_update" &&
+			(event.child.status === "done" || event.child.status === "error" || event.child.status === "cancelled");
+		if ((event.type !== "rlm_child_update" || terminalChildUpdate) && this._pendingRlmChildUpdates.size > 0) {
+			// Structural and terminal events cannot overtake a retained progress snapshot.
+			this._flushRlmChildUpdates();
+		}
 		for (const l of this._eventListeners) {
 			try {
 				l(event);
-			} catch {
+			} catch (error) {
 				// A failing observer must not prevent other subscribers from
 				// receiving lifecycle and persistence events.
+				this._recordBoundedDiagnostic("observer", error);
 			}
 		}
+	}
+
+	/**
+	 * Retain only the newest nonterminal snapshot per child until the next turn.
+	 * The caller supplies C01's assignment fence so a replaced incarnation cannot
+	 * be published from a stale timeout.
+	 */
+	private _queueRlmChildUpdate(
+		event: RlmChildUpdateEvent,
+		isCurrent: () => boolean,
+		publishSynchronously: boolean,
+	): void {
+		if (this._disposed || !isCurrent()) return;
+		const { child } = event;
+		const terminal = child.status === "done" || child.status === "error" || child.status === "cancelled";
+		if (terminal || publishSynchronously) {
+			// A terminal/edge cannot be overtaken by prior replaceable activity.
+			this._pendingRlmChildUpdates.delete(child.id);
+			this._flushRlmChildUpdates();
+			if (!this._disposed && isCurrent()) this._emit(event);
+			return;
+		}
+
+		this._pendingRlmChildUpdates.set(child.id, { event, isCurrent });
+		if (this._rlmChildUpdateFlushTimer !== undefined) return;
+		const generation = this._rlmChildUpdateGeneration;
+		this._rlmChildUpdateFlushTimer = setTimeout(() => {
+			if (generation !== this._rlmChildUpdateGeneration) return;
+			this._rlmChildUpdateFlushTimer = undefined;
+			if (this._disposed) return;
+			this._flushRlmChildUpdates();
+		}, 0);
+	}
+
+	private _flushRlmChildUpdates(): void {
+		if (this._rlmChildUpdateFlushTimer !== undefined) {
+			clearTimeout(this._rlmChildUpdateFlushTimer);
+			this._rlmChildUpdateFlushTimer = undefined;
+		}
+		const pending = [...this._pendingRlmChildUpdates.values()];
+		this._pendingRlmChildUpdates.clear();
+		for (const { event, isCurrent } of pending) {
+			if (!this._disposed && isCurrent()) this._emit(event);
+		}
+	}
+
+	private _cancelRlmChildUpdateFlush(): void {
+		this._rlmChildUpdateGeneration++;
+		if (this._rlmChildUpdateFlushTimer !== undefined) {
+			clearTimeout(this._rlmChildUpdateFlushTimer);
+			this._rlmChildUpdateFlushTimer = undefined;
+		}
+		this._pendingRlmChildUpdates.clear();
 	}
 
 	private _emitQueueUpdate(): void {
@@ -4000,6 +4090,7 @@ export class AgentSession {
 		if (this._disposed) {
 			return;
 		}
+		this._cancelRlmChildUpdateFlush();
 		this._disposed = true;
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
@@ -6555,6 +6646,7 @@ export class AgentSession {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
 		this.requestAbort();
+		this._cancelRlmChildUpdateFlush();
 		this._cancelActiveRlmChildRuns("Parent session aborted");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		try {
@@ -6577,6 +6669,7 @@ export class AgentSession {
 		this._sessionInputPumpSuspended = true;
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
+		this._cancelRlmChildUpdateFlush();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		this.agent.abort();
@@ -9798,16 +9891,20 @@ export class AgentSession {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 		};
 		this._activeRlmChildRuns.set(run.id, run);
+		let runningPublished = false;
 		const emitChildUpdate = () => {
-			const activeOwner =
-				this._activeRlmChildRuns.get(run.id) === run &&
-				this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId;
-			const retainedOwner =
-				this._rlmChildSessions.get(run.id) === childSession &&
-				this._rlmChildSessionAssignments.get(run.id) === run.assignmentId;
-			if (!activeOwner && !retainedOwner) return;
+			const isCurrent = () => {
+				const activeOwner =
+					this._activeRlmChildRuns.get(run.id) === run &&
+					this._activeRlmChildRuns.get(run.id)?.assignmentId === run.assignmentId;
+				const retainedOwner =
+					this._rlmChildSessions.get(run.id) === childSession &&
+					this._rlmChildSessionAssignments.get(run.id) === run.assignmentId;
+				return activeOwner || retainedOwner;
+			};
+			if (!isCurrent()) return;
 			const childModel = childSession?.model ?? modelSelection.model;
-			this._emit({
+			const event: RlmChildUpdateEvent = {
 				type: "rlm_child_update",
 				child: {
 					id: childNodeId,
@@ -9826,7 +9923,12 @@ export class AgentSession {
 					repliedSinceTask: childSession?._repliedToParentSinceTask,
 					error: run.error,
 				},
-			});
+			};
+			const terminal = run.status === "done" || run.status === "error" || run.status === "cancelled";
+			const publishSynchronously =
+				run.status === "queued" || (run.status === "running" && !runningPublished) || terminal;
+			this._queueRlmChildUpdate(event, isCurrent, publishSynchronously);
+			if (run.status === "running") runningPublished = true;
 		};
 		run.emitUpdate = emitChildUpdate;
 		emitChildUpdate();
