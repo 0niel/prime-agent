@@ -6,19 +6,21 @@ import { createHash, randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
+	constants,
+	fstatSync,
 	fsyncSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
+	readdirSync,
 	readFileSync,
 	readSync,
-	readdirSync,
+	realpathSync,
 	renameSync,
 	unlinkSync,
 	writeSync,
-	constants,
 } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, parse, relative, resolve } from "node:path";
 
 export const CHILD_RESULT_SCHEMA_VERSION = 1 as const;
 export const MAX_CHILD_RESULT_JSON_BYTES = 64 * 1024;
@@ -132,7 +134,9 @@ export interface C04TerminalCandidate {
 export interface C04ArtifactInput {
 	kind: C04ArtifactKind;
 	contentType: "text/plain" | "application/json" | "application/octet-stream";
-	data: Uint8Array | string | AsyncIterable<Uint8Array>;
+	/** Payloads are stream-only. Inline strings/Uint8Arrays are deliberately
+	 * rejected so a terminal can never accidentally retain an unbounded reply. */
+	data: AsyncIterable<Uint8Array>;
 }
 export interface C04CreateTerminalChildResultInput {
 	owner: C04ChildResultOwner;
@@ -164,32 +168,41 @@ export async function createOrGetTerminalChildResult(
 	input: C04CreateTerminalChildResultInput,
 ): Promise<C04ChildResultReference> {
 	const owner = validateOwner(input.owner);
+	// Bind before creating C04 state: an untrusted sibling/renamed root never gets
+	// a durable directory merely because it was supplied by a caller.
+	validateChildBinding(owner, input.childArtifactRoot);
 	const root = prepareRoot(input.childArtifactRoot);
 	const now = input.now?.() ?? new Date();
 	if (!Number.isFinite(now.getTime())) throw new Error("C04 time is invalid");
 	const candidate = validateCandidate(input.candidate);
-	const requestDigest = sha256(canonicalJson({ owner, candidate: digestableCandidate(candidate) }));
 	const indexPath = safePath(root, "operation-index", `${owner.operationId}.json`);
 	const existing = readIndex(indexPath);
+	// A committed operation is immutable.  We do not touch a retry stream until its
+	// operation identity has been resolved, avoiding a concurrent writer consuming it.
 	if (existing) {
-		if (!sameOwner(existing.owner, owner) || existing.requestDigest !== requestDigest) {
-			appendAudit(root, "uncertain", "immutable_conflict", owner.operationId);
-			throw new Error("C04 immutable operation conflict");
-		}
+		if (!sameOwner(existing.owner, owner)) throw immutableConflict(root, owner.operationId);
+		// A retry supplies a fresh stream; hash its bytes incrementally rather than
+		// collapsing all streams to a literal. Different raw output is a conflict.
+		if (existing.requestDigest !== (await digestCandidateStreams(owner, candidate)))
+			throw immutableConflict(root, owner.operationId);
 		return projection(readStored(root, existing.resultId));
 	}
-
+	const release = reserveOperationAndQuota(root, owner, indexPath);
 	const resultId = randomUuid();
 	const artifacts: C04OpaqueArtifactReference[] = [];
+	let reservedBytes = aggregateBytes(root, owner);
 	try {
 		for (const artifact of [
 			...(candidate.artifacts ?? []),
 			...(candidate.error?.diagnostic ? [candidate.error.diagnostic] : []),
 		]) {
 			if (artifacts.length >= MAX_ARTIFACTS_PER_RESULT) throw new Error("artifact count exceeds C04 limit");
-			artifacts.push(await writeArtifact(root, owner, resultId, artifact));
+			const written = await writeArtifact(root, owner, resultId, artifact, reservedBytes);
+			reservedBytes += written.byteLength;
+			artifacts.push(written);
 		}
 		const diagnostic = candidate.error?.diagnostic ? artifacts.at(-1) : undefined;
+		const requestDigest = digestableCandidateDigest(owner, candidate, artifacts);
 		const facts = candidate.facts.map((fact) => ({
 			claim: fact.claim,
 			...(fact.evidenceRef && artifacts.some((ref) => ref.handleId === fact.evidenceRef)
@@ -227,6 +240,13 @@ export async function createOrGetTerminalChildResult(
 		};
 		assertStored(stored);
 		atomicJson(safePath(root, "results", `${resultId}.json`), stored);
+		for (const artifact of artifacts)
+			atomicExclusiveJson(safePath(root, "handle-index", `${artifact.handleId}.json`), {
+				version: 1,
+				resultId,
+				owner,
+				handleId: artifact.handleId,
+			});
 		const index = { version: 1, resultId, owner, requestDigest };
 		try {
 			atomicExclusiveJson(indexPath, index);
@@ -241,11 +261,11 @@ export async function createOrGetTerminalChildResult(
 		appendAudit(root, "linked", "operation_indexed", resultId);
 		return projection(stored);
 	} catch (error) {
-		// The caller chooses C03's normal bounded failure terminal path.  Do not
-		// manufacture an optimistic reference or expose arbitrary OS error text.
 		if (!(error instanceof Error && error.message === "C04 immutable operation conflict"))
 			appendAudit(root, "uncertain", "storage_failed", owner.operationId);
 		throw error;
+	} finally {
+		release();
 	}
 }
 
@@ -306,7 +326,8 @@ export function readOwnedArtifact(
 	)
 		return undefined;
 	try {
-		const result = readStored(grant.root, grant.resultId);
+		// Retention is evaluated for every capability read, not merely resolution.
+		const result = expireIfElapsed(grant.root, readStored(grant.root, grant.resultId), new Date());
 		if (!sameOwner(result.owner, grant.owner)) return denied(grant.root, "owner_mismatch");
 		const artifact = result.artifacts.find((a) => a.handleId === grant.handleId);
 		if (!artifact || artifact.retentionState !== "retained" || range.offset > artifact.byteLength)
@@ -314,11 +335,20 @@ export function readOwnedArtifact(
 		const file = safePath(grant.root, "objects", `${artifact.handleId}.blob`);
 		const fd = openSyncNoFollow(file, "r");
 		try {
+			const before = fstatSync(fd);
+			if (!before.isFile() || before.size !== artifact.byteLength) return denied(grant.root, "integrity");
+			const hash = hashOpenFile(fd, artifact.byteLength);
+			const after = fstatSync(fd);
+			if (
+				hash !== artifact.sha256 ||
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.size !== artifact.byteLength
+			)
+				return denied(grant.root, "integrity");
 			const bytes = Buffer.allocUnsafe(Math.min(range.length, artifact.byteLength - range.offset));
 			const read = readSync(fd, bytes, 0, bytes.length, range.offset);
-			// Integrity is deliberately checked before *any* successful read. This is
-			// incremental and bounded by artifact cap, never readFile on payloads.
-			if (hashFile(file, artifact.byteLength) !== artifact.sha256) return denied(grant.root, "integrity");
+			if (fstatSync(fd).size !== artifact.byteLength) return denied(grant.root, "integrity");
 			appendAudit(grant.root, "read_allowed", "read", artifact.handleId);
 			return bytes.subarray(0, read);
 		} finally {
@@ -346,15 +376,16 @@ export function recordChildResultDisposition(
 				: artifact,
 		);
 		if (canonicalJson(changed) !== canonicalJson(result.artifacts)) {
-			for (const artifact of changed)
-				if (artifact.retentionState !== "retained")
-					safeUnlink(safePath(root, "objects", `${artifact.handleId}.blob`));
+			// State and audit are durable before bytes become unreachable.
 			atomicJson(safePath(root, "results", `${result.resultId}.json`), {
 				...result,
 				artifacts: changed,
 				retentionState: input.disposition,
 			});
 			appendAudit(root, input.disposition, input.disposition, input.handleId ?? input.resultId);
+			for (const artifact of changed)
+				if (artifact.retentionState !== "retained")
+					safeUnlink(safePath(root, "objects", `${artifact.handleId}.blob`));
 		}
 		return true;
 	} catch {
@@ -365,6 +396,27 @@ export function recordChildResultDisposition(
 export function canonicalChildResultBytes(value: C04ChildResultReference): Uint8Array {
 	assertReference(value);
 	return Buffer.from(canonicalJson(value));
+}
+
+/** A bounded C04-shaped terminal used when durable storage itself is unavailable. */
+export function terminalStorageFailedProjection(
+	input: { status?: Exclude<C04ChildResultStatus, "completed">; model?: Partial<C04ModelMetadata> } = {},
+): C04ChildResultReference {
+	const status = input.status ?? "failed";
+	const model = validateModel(input.model);
+	const result: C04ChildResultReference = {
+		version: 1,
+		resultId: randomUuid(),
+		status,
+		summary: "Child terminal storage failed.",
+		preview: "A bounded terminal result could not be persisted.",
+		error: { code: "terminal_storage_failed", message: "Terminal result storage failed." },
+		model,
+		artifacts: [],
+		retentionState: "unavailable",
+	};
+	assertReference(result);
+	return result;
 }
 
 function validateOwner(value: C04ChildResultOwner): C04ChildResultOwner {
@@ -502,9 +554,9 @@ function validateArtifact(value: unknown): C04ArtifactInput {
 		!exactKeys(value, ["kind", "contentType", "data"]) ||
 		!kinds.has(value.kind) ||
 		!contentTypes.has(value.contentType) ||
-		!(typeof value.data === "string" || value.data instanceof Uint8Array || isAsyncIterable(value.data))
+		!isAsyncIterable(value.data)
 	)
-		throw new Error("invalid C04 artifact");
+		throw new Error("invalid C04 artifact: payload must be an AsyncIterable<Uint8Array>");
 	return value as C04ArtifactInput;
 }
 async function writeArtifact(
@@ -512,8 +564,8 @@ async function writeArtifact(
 	owner: C04ChildResultOwner,
 	resultId: string,
 	artifact: C04ArtifactInput,
+	used = aggregateBytes(root, owner),
 ): Promise<C04OpaqueArtifactReference> {
-	const used = aggregateBytes(root, owner);
 	const handleId = randomUuid();
 	const finalPath = safePath(root, "objects", `${handleId}.blob`);
 	const temp = safePath(root, "objects", `.${handleId}.${randomUuid()}.tmp`);
@@ -555,22 +607,23 @@ async function writeArtifact(
 	}
 }
 async function* chunks(data: C04ArtifactInput["data"]): AsyncGenerator<Uint8Array> {
-	if (typeof data === "string") {
-		const bytes = Buffer.from(data);
-		for (let at = 0; at < bytes.length; at += MAX_STREAM_CHUNK_BYTES)
-			yield bytes.subarray(at, at + MAX_STREAM_CHUNK_BYTES);
-	} else if (data instanceof Uint8Array) {
-		for (let at = 0; at < data.length; at += MAX_STREAM_CHUNK_BYTES)
-			yield data.subarray(at, at + MAX_STREAM_CHUNK_BYTES);
-	} else for await (const chunk of data) yield chunk;
+	for await (const chunk of data) {
+		if (!(chunk instanceof Uint8Array)) throw new Error("C04 stream yielded non-bytes");
+		yield chunk;
+	}
 }
+
 function aggregateBytes(root: string, owner: C04ChildResultOwner): number {
 	let total = 0;
 	for (const name of readdirSync(safePath(root, "results"))) {
 		if (!name.endsWith(".json")) continue;
 		try {
 			const r = readStored(root, name.slice(0, -5));
-			if (sameOwner(r.owner, owner))
+			if (
+				r.owner.parentSessionId === owner.parentSessionId &&
+				r.owner.childSessionId === owner.childSessionId &&
+				r.owner.childSessionFile === owner.childSessionFile
+			)
 				total += r.artifacts.reduce((n, a) => n + (a.retentionState === "retained" ? a.byteLength : 0), 0);
 		} catch {
 			throw new Error("uncertain C04 result store");
@@ -578,17 +631,92 @@ function aggregateBytes(root: string, owner: C04ChildResultOwner): number {
 	}
 	return total;
 }
+const operationReservations = new Set<string>();
+/** Operation serialization plus a durable O_EXCL reservation prevents two live
+ * streams from being assigned the same operation or independently passing quota. */
+function reserveOperationAndQuota(root: string, owner: C04ChildResultOwner, indexPath: string): () => void {
+	const key = `${root}:${owner.parentSessionId}:${owner.childSessionId}`;
+	if (operationReservations.has(key)) throw immutableConflict(root, owner.operationId);
+	const reservation = safePath(root, "operation-index", `.${owner.operationId}.reserve`);
+	const quotaReservation = safePath(root, "operation-index", `.quota.${owner.childSessionId}.reserve`);
+	let operationFd: number | undefined;
+	let quotaFd: number | undefined;
+	try {
+		// Lock both exact operation and child-session quota before the first byte.
+		operationFd = openSyncNoFollow(reservation, "wx", 0o600);
+		quotaFd = openSyncNoFollow(quotaReservation, "wx", 0o600);
+		writeAll(operationFd, Buffer.from(canonicalJson({ version: 1, owner, indexPath })));
+		fsyncSync(operationFd);
+		fsyncSync(quotaFd);
+		closeSync(operationFd);
+		closeSync(quotaFd);
+		operationFd = quotaFd = undefined;
+		fsyncDirectory(dirname(reservation));
+		operationReservations.add(key);
+	} catch {
+		if (operationFd !== undefined) closeSync(operationFd);
+		if (quotaFd !== undefined) closeSync(quotaFd);
+		safeUnlink(reservation);
+		safeUnlink(quotaReservation);
+		throw immutableConflict(root, owner.operationId);
+	}
+	return () => {
+		operationReservations.delete(key);
+		safeUnlink(reservation);
+		safeUnlink(quotaReservation);
+		fsyncDirectory(dirname(reservation));
+	};
+}
+function immutableConflict(root: string, operationId: string): Error {
+	appendAudit(root, "uncertain", "immutable_conflict", operationId);
+	return new Error("C04 immutable operation conflict");
+}
+/** The C04 root belongs below, not beside, the validated child artifact dir. */
+function validateChildBinding(owner: C04ChildResultOwner, childArtifactRoot: string): void {
+	const file = canonicalExistingRegularFile(owner.childSessionFile);
+	if (!file) throw new Error("C04 child session file is not a stable regular file");
+	const root = canonicalDirectoryNoSymlinks(childArtifactRoot);
+	// The file must remain beneath the same trusted child session hierarchy. This
+	// rejects a swapped/renamed child root passed independently from its session.
+	if (relative(dirname(file), root).startsWith("..")) throw new Error("C04 child artifact root escapes child session");
+}
+function canonicalExistingRegularFile(path: string): string | undefined {
+	try {
+		const st = lstatSync(path);
+		return st.isFile() && !st.isSymbolicLink() ? realpathSync(path) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+function canonicalDirectoryNoSymlinks(path: string): string {
+	const requested = resolve(path);
+	const requestedStat = lstatSync(requested);
+	if (!requestedStat.isDirectory() || requestedStat.isSymbolicLink())
+		throw new Error("C04 rejects symlink/non-directory root");
+	// Normalize OS-owned aliases (/var -> /private/var on macOS), then reject every
+	// application-visible ancestor from the canonical path downward.
+	const absolute = realpathSync(requested);
+	const { root } = parse(absolute);
+	let current = root;
+	for (const part of relative(root, absolute).split(/[/\\]/).filter(Boolean)) {
+		current = join(current, part);
+		const st = lstatSync(current);
+		if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("C04 rejects symlink/non-directory ancestor");
+	}
+	return absolute;
+}
 function prepareRoot(childArtifactRoot: string, create = true): string {
 	if (typeof childArtifactRoot !== "string" || !childArtifactRoot) throw new Error("invalid C04 artifact root");
-	if (create) mkdirSync(childArtifactRoot, { recursive: true, mode: 0o700 });
-	const base = assertDirectory(childArtifactRoot);
+	// The trusted child artifact directory must already exist; never recursively
+	// create through an attacker-controlled ancestor.
+	const base = canonicalDirectoryNoSymlinks(childArtifactRoot);
 	const root = join(base, "rlm-child-results");
 	if (create) mkdirSync(root, { recursive: true, mode: 0o700 });
 	assertDirectory(root);
-	for (const dir of ["operation-index", "results", "objects"]) {
+	for (const dir of ["operation-index", "results", "objects", "handle-index"]) {
 		const path = join(root, dir);
 		if (create) mkdirSync(path, { recursive: true, mode: 0o700 });
-		assertDirectory(path);
+		canonicalDirectoryNoSymlinks(path);
 	}
 	chmodSync(root, 0o700);
 	return root;
@@ -601,7 +729,7 @@ function assertDirectory(path: string): string {
 function safePath(root: string, directory: string, name?: string): string {
 	if (
 		!/^[a-z-]+$/.test(directory) ||
-		(name !== undefined && (!/^[0-9a-f.-]+(?:\.json|\.blob|\.tmp)?$/.test(name) || name.includes("..")))
+		(name !== undefined && (!/^[a-z0-9.-]+(?:\.(?:json|blob|tmp|reserve))?$/.test(name) || name.includes("..")))
 	)
 		throw new Error("invalid C04 generated path");
 	const target = name === undefined ? join(root, directory) : join(root, directory, name);
@@ -646,13 +774,22 @@ function readIndex(
 }
 function handleResult(root: string, handleId: string): string {
 	if (!isUuid(handleId)) throw new Error("invalid handle");
-	for (const name of readdirSync(safePath(root, "results"))) {
-		if (!name.endsWith(".json")) continue;
-		const result = readStored(root, name.slice(0, -5));
-		if (result.artifacts.some((a) => a.handleId === handleId)) return result.resultId;
-	}
-	throw new Error("not found");
+	const path = safePath(root, "handle-index", `${handleId}.json`);
+	const st = lstatSync(path);
+	if (!st.isFile() || st.isSymbolicLink() || st.size > 4096) throw new Error("not found");
+	const index = JSON.parse(readFileSync(path, "utf8"));
+	if (
+		!isObject(index) ||
+		!exactKeys(index, ["version", "resultId", "owner", "handleId"]) ||
+		index.version !== 1 ||
+		index.handleId !== handleId ||
+		!isUuid(index.resultId)
+	)
+		throw new Error("not found");
+	validateOwner(index.owner as C04ChildResultOwner);
+	return index.resultId;
 }
+
 function expireIfElapsed(root: string, result: StoredChildResult, now: Date): StoredChildResult {
 	if (Date.parse(result.retention.expiresAt) > now.getTime()) return result;
 	if (result.retentionState !== "retained") return result;
@@ -664,9 +801,9 @@ function setExpired(root: string, result: StoredChildResult): StoredChildResult 
 		retentionState: "expired" as const,
 		artifacts: result.artifacts.map((a) => ({ ...a, retentionState: "expired" as const })),
 	};
-	for (const a of expired.artifacts) safeUnlink(safePath(root, "objects", `${a.handleId}.blob`));
 	atomicJson(safePath(root, "results", `${result.resultId}.json`), expired);
 	appendAudit(root, "expired", "retention_elapsed", result.resultId);
+	for (const a of expired.artifacts) safeUnlink(safePath(root, "objects", `${a.handleId}.blob`));
 	return expired;
 }
 function projection(result: StoredChildResult): C04ChildResultReference {
@@ -709,7 +846,19 @@ function assertStored(value: unknown): asserts value is StoredChildResult {
 		artifacts: value.artifacts,
 		retentionState: value.retentionState,
 	});
-	validateOwner(value.owner as C04ChildResultOwner);
+	const storedOwner = validateOwner(value.owner as C04ChildResultOwner);
+	for (const artifact of value.artifacts as C04OpaqueArtifactReference[]) {
+		if (
+			artifact.creatorAssignmentId !== storedOwner.assignmentId ||
+			artifact.ownerSessionId !== storedOwner.childSessionId
+		)
+			throw new Error("C04 artifact owner cross-reference mismatch");
+	}
+	if (
+		value.error?.diagnosticRef &&
+		!(value.artifacts as C04OpaqueArtifactReference[]).some((a) => a.handleId === value.error?.diagnosticRef)
+	)
+		throw new Error("C04 diagnostic cross-reference mismatch");
 	if (
 		!Array.isArray(value.facts) ||
 		value.facts.length > MAX_FACTS ||
@@ -733,6 +882,16 @@ function assertStored(value: unknown): asserts value is StoredChildResult {
 		!SHA256.test(value.requestDigest)
 	)
 		throw new Error("invalid C04 result record");
+	if (
+		value.retentionState === "retained" &&
+		(value.artifacts as C04OpaqueArtifactReference[]).some((a) => a.retentionState !== "retained")
+	)
+		throw new Error("C04 retention consistency mismatch");
+	if (
+		value.retentionState !== "retained" &&
+		(value.artifacts as C04OpaqueArtifactReference[]).some((a) => a.retentionState === "retained")
+	)
+		throw new Error("C04 retention consistency mismatch");
 }
 function assertReference(value: unknown): asserts value is C04ChildResultReference {
 	if (
@@ -859,23 +1018,21 @@ function denied<T>(root: string, reason: string): T | undefined {
 	appendAudit(root, "read_denied", reason, reason);
 	return undefined;
 }
-function hashFile(path: string, length: number): string {
-	const fd = openSyncNoFollow(path, "r");
-	try {
-		const h = createHash("sha256");
-		const buffer = Buffer.allocUnsafe(MAX_STREAM_CHUNK_BYTES);
-		let off = 0;
-		while (off < length) {
-			const n = readSync(fd, buffer, 0, Math.min(buffer.length, length - off), off);
-			if (n <= 0) throw new Error("short object");
-			h.update(buffer.subarray(0, n));
-			off += n;
-		}
-		return h.digest("hex");
-	} finally {
-		closeSync(fd);
+function hashOpenFile(fd: number, length: number): string {
+	const h = createHash("sha256");
+	const buffer = Buffer.allocUnsafe(MAX_STREAM_CHUNK_BYTES);
+	let off = 0;
+	while (off < length) {
+		const n = readSync(fd, buffer, 0, Math.min(buffer.length, length - off), off);
+		if (n <= 0) throw new Error("short object");
+		h.update(buffer.subarray(0, n));
+		off += n;
 	}
+	// A byte after declared length detects a trailing append without a second path/FD.
+	if (readSync(fd, buffer, 0, 1, length) !== 0) throw new Error("trailing object bytes");
+	return h.digest("hex");
 }
+
 function fsyncDirectory(path: string): void {
 	const fd = openSync(path, "r");
 	try {
@@ -976,18 +1133,63 @@ function sameOwner(a: C04ChildResultOwner, b: C04ChildResultOwner): boolean {
 		a.deliveryId === b.deliveryId
 	);
 }
-function digestableCandidate(candidate: any): unknown {
-	const artifactDigest = (a: C04ArtifactInput) => ({
-		kind: a.kind,
-		contentType: a.contentType,
-		payload:
-			typeof a.data === "string"
-				? sha256(a.data)
-				: a.data instanceof Uint8Array
-					? createHash("sha256").update(a.data).digest("hex")
-					: "stream",
-	});
-	return {
+function digestableCandidateDigest(
+	owner: C04ChildResultOwner,
+	candidate: C04TerminalCandidate,
+	artifacts: readonly C04OpaqueArtifactReference[],
+): string {
+	return sha256(canonicalJson({ owner, candidate: digestableCandidate(candidate, artifacts) }));
+}
+async function digestCandidateStreams(
+	owner: C04ChildResultOwner,
+	candidate: ReturnType<typeof validateCandidate>,
+): Promise<string> {
+	const descriptors: Array<{
+		kind: C04ArtifactKind;
+		contentType: C04ArtifactInput["contentType"];
+		byteLength: number;
+		sha256: string;
+	}> = [];
+	for (const artifact of [
+		...(candidate.artifacts ?? []),
+		...(candidate.error?.diagnostic ? [candidate.error.diagnostic] : []),
+	]) {
+		const hash = createHash("sha256");
+		let count = 0;
+		for await (const chunk of chunks(artifact.data)) {
+			if (chunk.length > MAX_STREAM_CHUNK_BYTES) throw new Error("C04 stream chunk exceeds limit");
+			count += chunk.length;
+			if (count > MAX_ARTIFACT_BYTES) throw new Error("C04 artifact exceeds limit");
+			hash.update(chunk);
+		}
+		descriptors.push({
+			kind: artifact.kind,
+			contentType: artifact.contentType,
+			byteLength: count,
+			sha256: hash.digest("hex"),
+		});
+	}
+	const surrogate = descriptors.map((d) => ({
+		version: 1 as const,
+		handleId: randomUuid(),
+		resultId: randomUuid(),
+		...d,
+		creatorAssignmentId: owner.assignmentId,
+		ownerSessionId: owner.childSessionId,
+		retentionState: "retained" as const,
+	}));
+	// digestableCandidate uses only kind/type/length/hash and no generated IDs.
+	return digestableCandidateDigest(owner, candidate, surrogate);
+}
+function digestableCandidate(candidate: any, artifacts: readonly C04OpaqueArtifactReference[]): unknown {
+	let cursor = 0;
+	const artifactDigest = (a: C04ArtifactInput) => {
+		const written = artifacts[cursor++];
+		if (!written || written.kind !== a.kind || written.contentType !== a.contentType)
+			throw new Error("C04 artifact digest mismatch");
+		return { kind: a.kind, contentType: a.contentType, byteLength: written.byteLength, sha256: written.sha256 };
+	};
+	const output = {
 		...candidate,
 		artifacts: (candidate.artifacts ?? []).map(artifactDigest),
 		error: candidate.error
@@ -998,4 +1200,6 @@ function digestableCandidate(candidate: any): unknown {
 				}
 			: undefined,
 	};
+	if (cursor !== artifacts.length) throw new Error("C04 artifact digest mismatch");
+	return output;
 }

@@ -215,15 +215,16 @@ import {
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
+	type C04ChildResultStatus,
+	canonicalChildResultBytes,
+	createOrGetTerminalChildResult,
+	terminalStorageFailedProjection,
+} from "./rlm-child-results.js";
+import {
 	createRlmSafeTerminalResultTerminalMessage,
 	materializedTerminalMessageId,
 	type RlmTerminalMessage,
 } from "./rlm-durable-operations.js";
-import {
-	canonicalChildResultBytes,
-	createOrGetTerminalChildResult,
-	type C04ChildResultStatus,
-} from "./rlm-child-results.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -1073,6 +1074,29 @@ export function compactRlmText(text: string, maxLength = 160): string {
 // would only hide the divergence between near-identical sibling prompts.
 export function rlmChildLabel(prompt: string): string {
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
+}
+
+/** C04 terminal output is externalized as bounded byte chunks; do not join, read,
+ * or truncate the child reply before persistence. */
+async function* streamAssistantTerminalOutput(session: AgentSession): AsyncGenerator<Uint8Array> {
+	const encoder = new TextEncoder();
+	for (const message of session.messages) {
+		if (message.role !== "assistant") continue;
+		for (const block of (message as AssistantMessage).content) {
+			if (block.type !== "text") continue;
+			const bytes = encoder.encode(block.text);
+			for (let offset = 0; offset < bytes.length; offset += 64 * 1024)
+				yield bytes.subarray(offset, offset + 64 * 1024);
+		}
+	}
+}
+/** A bounded structured presentation is independent of the raw artifact. */
+function safeAssistantPreview(message: AssistantMessage): string | undefined {
+	for (const block of message.content) {
+		if (block.type !== "text" || !block.text) continue;
+		return compactRlmText(block.text, 160);
+	}
+	return undefined;
 }
 
 function readAssistantText(message: AssistantMessage): string {
@@ -10176,11 +10200,22 @@ export class AgentSession {
 						operationId: run.operationId,
 						deliveryId: run.deliveryId,
 					},
-					childArtifactRoot: dirname(childArtifactDir),
+					childArtifactRoot: childArtifactDir,
 					candidate: {
 						status,
 						summary: status === "completed" ? "Child completed." : "Child terminal result is unavailable.",
 						preview: answerPreview || "No bounded terminal preview is available.",
+						...(status === "completed"
+							? {
+									artifacts: [
+										{
+											kind: "terminal_output" as const,
+											contentType: "text/plain" as const,
+											data: streamAssistantTerminalOutput(childSession),
+										},
+									],
+								}
+							: {}),
 						...(status === "completed"
 							? {}
 							: {
@@ -10206,9 +10241,20 @@ export class AgentSession {
 						: "Child ended; bounded result available.";
 				return createRlmSafeTerminalResultTerminalMessage(content, projection, Date.now());
 			} catch {
-				// No raw exception fallback and no second terminal path. A storage failure is
-				// intentionally left for C03 recovery/normal failure handling.
-				return undefined;
+				// Storage failure is itself a normal, bounded C04 projection. It always
+				// enters C03 through the same safe-terminal envelope, never as undefined.
+				const fallback = terminalStorageFailedProjection({
+					status: status === "completed" ? "failed" : status,
+					model: {
+						initialResolvedSelector: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+						terminalResolvedSelector: `${terminalModel.provider}/${terminalModel.id}`,
+					},
+				});
+				return createRlmSafeTerminalResultTerminalMessage(
+					"Child ended; bounded terminal result unavailable.",
+					Buffer.from(canonicalChildResultBytes(fallback)).toString("utf8"),
+					Date.now(),
+				);
 			}
 		};
 
@@ -10351,13 +10397,13 @@ export class AgentSession {
 								}
 							}
 						}
-						const text = compactRlmText(readAssistantText(assistant));
+						const text = safeAssistantPreview(assistant);
 						if (text) answerPreview = text;
 						void flushAgentTraceUpload(child.sessionManager).catch(() => undefined);
 						emitChildUpdate();
 					} else if (event.type === "message_start" || event.type === "message_update") {
 						if (event.message.role === "assistant") {
-							const text = compactRlmText(readAssistantText(event.message as AssistantMessage));
+							const text = safeAssistantPreview(event.message as AssistantMessage);
 							if (text) answerPreview = text;
 							activity = { kind: "writing" };
 							emitChildUpdate();
