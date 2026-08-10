@@ -486,54 +486,64 @@ export async function runAcpModeWithConnection(
 			try {
 				const { text, images } = promptContent(params.prompt);
 				const priorMessages = turnBoundary(await connection.getMessages());
+				if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
 				await connection.promptAndWait(text, images.length > 0 ? { images } : undefined);
-				// Cancellation between model completion and boundary publication cannot
-				// claim a result or terminal state; it is a normal cancelled response.
 				if (abort.signal.aborted) {
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
 				}
 				const failure = await turnFailure(connection, priorMessages);
-				if (failure && !abort.signal.aborted) {
-					await entry.producer.publish(
-						{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
-						promptTurnId,
-						"responseBoundary",
-						"error",
-					);
-					responseBoundaryEmitted = true;
+				if (abort.signal.aborted) {
 					await entry.producer.drain();
-					throw new Error(`prime-agent turn failed: ${failure}`);
+					return { stopReason: "cancelled" satisfies AcpStopReason };
 				}
-
-				// Establish the state that makes a result boundary truthful before
-				// publishing it. The boundary still precedes terminal quiescence.
+				// Both successful and failed model turns must establish quiescence from
+				// the same authoritative sources before making a terminal claim.
 				const status = await connection.waitForHeadlessCompletion();
+				if (abort.signal.aborted) {
+					await entry.producer.drain();
+					return { stopReason: "cancelled" satisfies AcpStopReason };
+				}
 				const autonomous = autonomousMeta(status);
 				const liveSnapshot = await connection.getInitialSnapshot();
-				// `result` is application causality, never an ACP transport reason.
+				if (abort.signal.aborted) {
+					await entry.producer.drain();
+					return { stopReason: "cancelled" satisfies AcpStopReason };
+				}
+				const outcome = failure ? "error" : "result";
+				if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
 				await entry.producer.publish(
 					{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
 					promptTurnId,
 					"responseBoundary",
-					"result",
+					outcome,
 				);
 				responseBoundaryEmitted = true;
-				const quiescence = quiescenceMeta(status, liveSnapshot.children);
-				const terminal = quiescence.outstandingSubagents === 0 && quiescence.remainingAutonomousContinuations === 0;
-				// Only zero work/budget is a scoreable terminal claim. When work is
-				// still outstanding, preserve the truthful snapshot as an ordinary
-				// event instead of declaring terminal quiescence.
-				if (terminal) entry.producer.sealTerminal(promptTurnId);
+				if (abort.signal.aborted) {
+					await entry.producer.drain();
+					return { stopReason: "cancelled" satisfies AcpStopReason };
+				}
+				const terminalQuiescence = quiescenceMeta(status, liveSnapshot.children);
+				const terminal =
+					terminalQuiescence.outstandingSubagents === 0 &&
+					terminalQuiescence.remainingAutonomousContinuations === 0;
+				if (terminal) {
+					// Cut before queuing terminal: callbacks after the cut are turn-zero
+					// events and can never trail this scoreable terminal on its turn.
+					if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
+					entry.producer.sealTerminal(promptTurnId);
+				}
 				await entry.producer.publish(
 					{
 						sessionUpdate: "session_info_update",
-						_meta: primeAgentMeta({ ...(autonomous ? { autonomous } : {}), quiescence }),
+						_meta: primeAgentMeta({ ...(autonomous ? { autonomous } : {}), quiescence: terminalQuiescence }),
 					},
 					promptTurnId,
 					terminal ? "terminalQuiescence" : "event",
+					terminal ? outcome : undefined,
 				);
 				await entry.producer.drain();
+				if (failure) throw new Error(`prime-agent turn failed: ${failure}`);
 				return { stopReason: acpStopReason({ cancelled: abort.signal.aborted, autonomous: status }) };
 			} catch (error) {
 				if (abort.signal.aborted) {

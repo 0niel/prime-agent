@@ -90,7 +90,7 @@ export interface PrimeAgentCwdMeta {
  */
 export type PrimeAgentEventPhase = "event" | "responseBoundary" | "terminalQuiescence";
 
-/** The outcome carried only by a prompt's response boundary. */
+/** The outcome carried by a correlated response boundary and terminal envelope. */
 export type PrimeAgentResponseOutcome = "result" | "error";
 
 export interface PrimeAgentSessionMeta {
@@ -101,7 +101,7 @@ export interface PrimeAgentSessionMeta {
 	/** Whether this is ordinary work, the prompt response boundary, or final quiescence. */
 	phase?: PrimeAgentEventPhase;
 	/**
-	 * The response-boundary outcome. This deliberately has only `result` and
+	 * The boundary/terminal outcome. This deliberately has only `result` and
 	 * `error`: ACP's transport stop reasons (including `end_turn`) are never a
 	 * causal completion signal.
 	 */
@@ -119,6 +119,7 @@ export interface PrimeAgentSessionMeta {
 	compaction?: { tokensBefore?: number; summary?: string };
 	subagents?: PrimeAgentSubagentMeta[];
 	autonomous?: PrimeAgentAutonomousMeta;
+	/** Exact zero counters carried by a scoreable terminal-quiescence boundary. */
 	quiescence?: PrimeAgentQuiescenceMeta;
 	ipython?: PrimeAgentIpythonMeta;
 }

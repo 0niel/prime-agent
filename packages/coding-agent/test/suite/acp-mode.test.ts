@@ -35,6 +35,8 @@ function fakeAcpConnection(
 		finalSnapshot?: () => Promise<any>;
 		onInitialSnapshot?: (subscribed: boolean) => void;
 		onPromptAndWait?: () => void | Promise<void>;
+		onWaitForHeadlessCompletion?: () => void | Promise<void>;
+		onFinalSnapshot?: () => void | Promise<void>;
 		onUnsubscribe?: () => void;
 	} = {},
 ): any {
@@ -59,7 +61,10 @@ function fakeAcpConnection(
 				options.initialSnapshot = undefined;
 				return result;
 			}
-			if (options.finalSnapshot) return options.finalSnapshot();
+			if (options.finalSnapshot) {
+				await options.onFinalSnapshot?.();
+				return options.finalSnapshot();
+			}
 			return snapshot;
 		},
 		promptAndWait: async () => {
@@ -67,13 +72,16 @@ function fakeAcpConnection(
 		},
 		dispose: async () => {},
 		abort: async () => {},
-		waitForHeadlessCompletion: async () => ({
-			enabled: false,
-			continuationsUsed: 0,
-			turnsUsed: 0,
-			tokensUsed: 0,
-			limits: { maxContinuations: 0 },
-		}),
+		waitForHeadlessCompletion: async () => {
+			await options.onWaitForHeadlessCompletion?.();
+			return {
+				enabled: false,
+				continuationsUsed: 0,
+				turnsUsed: 0,
+				tokensUsed: 0,
+				limits: { maxContinuations: 0 },
+			};
+		},
 		emitChild(child: any) {
 			listener?.({ type: "session_event", event: { type: "rlm_child_update", child } });
 		},
@@ -433,6 +441,74 @@ describe("ACP mode end to end", () => {
 		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
 		expect(metadata.some((meta) => meta.phase === "responseBoundary" && meta.outcome === "result")).toBe(false);
 		expect(metadata.some((meta) => meta.phase === "terminalQuiescence")).toBe(false);
+		close();
+	});
+
+	it("cancels during headless completion without any completion envelope", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const enteredWait = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const releaseWait = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connection = fakeAcpConnection({
+			onWaitForHeadlessCompletion: async () => {
+				entered();
+				await releaseWait;
+			},
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		const pending = client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "cancel in headless" }],
+		});
+		await enteredWait;
+		await client.notify("session/cancel", { sessionId: session.sessionId });
+		release();
+		await expect(pending).resolves.toMatchObject({ stopReason: "cancelled" });
+		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(metadata.some((meta) => meta.phase === "responseBoundary" || meta.phase === "terminalQuiescence")).toBe(
+			false,
+		);
+		close();
+	});
+
+	it("cancels during the authoritative final snapshot without any completion envelope", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const enteredSnapshot = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const releaseSnapshot = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connection = fakeAcpConnection({
+			initialSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [] }),
+			finalSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [] }),
+			onFinalSnapshot: async () => {
+				entered();
+				await releaseSnapshot;
+			},
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		const pending = client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "cancel in snapshot" }],
+		});
+		await enteredSnapshot;
+		await client.notify("session/cancel", { sessionId: session.sessionId });
+		release();
+		await expect(pending).resolves.toMatchObject({ stopReason: "cancelled" });
+		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(metadata.some((meta) => meta.phase === "responseBoundary" || meta.phase === "terminalQuiescence")).toBe(
+			false,
+		);
 		close();
 	});
 
