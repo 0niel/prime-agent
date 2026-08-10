@@ -40,7 +40,7 @@ describe("streaming JSON CPU benchmark CLI", () => {
 		);
 		const result = JSON.parse(readFileSync(output, "utf8")) as {
 			name: string;
-			results: Array<{ repetitions: number; inputLength: number; order: string }>;
+			results: Array<{ name: string; repetitions: number; inputBytes: number; inputLength: number; order: string }>;
 		};
 		expect(result.name).toBe("N01-streaming-structured-output-parse-cpu");
 		expect(result.results).toHaveLength(2);
@@ -49,6 +49,34 @@ describe("streaming JSON CPU benchmark CLI", () => {
 				expect.objectContaining({ repetitions: 3, order: "alternating legacy/incremental by repetition" }),
 			]),
 		);
+		expect(result.results).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ name: "escaped-nested-4096-64", inputBytes: 4096, inputLength: 4096 }),
+				expect.objectContaining({ name: "unicode-nested-4096-7", inputBytes: 4096 }),
+			]),
+		);
+		expect(result.results.find(({ name }) => name.startsWith("unicode"))?.inputLength).toBeLessThan(4096);
 		expect(JSON.stringify(result)).not.toContain('"outer"');
+	});
+
+	it("rejects a target below the nested corpus structural minimum before measuring", () => {
+		const directory = mkdtempSync(join(tmpdir(), "n01-benchmark-"));
+		temporaryDirectories.push(directory);
+		expect(() =>
+			execFileSync(
+				process.execPath,
+				[
+					tsxPath,
+					benchmarkPath,
+					"--name",
+					"N01-streaming-structured-output-parse-cpu",
+					"--json",
+					join(directory, "result.json"),
+					"--escaped-bytes",
+					"1",
+				],
+				{ cwd: packagePath, stdio: "pipe" },
+			),
+		).toThrow(/below structural minimum/);
 	});
 });

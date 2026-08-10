@@ -45,11 +45,52 @@ function parseOptions(args: string[]): Options {
 	};
 }
 
+function corpusDocument(outer: Array<{ index: number; text: string }>, padding: string): string {
+	return JSON.stringify({ outer, padding });
+}
+
+/** Returns the UTF-8 byte count for a corpus with `count` nested entries and no padding. */
+function estimateNestedCorpusBytes(count: number, text: string, emptyBytes: number): number {
+	if (count === 0) return emptyBytes;
+	const firstEntryBytes = Buffer.byteLength(JSON.stringify({ index: 0, text }));
+	let indexedDigits = 0;
+	let start = 0;
+	for (let digits = 1; start < count; digits++) {
+		const end = Math.min(count, 10 ** digits);
+		indexedDigits += (end - start) * digits;
+		start = end;
+	}
+	// One comma separates every pair; entry zero already accounts for its one digit.
+	return emptyBytes + count * (firstEntryBytes - 1) + indexedDigits + count - 1;
+}
+
+/**
+ * Find a bounded number of nested entries before filling the exact remaining
+ * UTF-8 budget with ASCII. The estimator makes the preflight logarithmic,
+ * rather than constructing increasingly large candidate documents.
+ */
 function corpus(bytes: number, unicode: boolean): string {
-	const unit = unicode ? "😀\u2028 nested é " : '\\"escaped\\n nested ';
-	return JSON.stringify({
-		outer: Array.from({ length: Math.ceil(bytes / unit.length) }, (_, index) => ({ index, text: unit })),
-	});
+	const text = unicode ? "😀\u2028 nested é " : '\\"escaped\\n nested ';
+	const emptyBytes = Buffer.byteLength(corpusDocument([], ""));
+	const structuralBytes = estimateNestedCorpusBytes(1, text, emptyBytes);
+	if (bytes < structuralBytes)
+		throw new Error(`requested ${bytes} bytes is below structural minimum ${structuralBytes}`);
+
+	const firstEntryBytes = structuralBytes - emptyBytes;
+	const maximumEntries = Math.floor((bytes - emptyBytes) / firstEntryBytes);
+	let lower = 1;
+	let upper = maximumEntries;
+	while (lower < upper) {
+		const middle = Math.ceil((lower + upper) / 2);
+		if (estimateNestedCorpusBytes(middle, text, emptyBytes) <= bytes) lower = middle;
+		else upper = middle - 1;
+	}
+
+	const outer = Array.from({ length: lower }, (_, index) => ({ index, text }));
+	const paddingBytes = bytes - estimateNestedCorpusBytes(lower, text, emptyBytes);
+	const document = corpusDocument(outer, "x".repeat(paddingBytes));
+	if (Buffer.byteLength(document) !== bytes) throw new Error("corpus did not meet requested UTF-8 byte length");
+	return document;
 }
 
 function chunks(document: string, size: number): string[] {
@@ -125,9 +166,13 @@ function run(options: Options): void {
 			throw new Error("incremental input examination is not linear");
 		if (incrementalCpuUs.median >= legacyCpuUs.median)
 			throw new Error("incremental median CPU did not beat legacy replay");
+		const inputBytes = Buffer.byteLength(document);
+		if (inputBytes !== (name.startsWith("escaped") ? options.escapedBytes : options.unicodeBytes))
+			throw new Error("corpus byte length differs from requested target");
 		return {
 			name,
 			inputHash: createHash("sha256").update(document).digest("hex"),
+			inputBytes,
 			inputLength: document.length,
 			chunkCount: input.length,
 			repetitions: options.repetitions,
