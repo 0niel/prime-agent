@@ -3384,6 +3384,7 @@ export class DaemonSupervisor {
 		switch (command.type) {
 			case "prompt":
 			case "prompt_and_wait":
+			case "cancel_prompt_admission":
 			case "steer":
 			case "follow_up":
 			case "restore_next_turn":
@@ -3420,6 +3421,9 @@ export class DaemonSupervisor {
 			case "set_auto_retry":
 			case "compact":
 			case "refine":
+			case "abort_compaction":
+			case "abort_branch_summary":
+			case "abort_retry":
 			case "reload":
 			case "new_session":
 			case "switch_session":

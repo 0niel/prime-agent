@@ -259,6 +259,10 @@ describe("daemon supervisor restart passivation", () => {
 
 	it.each([
 		{ type: "abort", activeSessionId: "active-read" },
+		{ type: "cancel_prompt_admission", activeSessionId: "active-read", admissionId: "admission-id" },
+		{ type: "abort_compaction", activeSessionId: "active-read" },
+		{ type: "abort_branch_summary", activeSessionId: "active-read" },
+		{ type: "abort_retry", activeSessionId: "active-read" },
 		{ type: "agent_messages_pause", activeSessionId: "active-read" },
 		{ type: "agent_messages_resume", activeSessionId: "active-read" },
 	])("wakes a passivated root for state-changing $type commands", async (command) => {
