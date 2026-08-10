@@ -529,6 +529,8 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // inline limit before storing, so this holds many recent pastes; the oldest are
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
+/** Bound UI-only coalescing memory without limiting agent or provider work. */
+const MAX_PENDING_PROGRESS_EVENTS = 128;
 const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
 
 function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
@@ -5128,7 +5130,14 @@ export class InteractiveMode {
 		const pending = this.pendingProgress();
 		// A replacement is a later event, so move it to the tail to preserve event
 		// order among the newest retained snapshots.
-		if (pending.has(key)) pending.delete(key);
+		if (pending.has(key)) {
+			pending.delete(key);
+		} else if (pending.size >= MAX_PENDING_PROGRESS_EVENTS) {
+			// Do not evict UI entities. Put this complete ordered batch onto the
+			// existing UI tail now, then retain the new entity for its scheduled flush.
+			// This bounds only local coalescing memory, never provider/agent work.
+			this.enqueueFlushedProgress(this.drainPendingProgressEvents(), sessionGeneration);
+		}
 		pending.set(key, event);
 		if (this.progressFlushTimer) return;
 

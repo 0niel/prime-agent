@@ -1723,6 +1723,77 @@ describe("InteractiveMode connection events", () => {
 		}
 	});
 
+	test("bounds distinct progress coalescing without dropping ordered newest updates", async () => {
+		vi.useFakeTimers();
+		try {
+			type Event = { type: "session_event"; event: AgentConnectionSessionEvent };
+			let listener: ((event: Event) => Promise<void>) | undefined;
+			const attempted: string[] = [];
+			const showError = vi.fn();
+			const fakeThis = {
+				agentConnection: {
+					subscribe: (callback: (event: Event) => Promise<void>) => {
+						listener = callback;
+						return vi.fn();
+					},
+				},
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				progressFlushGeneration: 0,
+				progressFlushStopped: false,
+				handleEvent: vi.fn(async (event: { type: string; toolCallId?: string }) => {
+					const id = event.toolCallId ?? event.type;
+					attempted.push(id);
+					if (id === "tool-64") throw new Error("bounded flush failed");
+				}),
+				showError,
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			(
+				InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }
+			).subscribeToAgent.call(fakeThis);
+			const progress = (toolCallId: string) =>
+				listener?.({
+					type: "session_event",
+					event: { type: "tool_execution_update", toolCallId, partialResult: { content: [] } },
+				} as unknown as Event);
+
+			let observedPendingHighWater = 0;
+			// 129 is one more than MAX_PENDING_PROGRESS_EVENTS. The 129th distinct
+			// key must synchronously drain the first ordered batch rather than evict it.
+			for (let index = 0; index <= 128; index++) {
+				await progress(`tool-${index}`);
+				observedPendingHighWater = Math.max(
+					observedPendingHighWater,
+					(fakeThis as unknown as { pendingProgressEvents: Map<unknown, unknown> }).pendingProgressEvents.size,
+				);
+			}
+			expect(observedPendingHighWater).toBe(128);
+			expect(
+				(fakeThis as unknown as { pendingProgressEvents: Map<unknown, unknown> }).pendingProgressEvents.size,
+			).toBe(1);
+
+			await (fakeThis as unknown as { sessionEventQueue: Promise<void> }).sessionEventQueue;
+			await vi.runAllTimersAsync();
+			await (fakeThis as unknown as { sessionEventQueue: Promise<void> }).sessionEventQueue;
+			expect(attempted).toEqual(Array.from({ length: 129 }, (_, index) => `tool-${index}`));
+			expect(showError).toHaveBeenCalledWith("bounded flush failed");
+
+			// A failed entry never poisons the existing UI tail; a later scheduled
+			// flush still runs after the bounded batch has drained.
+			await progress("tool-recovered");
+			await vi.runAllTimersAsync();
+			await (fakeThis as unknown as { sessionEventQueue: Promise<void> }).sessionEventQueue;
+			expect(attempted).toEqual([...Array.from({ length: 129 }, (_, index) => `tool-${index}`), "tool-recovered"]);
+			expect(
+				(fakeThis as unknown as { pendingProgressEvents: Map<unknown, unknown> }).pendingProgressEvents.size,
+			).toBe(0);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("surfaces timer and explicit progress flush failures while recovering the queue", async () => {
 		vi.useFakeTimers();
 		try {
