@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -18,6 +18,30 @@ const children = new Set<ChildProcess>();
 
 function record(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+}
+
+function residentWorkerDescriptorPath(agentDir: string): string {
+	const workersRoot = join(agentDir, "daemon-workers");
+	for (const directory of readdirSync(workersRoot)) {
+		const candidate = join(workersRoot, directory);
+		const descriptor = readdirSync(candidate).find((name) => name.endsWith(".json"));
+		if (descriptor) return join(candidate, descriptor);
+	}
+	throw new Error("Resident worker descriptor was not persisted");
+}
+
+async function waitForFailedResidentWorker(descriptorPath: string): Promise<void> {
+	const deadline = Date.now() + 15_000;
+	while (Date.now() < deadline) {
+		try {
+			const descriptor = JSON.parse(readFileSync(descriptorPath, "utf8")) as { lifecycle?: unknown };
+			if (descriptor.lifecycle === "failed") return;
+		} catch {
+			// Recovery is still updating the descriptor.
+		}
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+	}
+	throw new Error("Resident ACP worker did not enter the fresh-environment recovery state");
 }
 
 async function stopChild(child: ChildProcess): Promise<void> {
@@ -154,7 +178,9 @@ function writeModels(agentDir: string, baseUrl: string): void {
 				fixture: {
 					baseUrl,
 					api: "openai-completions",
-					apiKey: "fixture-key",
+					// Resolve it afresh from the worker's live environment. The value
+					// itself never belongs in models.json or a worker descriptor.
+					apiKey: "ACP_FIXTURE_API_KEY",
 					models: [{ id: "fixture/model", reasoning: false, input: ["text"] }],
 				},
 			},
@@ -166,9 +192,18 @@ function writeSse(res: ServerResponse, body: Record<string, unknown>): void {
 	res.write(`data: ${JSON.stringify(body)}\n\n`);
 }
 
-async function startIpythonFixture(): Promise<{ baseUrl: string; sawLiveNamespace: () => boolean }> {
+async function startIpythonFixture(): Promise<{
+	baseUrl: string;
+	sawLiveNamespace: () => boolean;
+	authenticatedRequestCount: (secret: string) => number;
+}> {
 	let sawLiveNamespace = false;
+	const authenticatedRequests = new Map<string, number>();
 	const server = createServer(async (req, res) => {
+		const authorization = req.headers.authorization;
+		if (typeof authorization === "string") {
+			authenticatedRequests.set(authorization, (authenticatedRequests.get(authorization) ?? 0) + 1);
+		}
 		let body = "";
 		for await (const chunk of req) body += chunk.toString();
 		const request = record(JSON.parse(body));
@@ -240,10 +275,20 @@ async function startIpythonFixture(): Promise<{ baseUrl: string; sawLiveNamespac
 	await new Promise<void>((resolveListening) => server.listen(0, "127.0.0.1", resolveListening));
 	const address = server.address();
 	if (!address || typeof address === "string") throw new Error("Fixture server did not expose a TCP port");
-	return { baseUrl: `http://127.0.0.1:${address.port}/v1`, sawLiveNamespace: () => sawLiveNamespace };
+	return {
+		baseUrl: `http://127.0.0.1:${address.port}/v1`,
+		sawLiveNamespace: () => sawLiveNamespace,
+		authenticatedRequestCount: (secret) => authenticatedRequests.get(`Bearer ${secret}`) ?? 0,
+	};
 }
 
-function launchAcp(agentDir: string, projectDir: string, daemonSocket: string, resume: boolean): AcpStdioClient {
+function launchAcp(
+	agentDir: string,
+	projectDir: string,
+	daemonSocket: string,
+	resume: boolean,
+	fixtureApiKey = "acp-initial-fixture-secret",
+): AcpStdioClient {
 	const child = spawn(
 		process.execPath,
 		[
@@ -266,6 +311,9 @@ function launchAcp(agentDir: string, projectDir: string, daemonSocket: string, r
 				...process.env,
 				[ENV_AGENT_DIR]: agentDir,
 				HOME: agentDir,
+				// This is intentionally runtime-only. Recovery reacquires it from the
+				// live daemon environment rather than serializing it in a descriptor.
+				ACP_FIXTURE_API_KEY: fixtureApiKey,
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
 			},
 			stdio: ["pipe", "pipe", "pipe"],
@@ -287,7 +335,7 @@ describe("ACP daemon lifecycle negotiation", () => {
 	});
 
 	it(
-		"preserves an ACP kernel's live Python namespace across client disconnect and re-attach",
+		"recovers a crashed resident ACP worker with fresh environment-backed model authentication",
 		{ tags: ["kernel-heavy"], timeout: 240_000 },
 		async () => {
 			const root = mkdtempSync(join(tmpdir(), "pi-acp-resident-"));
@@ -301,13 +349,15 @@ describe("ACP daemon lifecycle negotiation", () => {
 			const fixture = await startIpythonFixture();
 			writeModels(agentDir, fixture.baseUrl);
 
-			const first = launchAcp(agentDir, projectDir, daemonSocket, false);
+			const initialSecret = "acp-initial-fixture-secret";
+			const recoveredSecret = "acp-fresh-recovery-secret";
+			const first = launchAcp(agentDir, projectDir, daemonSocket, false, initialSecret);
 			const firstSession = await first.start(projectDir);
 			await first.prompt(firstSession, "set reconnect state");
 			await first.close();
 			children.delete(first.child);
 
-			const reattached = launchAcp(agentDir, projectDir, daemonSocket, true);
+			const reattached = launchAcp(agentDir, projectDir, daemonSocket, true, initialSecret);
 			const reattachedSession = await reattached.start(projectDir);
 			await reattached.prompt(reattachedSession, "read reconnect state");
 			await reattached.close();
@@ -316,6 +366,39 @@ describe("ACP daemon lifecycle negotiation", () => {
 			// `object()` restores as a distinct object, so True proves this was the
 			// live kernel namespace rather than a replacement kernel revived from disk.
 			expect(fixture.sawLiveNamespace()).toBe(true);
+
+			// The worker process received the secret only transiently. Its descriptor
+			// must keep neither the value nor even the credential's environment name.
+			const descriptorPath = residentWorkerDescriptorPath(agentDir);
+			const descriptorText = readFileSync(descriptorPath, "utf8");
+			expect(descriptorText).not.toContain(initialSecret);
+			expect(descriptorText).not.toContain(recoveredSecret);
+			expect(descriptorText).not.toContain("ACP_FIXTURE_API_KEY");
+			const descriptor = JSON.parse(descriptorText) as { pid?: number };
+			if (typeof descriptor.pid !== "number") throw new Error("Resident ACP worker did not expose its pid");
+			const authenticatedBeforeCrash = fixture.authenticatedRequestCount(initialSecret);
+			expect(authenticatedBeforeCrash).toBeGreaterThan(0);
+
+			// Crash the detached resident process, then let its already-live
+			// supervisor recover it. The successor must reacquire its model/proxy
+			// environment from that live supervisor, not a durable descriptor.
+			process.kill(-descriptor.pid, "SIGKILL");
+			await waitForFailedResidentWorker(descriptorPath);
+
+			const recovered = launchAcp(agentDir, projectDir, daemonSocket, true, recoveredSecret);
+			const recoveredSession = await recovered.start(projectDir);
+			await recovered.prompt(recoveredSession, "recover authenticated model access");
+			await recovered.close();
+			children.delete(recovered.child);
+
+			// The recovered resident made a new authenticated request using
+			// models.json's env reference, proving live credential reacquisition
+			// instead of persisted credential replay.
+			expect(fixture.authenticatedRequestCount(recoveredSecret)).toBeGreaterThan(0);
+			expect(fixture.authenticatedRequestCount(initialSecret)).toBe(authenticatedBeforeCrash);
+			const recoveredDescriptorText = readFileSync(descriptorPath, "utf8");
+			expect(recoveredDescriptorText).not.toContain(initialSecret);
+			expect(recoveredDescriptorText).not.toContain(recoveredSecret);
 		},
 	);
 });

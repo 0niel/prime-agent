@@ -270,6 +270,8 @@ interface ResidentWorker {
 	intentionalStop: boolean;
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
+	/** Fresh client environment used once for a resident replacement, never persisted. */
+	recoveryLaunchEnv?: Record<string, string>;
 	stopFinalization?: Promise<void>;
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
@@ -2030,7 +2032,7 @@ export class DaemonSupervisor {
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
-				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
+				return await this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath, command);
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -2042,7 +2044,7 @@ export class DaemonSupervisor {
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing.worker))) {
-				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath);
+				return await this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath, command);
 			}
 			// A passive child from a stopped worker reopens as top-level here (pre-existing behavior);
 			// the recursive-harness residency/eviction PR will revisit it.
@@ -2081,15 +2083,36 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private reuseWorkerForCreate(
+	private async reuseWorkerForCreate(
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
 		sessionPath: string,
-	): ResidentWorker {
-		if (worker.descriptor.ownerClientId === ownerClientId) {
-			return worker;
+		command: DaemonCreateCommand,
+	): Promise<ResidentWorker> {
+		if (worker.descriptor.ownerClientId !== ownerClientId) {
+			throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
 		}
-		throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
+		// A saved resident session may be resumed by a fresh ACP client after its
+		// worker died. The resume create is the authenticated caller path that
+		// already carries the complete transient environment. Never save it: it is
+		// consumed only by recovery, while ordinary live-worker reuse remains a
+		// no-op and cannot rebind the session's process environment.
+		if (
+			ownerClientId === undefined &&
+			command.lifecycle !== "client_owned" &&
+			command.launchEnv &&
+			(!worker.client || worker.descriptor.lifecycle !== "ready")
+		) {
+			worker.recoveryLaunchEnv = command.launchEnv;
+			worker.intentionalStop = false;
+			worker.descriptor.stopRequestedAt = undefined;
+			worker.descriptor.archiveOnStop = undefined;
+			worker.descriptor.lifecycle = "recovering";
+			worker.descriptor.consecutiveFailures = 0;
+			this.persistWorker(worker);
+			await this.recoverWorker(worker);
+		}
+		return worker;
 	}
 
 	/**
@@ -2175,17 +2198,18 @@ export class DaemonSupervisor {
 		// launch settings, which are never written to a descriptor.
 		const launchEnv = existing
 			? ownerClientIdForDescriptor === undefined
-				? existing.descriptor.launchEnv
+				? (existing.recoveryLaunchEnv ?? existing.descriptor.launchEnv)
 				: existing.launchEnv
 			: command.launchEnv;
 		// Only non-secret, explicitly allowed settings are durable. The initial
 		// spawn may still receive caller credentials through launchEnv, but those
 		// credentials must never be serialized into a worker descriptor.
 		const persistedLaunchEnv = filterPersistedDaemonLaunchEnv(launchEnv);
-		// A replacement supervisor can itself have been restarted by the old worker
-		// and therefore inherit that worker's original credentials. Automatic
-		// resident recovery must not copy those ambient secrets into the replacement
-		// worker. Client-owned recovery instead uses its live owner's transient env.
+		// A resident descriptor is deliberately a non-secret recovery recipe, not a
+		// credential cache. Only a fresh client resume may supply a transient
+		// recovery environment. Keep the inherited base limited to durable-safe
+		// settings so a supervisor's ambient credentials can never silently revive a
+		// crashed resident worker.
 		const inheritedEnv =
 			existing && ownerClientIdForDescriptor === undefined
 				? filterPersistedDaemonLaunchEnv(collectDaemonLaunchEnv(process.env))
@@ -2299,6 +2323,9 @@ export class DaemonSupervisor {
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
 		} catch (error) {
+			// The launched child never passed its startup gate; do not retain a
+			// transient recovery environment for a later automatic retry.
+			existing?.recoveryLaunchEnv = undefined;
 			if (startupGate instanceof Writable) {
 				startupGate.destroy();
 			}
@@ -2356,8 +2383,14 @@ export class DaemonSupervisor {
 			this.persistWorker(worker);
 			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 			this.broadcastHeartbeatsChanged();
+			// The child has consumed the fresh environment. It must not survive in
+			// the supervisor for any later automatic recovery.
+			worker.recoveryLaunchEnv = undefined;
 			return worker;
 		} catch (error) {
+			// A replacement was attempted; require another fresh client resume rather
+			// than retaining credentials for a retry.
+			worker.recoveryLaunchEnv = undefined;
 			if (isSupervisorGenerationStale(error)) {
 				throw error;
 			}
@@ -2819,6 +2852,19 @@ export class DaemonSupervisor {
 		if (this.isWorkerRecoveryCancelled(worker)) {
 			return;
 		}
+		if (
+			worker.descriptor.ownerClientId === undefined &&
+			!worker.recoveryLaunchEnv &&
+			!isProcessAlive(worker.descriptor.pid)
+		) {
+			// Never recover resident credentials from a descriptor or the daemon's
+			// ambient environment. A primary client resume supplies a fresh transient
+			// launch environment and explicitly restarts this recovery path.
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = "Waiting for a client with fresh environment";
+			this.persistWorker(worker);
+			return;
+		}
 		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
 			worker.descriptor.lifecycle = "failed";
 			worker.descriptor.lastError = "Waiting for the owning client to reconnect";
@@ -2832,6 +2878,16 @@ export class DaemonSupervisor {
 			for (const [retryIndex, retryDelay] of WORKER_RETRY_DELAYS_MS.entries()) {
 				await delay(retryDelay);
 				if (this.isWorkerRecoveryCancelled(worker)) {
+					return;
+				}
+				if (
+					worker.descriptor.ownerClientId === undefined &&
+					!worker.recoveryLaunchEnv &&
+					!isProcessAlive(worker.descriptor.pid)
+				) {
+					worker.descriptor.lifecycle = "failed";
+					worker.descriptor.lastError = "Waiting for a client with fresh environment";
+					this.persistWorker(worker);
 					return;
 				}
 				try {
