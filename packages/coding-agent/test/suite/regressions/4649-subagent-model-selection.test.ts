@@ -75,11 +75,11 @@ describe("ENG-4649 subagent model selection", () => {
 		const codexProvider = "openai-codex";
 		const harness = await createHarness({
 			provider: codexProvider,
-			models: [{ id: "parent-model" }, { id: "unsupported-model" }],
+			models: [{ id: "gpt-5.6-sol" }, { id: "unsupported-model" }],
 		});
 		const fetchModels = vi.fn(
-			async () =>
-				new Response(JSON.stringify({ models: [{ slug: "parent-model" }] }), {
+			async (_input?: string | URL, _init?: RequestInit) =>
+				new Response(JSON.stringify({ models: [{ slug: "gpt-5.6-sol" }] }), {
 					status: 200,
 					headers: { "content-type": "application/json" },
 				}),
@@ -88,13 +88,16 @@ describe("ENG-4649 subagent model selection", () => {
 		try {
 			harness.authStorage.setRuntimeApiKey(codexProvider, openAICodexToken("account-1"));
 			const discovered = await harness.session.findRlmModels("", 20);
-			expect(discovered.models.map((model) => model.selector)).toEqual([`${codexProvider}/parent-model`]);
+			expect(discovered.models.map((model) => model.selector)).toEqual([`${codexProvider}/gpt-5.6-sol`]);
 			expect(fetchModels).toHaveBeenCalledWith(
 				expect.stringMatching(/\/codex\/models\?client_version=/),
 				expect.objectContaining({
 					headers: expect.objectContaining({ "chatgpt-account-id": "account-1" }),
 				}),
 			);
+
+			const [catalogUrl] = fetchModels.mock.calls[0] ?? [];
+			expect(new URL(String(catalogUrl)).searchParams.get("client_version")).toBe("0.144.0");
 
 			await expect(
 				harness.session.runRlmChild("reject unsupported account model", {

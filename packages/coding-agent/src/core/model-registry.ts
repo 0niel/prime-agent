@@ -27,7 +27,7 @@ import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
-import { getAgentDir, VERSION } from "../config.js";
+import { getAgentDir } from "../config.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
@@ -372,6 +372,10 @@ function readOpenAICodexAccountId(token: string): string | undefined {
 	}
 }
 
+// ChatGPT gates Codex model catalogs by Codex CLI compatibility, not by the
+// unrelated Prime Agent package version. This floor includes the gpt-5.6 family.
+const OPENAI_CODEX_MODELS_CLIENT_VERSION = "0.144.0";
+
 function openAICodexModelsUrl(baseUrl: string): string {
 	const normalized = baseUrl.replace(/\/+$/, "");
 	let path: string;
@@ -383,7 +387,7 @@ function openAICodexModelsUrl(baseUrl: string): string {
 		path = `${normalized}/codex/models`;
 	}
 	const url = new URL(path);
-	url.searchParams.set("client_version", VERSION);
+	url.searchParams.set("client_version", OPENAI_CODEX_MODELS_CLIENT_VERSION);
 	return url.toString();
 }
 
