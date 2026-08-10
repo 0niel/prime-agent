@@ -598,10 +598,18 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
-	it("publishes canonical offline correlation fixtures for the consumer", () => {
+	it("matches the exact canonical offline transcript fixture consumed by V3", () => {
 		const fixture = JSON.parse(
 			readFileSync(resolve(import.meta.dirname, "../fixtures/acp-correlation-transcripts.json"), "utf8"),
 		) as { cases: Record<string, Array<Record<string, unknown>>> };
+		expect(Object.keys(fixture.cases)).toEqual([
+			"success",
+			"error_terminal",
+			"error_incomplete",
+			"cancelled",
+			"late_child",
+			"global_sequence_turn_two",
+		]);
 		for (const [name, records] of Object.entries(fixture.cases)) {
 			for (let index = 1; index < records.length; index++) {
 				expect(records[index].eventSequence, `${name} sequence`).toBeGreaterThan(
@@ -609,21 +617,22 @@ describe("ACP mode end to end", () => {
 				);
 			}
 		}
-		for (const name of ["success_zero_terminal", "error_zero_terminal", "global_sequence_two_prompts"]) {
+		for (const name of ["success", "error_terminal", "global_sequence_turn_two"]) {
 			const records = fixture.cases[name];
-			for (let index = 0; index < records.length; index += 2) {
-				expect(records[index]).toMatchObject({ phase: "responseBoundary" });
-				expect(records[index + 1]).toMatchObject({
-					promptTurnId: records[index].promptTurnId,
-					phase: "terminalQuiescence",
-					outcome: records[index].outcome,
-					quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 0 },
-				});
-			}
+			const boundary = records.find((record) => record.phase === "responseBoundary");
+			const terminal = records.find((record) => record.phase === "terminalQuiescence");
+			expect(boundary).toBeDefined();
+			expect(terminal).toMatchObject({
+				promptTurnId: boundary?.promptTurnId,
+				outcome: boundary?.outcome,
+				quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 0 },
+			});
 		}
 		expect(fixture.cases.error_incomplete).toHaveLength(1);
-		expect(fixture.cases.cancel.every((record) => record.phase === "event")).toBe(true);
-		expect(fixture.cases.late_child_after_terminal.at(-1)).toMatchObject({ promptTurnId: 0, phase: "event" });
+		expect(fixture.cases.cancelled).toEqual([]);
+		expect(fixture.cases.late_child).toEqual([
+			expect.objectContaining({ promptTurnId: 1, phase: "event", child: { id: "late", status: "done" } }),
+		]);
 	});
 
 	it("correlates connection-scoped heartbeats to turn zero", async () => {
