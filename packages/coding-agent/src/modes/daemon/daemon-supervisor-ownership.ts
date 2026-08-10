@@ -18,6 +18,7 @@ const SHUTDOWN_ADMISSION_FILE_NAME = "shutdown-admission.json";
 const SHUTDOWN_ADMISSION_LEASE_MS = 5000;
 const SHUTDOWN_ADMISSION_REFRESH_MS = 1000;
 const SHUTDOWN_ADMISSION_WAIT_MS = 50;
+const PROCESS_START_ID_CACHE_TTL_MS = 5000;
 
 type DaemonSupervisorOwnerPhase = "starting" | "owner" | "stopping";
 
@@ -681,6 +682,30 @@ export async function waitForDaemonStartupFence(
 	}
 }
 
+export type ProcessStartIdLookup = (pid: number) => string | undefined;
+
+/** @internal Exported for deterministic worker-auth regression coverage. */
+export function createProcessStartIdCache(
+	lookup: ProcessStartIdLookup,
+	ttlMs = PROCESS_START_ID_CACHE_TTL_MS,
+	now: () => number = Date.now,
+): ProcessStartIdLookup {
+	const entries = new Map<number, { value: string | undefined; expiresAt: number }>();
+	return (pid) => {
+		const cached = entries.get(pid);
+		if (cached && cached.expiresAt > now()) {
+			return cached.value;
+		}
+		const value = lookup(pid);
+		// Windows process identity uses a synchronous PowerShell query, which can
+		// itself outlast the TTL on a cold start. Start the TTL after it returns.
+		entries.set(pid, { value, expiresAt: now() + ttlMs });
+		return value;
+	};
+}
+
+const cachedProcessStartId = createProcessStartIdCache(getProcessStartId);
+
 function isProcessIdentityAlive(identity: ProcessIdentity): boolean {
 	if (!isProcessAlive(identity.pid)) {
 		return false;
@@ -688,7 +713,7 @@ function isProcessIdentityAlive(identity: ProcessIdentity): boolean {
 	if (!identity.processStartId) {
 		return true;
 	}
-	const observed = getProcessStartId(identity.pid);
+	const observed = cachedProcessStartId(identity.pid);
 	return observed === undefined || observed === identity.processStartId;
 }
 
@@ -696,7 +721,7 @@ function matchesExactProcessIdentity(identity: ProcessIdentity): boolean {
 	if (!isProcessAlive(identity.pid)) {
 		return false;
 	}
-	return identity.processStartId === undefined || getProcessStartId(identity.pid) === identity.processStartId;
+	return identity.processStartId === undefined || cachedProcessStartId(identity.pid) === identity.processStartId;
 }
 
 function isProcessAlive(pid: number): boolean {

@@ -127,6 +127,17 @@ type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 const structuredLog = getLogger("coding-agent.daemon-supervisor");
 const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const WORKER_AUTH_DEFAULT_ATTEMPT_TIMEOUT_MS = 1000;
+
+/** @internal Exported for deterministic worker-auth regression coverage. */
+export function workerAuthenticationAttemptTimeoutMs(
+	deadline: number,
+	platform: NodeJS.Platform = process.platform,
+	now = Date.now(),
+): number {
+	const remaining = Math.max(1, deadline - now);
+	return platform === "win32" ? remaining : Math.min(WORKER_AUTH_DEFAULT_ATTEMPT_TIMEOUT_MS, remaining);
+}
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // The whole pre-commit prepare (drain + worker fencing) must finish inside the
@@ -728,7 +739,7 @@ export class DaemonSupervisor {
 			if (migratedJobs > 0) {
 				this.log(`Migrated ${migratedJobs} scheduled jobs into session artifacts`);
 			}
-			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
+			void this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
 			await Promise.all(
@@ -2183,6 +2194,7 @@ export class DaemonSupervisor {
 				[SESSION_LEASE_OWNER_ID_ENV]: rootActiveSessionId,
 			}),
 			stdio: ["ignore", "ignore", "pipe", "pipe"],
+			windowsHide: true,
 		});
 		const detachWorkerStderr = child.stderr
 			? attachJsonlLineReader(child.stderr, (line) => this.log(`Session worker ${workerId} stderr: ${line}`), {
@@ -2385,7 +2397,7 @@ export class DaemonSupervisor {
 				await client.authenticateWorker(
 					worker.descriptor.authenticationToken,
 					this.supervisorAuthenticationClaim(),
-					1000,
+					workerAuthenticationAttemptTimeoutMs(deadline),
 				);
 				await this.assertRecoveryAllowed();
 				client.onFrame((frame) => this.handleWorkerFrame(worker, frame));

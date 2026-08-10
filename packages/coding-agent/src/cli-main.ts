@@ -7,8 +7,14 @@ import {
 	maybeRunOwnedSessionWorkerFrontend,
 } from "./cli/owned-session-worker.js";
 import { APP_NAME } from "./config.js";
+import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
 
 export async function runCli(): Promise<void> {
+	if (isDaemonCatalogProcess()) {
+		await runDaemonCatalogProcess();
+		return;
+	}
+
 	try {
 		enableCompileCache?.();
 	} catch {
