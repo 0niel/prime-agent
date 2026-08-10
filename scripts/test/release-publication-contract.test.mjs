@@ -28,15 +28,15 @@ test("immutable R2 publication conditionally creates then hash-verifies collisio
 	assert.match(helpers, /actual_sha=\$\(sha256sum "\$collision_file"/);
 	assert.match(helpers, /\[ "\$actual_sha" != "\$expected_sha" \]/);
 
-	for (const [publishStep, directory, manifest] of [
-		["Publish immutable production artifacts to R2", "PRODUCTION_DIR", "latest.json"],
-		["Publish immutable beta artifacts to R2", "BETA_DIR", "beta.json"],
+	for (const [publishStep, directory] of [
+		["Publish immutable production artifacts to R2", "PRODUCTION_DIR"],
+		["Publish immutable beta artifacts to R2", "BETA_DIR"],
 	]) {
 		const publication = step(publishStep, publishStep.startsWith("Publish immutable production") ? "Create or verify immutable production GitHub release and assets" : "Create or verify immutable beta GitHub release and assets");
 		assert.ok(publication.includes(`for artifact in "$${directory}"/*.tgz; do`));
 		assert.match(publication, /create_or_verify_immutable_r2_object "\$artifact"/);
+		assert.ok(publication.includes(`create_or_verify_immutable_r2_object "$${directory}/manifest.json"`));
 		assert.ok(publication.includes(`create_or_verify_immutable_r2_object "$${directory}/SHA256SUMS"`));
-		assert.ok(publication.includes(`create_or_verify_immutable_r2_object "$${directory}/${manifest}"`));
 		assert.doesNotMatch(publication, /aws s3 cp/);
 	}
 });
@@ -49,11 +49,11 @@ test("GitHub release assets are create-or-verify-identical canonical release evi
 	assert.match(helpers, /Immutable release asset collision/);
 
 	const production = step("Create or verify immutable production GitHub release and assets", "Advance production root pointers after immutable release publication");
-	assert.match(production, /for artifact in "\$PRODUCTION_DIR"\/\*\.tgz "\$PRODUCTION_DIR\/SHA256SUMS" "\$PRODUCTION_DIR\/latest\.json"/);
+	assert.match(production, /for artifact in "\$PRODUCTION_DIR"\/\*\.tgz "\$PRODUCTION_DIR\/manifest\.json" "\$PRODUCTION_DIR\/SHA256SUMS"/);
 	assert.doesNotMatch(production, /\$PRODUCTION_DIR\/stable|install(?:-beta)?\.sh/);
 
 	const beta = step("Create or verify immutable beta GitHub release and assets", "Advance beta root pointers after immutable release publication");
-	assert.match(beta, /for artifact in "\$BETA_DIR"\/\*\.tgz "\$BETA_DIR\/SHA256SUMS" "\$BETA_DIR\/beta\.json"/);
+	assert.match(beta, /for artifact in "\$BETA_DIR"\/\*\.tgz "\$BETA_DIR\/manifest\.json" "\$BETA_DIR\/SHA256SUMS"/);
 	assert.doesNotMatch(beta, /"\$BETA_DIR\/beta"(?!\.json)|install(?:-beta)?\.sh/);
 });
 

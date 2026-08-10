@@ -446,18 +446,19 @@ jobs:
             --commit "$SOURCE_COMMIT" \
             --dry-run
           test -f "$PRODUCTION_DIR/prime-agent-${PRODUCTION_VERSION}.tgz"
+          test -f "$PRODUCTION_DIR/manifest.json"
           test -f "$PRODUCTION_DIR/SHA256SUMS"
           test -f "$PRODUCTION_DIR/latest.json"
           test -n "$R2_BUCKET"
           test -n "$R2_ENDPOINT_URL"
 
-          # The versioned prefix has only canonical, immutable release evidence:
-          # the four tarballs, their checksum file, and the JSON manifest.
+          # The versioned prefix contains canonical, immutable release evidence.
+          # latest.json remains a mutable root pointer and is never versioned here.
           for artifact in "$PRODUCTION_DIR"/*.tgz; do
             create_or_verify_immutable_r2_object "$artifact" "$RELEASE_PREFIX/$(basename "$artifact")" application/gzip
           done
+          create_or_verify_immutable_r2_object "$PRODUCTION_DIR/manifest.json" "$RELEASE_PREFIX/manifest.json" application/json
           create_or_verify_immutable_r2_object "$PRODUCTION_DIR/SHA256SUMS" "$RELEASE_PREFIX/SHA256SUMS" text/plain
-          create_or_verify_immutable_r2_object "$PRODUCTION_DIR/latest.json" "$RELEASE_PREFIX/latest.json" application/json
 
       - name: Create or verify immutable production GitHub release and assets
         if: env.PUBLISH_PRODUCTION == 'true'
@@ -482,7 +483,9 @@ jobs:
               --notes-file /tmp/release-notes.md || true
           fi
           gh release view "$RELEASE_TAG" >/dev/null
-          for artifact in "$PRODUCTION_DIR"/*.tgz "$PRODUCTION_DIR/SHA256SUMS" "$PRODUCTION_DIR/latest.json"; do
+          # GitHub assets mirror the versioned canonical evidence, never a mutable
+          # channel pointer. Clients resolve latest.json only from the R2 root.
+          for artifact in "$PRODUCTION_DIR"/*.tgz "$PRODUCTION_DIR/manifest.json" "$PRODUCTION_DIR/SHA256SUMS"; do
             attach_or_verify_immutable_release_asset "$RELEASE_TAG" "$artifact"
           done
           git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
@@ -553,6 +556,7 @@ jobs:
             --commit "$SOURCE_COMMIT" \
             --dry-run
           test -f "$BETA_DIR/prime-agent-${BETA_VERSION}.tgz"
+          test -f "$BETA_DIR/manifest.json"
           test -f "$BETA_DIR/SHA256SUMS"
           test -f "$BETA_DIR/beta.json"
           test -n "$R2_BUCKET"
@@ -560,8 +564,8 @@ jobs:
           for artifact in "$BETA_DIR"/*.tgz; do
             create_or_verify_immutable_r2_object "$artifact" "$RELEASE_PREFIX/$(basename "$artifact")" application/gzip
           done
+          create_or_verify_immutable_r2_object "$BETA_DIR/manifest.json" "$RELEASE_PREFIX/manifest.json" application/json
           create_or_verify_immutable_r2_object "$BETA_DIR/SHA256SUMS" "$RELEASE_PREFIX/SHA256SUMS" text/plain
-          create_or_verify_immutable_r2_object "$BETA_DIR/beta.json" "$RELEASE_PREFIX/beta.json" application/json
 
       - name: Create or verify immutable beta GitHub release and assets
         if: env.PUBLISH_BETA == 'true'
@@ -582,7 +586,9 @@ jobs:
               --prerelease || true
           fi
           gh release view "$RELEASE_TAG" >/dev/null
-          for artifact in "$BETA_DIR"/*.tgz "$BETA_DIR/SHA256SUMS" "$BETA_DIR/beta.json"; do
+          # GitHub assets mirror the versioned canonical evidence, never a mutable
+          # channel pointer. Clients resolve beta.json only from the R2 root.
+          for artifact in "$BETA_DIR"/*.tgz "$BETA_DIR/manifest.json" "$BETA_DIR/SHA256SUMS"; do
             attach_or_verify_immutable_release_asset "$RELEASE_TAG" "$artifact"
           done
           git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"

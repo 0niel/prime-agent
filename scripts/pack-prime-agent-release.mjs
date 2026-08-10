@@ -110,9 +110,10 @@ Creates private npm tarballs for R2 distribution:
   <out-dir>/artifacts/prime-agent-ai-<version>.tgz
   <out-dir>/artifacts/prime-agent-core-<version>.tgz
   <out-dir>/artifacts/prime-agent-tui-<version>.tgz
+  <out-dir>/artifacts/manifest.json
   <out-dir>/artifacts/SHA256SUMS
   <out-dir>/artifacts/<channel>
-  <out-dir>/artifacts/latest.json (stable) or beta.json (beta)
+  <out-dir>/artifacts/latest.json (stable) or beta.json (beta), an integrity-bound manifest pointer
 `);
 }
 
@@ -429,13 +430,13 @@ function main() {
 			sha256: sha256File(artifactPath),
 		});
 	}
-	writeFileSync(
-		join(artifactsDir, "SHA256SUMS"),
-		tarballs.map((tarball) => `${tarball.sha256}  ${tarball.file}`).join("\n") + "\n",
-	);
-	writeFileSync(join(artifactsDir, args.channel), `v${releaseVersion}\n`);
-	const manifestName = args.channel === "stable" ? "latest.json" : "beta.json";
-	writeJson(join(artifactsDir, manifestName), {
+	// This immutable manifest is written before SHA256SUMS so the checksum file can
+	// bind it without attempting an impossible self-checksum. Its field and tarball
+	// order are intentional: JSON.stringify produces the release's canonical bytes.
+	const manifestName = "manifest.json";
+	const manifestPath = join(artifactsDir, manifestName);
+	writeJson(manifestPath, {
+		schema: 1,
 		version: `v${releaseVersion}`,
 		source: {
 			commit: args.commit,
@@ -443,6 +444,17 @@ function main() {
 		package: publicPackageName,
 		tarball: `releases/v${releaseVersion}/${artifactFiles.get("coding-agent")}`,
 		tarballs,
+	});
+	const manifestSha256 = sha256File(manifestPath);
+	writeFileSync(
+		join(artifactsDir, "SHA256SUMS"),
+		[...tarballs.map((tarball) => `${tarball.sha256}  ${tarball.file}`), `${manifestSha256}  ${manifestName}`].join("\n") + "\n",
+	);
+	writeFileSync(join(artifactsDir, args.channel), `v${releaseVersion}\n`);
+	const pointerName = args.channel === "stable" ? "latest.json" : "beta.json";
+	writeJson(join(artifactsDir, pointerName), {
+		manifest: `releases/v${releaseVersion}/${manifestName}`,
+		sha256: manifestSha256,
 	});
 
 	for (const tarball of tarballs) {

@@ -3,7 +3,8 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { publicPackageName, releaseComponents } from "./prime-agent-release-components.mjs";
 
 const releaseChannels = new Set(["stable", "beta"]);
@@ -19,7 +20,13 @@ function parseArgs(args) {
 	const parsed = { artifactDir: undefined, channel: undefined, commit: undefined, dryRun: false, version: undefined };
 	for (let i = 0; i < args.length; i += 1) {
 		switch (args[i]) {
-			case "--artifact-dir": parsed.artifactDir = resolve(args[++i] || ""); break;
+			case "--artifact-dir": {
+				const value = args[i + 1];
+				if (!value || value.startsWith("--")) throw new Error("--artifact-dir requires a value");
+				parsed.artifactDir = resolve(value);
+				i += 1;
+				break;
+			}
 			case "--channel": parsed.channel = args[++i]; break;
 			case "--commit": parsed.commit = args[++i]; break;
 			case "--version": parsed.version = normalizeVersion(args[++i] || ""); break;
@@ -33,8 +40,10 @@ function parseArgs(args) {
 	return parsed;
 }
 
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+
 function authoritativeSourceCommit() {
-	const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd: resolve(new URL("..", import.meta.url).pathname), encoding: "utf8" });
+	const result = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" });
 	if (result.status !== 0) throw new Error(`Unable to resolve authoritative source HEAD: ${result.stderr.trim()}`);
 	return result.stdout.trim();
 }
@@ -48,12 +57,15 @@ function main() {
 	const args = parseArgs(process.argv.slice(2));
 	const sourceCommit = authoritativeSourceCommit();
 	assert(args.commit === sourceCommit, `--commit must exactly match authoritative source HEAD ${sourceCommit}`);
-	const manifestName = args.channel === "stable" ? "latest.json" : "beta.json";
-	const manifestPath = `${args.artifactDir}/${manifestName}`;
-	const sumsPath = `${args.artifactDir}/SHA256SUMS`;
-	const channelPath = `${args.artifactDir}/${args.channel}`;
-	for (const path of [manifestPath, sumsPath, channelPath]) assert(existsSync(path) && statSync(path).isFile(), `Missing required artifact ${basename(path)}`);
+	const pointerName = args.channel === "stable" ? "latest.json" : "beta.json";
+	const manifestName = "manifest.json";
+	const manifestPath = join(args.artifactDir, manifestName);
+	const sumsPath = join(args.artifactDir, "SHA256SUMS");
+	const channelPath = join(args.artifactDir, args.channel);
+	const pointerPath = join(args.artifactDir, pointerName);
+	for (const path of [manifestPath, sumsPath, channelPath, pointerPath]) assert(existsSync(path) && statSync(path).isFile(), `Missing required artifact ${basename(path)}`);
 
+	const manifestBytes = readFileSync(manifestPath, "utf8");
 	const manifest = readJson(manifestPath);
 	assert(manifest.version === `v${args.version}`, `Manifest version must be v${args.version}`);
 	assert(manifest.source?.commit === sourceCommit, `Manifest source commit must be authoritative source HEAD ${sourceCommit}`);
@@ -68,15 +80,34 @@ function main() {
 	exact(tarballs.map(({ component, package: packageName, version, file }) => ({ component, package: packageName, version, file })), expectedTarballs, "Manifest tarballs");
 	for (const tarball of tarballs) {
 		assert(typeof tarball.sha256 === "string" && /^[0-9a-f]{64}$/.test(tarball.sha256), `Invalid hash for ${tarball.file}`);
-		const artifactPath = `${args.artifactDir}/${tarball.file}`;
+		const artifactPath = join(args.artifactDir, tarball.file);
 		assert(existsSync(artifactPath) && statSync(artifactPath).isFile(), `Missing tarball ${tarball.file}`);
 		assert(sha256File(artifactPath) === tarball.sha256, `Hash mismatch for ${tarball.file}`);
 	}
 	const files = tarballs.map(({ file }) => file);
-	exact(readdirSync(args.artifactDir).filter((file) => file.endsWith(".tgz")).sort(), [...files].sort(), "Artifact tarballs");
-	assert(readFileSync(sumsPath, "utf8") === `${tarballs.map(({ sha256, file }) => `${sha256}  ${file}`).join("\n")}\n`, "SHA256SUMS does not match the manifest");
-	assert(readFileSync(channelPath, "utf8") === `v${args.version}\n`, `${args.channel} pointer does not match version`);
-	if (args.dryRun) console.log(JSON.stringify({ channel: args.channel, commit: sourceCommit, manifest: manifestName, tarballs: files, version: `v${args.version}` }, null, 2));
-}
+	const expectedManifest = {
+		schema: 1,
+		version: `v${args.version}`,
+		source: { commit: sourceCommit },
+		package: publicPackageName,
+		tarball: `releases/v${args.version}/prime-agent-${args.version}.tgz`,
+		tarballs,
+	};
+	exact(manifest, expectedManifest, "Canonical manifest");
+	assert(manifestBytes === `${JSON.stringify(manifest, null, 2)}\n`, "Manifest must use canonical JSON bytes");
 
+	const manifestSha256 = sha256File(manifestPath);
+	const expectedSums = [...tarballs.map(({ sha256, file }) => `${sha256}  ${file}`), `${manifestSha256}  ${manifestName}`].join("\n") + "\n";
+	assert(readFileSync(sumsPath, "utf8") === expectedSums, "SHA256SUMS does not match the canonical manifest inventory");
+	assert(readFileSync(channelPath, "utf8") === `v${args.version}\n`, `${args.channel} pointer does not match version`);
+
+	const pointerBytes = readFileSync(pointerPath, "utf8");
+	const pointer = readJson(pointerPath);
+	const expectedPointer = { manifest: `releases/v${args.version}/${manifestName}`, sha256: manifestSha256 };
+	exact(pointer, expectedPointer, "Root manifest pointer");
+	assert(pointerBytes === `${JSON.stringify(pointer, null, 2)}\n`, "Root manifest pointer must use canonical JSON bytes");
+	const expectedInventory = [...files, manifestName, "SHA256SUMS", args.channel, pointerName].sort();
+	exact(readdirSync(args.artifactDir).sort(), expectedInventory, "Artifact inventory");
+	if (args.dryRun) console.log(JSON.stringify({ channel: args.channel, commit: sourceCommit, manifest: manifestName, pointer: pointerName, tarballs: files, version: `v${args.version}` }, null, 2));
+}
 try { main(); } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }

@@ -30,11 +30,14 @@ function createArtifacts(mutator) {
 		writeFileSync(join(directory, file), contents);
 		return { component, package: packageName, version, file, sha256: sha256(contents) };
 	});
-	const manifest = { version: `v${version}`, source: { commit: sourceCommit }, package: "prime-agent", tarball: `releases/v${version}/prime-agent-${version}.tgz`, tarballs };
+	const manifest = { schema: 1, version: `v${version}`, source: { commit: sourceCommit }, package: "prime-agent", tarball: `releases/v${version}/prime-agent-${version}.tgz`, tarballs };
 	mutator?.({ directory, manifest, tarballs });
-	writeFileSync(join(directory, "SHA256SUMS"), manifest.tarballs.map((tarball) => `${tarball.sha256}  ${tarball.file}`).join("\n") + "\n");
+	const manifestBytes = `${JSON.stringify(manifest, null, 2)}\n`;
+	const manifestSha256 = sha256(manifestBytes);
+	writeFileSync(join(directory, "manifest.json"), manifestBytes);
+	writeFileSync(join(directory, "SHA256SUMS"), [...manifest.tarballs.map((tarball) => `${tarball.sha256}  ${tarball.file}`), `${manifestSha256}  manifest.json`].join("\n") + "\n");
 	writeFileSync(join(directory, "stable"), `v${version}\n`);
-	writeFileSync(join(directory, "latest.json"), JSON.stringify(manifest) + "\n");
+	writeFileSync(join(directory, "latest.json"), `${JSON.stringify({ manifest: `releases/v${version}/manifest.json`, sha256: manifestSha256 }, null, 2)}\n`);
 	return directory;
 }
 function verify(directory, commit = sourceCommit) {
@@ -194,6 +197,31 @@ test("release verifier retains hash tamper protection", () => {
 		assert.notEqual(result.status, 0);
 		assert.match(result.stderr, /Hash mismatch/);
 	} finally { cleanup(directory); }
+});
+
+test("release verifier binds the root pointer and SHA256SUMS to the immutable manifest", () => {
+	for (const mutate of [
+		(directory) => writeFileSync(join(directory, "latest.json"), `${JSON.stringify({ manifest: `releases/v${version}/manifest.json`, sha256: "0".repeat(64) }, null, 2)}\n`),
+		(directory) => writeFileSync(join(directory, "SHA256SUMS"), readFileSync(join(directory, "SHA256SUMS"), "utf8").replace(/[0-9a-f]{64}  manifest\.json/, `${"0".repeat(64)}  manifest.json`)),
+		(directory) => writeFileSync(join(directory, "manifest.json"), `${JSON.stringify({ schema: 1 }, null, 2)}\n`),
+	]) {
+		const directory = createArtifacts();
+		try {
+			mutate(directory);
+			const result = verify(directory);
+			assert.notEqual(result.status, 0);
+		} finally { cleanup(directory); }
+	}
+});
+
+test("release verifier rejects a missing artifact directory and a flag substituted for its value", () => {
+	const missing = spawnSync(process.execPath, [verifier.pathname, "--channel", "stable", "--version", version, "--commit", sourceCommit], { cwd: root.pathname, encoding: "utf8" });
+	assert.notEqual(missing.status, 0);
+	assert.match(missing.stderr, /--artifact-dir, --channel, --commit, and --version are required/);
+
+	const flagValue = spawnSync(process.execPath, [verifier.pathname, "--artifact-dir", "--channel", "stable", "--version", version, "--commit", sourceCommit], { cwd: root.pathname, encoding: "utf8" });
+	assert.notEqual(flagValue.status, 0);
+	assert.match(flagValue.stderr, /--artifact-dir requires a value/);
 });
 
 test("workflow resolves once then only checks out and verifies immutable source_sha", () => {
