@@ -188,8 +188,15 @@ function getSelfUpdateCommandForMethod(
 		case "npm": {
 			const [command = "npm", ...npmArgs] = npmCommand ?? [];
 			const inferred = npmCommand?.length ? undefined : getInferredNpmInstall();
+			const npmVersion = readCommandOutput(command, [...npmArgs, "--version"]);
 			const prefixArgs = [...npmArgs, ...(inferred ? ["--prefix", inferred.prefix] : [])];
-			const installStep = makeSelfUpdateCommandStep(command, [...prefixArgs, "install", "-g", updateSpec]);
+			const installStep = makeSelfUpdateCommandStep(command, [
+				...prefixArgs,
+				...npmRemoteInstallArgs(npmVersion),
+				"install",
+				"-g",
+				updateSpec,
+			]);
 			const uninstallStep =
 				updatePackageName === installedPackageName
 					? undefined
@@ -199,6 +206,11 @@ function getSelfUpdateCommandForMethod(
 		case "unknown":
 			return undefined;
 	}
+}
+
+export function npmRemoteInstallArgs(version: string | undefined): string[] {
+	const major = version?.trim().match(/^(\d+)(?:\.|$)/)?.[1];
+	return major !== undefined && Number(major) >= 12 ? ["--allow-remote=all"] : [];
 }
 
 function readCommandOutput(

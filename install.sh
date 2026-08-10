@@ -135,7 +135,7 @@ main() {
 The $prime_agent_cmd command was installed, but it is not on your PATH yet.
 Check npm's global bin directory with:
 
-  npm bin -g
+  echo "$(npm prefix -g)/bin"
 
 Then add that directory to your shell PATH.
 EOF
@@ -1528,10 +1528,14 @@ prime_agent_run_checksum_check() {
 confirm_install() {
 	version="$1"
 	tarball_url="$2"
+	install_detail="Downloads the verified release and runs npm install -g."
+	if prime_agent_npm_requires_remote_access; then
+		install_detail="npm 12 will use allow-remote=all for this verified install only."
+	fi
 
 	if prime_agent_prompt_yes_no \
 		"Install Prime Agent v$version globally with npm?" \
-		"Downloads the verified release and runs npm install -g." \
+		"$install_detail" \
 		"Install? [Y/n]"; then
 		return 0
 	else
@@ -1540,6 +1544,9 @@ confirm_install() {
 
 	if [ "$prompt_status" -eq 2 ]; then
 		printf 'This will download, verify, and install:\n\n  %s\n\n' "$tarball_url"
+		if prime_agent_npm_requires_remote_access; then
+			printf 'npm 12 will use allow-remote=all for this verified install only.\n'
+		fi
 		printf 'No terminal detected; continuing without confirmation.\n'
 		return 0
 	fi
@@ -1589,6 +1596,24 @@ confirm_kernel_runtime_setup() {
 	fi
 }
 
+prime_agent_npm_requires_remote_access() {
+	npm_major=$(npm --version 2>/dev/null | sed 's/\..*$//')
+	case "$npm_major" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$npm_major" -ge 12 ]
+}
+
+prime_agent_run_npm_install() {
+	tarball_path="$1"
+	shift
+	if prime_agent_npm_requires_remote_access; then
+		npm_config_allow_remote=all npm_config_allow_scripts="file:$tarball_path" "$@"
+	else
+		"$@"
+	fi
+}
+
 install_prime_agent_package() {
 	tarball_path="$1"
 	if [ "$prime_agent_bootstrap_kernel_on_install" = 1 ]; then
@@ -1602,7 +1627,7 @@ Finalizing npm install."
 			"Installing Prime Agent" \
 			"Installing Prime Agent" \
 			"$npm_install_details" \
-			env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1 PRIME_AGENT_INSTALL_UV=1 npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
+			prime_agent_run_npm_install "$tarball_path" env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1 PRIME_AGENT_INSTALL_UV=1 npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
 	else
 		npm_install_details="Preparing global install.
 Linking command binaries.
@@ -1613,7 +1638,7 @@ Finalizing npm install."
 			"Installing Prime Agent" \
 			"Installing Prime Agent" \
 			"$npm_install_details" \
-			env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
+			prime_agent_run_npm_install "$tarball_path" env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
 	fi
 }
 
