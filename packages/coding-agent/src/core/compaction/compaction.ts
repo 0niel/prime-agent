@@ -245,65 +245,60 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 // ============================================================================
 
 /**
- * Estimate token count for a message using chars/4 heuristic.
- * This is conservative (overestimates tokens).
+ * Estimate token count for a message using the shared context heuristic.
+ * Dense non-ASCII content uses a conservative byte-fallback estimate.
  */
+/**
+ * Shared context estimate. ASCII retains the project's chars/4 baseline;
+ * non-ASCII uses full UTF-8 bytes so dense Unicode is not artificially cheap.
+ */
+export function estimateTextTokens(text: string): number {
+	let asciiCharacters = 0;
+	let nonAsciiBytes = 0;
+	for (const character of text) {
+		if (character.codePointAt(0)! <= 0x7f) asciiCharacters++;
+		else nonAsciiBytes += Buffer.byteLength(character, "utf8");
+	}
+	return Math.ceil(asciiCharacters / 4) + nonAsciiBytes;
+}
+
 export function estimateTokens(message: AgentMessage): number {
 	if (!isModelContextMessage(message)) return 0;
-	let chars = 0;
 
 	switch (message.role) {
 		case "user": {
 			const content = (message as { content: string | Array<{ type: string; text?: string }> }).content;
-			if (typeof content === "string") {
-				chars = content.length;
-			} else if (Array.isArray(content)) {
-				for (const block of content) {
-					if (block.type === "text" && block.text) {
-						chars += block.text.length;
-					}
-				}
-			}
-			return Math.ceil(chars / 4);
+			if (typeof content === "string") return estimateTextTokens(content);
+			return content.reduce(
+				(tokens, block) => tokens + (block.type === "text" && block.text ? estimateTextTokens(block.text) : 0),
+				0,
+			);
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
-			for (const block of assistant.content) {
-				if (block.type === "text") {
-					chars += block.text.length;
-				} else if (block.type === "thinking") {
-					chars += block.thinking.length;
-				} else if (block.type === "toolCall") {
-					chars += block.name.length + JSON.stringify(block.arguments).length;
+			return assistant.content.reduce((tokens, block) => {
+				if (block.type === "text") return tokens + estimateTextTokens(block.text);
+				if (block.type === "thinking") return tokens + estimateTextTokens(block.thinking);
+				if (block.type === "toolCall") {
+					return tokens + estimateTextTokens(block.name) + estimateTextTokens(JSON.stringify(block.arguments));
 				}
-			}
-			return Math.ceil(chars / 4);
+				return tokens;
+			}, 0);
 		}
 		case "custom":
 		case "toolResult": {
-			if (typeof message.content === "string") {
-				chars = message.content.length;
-			} else {
-				for (const block of message.content) {
-					if (block.type === "text" && block.text) {
-						chars += block.text.length;
-					}
-					if (block.type === "image") {
-						chars += 4800; // Estimate images as 4000 chars, or 1200 tokens
-					}
-				}
-			}
-			return Math.ceil(chars / 4);
+			if (typeof message.content === "string") return estimateTextTokens(message.content);
+			return message.content.reduce((tokens, block) => {
+				if (block.type === "text") return tokens + estimateTextTokens(block.text);
+				if (block.type === "image") return tokens + 1200;
+				return tokens;
+			}, 0);
 		}
-		case "bashExecution": {
-			chars = message.command.length + message.output.length;
-			return Math.ceil(chars / 4);
-		}
+		case "bashExecution":
+			return estimateTextTokens(message.command) + estimateTextTokens(message.output);
 		case "branchSummary":
-		case "compactionSummary": {
-			chars = message.summary.length;
-			return Math.ceil(chars / 4);
-		}
+		case "compactionSummary":
+			return estimateTextTokens(message.summary);
 	}
 
 	return 0;
@@ -565,8 +560,18 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
  */
-const SUMMARY_CHARS_PER_TOKEN = 2;
-const SUMMARY_TRUNCATION_MARKER = "\n[... oversized message truncated for compaction ...]";
+const SUMMARY_REQUEST_OVERHEAD_TOKENS = 64;
+const SUMMARY_CHUNK_MARGIN_TOKENS = 32;
+
+/** A tokenizer-independent upper bound used only for request admission. */
+function estimateSummaryTextTokens(text: string): number {
+	return Math.max(estimateTextTokens(text), Buffer.byteLength(text, "utf8"));
+}
+const SUMMARY_CONTINUATION_PREFIX = "[continued segment]\n";
+const SUMMARY_CONTINUATION_SUFFIX = "\n[segment continues]";
+const CHECKPOINT_COMPRESSION_PROMPT = `Compress the complete checkpoint above without dropping unresolved work.
+Preserve the structured sections, especially every item in ## Next Steps and ## Critical Context.
+Treat earlier compressed checkpoint text and later segments as one document. Do not omit tail content.`;
 
 interface BoundedSummaryOptions {
 	messages: AgentMessage[];
@@ -582,29 +587,34 @@ interface BoundedSummaryOptions {
 	failureLabel: string;
 }
 
-function truncateForSummary(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	if (maxChars <= SUMMARY_TRUNCATION_MARKER.length) return text.slice(0, Math.max(0, maxChars));
-	const keep = maxChars - SUMMARY_TRUNCATION_MARKER.length;
-	return `${text.slice(0, keep)}${SUMMARY_TRUNCATION_MARKER}`;
+interface SummaryRequestLimits {
+	maxTokens: number;
+	maxPromptTokens: number;
+	safetyTokens: number;
 }
 
-function summaryRequestLimits(
-	model: Model<Api>,
-	requestedMaxTokens: number,
-): {
-	maxTokens: number;
-	maxPromptChars: number;
-} {
+export function estimateSummaryRequestTokens(promptText: string): number {
+	return (
+		estimateSummaryTextTokens(SUMMARIZATION_SYSTEM_PROMPT) +
+		estimateSummaryTextTokens(promptText) +
+		SUMMARY_REQUEST_OVERHEAD_TOKENS
+	);
+}
+
+function summaryRequestLimits(model: Model<Api>, requestedMaxTokens: number): SummaryRequestLimits {
 	const contextWindow = Math.max(1, model.contextWindow);
-	const maxTokens = Math.max(1, Math.min(requestedMaxTokens, model.maxTokens, Math.floor(contextWindow * 0.25)));
-	const safetyTokens = Math.max(256, Math.min(4096, Math.floor(contextWindow * 0.05)));
-	const inputTokens = contextWindow - maxTokens - safetyTokens;
-	const maxPromptChars = Math.floor(inputTokens * SUMMARY_CHARS_PER_TOKEN - SUMMARIZATION_SYSTEM_PROMPT.length);
-	if (maxPromptChars <= 0) {
+	const maxTokens = Math.max(1, Math.min(requestedMaxTokens, model.maxTokens, Math.floor(contextWindow * 0.15)));
+	const safetyTokens = Math.max(256, Math.min(8192, Math.floor(contextWindow * 0.08)));
+	const maxPromptTokens =
+		contextWindow -
+		maxTokens -
+		safetyTokens -
+		estimateSummaryTextTokens(SUMMARIZATION_SYSTEM_PROMPT) -
+		SUMMARY_REQUEST_OVERHEAD_TOKENS;
+	if (maxPromptTokens <= 0) {
 		throw new Error(`Model context window is too small for compaction (${contextWindow} tokens)`);
 	}
-	return { maxTokens, maxPromptChars };
+	return { maxTokens, maxPromptTokens, safetyTokens };
 }
 
 function buildBoundedSummaryPrompt(
@@ -617,94 +627,200 @@ function buildBoundedSummaryPrompt(
 	return prompt + instructions;
 }
 
-async function generateBoundedSummary(options: BoundedSummaryOptions): Promise<string> {
-	const limits = summaryRequestLimits(options.model, options.maxTokens);
-	const llmMessages = convertToLlm(options.messages);
-	const pending = llmMessages.map((message) => serializeConversation([message]));
-	let rollingSummary = options.previousSummary;
-	let firstRequest = true;
+function sliceToEstimatedTokenBudget(text: string, tokenBudget: number): [string, string] {
+	if (estimateSummaryTextTokens(text) <= tokenBudget) return [text, ""];
+	const characters = Array.from(text);
+	let low = 0;
+	let high = characters.length;
+	while (low < high) {
+		const midpoint = Math.ceil((low + high) / 2);
+		const candidate = characters.slice(0, midpoint).join("");
+		if (estimateSummaryTextTokens(candidate) <= tokenBudget) low = midpoint;
+		else high = midpoint - 1;
+	}
+	if (low <= 0) throw new Error("Compaction request budget cannot fit one input character");
+	return [characters.slice(0, low).join(""), characters.slice(low).join("")];
+}
 
-	do {
-		const boundedCustomInstructions = options.customInstructions
-			? truncateForSummary(options.customInstructions, Math.floor(limits.maxPromptChars * 0.15))
-			: undefined;
-		let boundedPreviousSummary = rollingSummary
-			? truncateForSummary(rollingSummary, Math.floor(limits.maxPromptChars * 0.4))
-			: undefined;
-		let instructions = options.instructions(!!boundedPreviousSummary, boundedCustomInstructions);
-		let fixedPrompt = buildBoundedSummaryPrompt("", boundedPreviousSummary, instructions);
-		if (fixedPrompt.length >= limits.maxPromptChars && boundedPreviousSummary) {
-			boundedPreviousSummary = truncateForSummary(
-				boundedPreviousSummary,
-				Math.max(0, boundedPreviousSummary.length - (fixedPrompt.length - limits.maxPromptChars) - 1),
-			);
-			instructions = options.instructions(!!boundedPreviousSummary, boundedCustomInstructions);
-			fixedPrompt = buildBoundedSummaryPrompt("", boundedPreviousSummary, instructions);
+interface PendingSummarySegment {
+	text: string;
+	continued: boolean;
+}
+
+function takeSummaryChunk(pending: PendingSummarySegment[], tokenBudget: number): string {
+	const chunk: string[] = [];
+	let usedTokens = 0;
+	while (pending.length > 0) {
+		const separatorTokens = chunk.length === 0 ? 0 : estimateSummaryTextTokens("\n");
+		const available = tokenBudget - usedTokens - separatorTokens;
+		if (available <= 0) break;
+		const next = pending[0];
+		const prefix = next.continued ? SUMMARY_CONTINUATION_PREFIX : "";
+		const prefixedText = prefix + next.text;
+		const nextTokens = estimateSummaryTextTokens(prefixedText);
+		if (nextTokens <= available) {
+			pending.shift();
+			chunk.push(prefixedText);
+			usedTokens += separatorTokens + nextTokens;
+			continue;
 		}
-		const conversationBudget = limits.maxPromptChars - fixedPrompt.length;
-		if (conversationBudget <= 0) {
+		if (chunk.length > 0) break;
+		const firstCharacter = Array.from(next.text)[0];
+		if (!firstCharacter) {
+			pending.shift();
+			continue;
+		}
+		const firstCharacterTokens = estimateSummaryTextTokens(firstCharacter);
+		let splitPrefix = prefix;
+		let splitSuffix = SUMMARY_CONTINUATION_SUFFIX;
+		if (available < estimateSummaryTextTokens(splitPrefix + splitSuffix) + firstCharacterTokens) splitSuffix = "";
+		if (available < estimateSummaryTextTokens(splitPrefix) + firstCharacterTokens) splitPrefix = "";
+		const framingTokens = estimateSummaryTextTokens(splitPrefix + splitSuffix);
+		const [head, tail] = sliceToEstimatedTokenBudget(next.text, available - framingTokens);
+		if (!tail) {
+			pending.shift();
+			chunk.push(splitPrefix + head);
+			usedTokens += estimateSummaryTextTokens(splitPrefix + head);
+			continue;
+		}
+		pending[0] = { text: tail, continued: true };
+		const framedHead = splitPrefix + head + splitSuffix;
+		chunk.push(framedHead);
+		usedTokens += estimateSummaryTextTokens(framedHead);
+		break;
+	}
+	return chunk.join("\n");
+}
+
+async function completeSummaryRequest(
+	promptText: string,
+	options: BoundedSummaryOptions,
+	limits: SummaryRequestLimits,
+): Promise<string> {
+	const estimatedTotal = estimateSummaryRequestTokens(promptText) + limits.maxTokens + limits.safetyTokens;
+	if (estimatedTotal > options.model.contextWindow) {
+		throw new Error(
+			`Compaction request exceeds model context budget (${estimatedTotal} > ${options.model.contextWindow} tokens)`,
+		);
+	}
+	const completionOptions =
+		options.model.reasoning && options.thinkingLevel && options.thinkingLevel !== "off"
+			? {
+					maxTokens: limits.maxTokens,
+					signal: options.signal,
+					apiKey: options.apiKey,
+					headers: options.headers,
+					reasoning: options.thinkingLevel,
+				}
+			: {
+					maxTokens: limits.maxTokens,
+					signal: options.signal,
+					apiKey: options.apiKey,
+					headers: options.headers,
+				};
+	const response = await completeSimple(
+		options.model,
+		{
+			systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: promptText }],
+					timestamp: Date.now(),
+				},
+			],
+		},
+		completionOptions,
+	);
+	if (response.stopReason !== "stop") {
+		const detail = response.stopReason === "error" ? response.errorMessage || "Unknown error" : response.stopReason;
+		throw new Error(`${options.failureLabel}: incomplete response (${detail})`);
+	}
+	const summary = response.content
+		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.map((content) => content.text)
+		.join("\n");
+	if (!summary.trim()) {
+		throw new Error(`${options.failureLabel}: empty response`);
+	}
+	return summary;
+}
+
+async function compressCompleteCheckpoint(
+	checkpoint: string,
+	options: BoundedSummaryOptions,
+	limits: SummaryRequestLimits,
+): Promise<string> {
+	return runBoundedSummarySegments(
+		[`<checkpoint>\n${checkpoint}\n</checkpoint>`],
+		undefined,
+		() => CHECKPOINT_COMPRESSION_PROMPT,
+		options,
+		limits,
+		false,
+	);
+}
+
+async function runBoundedSummarySegments(
+	inputSegments: string[],
+	initialSummary: string | undefined,
+	instructionsFor: (hasPreviousSummary: boolean) => string,
+	options: BoundedSummaryOptions,
+	limits: SummaryRequestLimits,
+	allowCheckpointCompression: boolean,
+): Promise<string> {
+	const pending: PendingSummarySegment[] = inputSegments.map((text) => ({ text, continued: false }));
+	let rollingSummary = initialSummary;
+	let requireEmptyRequest = pending.length === 0;
+
+	while (pending.length > 0 || requireEmptyRequest) {
+		let instructions = instructionsFor(!!rollingSummary);
+		let fixedPrompt = buildBoundedSummaryPrompt("", rollingSummary, instructions);
+		if (
+			estimateSummaryTextTokens(fixedPrompt) + SUMMARY_CHUNK_MARGIN_TOKENS >= limits.maxPromptTokens &&
+			rollingSummary
+		) {
+			if (!allowCheckpointCompression) {
+				throw new Error("Compressed checkpoint still exceeds the model context window");
+			}
+			rollingSummary = await compressCompleteCheckpoint(rollingSummary, options, limits);
+			instructions = instructionsFor(true);
+			fixedPrompt = buildBoundedSummaryPrompt("", rollingSummary, instructions);
+		}
+		const fixedTokens = estimateSummaryTextTokens(fixedPrompt);
+		if (fixedTokens + SUMMARY_CHUNK_MARGIN_TOKENS >= limits.maxPromptTokens) {
 			throw new Error("Compaction instructions exceed the model context window");
 		}
-
-		const chunk: string[] = [];
-		let chunkChars = 0;
-		while (pending.length > 0) {
-			const separatorChars = chunk.length === 0 ? 0 : 1;
-			const available = conversationBudget - chunkChars - separatorChars;
-			if (available <= 0) break;
-			const next = pending[0];
-			if (next.length <= available) {
-				pending.shift();
-				chunk.push(next);
-				chunkChars += separatorChars + next.length;
-				continue;
-			}
-			if (chunk.length > 0) break;
-			pending.shift();
-			const truncated = truncateForSummary(next, available);
-			chunk.push(truncated);
-			chunkChars += truncated.length;
-		}
-
-		const promptText = buildBoundedSummaryPrompt(chunk.join("\n"), boundedPreviousSummary, instructions);
-		const summarizationMessages = [
-			{
-				role: "user" as const,
-				content: [{ type: "text" as const, text: promptText }],
-				timestamp: Date.now(),
-			},
-		];
-		const completionOptions =
-			options.model.reasoning && options.thinkingLevel && options.thinkingLevel !== "off"
-				? {
-						maxTokens: limits.maxTokens,
-						signal: options.signal,
-						apiKey: options.apiKey,
-						headers: options.headers,
-						reasoning: options.thinkingLevel,
-					}
-				: {
-						maxTokens: limits.maxTokens,
-						signal: options.signal,
-						apiKey: options.apiKey,
-						headers: options.headers,
-					};
-		const response = await completeSimple(
-			options.model,
-			{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-			completionOptions,
+		const pendingCharsBefore = pending.reduce((characters, segment) => characters + segment.text.length, 0);
+		const conversation = takeSummaryChunk(
+			pending,
+			limits.maxPromptTokens - fixedTokens - SUMMARY_CHUNK_MARGIN_TOKENS,
 		);
-		if (response.stopReason === "error") {
-			throw new Error(`${options.failureLabel}: ${response.errorMessage || "Unknown error"}`);
+		const pendingCharsAfter = pending.reduce((characters, segment) => characters + segment.text.length, 0);
+		if (pendingCharsBefore > 0 && (conversation.length === 0 || pendingCharsAfter >= pendingCharsBefore)) {
+			throw new Error("Compaction could not make progress within the model context window");
 		}
-		rollingSummary = response.content
-			.filter((content): content is { type: "text"; text: string } => content.type === "text")
-			.map((content) => content.text)
-			.join("\n");
-		firstRequest = false;
-	} while (pending.length > 0 || firstRequest);
+		const promptText = buildBoundedSummaryPrompt(conversation, rollingSummary, instructions);
+		rollingSummary = await completeSummaryRequest(promptText, options, limits);
+		requireEmptyRequest = false;
+	}
 
 	return rollingSummary ?? "";
+}
+
+async function generateBoundedSummary(options: BoundedSummaryOptions): Promise<string> {
+	const limits = summaryRequestLimits(options.model, options.maxTokens);
+	const segments = convertToLlm(options.messages)
+		.map((message) => serializeConversation([message], { maxToolResultChars: null }))
+		.filter((segment) => segment.length > 0);
+	return runBoundedSummarySegments(
+		segments,
+		options.previousSummary,
+		(hasPreviousSummary) => options.instructions(hasPreviousSummary, options.customInstructions),
+		options,
+		limits,
+		true,
+	);
 }
 
 /**
@@ -732,8 +848,8 @@ export async function generateSummary(
 		thinkingLevel,
 		previousSummary,
 		customInstructions,
-		instructions: (hasPreviousSummary, boundedInstructions) =>
-			buildSummarizationPrompt(boundedInstructions, hasPreviousSummary ? "rolling" : undefined),
+		instructions: (hasPreviousSummary, instructions) =>
+			buildSummarizationPrompt(instructions, hasPreviousSummary ? "rolling" : undefined),
 		failureLabel: "Summarization failed",
 	});
 }

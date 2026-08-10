@@ -1,7 +1,14 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { estimateContextTokens, generateSummary, prepareCompaction } from "../../../src/core/compaction/index.js";
+import {
+	buildSummarizationPrompt,
+	estimateContextTokens,
+	estimateSummaryRequestTokens,
+	estimateTextTokens,
+	generateSummary,
+	prepareCompaction,
+} from "../../../src/core/compaction/index.js";
 import { buildSessionContext, type SessionEntry } from "../../../src/core/session-manager.js";
 import { createHarness, type Harness } from "../harness.js";
 
@@ -53,15 +60,130 @@ describe("#900 bounded compaction recovery", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
-	it("truncates one oversized message before issuing a summary request", async () => {
-		await generateSummary([{ role: "user", content: "x".repeat(900_000), timestamp: 1 }], model, 2_000, "test-key");
+	it("rolls every segment of one oversized message through bounded requests", async () => {
+		const tailSentinel = "OVERSIZED_MESSAGE_TAIL_SENTINEL";
+		completeSimpleMock.mockImplementation(async (_model, context) => {
+			const prompt = context.messages[0].content[0].text as string;
+			return fauxAssistantMessage(
+				prompt.includes(tailSentinel)
+					? `## Next Steps\n1. Preserve ${tailSentinel}\n\n## Critical Context\n- tail was observed`
+					: "rolling checkpoint",
+			);
+		});
+		const content = `HEAD_SENTINEL_${"x".repeat(120_000)}_${tailSentinel}`;
 
-		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
-		const [, context, options] = completeSimpleMock.mock.calls[0];
-		const prompt = context.messages[0].content[0].text as string;
-		expect(prompt.length).toBeLessThan(model.contextWindow * 2);
-		expect(prompt).toContain("oversized message truncated for compaction");
-		expect(options.maxTokens).toBe(1_600);
+		const summary = await generateSummary([{ role: "user", content, timestamp: 1 }], model, 2_000, "test-key");
+
+		expect(completeSimpleMock.mock.calls.length).toBeGreaterThan(1);
+		const prompts = completeSimpleMock.mock.calls.map(([, context]) => context.messages[0].content[0].text as string);
+		expect(prompts.join("\n")).toContain("HEAD_SENTINEL");
+		expect(prompts.join("\n")).toContain(tailSentinel);
+		expect(prompts.join("\n")).not.toContain("oversized message truncated");
+		expect(summary).toContain(tailSentinel);
+	});
+
+	it("preserves oversized tool-result tails now that requests are externally bounded", async () => {
+		const tailSentinel = "TOOL_RESULT_TAIL_SENTINEL";
+		completeSimpleMock.mockImplementation(async (_model, context) => {
+			const prompt = context.messages[0].content[0].text as string;
+			return fauxAssistantMessage(prompt.includes(tailSentinel) ? `checkpoint ${tailSentinel}` : "checkpoint");
+		});
+
+		const summary = await generateSummary(
+			[
+				{
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "read",
+					content: [{ type: "text", text: `${"tool output ".repeat(10_000)}${tailSentinel}` }],
+					isError: false,
+					timestamp: 1,
+				},
+			],
+			model,
+			2_000,
+			"test-key",
+		);
+
+		expect(completeSimpleMock.mock.calls.length).toBeGreaterThan(1);
+		expect(summary).toContain(tailSentinel);
+	});
+
+	it("makes strict progress at the continuation-marker Unicode boundary", async () => {
+		const boundaryModel = { ...model };
+		const maxTokens = Math.min(1_600, boundaryModel.maxTokens, Math.floor(boundaryModel.contextWindow * 0.15));
+		const safetyTokens = Math.max(256, Math.min(8_192, Math.floor(boundaryModel.contextWindow * 0.08)));
+		const maxPromptTokens = boundaryModel.contextWindow - maxTokens - safetyTokens - estimateSummaryRequestTokens("");
+		const previousSummary = "stable";
+		const fixedPrompt = (instructions: string) =>
+			`<conversation>\n\n</conversation>\n\n<previous-summary>\n${previousSummary}\n</previous-summary>\n\n${buildSummarizationPrompt(instructions, "rolling")}`;
+		const availableWithOneInstructionCharacter = maxPromptTokens - Buffer.byteLength(fixedPrompt("x"), "utf8") - 32;
+		const customInstructions = "x".repeat(availableWithOneInstructionCharacter - 41 + 1);
+		expect(maxPromptTokens - Buffer.byteLength(fixedPrompt(customInstructions), "utf8") - 32).toBe(41);
+		completeSimpleMock.mockResolvedValue(fauxAssistantMessage(previousSummary));
+		const character = "\u{10ffff}";
+
+		await generateSummary(
+			[{ role: "user", content: character.repeat(30), timestamp: 1 }],
+			boundaryModel,
+			2_000,
+			"test-key",
+			undefined,
+			undefined,
+			customInstructions,
+			previousSummary,
+		);
+
+		const prompts = completeSimpleMock.mock.calls.map(([, context]) => context.messages[0].content[0].text as string);
+		expect(prompts.length).toBeGreaterThan(1);
+		expect(prompts.length).toBeLessThan(100);
+		expect(prompts.join("").split(character)).toHaveLength(31);
+	});
+
+	it("keeps every request within the estimated model budget for byte-fallback Unicode", async () => {
+		const denseUnicode = `${"\u{10ffff}".repeat(12_000)}${"\u0080".repeat(12_000)}`;
+		expect(estimateTextTokens(denseUnicode)).toBeGreaterThan(denseUnicode.length);
+
+		await generateSummary([{ role: "user", content: denseUnicode, timestamp: 1 }], model, 2_000, "test-key");
+
+		expect(completeSimpleMock.mock.calls.length).toBeGreaterThan(1);
+		for (const [, context, options] of completeSimpleMock.mock.calls) {
+			const prompt = context.messages[0].content[0].text as string;
+			const estimatedTotal = estimateSummaryRequestTokens(prompt) + options.maxTokens;
+			expect(estimatedTotal).toBeLessThanOrEqual(model.contextWindow - 256);
+		}
+	});
+
+	it("compresses the complete prior checkpoint without clipping Next Steps or Critical Context", async () => {
+		const nextSentinel = "NEXT_STEPS_TAIL_SENTINEL";
+		const criticalSentinel = "CRITICAL_CONTEXT_TAIL_SENTINEL";
+		completeSimpleMock.mockImplementation(async (_model, context) => {
+			const prompt = context.messages[0].content[0].text as string;
+			const next = prompt.includes(nextSentinel) ? `\n## Next Steps\n1. ${nextSentinel}` : "";
+			const critical = prompt.includes(criticalSentinel) ? `\n## Critical Context\n- ${criticalSentinel}` : "";
+			return fauxAssistantMessage(`rolling checkpoint${next}${critical}`);
+		});
+		const previousSummary = `## Goal\nrecover\n${"prior detail ".repeat(15_000)}\n## Next Steps\n1. ${nextSentinel}\n## Critical Context\n- ${criticalSentinel}`;
+
+		const summary = await generateSummary(
+			[{ role: "user", content: "new message", timestamp: 1 }],
+			model,
+			2_000,
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			previousSummary,
+		);
+
+		expect(completeSimpleMock.mock.calls.length).toBeGreaterThan(1);
+		expect(
+			completeSimpleMock.mock.calls.some(([, context]) =>
+				(context.messages[0].content[0].text as string).includes(nextSentinel),
+			),
+		).toBe(true);
+		expect(summary).toContain(nextSentinel);
+		expect(summary).toContain(criticalSentinel);
 	});
 
 	it("rolls many messages through sequential bounded requests", async () => {
@@ -74,11 +196,25 @@ describe("#900 bounded compaction recovery", () => {
 		const summary = await generateSummary(messages, model, 2_000, "test-key");
 
 		expect(completeSimpleMock.mock.calls.length).toBeGreaterThan(1);
-		for (const [, context] of completeSimpleMock.mock.calls) {
+		for (const [, context, options] of completeSimpleMock.mock.calls) {
 			const prompt = context.messages[0].content[0].text as string;
-			expect(prompt.length).toBeLessThan(model.contextWindow * 2);
+			expect(estimateSummaryRequestTokens(prompt) + options.maxTokens).toBeLessThanOrEqual(
+				model.contextWindow - 256,
+			);
 		}
 		expect(summary).toMatch(/^summary-/);
+	});
+
+	it.each([
+		{ label: "length-limited", response: fauxAssistantMessage("partial", { stopReason: "length" }) },
+		{ label: "aborted", response: fauxAssistantMessage("partial", { stopReason: "aborted" }) },
+		{ label: "empty", response: fauxAssistantMessage("") },
+	])("rejects $label rolling checkpoints instead of consuming input", async ({ response }) => {
+		completeSimpleMock.mockResolvedValue(response);
+
+		await expect(
+			generateSummary([{ role: "user", content: "must survive", timestamp: 1 }], model, 2_000, "test-key"),
+		).rejects.toThrow(/Summarization failed: (incomplete|empty)/);
 	});
 
 	it("keeps retry debris in the journal topology but excludes it from model and compaction context", () => {

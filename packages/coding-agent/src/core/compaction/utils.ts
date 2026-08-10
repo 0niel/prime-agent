@@ -100,8 +100,15 @@ function truncateForSummary(text: string, maxChars: number): string {
  * Tool results are truncated to keep the summarization request within
  * reasonable token budgets. Full content is not needed for summarization.
  */
-export function serializeConversation(messages: Message[]): string {
+export interface SerializeConversationOptions {
+	/** `null` preserves complete tool results for an externally bounded caller. */
+	maxToolResultChars?: number | null;
+}
+
+export function serializeConversation(messages: Message[], options: SerializeConversationOptions = {}): string {
 	const parts: string[] = [];
+	const maxToolResultChars =
+		options.maxToolResultChars === undefined ? TOOL_RESULT_MAX_CHARS : options.maxToolResultChars;
 
 	for (const msg of messages) {
 		if (msg.role === "user") {
@@ -147,7 +154,9 @@ export function serializeConversation(messages: Message[]): string {
 				.map((c) => c.text)
 				.join("");
 			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
+				const serializedContent =
+					maxToolResultChars === null ? content : truncateForSummary(content, maxToolResultChars);
+				parts.push(`[Tool result]: ${serializedContent}`);
 			}
 		}
 	}
