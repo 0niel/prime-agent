@@ -22,14 +22,30 @@ import { dirname, isAbsolute, relative } from "node:path";
 export type RlmChildTerminalStatus = "done" | "error" | "cancelled";
 export const RLM_DURABLE_VERSION = 1 as const;
 
-export interface RlmTerminalMessage {
-	role: "custom";
-	customType: "rlm_child_failure" | "rlm_child_terminal_notice" | "agent_message";
-	content: string;
-	display: boolean;
-	details: Record<string, unknown>;
-	timestamp: number;
-}
+export type RlmTerminalMessage =
+	| {
+			role: "custom";
+			customType: "rlm_child_failure";
+			content: string;
+			display: true;
+			details: { childId: string; sessionName: string; error: string };
+			timestamp: number;
+	  }
+	| {
+			role: "custom";
+			customType: "rlm_child_terminal_notice";
+			content: string;
+			display: true;
+			details:
+				| { kind: "cancelled"; childId: string; sessionName: string; reason?: string }
+				| {
+						kind: "completed_without_reply";
+						childId: string;
+						sessionName: string;
+						lastAssistantTextPreview?: string;
+				  };
+			timestamp: number;
+	  };
 
 export interface RlmOperationAdmittedRecord {
 	version: 1;
@@ -54,7 +70,10 @@ export interface RlmOperationMaterializedRecord {
 	operationId: string;
 	childSessionId: string;
 	childSessionFile: string;
+	/** Immutable roots captured from the trusted materialization call. */
+	childSessionRoot: string;
 	childArtifactDir: string;
+	childArtifactRoot: string;
 	recordedAt: string;
 }
 export interface RlmOperationTerminalRecordedRecord {
@@ -183,7 +202,10 @@ export interface RlmDurableOperation {
 	rlmMaxDepth: number;
 	childSessionId?: string;
 	childSessionFile?: string;
+	/** These are immutable, trusted roots captured at materialization. */
+	childSessionRoot?: string;
 	childArtifactDir?: string;
+	childArtifactRoot?: string;
 	terminal?: RlmChildTerminalStatus;
 	lifecycle: "admitted" | "materialized" | "terminal_recorded" | "released" | "deleted";
 	uncertain: boolean;
@@ -229,9 +251,22 @@ export interface RlmDurableIo {
 	realpathSync: typeof realpathSync;
 	renameSync: typeof renameSync;
 }
+export interface RlmTrustedChildRecoveryRoots {
+	childSessionRoot: string;
+	childArtifactRoot: string;
+}
+/**
+ * Recovery roots come from the owning session manager, never from JSONL. A
+ * passive read without this authority deliberately leaves child outboxes
+ * unopened and their operations uncertain.
+ */
+export type RlmChildRecoveryTrust = (
+	operation: Readonly<RlmDurableOperation>,
+) => RlmTrustedChildRecoveryRoots | undefined;
 export interface RlmDurableOperationStoreOptions {
 	io?: RlmDurableIo;
 	now?: () => string;
+	trustedChildRecoveryRoots?: RlmChildRecoveryTrust;
 }
 
 const defaultIo: RlmDurableIo = {
@@ -269,18 +304,24 @@ export function openRlmDurableOperationStore(
 }
 
 /** Passive: this does not create, chmod, repair, or write an artifact/cache. */
-export function readRlmDurableOperationRegistry(parentArtifactDir: string): RlmDurableOperationRegistry {
-	return reduceArtifact(parentArtifactDir, defaultIo, false);
+export function readRlmDurableOperationRegistry(
+	parentArtifactDir: string,
+	trustedChildRecoveryRoots?: RlmChildRecoveryTrust,
+): RlmDurableOperationRegistry {
+	return reduceArtifact(parentArtifactDir, defaultIo, trustedChildRecoveryRoots);
 }
 
 class Store implements RlmDurableOperationStore {
 	private readonly io: RlmDurableIo;
 	private readonly now: () => string;
 	private readonly parentArtifactDir: string;
+	private readonly trustedChildRecoveryRoots?: RlmChildRecoveryTrust;
+	private readonly inProcessChildRoots = new Map<string, RlmTrustedChildRecoveryRoots>();
 
 	constructor(parentArtifactDir: string, options: RlmDurableOperationStoreOptions) {
 		this.io = options.io ?? defaultIo;
 		this.now = options.now ?? (() => new Date().toISOString());
+		this.trustedChildRecoveryRoots = options.trustedChildRecoveryRoots;
 		this.io.mkdirSync(parentArtifactDir, { recursive: true, mode: 0o700 });
 		this.io.chmodSync(parentArtifactDir, 0o700);
 		this.parentArtifactDir = this.io.realpathSync(parentArtifactDir);
@@ -322,8 +363,7 @@ class Store implements RlmDurableOperationStore {
 		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
-		if (!operation || operation.uncertain || operation.lifecycle === "released" || operation.lifecycle === "deleted")
-			return false;
+		if (!operation || operation.uncertain || operation.lifecycle !== "admitted") return false;
 		const childFile = canonicalExistingFile(input.childSessionFile, input.childSessionRoot, this.io);
 		try {
 			assertSessionIdentity(input.childSessionId, childFile, this.io);
@@ -339,17 +379,26 @@ class Store implements RlmDurableOperationStore {
 			operationId: input.operationId,
 			childSessionId: input.childSessionId,
 			childSessionFile: childFile,
+			childSessionRoot: canonicalDirectory(input.childSessionRoot, input.childSessionRoot, this.io),
 			childArtifactDir: assertContainedDirectory(input.childArtifactDir, input.childArtifactRoot, this.io, true),
+			childArtifactRoot: canonicalDirectory(input.childArtifactRoot, input.childArtifactRoot, this.io),
 			recordedAt: this.now(),
 		};
 		if (operation.childSessionFile) {
 			if (
 				operation.childSessionId === record.childSessionId &&
-				operation.childSessionFile === record.childSessionFile
+				operation.childSessionFile === record.childSessionFile &&
+				operation.childSessionRoot === record.childSessionRoot &&
+				operation.childArtifactDir === record.childArtifactDir &&
+				operation.childArtifactRoot === record.childArtifactRoot
 			)
 				return true;
 			return false;
 		}
+		this.inProcessChildRoots.set(operation.key, {
+			childSessionRoot: record.childSessionRoot,
+			childArtifactRoot: record.childArtifactRoot,
+		});
 		this.append(this.path(LEDGER), record);
 		this.afterAppend();
 		return true;
@@ -363,7 +412,13 @@ class Store implements RlmDurableOperationStore {
 		const operation = registry.operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
-		if (!operation || operation.uncertain || !operation.childSessionFile || operation.deliveryId !== input.deliveryId)
+		if (
+			!operation ||
+			operation.uncertain ||
+			operation.lifecycle !== "materialized" ||
+			!operation.childSessionFile ||
+			operation.deliveryId !== input.deliveryId
+		)
 			return false;
 		if (operation.terminal) return operation.terminal === input.terminal;
 		const delivery = registry.deliveries.get(deliveryKey(operation.key, input.deliveryId));
@@ -378,11 +433,10 @@ class Store implements RlmDurableOperationStore {
 		const registry = this.reduce();
 		const prior = registry.deliveries.get(deliveryKey(operation.key, record.deliveryId));
 		if (prior?.outboxed) {
-			const priorDigest = (prior as RlmDurableDelivery & { _digest?: string })._digest;
 			if (
 				prior.uncertain ||
 				prior.terminal !== record.terminal ||
-				(priorDigest !== undefined && priorDigest !== digestMessage(record.message))
+				deliveryDigest(prior as DeliveryFact, record) !== digestMessage(record.message)
 			) {
 				throw new Error("Conflicting durable outbox record");
 			}
@@ -397,11 +451,17 @@ class Store implements RlmDurableOperationStore {
 		const { operation, record } = this.validateOutboxInput(input, true);
 		const registry = this.reduce();
 		const delivery = registry.deliveries.get(deliveryKey(operation.key, record.deliveryId));
-		if (!delivery?.outboxed || delivery.uncertain || operation.terminal !== record.terminal) {
+		if (
+			!delivery?.outboxed ||
+			delivery.uncertain ||
+			operation.terminal !== record.terminal ||
+			outboxDigest(delivery) !== digestOutbox(record)
+		) {
 			throw new Error("Outbox is not a durable terminal hand-off");
 		}
 		if (delivery.received) return "already_received";
-		const inbox: RlmTerminalInboxRecord = { ...record, type: "received", receivedAt: this.now() };
+		const { recordedAt: _recordedAt, ...outboxFact } = record;
+		const inbox: RlmTerminalInboxRecord = { ...outboxFact, type: "received", receivedAt: this.now() };
 		this.append(this.path(INBOX), inbox);
 		this.afterAppend();
 		return "new";
@@ -468,8 +528,7 @@ class Store implements RlmDurableOperationStore {
 		const operation = this.reduce().operations.get(
 			operationKey(input.parentSessionId, input.assignmentId, input.operationId),
 		);
-		if (!operation || operation.uncertain || operation.lifecycle === "released" || operation.lifecycle === "deleted")
-			return false;
+		if (!operation || operation.uncertain || operation.lifecycle !== "terminal_recorded") return false;
 		this.append(this.path(LEDGER), { version: 1, type, ...input, recordedAt: this.now() });
 		this.afterAppend();
 		return true;
@@ -543,7 +602,11 @@ class Store implements RlmDurableOperationStore {
 		canonicalDirectory(input.childSessionDir, input.childSessionDir, this.io);
 	}
 	private reduce(): RlmDurableOperationRegistry {
-		return reduceArtifact(this.parentArtifactDir, this.io, false);
+		return reduceArtifact(
+			this.parentArtifactDir,
+			this.io,
+			(operation) => this.inProcessChildRoots.get(operation.key) ?? this.trustedChildRecoveryRoots?.(operation),
+		);
 	}
 	private afterAppend(): RlmDurableOperationRegistry {
 		const registry = this.reduce();
@@ -569,7 +632,7 @@ class Store implements RlmDurableOperationStore {
 function reduceArtifact(
 	parentArtifactDir: string,
 	io: RlmDurableIo,
-	_writeCache: boolean,
+	trustedChildRecoveryRoots?: RlmChildRecoveryTrust,
 ): RlmDurableOperationRegistry {
 	const registry: RlmDurableOperationRegistry = {
 		operations: new Map(),
@@ -586,14 +649,35 @@ function reduceArtifact(
 	}
 	for (const parsed of readJsonl(joinArtifact(canonicalParent, LEDGER, io), io, registry, "ledger"))
 		reduceLedger(parsed, registry);
-	// A child outbox becomes discoverable only from a materialized, admitted operation.
+	// Child paths in JSONL are data, not authority. Only a live session-manager
+	// trust resolver can authorize opening a child artifact.
 	for (const operation of registry.operations.values()) {
-		if (!operation.childSessionFile || !operation.childArtifactDir || operation.uncertain) continue;
+		if (
+			!operation.childSessionId ||
+			!operation.childSessionFile ||
+			!operation.childArtifactDir ||
+			operation.uncertain
+		)
+			continue;
+		const roots = trustedChildRecoveryRoots?.(operation);
+		if (!roots) {
+			markOperationUncertain(operation, registry, "child recovery roots unavailable");
+			continue;
+		}
 		try {
-			for (const parsed of readJsonl(joinArtifact(operation.childArtifactDir, OUTBOX, io), io, registry, "outbox"))
+			const trustedSessionRoot = canonicalDirectory(roots.childSessionRoot, roots.childSessionRoot, io);
+			const trustedArtifactRoot = canonicalDirectory(roots.childArtifactRoot, roots.childArtifactRoot, io);
+			if (operation.childSessionRoot !== trustedSessionRoot || operation.childArtifactRoot !== trustedArtifactRoot)
+				throw new Error("persisted roots do not match session-manager authority");
+			const childFile = canonicalExistingFile(operation.childSessionFile, trustedSessionRoot, io);
+			assertSessionIdentity(operation.childSessionId, childFile, io);
+			if (childFile !== operation.childSessionFile) throw new Error("child session file changed");
+			const artifact = assertContainedDirectory(operation.childArtifactDir, trustedArtifactRoot, io, false);
+			if (artifact !== operation.childArtifactDir) throw new Error("child artifact path changed");
+			for (const parsed of readJsonl(joinArtifact(artifact, OUTBOX, io), io, registry, "outbox"))
 				reduceOutbox(parsed, registry);
 		} catch {
-			markOperationUncertain(operation, registry, "outbox path cannot be read");
+			markOperationUncertain(operation, registry, "untrusted or unreadable child recovery binding");
 		}
 	}
 	for (const parsed of readJsonl(joinArtifact(canonicalParent, INBOX, io), io, registry, "inbox"))
@@ -684,37 +768,48 @@ function reduceLedger(raw: unknown, registry: RlmDurableOperationRegistry): void
 		if (!operation.childSessionFile) {
 			operation.childSessionId = raw.childSessionId;
 			operation.childSessionFile = raw.childSessionFile;
+			operation.childSessionRoot = raw.childSessionRoot;
 			operation.childArtifactDir = raw.childArtifactDir;
+			operation.childArtifactRoot = raw.childArtifactRoot;
 			operation.lifecycle = "materialized";
 		} else if (
 			operation.childSessionId !== raw.childSessionId ||
 			operation.childSessionFile !== raw.childSessionFile ||
-			operation.childArtifactDir !== raw.childArtifactDir
+			operation.childSessionRoot !== raw.childSessionRoot ||
+			operation.childArtifactDir !== raw.childArtifactDir ||
+			operation.childArtifactRoot !== raw.childArtifactRoot
 		)
 			markOperationUncertain(operation, registry, "conflicting materialization");
 		return;
 	}
 	if (raw.type === "terminal_recorded") {
-		if (!validTerminalRecorded(raw) || !operation.childSessionFile || raw.deliveryId !== operation.deliveryId) {
+		if (
+			!validTerminalRecorded(raw) ||
+			operation.lifecycle !== "materialized" ||
+			!operation.childSessionFile ||
+			raw.deliveryId !== operation.deliveryId
+		) {
 			markOperationUncertain(operation, registry, "invalid terminal");
 			return;
 		}
 		if (!operation.terminal) {
 			operation.terminal = raw.terminal as RlmChildTerminalStatus;
-			if (operation.lifecycle !== "deleted") operation.lifecycle = "terminal_recorded";
+			operation.lifecycle = "terminal_recorded";
 		} else if (operation.terminal !== raw.terminal)
 			markOperationUncertain(operation, registry, "conflicting terminal");
 		return;
 	}
 	if (raw.type === "released" || raw.type === "deleted") {
-		if (!validStamped(raw)) {
+		if (!validReleased(raw)) {
 			markOperationUncertain(operation, registry, "invalid release");
 			return;
 		}
-		if (operation.lifecycle === "released" || operation.lifecycle === "deleted") {
-			if (operation.lifecycle !== raw.type)
-				markOperationUncertain(operation, registry, "conflicting release/deletion");
-		} else operation.lifecycle = raw.type;
+		if (operation.lifecycle === raw.type) return;
+		if (operation.lifecycle !== "terminal_recorded") {
+			markOperationUncertain(operation, registry, "release/deletion before terminal");
+			return;
+		}
+		operation.lifecycle = raw.type;
 		return;
 	}
 	markOperationUncertain(operation, registry, "unknown ledger event");
@@ -776,7 +871,8 @@ function reduceInbox(raw: unknown, registry: RlmDurableOperationRegistry): void 
 		delivery.uncertain ||
 		!operation.terminal ||
 		operation.terminal !== record.terminal ||
-		delivery.terminal !== record.terminal
+		delivery.terminal !== record.terminal ||
+		outboxDigest(delivery) !== digestOutbox(record)
 	) {
 		markDeliveryUncertain(delivery, operation, registry, "inbox without matching outbox/terminal");
 		return;
@@ -806,6 +902,10 @@ function reduceConsumed(raw: unknown, registry: RlmDurableOperationRegistry): vo
 		markDeliveryUncertain(delivery, operation, registry, "consumed before inbox");
 		return;
 	}
+	if (record.type === "materialized" && record.sessionMessageId !== materializedTerminalMessageId(record.deliveryId)) {
+		markDeliveryUncertain(delivery, operation, registry, "forged materialized message id");
+		return;
+	}
 	if (record.type === "discarded" && operation.lifecycle !== "deleted") {
 		markDeliveryUncertain(delivery, operation, registry, "discard without deletion");
 		return;
@@ -828,17 +928,37 @@ function deliveryFor(
 	}
 	return delivery;
 }
-function defineDeliveryDigest(
-	delivery: RlmDurableDelivery & { _digest?: string },
-	record: { message: RlmTerminalMessage },
-): void {
-	delivery._digest = digestMessage(record.message);
+type DeliveryFact = RlmDurableDelivery & { _messageDigest?: string; _outboxDigest?: string };
+function defineDeliveryDigest(delivery: DeliveryFact, record: RlmTerminalOutboxRecord | RlmTerminalInboxRecord): void {
+	delivery._messageDigest = digestMessage(record.message);
+	if (record.type === "terminal") delivery._outboxDigest = digestOutbox(record);
 }
-function deliveryDigest(
-	delivery: RlmDurableDelivery & { _digest?: string },
-	record: { message: RlmTerminalMessage },
-): string {
-	return delivery._digest ?? digestMessage(record.message);
+function deliveryDigest(delivery: DeliveryFact, record: { message: RlmTerminalMessage }): string {
+	return delivery._messageDigest ?? digestMessage(record.message);
+}
+function outboxDigest(delivery: DeliveryFact): string | undefined {
+	return delivery._outboxDigest;
+}
+/** Immutable parent/child identity and bounded body are a single hand-off fact. */
+function digestOutbox(record: RlmTerminalOutboxRecord | RlmTerminalInboxRecord): string {
+	return createHash("sha256")
+		.update(
+			stableJson({
+				version: 1,
+				type: "terminal",
+				parentSessionId: record.parentSessionId,
+				parentSessionFile: record.parentSessionFile,
+				childSessionId: record.childSessionId,
+				childSessionFile: record.childSessionFile,
+				childId: record.childId,
+				assignmentId: record.assignmentId,
+				operationId: record.operationId,
+				deliveryId: record.deliveryId,
+				terminal: record.terminal,
+				message: record.message,
+			}),
+		)
+		.digest("hex");
 }
 function markOperationUncertain(
 	operation: RlmDurableOperation,
@@ -991,37 +1111,55 @@ function assertOperationInput(value: { parentSessionId: string; assignmentId: st
 function assertTerminalMessage(value: unknown): asserts value is RlmTerminalMessage {
 	if (
 		!isObject(value) ||
+		!exactKeys(value, ["role", "customType", "content", "display", "details", "timestamp"]) ||
 		value.role !== "custom" ||
-		(value.customType !== "rlm_child_failure" &&
-			value.customType !== "rlm_child_terminal_notice" &&
-			value.customType !== "agent_message") ||
-		typeof value.content !== "string" ||
-		value.content.length > MAX_MESSAGE_CHARS ||
-		typeof value.display !== "boolean" ||
-		!Number.isFinite(value.timestamp) ||
-		!isSafeDetails(value.details, 0)
+		value.display !== true ||
+		!isBoundedText(value.content, MAX_MESSAGE_CHARS) ||
+		!Number.isFinite(value.timestamp)
 	)
 		throw new Error("Terminal message is not a bounded approved custom projection");
-	if (Buffer.byteLength(stableJson(value)) > MAX_MESSAGE_BYTES) throw new Error("Terminal message is too large");
-}
-function isSafeDetails(value: unknown, depth: number): boolean {
-	if (depth > 4) return false;
-	if (value === null || typeof value === "boolean" || typeof value === "number") return true;
-	if (typeof value === "string") return value.length <= 4096;
-	if (Array.isArray(value)) return value.length <= 32 && value.every((item) => isSafeDetails(item, depth + 1));
-	if (!isObject(value)) return false;
-	const entries = Object.entries(value);
-	return (
-		entries.length <= 32 &&
-		entries.every(
-			([key, item]) =>
-				key.length <= 64 &&
-				key !== "__proto__" &&
-				key !== "constructor" &&
-				key !== "prototype" &&
-				isSafeDetails(item, depth + 1),
+	if (value.customType === "rlm_child_failure") {
+		if (
+			!isObject(value.details) ||
+			!exactKeys(value.details, ["childId", "sessionName", "error"]) ||
+			!isBoundedText(value.details.childId, 256) ||
+			!isBoundedText(value.details.sessionName, 256) ||
+			!isBoundedText(value.details.error, 4096)
 		)
-	);
+			throw new Error("Failure message details are not approved");
+	} else if (value.customType === "rlm_child_terminal_notice") {
+		if (
+			!isObject(value.details) ||
+			!isBoundedText(value.details.childId, 256) ||
+			!isBoundedText(value.details.sessionName, 256)
+		)
+			throw new Error("Terminal notice details are not approved");
+		if (value.details.kind === "cancelled") {
+			if (
+				!exactKeys(
+					value.details,
+					value.details.reason === undefined
+						? ["kind", "childId", "sessionName"]
+						: ["kind", "childId", "sessionName", "reason"],
+				) ||
+				(value.details.reason !== undefined && !isBoundedText(value.details.reason, 4096))
+			)
+				throw new Error("Cancelled notice details are not approved");
+		} else if (value.details.kind === "completed_without_reply") {
+			if (
+				!exactKeys(
+					value.details,
+					value.details.lastAssistantTextPreview === undefined
+						? ["kind", "childId", "sessionName"]
+						: ["kind", "childId", "sessionName", "lastAssistantTextPreview"],
+				) ||
+				(value.details.lastAssistantTextPreview !== undefined &&
+					!isBoundedText(value.details.lastAssistantTextPreview, 4096))
+			)
+				throw new Error("Completed notice details are not approved");
+		} else throw new Error("Unknown terminal notice kind");
+	} else throw new Error("Terminal message custom type is not approved");
+	if (Buffer.byteLength(stableJson(value)) > MAX_MESSAGE_BYTES) throw new Error("Terminal message is too large");
 }
 function digestMessage(message: RlmTerminalMessage): string {
 	return createHash("sha256").update(stableJson(message)).digest("hex");
@@ -1048,41 +1186,94 @@ function hasOperationIdentity(value: Record<string, unknown>): value is Record<s
 		UUID.test(value.operationId)
 	);
 }
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+	const actual = Object.keys(value).sort();
+	const expected = [...keys].sort();
+	return actual.length === expected.length && actual.every((key, i) => key === expected[i]);
+}
 function validStamped(value: Record<string, unknown>): boolean {
-	return typeof value.recordedAt === "string" && !Number.isNaN(Date.parse(value.recordedAt));
+	return (
+		typeof value.recordedAt === "string" &&
+		value.recordedAt.length <= 64 &&
+		!Number.isNaN(Date.parse(value.recordedAt))
+	);
 }
 function validAdmitted(value: Record<string, unknown>): boolean {
 	return (
+		exactKeys(value, [
+			"version",
+			"type",
+			"parentSessionId",
+			"parentSessionFile",
+			"childId",
+			"assignmentId",
+			"operationId",
+			"deliveryId",
+			"childSessionDir",
+			"requestedModel",
+			"rlmDepth",
+			"rlmMaxDepth",
+			"recordedAt",
+		]) &&
 		hasOperationIdentity(value) &&
 		typeof value.deliveryId === "string" &&
 		UUID.test(value.deliveryId) &&
 		typeof value.parentSessionFile === "string" &&
 		isAbsolute(value.parentSessionFile) &&
-		typeof value.childId === "string" &&
+		isBoundedText(value.childId, 256) &&
 		typeof value.childSessionDir === "string" &&
 		isAbsolute(value.childSessionDir) &&
-		isObject(value.requestedModel) &&
-		typeof value.requestedModel.provider === "string" &&
-		typeof value.requestedModel.modelId === "string" &&
-		Number.isInteger(value.rlmDepth) &&
-		Number.isInteger(value.rlmMaxDepth) &&
+		isValidModel(value.requestedModel) &&
+		isBoundedInteger(value.rlmDepth) &&
+		isBoundedInteger(value.rlmMaxDepth) &&
+		value.rlmDepth <= value.rlmMaxDepth &&
 		validStamped(value)
 	);
 }
 function validMaterialized(value: Record<string, unknown>): value is Record<string, string> {
 	return (
+		exactKeys(value, [
+			"version",
+			"type",
+			"parentSessionId",
+			"assignmentId",
+			"operationId",
+			"childSessionId",
+			"childSessionFile",
+			"childSessionRoot",
+			"childArtifactDir",
+			"childArtifactRoot",
+			"recordedAt",
+		]) &&
 		hasOperationIdentity(value) &&
 		typeof value.childSessionId === "string" &&
 		UUID.test(value.childSessionId) &&
-		typeof value.childSessionFile === "string" &&
-		isAbsolute(value.childSessionFile) &&
-		typeof value.childArtifactDir === "string" &&
-		isAbsolute(value.childArtifactDir) &&
+		["childSessionFile", "childSessionRoot", "childArtifactDir", "childArtifactRoot"].every(
+			(key) => typeof value[key] === "string" && isAbsolute(value[key] as string),
+		) &&
+		validStamped(value)
+	);
+}
+function validReleased(value: Record<string, unknown>): boolean {
+	return (
+		exactKeys(value, ["version", "type", "parentSessionId", "assignmentId", "operationId", "recordedAt"]) &&
+		hasOperationIdentity(value) &&
+		(value.type === "released" || value.type === "deleted") &&
 		validStamped(value)
 	);
 }
 function validTerminalRecorded(value: Record<string, unknown>): value is Record<string, string> {
 	return (
+		exactKeys(value, [
+			"version",
+			"type",
+			"parentSessionId",
+			"assignmentId",
+			"operationId",
+			"deliveryId",
+			"terminal",
+			"recordedAt",
+		]) &&
 		hasOperationIdentity(value) &&
 		typeof value.deliveryId === "string" &&
 		UUID.test(value.deliveryId) &&
@@ -1096,6 +1287,40 @@ function validOutbox(value: unknown, type: "terminal" | "received"): boolean {
 		!isObject(value) ||
 		value.version !== 1 ||
 		value.type !== type ||
+		!exactKeys(
+			value,
+			type === "terminal"
+				? [
+						"version",
+						"type",
+						"parentSessionId",
+						"parentSessionFile",
+						"childSessionId",
+						"childSessionFile",
+						"childId",
+						"assignmentId",
+						"operationId",
+						"deliveryId",
+						"terminal",
+						"message",
+						"recordedAt",
+					]
+				: [
+						"version",
+						"type",
+						"parentSessionId",
+						"parentSessionFile",
+						"childSessionId",
+						"childSessionFile",
+						"childId",
+						"assignmentId",
+						"operationId",
+						"deliveryId",
+						"terminal",
+						"message",
+						"receivedAt",
+					],
+		) ||
 		!hasOperationIdentity(value) ||
 		typeof value.deliveryId !== "string" ||
 		!UUID.test(value.deliveryId) ||
@@ -1105,7 +1330,7 @@ function validOutbox(value: unknown, type: "terminal" | "received"): boolean {
 		!UUID.test(value.childSessionId) ||
 		typeof value.childSessionFile !== "string" ||
 		!isAbsolute(value.childSessionFile) ||
-		typeof value.childId !== "string" ||
+		!isBoundedText(value.childId, 256) ||
 		typeof value.terminal !== "string" ||
 		!TERMINALS.has(value.terminal as RlmChildTerminalStatus)
 	)
@@ -1117,22 +1342,62 @@ function validOutbox(value: unknown, type: "terminal" | "received"): boolean {
 	}
 	return type === "terminal"
 		? validStamped(value)
-		: typeof value.receivedAt === "string" && !Number.isNaN(Date.parse(value.receivedAt));
+		: typeof value.receivedAt === "string" &&
+				value.receivedAt.length <= 64 &&
+				!Number.isNaN(Date.parse(value.receivedAt));
 }
 function validConsumed(value: unknown): boolean {
+	if (
+		!isObject(value) ||
+		value.version !== 1 ||
+		!hasOperationIdentity(value) ||
+		typeof value.deliveryId !== "string" ||
+		!UUID.test(value.deliveryId) ||
+		!validStamped(value)
+	)
+		return false;
+	if (value.type === "materialized")
+		return (
+			exactKeys(value, [
+				"version",
+				"type",
+				"parentSessionId",
+				"assignmentId",
+				"operationId",
+				"deliveryId",
+				"sessionMessageId",
+				"recordedAt",
+			]) &&
+			typeof value.sessionMessageId === "string" &&
+			value.sessionMessageId === `rlm-terminal-${value.deliveryId}`
+		);
+	return (
+		value.type === "discarded" &&
+		exactKeys(value, [
+			"version",
+			"type",
+			"parentSessionId",
+			"assignmentId",
+			"operationId",
+			"deliveryId",
+			"reason",
+			"recordedAt",
+		]) &&
+		(value.reason === "parent_mismatch" || value.reason === "superseded_assignment" || value.reason === "deleted")
+	);
+}
+function isBoundedText(value: unknown, maximum: number): value is string {
+	return typeof value === "string" && !!value.trim() && value.length <= maximum;
+}
+function isBoundedInteger(value: unknown): value is number {
+	return Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 1024;
+}
+function isValidModel(value: unknown): boolean {
 	return (
 		isObject(value) &&
-		value.version === 1 &&
-		(value.type === "materialized" || value.type === "discarded") &&
-		hasOperationIdentity(value) &&
-		typeof value.deliveryId === "string" &&
-		UUID.test(value.deliveryId) &&
-		validStamped(value) &&
-		(value.type !== "materialized" || typeof value.sessionMessageId === "string") &&
-		(value.type !== "discarded" ||
-			value.reason === "parent_mismatch" ||
-			value.reason === "superseded_assignment" ||
-			value.reason === "deleted")
+		exactKeys(value, ["provider", "modelId"]) &&
+		isBoundedText(value.provider, 256) &&
+		isBoundedText(value.modelId, 256)
 	);
 }
 function sameAdmitted(operation: RlmDurableOperation, record: RlmOperationAdmittedRecord): boolean {
