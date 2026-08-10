@@ -9899,7 +9899,7 @@ export class AgentSession {
 		};
 		this._activeRlmChildRuns.set(run.id, run);
 		let runningPublished = false;
-		const emitChildUpdate = () => {
+		const emitChildUpdate = (structural = false) => {
 			const isCurrent = () => {
 				const activeOwner =
 					this._activeRlmChildRuns.get(run.id) === run &&
@@ -9933,7 +9933,7 @@ export class AgentSession {
 			};
 			const terminal = run.status === "done" || run.status === "error" || run.status === "cancelled";
 			const publishSynchronously =
-				run.status === "queued" || (run.status === "running" && !runningPublished) || terminal;
+				structural || run.status === "queued" || (run.status === "running" && !runningPublished) || terminal;
 			this._queueRlmChildUpdate(event, isCurrent, publishSynchronously);
 			if (run.status === "running") runningPublished = true;
 		};
@@ -10072,7 +10072,11 @@ export class AgentSession {
 						runningToolCount = Math.max(0, runningToolCount - 1);
 						if (runningToolCount === 0) activity = { kind: "waiting" };
 						emitChildUpdate();
-					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
+					} else if (event.type === "session_info_changed") {
+						// A child rename changes its public identity. Unlike recap/progress activity,
+						// it must be visible before another macrotask can replace the snapshot.
+						emitChildUpdate(true);
+					} else if (event.type === "recap_update") {
 						emitChildUpdate();
 					}
 				});

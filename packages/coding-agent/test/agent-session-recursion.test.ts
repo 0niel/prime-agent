@@ -1697,7 +1697,7 @@ describe("AgentSession rlm recursion", () => {
 		}
 	});
 
-	it("emits updated child session names after a retained child is renamed", async () => {
+	it("emits a retained child rename before the next macrotask", async () => {
 		const root = createSession();
 		const events: unknown[] = [];
 		root.subscribe((event) => events.push(event));
@@ -1707,18 +1707,32 @@ describe("AgentSession rlm recursion", () => {
 			throw new Error("Missing child session directory");
 		}
 		const childId = basename(result.session_dir);
+		await waitFor(
+			() => root.getRlmChildRunStatus(childId) === undefined && root.getRlmChildSession(childId) !== undefined,
+		);
 		const child = root.getRlmChildSession(childId);
 		if (!child) {
 			throw new Error("Missing retained child session");
 		}
 
+		// Keep replaceable activity pending when the retained child is renamed. The
+		// rename itself is structural and must be published synchronously, rather
+		// than waiting for (or being overwritten by) the next macrotask.
+		child.setCurrentRecap("pending replaceable activity");
 		child.setSessionName("renamed-worker");
 
-		const childUpdates = events.filter(
-			(event): event is { type: "rlm_child_update"; child: { sessionName?: string } } =>
-				typeof event === "object" && event !== null && (event as { type?: string }).type === "rlm_child_update",
-		);
-		expect(childUpdates.at(-1)?.child.sessionName).toBe("renamed-worker");
+		const childUpdates = () =>
+			events.filter(
+				(event): event is { type: "rlm_child_update"; child: { sessionName?: string; recap?: string } } =>
+					typeof event === "object" && event !== null && (event as { type?: string }).type === "rlm_child_update",
+			);
+		expect(childUpdates().at(-1)?.child.sessionName).toBe("renamed-worker");
+		const updatesAtRename = childUpdates().length;
+		await sleep(0);
+		expect(childUpdates()).toHaveLength(updatesAtRename);
+		expect(childUpdates().at(-1)).toMatchObject({
+			child: { sessionName: "renamed-worker", recap: "pending replaceable activity" },
+		});
 	});
 
 	it("surfaces a child's recap on its snapshot once the summarizer sets it", async () => {
