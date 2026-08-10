@@ -12,7 +12,12 @@ import {
 	type RunningDaemonProbe,
 	shutdownConnectedDaemonAndWait,
 } from "./cli/daemon-launch.js";
-import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
+import {
+	confirmDaemonSessionLoss,
+	type DaemonSessionLossCopy,
+	pluralizeSessions,
+	promptYesNo,
+} from "./cli/daemon-stop-confirm.js";
 import {
 	acquireDaemonUpdateRestartCoordinator,
 	buildDaemonUpdateRestartReport,
@@ -36,10 +41,12 @@ import {
 	getLegacyDaemonUpdateRestartManifestPath,
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
+	NPM_REMOTE_DEPENDENCY_WARNING,
 	PACKAGE_NAME,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	type SelfUpdateCommand,
+	selfUpdateUsesRemoteDependencyAccess,
 	VERSION,
 } from "./config.js";
 import type { SessionActionRecoverySnapshot } from "./core/agent-session.js";
@@ -456,6 +463,17 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 
 	console.log(chalk.green(`${APP_NAME} is already up to date (v${VERSION})`));
 	return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: false };
+}
+
+export async function confirmNpmRemoteDependencyAccess(command: SelfUpdateCommand, force: boolean): Promise<boolean> {
+	if (!selfUpdateUsesRemoteDependencyAccess(command)) return true;
+	console.error(chalk.yellow(`Warning: ${NPM_REMOTE_DEPENDENCY_WARNING}`));
+	if (force) return true;
+	if (!process.stdin.isTTY) {
+		console.error(chalk.red("Re-run with --force to consent to npm remote dependency access."));
+		return false;
+	}
+	return promptYesNo("Continue with npm remote dependency access?");
 }
 
 async function runSelfUpdate(command: SelfUpdateCommand): Promise<void> {
@@ -1584,6 +1602,11 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 							selfUpdatePlan.installSpec,
 							selfUpdatePlan.packageName,
 						);
+						process.exitCode = 1;
+						return true;
+					}
+					if (!(await confirmNpmRemoteDependencyAccess(selfUpdateCommand, options.force))) {
+						if (process.stdin.isTTY) console.log(chalk.dim("Update cancelled."));
 						process.exitCode = 1;
 						return true;
 					}

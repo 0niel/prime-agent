@@ -2,8 +2,14 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { getSelfUpdateCommand, npmRemoteInstallArgs } from "../../../src/config.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	getSelfUpdateCommand,
+	NPM_REMOTE_DEPENDENCY_WARNING,
+	npmRemoteInstallArgs,
+	selfUpdateUsesRemoteDependencyAccess,
+} from "../../../src/config.js";
+import { confirmNpmRemoteDependencyAccess } from "../../../src/package-manager-cli.js";
 
 const packageRoot = resolve(__dirname, "../../..");
 const repoRoot = resolve(packageRoot, "../..");
@@ -79,7 +85,11 @@ describe("issue #741 npm 12 release installs", () => {
 	it("scopes remote and postinstall access to npm 12 installer invocations", () => {
 		expect(runInstallerInstall("11.17.0")).toBe("remote=\nscripts=\n");
 		expect(runInstallerInstall("12.0.2")).toBe("remote=all\nscripts=file:/tmp/prime-agent-0.7.1.tgz\n");
-		expect(installerSource).toContain("npm 12 will use allow-remote=all for this verified install only.");
+		expect(installerSource).toContain("permits unverified dependency URLs at any depth/host");
+		expect(installerSource).toContain("permits dependencies at any depth to download from any URL host");
+		expect(installerSource).toContain(
+			"Only the Prime Agent archive is checksum-verified; remote dependency archives are not.",
+		);
 	});
 
 	it("adds the npm 12 remote grant to self-update commands only", () => {
@@ -105,6 +115,30 @@ describe("issue #741 npm 12 release installs", () => {
 
 		const command = getSelfUpdateCommand("prime-agent", [npmPath, "--prefix", prefix]);
 		expect(command?.args).toEqual(["--prefix", prefix, "--allow-remote=all", "install", "-g", "prime-agent"]);
+		if (!command) throw new Error("Expected npm self-update command");
+		expect(selfUpdateUsesRemoteDependencyAccess(command)).toBe(true);
+		expect(NPM_REMOTE_DEPENDENCY_WARNING).toContain("at any depth");
+		expect(NPM_REMOTE_DEPENDENCY_WARNING).toContain("any URL host");
+		expect(NPM_REMOTE_DEPENDENCY_WARNING).toContain("does not verify those dependency archives");
+	});
+
+	it("warns and requires explicit non-TTY self-update consent", async () => {
+		const command = {
+			command: "npm",
+			args: ["--allow-remote=all", "install", "-g", "prime-agent"],
+			display: "npm --allow-remote=all install -g prime-agent",
+		};
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await expect(confirmNpmRemoteDependencyAccess(command, false)).resolves.toBe(false);
+			expect(error.mock.calls.flat().join(" ")).toContain("any URL host");
+			expect(error.mock.calls.flat().join(" ")).toContain("Re-run with --force to consent");
+			error.mockClear();
+			await expect(confirmNpmRemoteDependencyAccess(command, true)).resolves.toBe(true);
+			expect(error.mock.calls.flat().join(" ")).toContain("does not verify those dependency archives");
+		} finally {
+			error.mockRestore();
+		}
 	});
 
 	it("uses npm prefix for PATH recovery instead of the removed npm bin command", () => {

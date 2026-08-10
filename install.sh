@@ -1530,7 +1530,7 @@ confirm_install() {
 	tarball_url="$2"
 	install_detail="Downloads the verified release and runs npm install -g."
 	if prime_agent_npm_requires_remote_access; then
-		install_detail="npm 12 will use allow-remote=all for this verified install only."
+		install_detail="npm 12: allow-remote=all permits unverified dependency URLs at any depth/host."
 	fi
 
 	if prime_agent_prompt_yes_no \
@@ -1545,7 +1545,7 @@ confirm_install() {
 	if [ "$prompt_status" -eq 2 ]; then
 		printf 'This will download, verify, and install:\n\n  %s\n\n' "$tarball_url"
 		if prime_agent_npm_requires_remote_access; then
-			printf 'npm 12 will use allow-remote=all for this verified install only.\n'
+			printf 'npm 12 requires allow-remote=all, which permits dependencies at any depth to download from any URL host. Only the Prime Agent archive is checksum-verified; remote dependency archives are not.\n'
 		fi
 		printf 'No terminal detected; continuing without confirmation.\n'
 		return 0

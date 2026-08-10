@@ -36,6 +36,8 @@ export const isBunRuntime = !!process.versions.bun;
 
 export const SELF_UPDATE_INTERACTIVE_CHILD_ENV = "PRIME_AGENT_INTERACTIVE_SELF_UPDATE";
 export const SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE = 75;
+export const NPM_REMOTE_DEPENDENCY_WARNING =
+	"npm 12 requires allow-remote=all, which permits dependencies at any depth to download from any URL host. npm does not verify those dependency archives against Prime Agent release checksums.";
 
 // =============================================================================
 // Install Method Detection
@@ -51,6 +53,10 @@ interface SelfUpdateCommandStep {
 
 export interface SelfUpdateCommand extends SelfUpdateCommandStep {
 	steps?: SelfUpdateCommandStep[];
+}
+
+export function selfUpdateUsesRemoteDependencyAccess(command: SelfUpdateCommand): boolean {
+	return (command.steps ?? [command]).some((step) => step.args.includes("--allow-remote=all"));
 }
 
 function makeSelfUpdateCommand(
