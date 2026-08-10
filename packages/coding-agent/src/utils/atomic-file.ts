@@ -29,8 +29,8 @@ interface FileMetadata {
 export function resolveManagedFilePathSync(path: string, label: string): string {
 	try {
 		const stats = lstatSync(path);
-		if (stats.isSymbolicLink()) throw new Error(`Refusing ${label} symlink: ${path}`);
-		if (!stats.isFile()) throw new Error(`Refusing non-file ${label} path: ${path}`);
+		if (stats.isSymbolicLink()) throw new Error(`Refusing ${label} symlink: non-regular private file: ${path}`);
+		if (!stats.isFile()) throw new Error(`Refusing non-file ${label} path: non-regular private file: ${path}`);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}

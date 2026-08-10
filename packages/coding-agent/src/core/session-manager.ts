@@ -7,6 +7,7 @@ import {
 	appendFileSync,
 	closeSync,
 	existsSync,
+	fchmodSync,
 	fstatSync,
 	fsyncSync,
 	ftruncateSync,
@@ -1914,7 +1915,7 @@ export class SessionManager {
 		if (currentRevision !== undefined && !sessionFileRevisionsEqual(currentRevision, this.fileRevision)) {
 			throw new Error(`Session file changed before rewrite: ${targetPath}`);
 		}
-		writeFileAtomicallySync(targetPath, content, { createMode: 0o600 });
+		writeFileAtomicallySync(targetPath, content, { mode: 0o600 });
 		this.fileRevision = getSessionFileRevision(targetPath);
 	}
 
@@ -1930,6 +1931,7 @@ export class SessionManager {
 		const fd = openSync(targetPath, "r+");
 		let recovery: UnterminatedSessionTail | undefined;
 		try {
+			if (process.platform !== "win32") fchmodSync(fd, 0o600);
 			recovery = inspectUnterminatedSessionTailFd(fd);
 			if (recovery) sessionTailInspectionHook?.(targetPath);
 			if (!recovery) {
