@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import secrets
+import subprocess
 import time
 import unicodedata
 from dataclasses import asdict, dataclass, field, fields
@@ -182,6 +183,7 @@ class HarnessRecoveryRequired(RuntimeError):
 
 
 _MAX_SAFE_INTEGER = 9_007_199_254_740_991
+_RFC3339_MILLIS_Z = __import__("re").compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
 
 
 def _pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -237,6 +239,33 @@ def _safe_integer(value: Any, *, positive: bool = False) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_SAFE_INTEGER and (not positive or value > 0)
 
 
+def _validate_json(value: Any) -> None:
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        if value != unicodedata.normalize("NFC", value):
+            raise ValueError("non_nfc")
+        return
+    if isinstance(value, int) and not isinstance(value, bool):
+        if not _safe_integer(value):
+            raise ValueError("unsafe_number")
+        return
+    if isinstance(value, list):
+        for child in value:
+            _validate_json(child)
+        return
+    if not _plain_object(value):
+        raise ValueError("invalid_json_value")
+    for key, child in value.items():
+        if key != unicodedata.normalize("NFC", key):
+            raise ValueError("non_nfc")
+        _validate_json(child)
+
+
+def _nfc_text(value: Any) -> bool:
+    return isinstance(value, str) and value == unicodedata.normalize("NFC", value)
+
+
 def _validate_v2(data: Any, scope: HarnessScope) -> None:
     if not _plain_object(data) or set(data) != {"schema", "generation", "entries", "refinements"}:
         raise ValueError("invalid_shape")
@@ -256,18 +285,22 @@ def _validate_v2(data: Any, scope: HarnessScope) -> None:
             required = {"id", "kind", "title", "content", "path", "scope", "reference", "arguments", "metadata", "source", "created_at", "updated_at", "version"}
             if set(entry) != required or entry.get("id") != entry_id or entry.get("kind") != kind:
                 raise ValueError("invalid_shape")
-            if any(not isinstance(entry[field], str) for field in ("id", "kind", "title", "content", "path", "scope", "source", "created_at", "updated_at")):
+            if any(not _nfc_text(entry[field]) for field in ("id", "kind", "title", "content", "path", "scope", "source", "created_at", "updated_at")):
+                raise ValueError("invalid_shape")
+            if not _RFC3339_MILLIS_Z.fullmatch(entry["created_at"]) or not _RFC3339_MILLIS_Z.fullmatch(entry["updated_at"]):
                 raise ValueError("invalid_shape")
             if entry["scope"] not in ("local", "global") or not _safe_integer(entry["version"], positive=True):
                 raise ValueError("invalid_shape")
             if not all(_plain_object(entry[field]) for field in ("reference", "arguments", "metadata")):
                 raise ValueError("invalid_shape")
+            for field in ("reference", "arguments", "metadata"):
+                _validate_json(entry[field])
             if kind == "skill":
                 _validate_python_skill_reference(entry["reference"])
     for event in data["refinements"]:
         if not _plain_object(event) or set(event) != {"id", "trigger", "changes", "evidence", "outcome", "created_at"}:
             raise ValueError("invalid_shape")
-        if any(not isinstance(event[field], str) for field in ("id", "trigger", "evidence", "outcome", "created_at")) or not isinstance(event["changes"], list) or not all(isinstance(x, str) for x in event["changes"]) or event["id"] in seen_events:
+        if any(not _nfc_text(event[field]) for field in ("id", "trigger", "evidence", "outcome", "created_at")) or not _RFC3339_MILLIS_Z.fullmatch(event["created_at"]) or not isinstance(event["changes"], list) or not all(_nfc_text(x) for x in event["changes"]) or event["id"] in seen_events:
             raise ValueError("invalid_shape")
         seen_events.add(event["id"])
 
@@ -320,31 +353,125 @@ def _legacy_data(raw: bytes, scope: HarnessScope) -> dict[str, Any]:
     return {"schema": 1, "entries": entries, "refinements": refinements}
 
 
+def _process_start(pid: int) -> str | None:
+    """Linux process start ticks are a PID-reuse fence shared with Node."""
+    try:
+        # field 22 follows the final ')' in /proc/<pid>/stat; it is stable for
+        # a process lifetime and avoids treating a recycled PID as our owner.
+        return Path(f"/proc/{pid}/stat").read_text("utf-8").rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        pass
+    try:
+        # macOS has no /proc. `ps lstart` is stable for a process lifetime and
+        # is deliberately the exact fallback used by the Node writer.
+        value = subprocess.check_output(["ps", "-o", "lstart=", "-p", str(pid)], text=True, stderr=subprocess.DEVNULL).strip()
+        return value or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _lock_owner(raw: bytes) -> dict[str, Any] | None:
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs_no_duplicates)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(value, dict) or set(value) != {"nonce", "pid", "process_start", "created_at"}:
+        return None
+    if not isinstance(value["nonce"], str) or len(value["nonce"]) != 32 or any(ch not in "0123456789abcdef" for ch in value["nonce"]):
+        return None
+    if not _safe_integer(value["pid"], positive=True) or not isinstance(value["process_start"], str) or not value["process_start"] or not isinstance(value["created_at"], str):
+        return None
+    return value
+
+
 class _Lease:
+    """The shared P.lock protocol.  Unknown and unreadable owners fail closed."""
     def __init__(self, state_path: Path):
         self.path = Path(f"{state_path}.lock")
         self.nonce = secrets.token_hex(16)
+        self.owner: dict[str, Any] | None = None
+
     def __enter__(self) -> "_Lease":
+        start = _process_start(os.getpid())
+        if start is None:
+            raise HarnessAtomicWriteUnsupported("process-start identity unavailable")
+        self.owner = {"nonce": self.nonce, "pid": os.getpid(), "process_start": start, "created_at": _now()}
+        payload = _canonical_lock_bytes(self.owner)
         deadline = time.monotonic() + 2.0
-        payload = json.dumps({"nonce": self.nonce, "pid": os.getpid(), "created_at": _now()}, separators=(",", ":")).encode()
         while True:
             try:
                 fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 try:
-                    os.write(fd, payload); os.fsync(fd)
-                finally: os.close(fd)
+                    _write_all(fd, payload)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                if (self.path.stat().st_mode & 0o777) != 0o600:
+                    raise HarnessAtomicWriteUnsupported("owner-only lease unavailable")
                 return self
             except FileExistsError:
-                # We intentionally do not steal an unverified owner: cross-runtime
-                # correctness beats availability if PID-start identity is unavailable.
-                if time.monotonic() >= deadline: raise HarnessLockBusy("harness state lease is busy")
-                time.sleep(0.025)
+                try:
+                    raw = self.path.read_bytes()
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise HarnessLockBusy("harness state lease is busy")
+                    time.sleep(0.025)
+                    continue
+                owner = _lock_owner(raw)
+                if owner is None:
+                    raise HarnessLockBusy("harness state lease is busy")
+                actual_start = _process_start(owner["pid"])
+                if actual_start is not None:
+                    if actual_start == owner["process_start"]:
+                        if time.monotonic() >= deadline:
+                            raise HarnessLockBusy("harness state lease is busy")
+                        time.sleep(0.025)
+                        continue
+                    # PID exists with a different start identity: verified dead owner.
+                    try:
+                        if self.path.read_bytes() == raw:
+                            self.path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                # /proc absent is only proof of death if kill explicitly says ESRCH.
+                try:
+                    os.kill(owner["pid"], 0)
+                except ProcessLookupError:
+                    try:
+                        if self.path.read_bytes() == raw:
+                            self.path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                except OSError:
+                    pass
+                raise HarnessLockBusy("harness state lease is busy")
+            except OSError as exc:
+                raise HarnessAtomicWriteUnsupported("exclusive lease unavailable") from exc
+
     def __exit__(self, *exc: Any) -> None:
+        # Exact nonce ownership only. Failure to release must not delete a new owner.
         try:
-            if self.path.exists() and self.nonce in self.path.read_text("utf-8", errors="ignore"):
+            owner = _lock_owner(self.path.read_bytes())
+            if owner is not None and owner["nonce"] == self.nonce:
                 self.path.unlink()
         except OSError:
             pass
+
+
+def _canonical_lock_bytes(owner: dict[str, Any]) -> bytes:
+    # Same parsed wire fields and compact UTF-8 representation as Node.
+    return json.dumps(owner, ensure_ascii=False, separators=(",", ":"), sort_keys=False).encode("utf-8") + b"\n"
+
+
+def _write_all(fd: int, raw: bytes) -> None:
+    view = memoryview(raw)
+    while view:
+        count = os.write(fd, view)
+        if count <= 0:
+            raise OSError("short write")
+        view = view[count:]
 
 class HarnessState:
     """CRUD store for reset-free harness refinement state."""
@@ -412,12 +539,12 @@ class HarnessState:
         assert self.file_path is not None
         try:
             fd = os.open(self.file_path.parent, os.O_RDONLY)
-            try: os.fsync(fd)
-            finally: os.close(fd)
-        except (OSError, AttributeError):
-            # Directory fsync is not available on every qualified platform. The
-            # file has already been fsynced and replace is still atomic on POSIX.
-            pass
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except (OSError, AttributeError) as exc:
+            raise HarnessAtomicWriteUnsupported("directory fsync unavailable") from exc
 
     def _atomic_write_locked(self, data: dict[str, Any]) -> HarnessSnapshot:
         assert self.file_path is not None
@@ -487,8 +614,10 @@ class HarnessState:
         self.file_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(self.file_path.parent, 0o700)
-        except OSError:
-            pass
+            if (self.file_path.parent.stat().st_mode & 0o777) != 0o700:
+                raise OSError("owner-only root unavailable")
+        except OSError as exc:
+            raise HarnessAtomicWriteUnsupported("owner-only harness root unavailable") from exc
         with _Lease(self.file_path):
             try:
                 data, snapshot, legacy = self._read_disk()
@@ -506,6 +635,12 @@ class HarnessState:
             return self._snapshot
         expected = self._snapshot if expected is None else expected
         self.file_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(self.file_path.parent, 0o700)
+            if (self.file_path.parent.stat().st_mode & 0o777) != 0o700:
+                raise OSError("owner-only root unavailable")
+        except OSError as exc:
+            raise HarnessAtomicWriteUnsupported("owner-only harness root unavailable") from exc
         with _Lease(self.file_path):
             try:
                 _, actual, _ = self._read_disk()
@@ -514,6 +649,7 @@ class HarnessState:
             if actual != expected:
                 raise HarnessGenerationConflict(expected, actual)
             candidate = self._current_data(actual.generation + 1)
+            _validate_v2(candidate, self.scope)
             snapshot = self._atomic_write_locked(candidate)
         self._install_data(candidate, snapshot)
         self._legacy = False
@@ -535,9 +671,11 @@ class HarnessState:
     ) -> HarnessEntry:
         id, global_ = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
+            # A proxy routed to a separately cached global handle did not form a
+            # candidate yet; refresh that handle before beginning its operation.
+            target._sync_from_disk()
             return target.upsert(kind, title, content, id=id, path=path, reference=reference, arguments=arguments, metadata=metadata, source=source)
         self._ensure_local_writable()
-        self._sync_from_disk()
         return self._upsert(kind, title, content, id=id, path=path, reference=reference, arguments=arguments, metadata=metadata, source=source)
 
     def _candidate(self) -> "HarnessState":
@@ -593,9 +731,9 @@ class HarnessState:
     def delete(self, kind: HarnessKind, id: str, *, global_: bool = False, **kwargs: Any) -> bool:
         id, global_ = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
+            target._sync_from_disk()
             return target.delete(kind, id)
         self._ensure_local_writable()
-        self._sync_from_disk()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         if id not in self.entries[kind]:
@@ -634,6 +772,7 @@ class HarnessState:
     ) -> HarnessEntry:
         id, global_ = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
+            target._sync_from_disk()
             return target.create(
                 kind,
                 title,
@@ -646,7 +785,6 @@ class HarnessState:
                 source=source,
             )
         self._ensure_local_writable()
-        self._sync_from_disk()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         entry_id = id or _slug(title, kind)
@@ -868,9 +1006,9 @@ class HarnessState:
         **kwargs: Any,
     ) -> RefinementEvent:
         if target := self._global_target(global_, kwargs):
+            target._sync_from_disk()
             return target.record_refinement(trigger, changes, evidence=evidence, outcome=outcome, id=id)
         self._ensure_local_writable()
-        self._sync_from_disk()
         event_id = id or f"refine_{len(self.refinements) + 1:04d}"
         normalized_changes = [changes] if isinstance(changes, str) else list(changes)
         event = RefinementEvent(

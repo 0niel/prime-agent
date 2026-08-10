@@ -10,7 +10,7 @@ from pathlib import Path
 
 from rlm import harness as package_harness
 from rlm import rlm as callable_rlm
-from rlm.harness import HarnessEntry, HarnessState, get_harness_state
+from rlm.harness import HarnessEntry, HarnessGenerationConflict, HarnessState, get_harness_state
 
 PYTHON_REFERENCE = {
     "type": "python",
@@ -446,10 +446,12 @@ class HarnessStateTest(unittest.TestCase):
             future = state_path.stat().st_mtime + 5
             os.utime(state_path, (future, future))
 
-            # create() must observe the external entry and honor create-or-fail.
-            with self.assertRaisesRegex(ValueError, "already exists"):
+            # A stale candidate must receive a typed CAS conflict rather than
+            # silently reload/replay and claim a different operation succeeded.
+            with self.assertRaises(HarnessGenerationConflict):
                 state.create_memory("Local", "Should not overwrite.", id="dup")
-            self.assertEqual(state.get("memory", "dup").content, "Written elsewhere.")
+            self.assertIsNone(state.entries["memory"].get("dup"))
+            self.assertEqual(HarnessState(state_path).get("memory", "dup").content, "Written elsewhere.")
 
     def test_explicit_create_and_update_enforce_entry_existence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

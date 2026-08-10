@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	appendFileSync,
@@ -11,6 +12,7 @@ import {
 	writeFileSync,
 	fsyncSync,
 	closeSync,
+	chmodSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -288,6 +290,15 @@ export interface HarnessSnapshot {
 	sha256: string;
 }
 
+/** A loaded root and the exact durable snapshot used as its CAS fence. */
+export interface LoadedHarnessState extends HarnessState {
+	/** The explicit state view; aliases this object for source compatibility. */
+	state: HarnessState;
+	snapshot: HarnessSnapshot;
+	recovered: boolean;
+	recovery?: string;
+}
+
 export class HarnessGenerationConflict extends Error {
 	constructor(public readonly expected: HarnessSnapshot, public readonly actual: HarnessSnapshot) {
 		super("harness state changed while this operation was in progress");
@@ -297,110 +308,173 @@ export class HarnessLockBusy extends Error {}
 export class HarnessAtomicWriteUnsupported extends Error {}
 export class HarnessRecoveryRequired extends Error {}
 
-function canonicalize(value: unknown): unknown {
-	if (typeof value === "string") return value.normalize("NFC");
-	if (Array.isArray(value)) return value.map(canonicalize);
-	if (value && typeof value === "object") {
-		const result: Record<string, unknown> = {};
-		for (const key of Object.keys(value as Record<string, unknown>).sort()) result[key.normalize("NFC")] = canonicalize((value as Record<string, unknown>)[key]);
-		return result;
+const MAX_SAFE_INTEGER = 9_007_199_254_740_991;
+const V2_KEYS = ["entries", "generation", "refinements", "schema"];
+const ENTRY_KEYS = ["arguments", "content", "created_at", "id", "kind", "metadata", "path", "reference", "scope", "source", "title", "updated_at", "version"];
+const EVENT_KEYS = ["changes", "created_at", "evidence", "id", "outcome", "trigger"];
+const ISO_MILLIS_Z = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/;
+
+function scalarCompare(left: string, right: string): number {
+	const a = Array.from(left); const b = Array.from(right);
+	for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+		const delta = a[index].codePointAt(0)! - b[index].codePointAt(0)!;
+		if (delta) return delta;
 	}
-	if (typeof value === "number" && (!Number.isSafeInteger(value) || Object.is(value, -0))) throw new Error("invalid numeric value");
-	if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
-	throw new Error("invalid JSON value");
+	return a.length - b.length;
 }
-function canonicalBytes(state: HarnessState): Buffer {
-	return Buffer.from(`${JSON.stringify(canonicalize(state))}\n`, "utf8");
+function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
+	const actual = Object.keys(value).sort(scalarCompare);
+	const expected = [...keys].sort(scalarCompare);
+	return actual.length === expected.length && actual.every((key, i) => key === expected[i]);
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+function nfcString(value: unknown): value is string {
+	return typeof value === "string" && value === value.normalize("NFC") && !/[\uD800-\uDFFF]/.test(value);
+}
+function safeInteger(value: unknown, positive = false): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && !Object.is(value, -0) && value >= (positive ? 1 : 0) && value <= MAX_SAFE_INTEGER;
+}
+function validateJson(value: unknown): void {
+	if (value === null || typeof value === "boolean") return;
+	if (typeof value === "string") { if (!nfcString(value)) throw new Error("non_nfc"); return; }
+	if (typeof value === "number") { if (!safeInteger(value)) throw new Error("invalid_number"); return; }
+	if (Array.isArray(value)) { value.forEach(validateJson); return; }
+	if (!isRecord(value)) throw new Error("invalid_json_value");
+	for (const [key, child] of Object.entries(value)) { if (!nfcString(key)) throw new Error("non_nfc"); validateJson(child); }
+}
+function canonicalBytes(value: HarnessState): Buffer {
+	validateJson(value);
+	const order = (item: unknown): unknown => {
+		if (Array.isArray(item)) return item.map(order);
+		if (isRecord(item)) {
+			const result: Record<string, unknown> = {};
+			for (const key of Object.keys(item).sort(scalarCompare)) result[key] = order(item[key]);
+			return result;
+		}
+		return item;
+	};
+	return Buffer.from(`${JSON.stringify(order(value))}\n`, "utf8");
 }
 function snapshotFor(state: HarnessState): HarnessSnapshot {
 	const bytes = canonicalBytes(state);
 	return { generation: state.generation, sha256: createHash("sha256").update(bytes).digest("hex") };
 }
-function validV2(state: unknown): state is HarnessState {
-	if (!state || typeof state !== "object" || Array.isArray(state)) return false;
-	const record = state as Record<string, unknown>;
-	if (Object.keys(record).sort().join(",") !== "entries,generation,refinements,schema" || record.schema !== 2 || !Number.isSafeInteger(record.generation) || (record.generation as number) < 0 || !record.entries || typeof record.entries !== "object" || Array.isArray(record.entries) || !Array.isArray(record.refinements)) return false;
-	const entries = record.entries as Record<string, unknown>;
-	return Object.keys(entries).sort().join(",") === "memory,prompt,skill,subagent" && Object.values(entries).every((x) => x && typeof x === "object" && !Array.isArray(x));
+function timestamp(value: unknown): boolean { return nfcString(value) && ISO_MILLIS_Z.test(value); }
+function validateSkill(reference: Record<string, unknown>): void {
+	if (reference.type !== "python" || !(nfcString(reference.import) || nfcString(reference.python_import)) || !(nfcString(reference.callable) || nfcString(reference.call_pattern))) throw new Error("invalid_skill_reference");
 }
-function legacyState(raw: unknown, scope: HarnessScope): HarnessState | undefined {
-	if (!raw || typeof raw !== "object" || Array.isArray(raw) || ((raw as { schema?: unknown }).schema !== undefined && (raw as { schema?: unknown }).schema !== 1)) return undefined;
-	const legacy = raw as Partial<HarnessState>; const state = emptyHarnessState(); state.schema = 1; state.generation = 0;
-	for (const kind of Object.keys(state.entries) as RefinementKind[]) {
-		const records = legacy.entries?.[kind];
-		if (records && typeof records === "object") for (const [id, entry] of Object.entries(records)) {
-			const value = objectRecord(entry); if (!value || typeof value.title !== "string" || typeof value.content !== "string") continue;
-			state.entries[kind][id] = { id, kind, title: value.title, content: value.content, path: typeof value.path === "string" ? value.path : "general", scope: normalizeHarnessScope(value.scope, scope), reference: objectRecord(value.reference) ?? {}, arguments: objectRecord(value.arguments) ?? {}, metadata: objectRecord(value.metadata) ?? {}, source: typeof value.source === "string" ? value.source : "agent", created_at: typeof value.created_at === "string" ? value.created_at : now(), updated_at: typeof value.updated_at === "string" ? value.updated_at : now(), version: typeof value.version === "number" && Number.isSafeInteger(value.version) && value.version > 0 ? value.version : 1 };
+function validateV2(data: unknown): asserts data is HarnessState {
+	if (!isRecord(data) || !exactKeys(data, V2_KEYS) || data.schema !== 2 || !safeInteger(data.generation) || !isRecord(data.entries) || !exactKeys(data.entries, ["prompt", "memory", "skill", "subagent"]) || !Array.isArray(data.refinements)) throw new Error("invalid_shape");
+	const ids = new Set<string>();
+	for (const kind of ["prompt", "memory", "skill", "subagent"] as RefinementKind[]) {
+		const records = data.entries[kind];
+		if (!isRecord(records)) throw new Error("invalid_shape");
+		for (const [id, raw] of Object.entries(records)) {
+			if (!nfcString(id) || !id || ids.has(id) || !isRecord(raw) || !exactKeys(raw, ENTRY_KEYS) || raw.id !== id || raw.kind !== kind || !nfcString(raw.title) || !nfcString(raw.content) || !nfcString(raw.path) || !nfcString(raw.source) || !timestamp(raw.created_at) || !timestamp(raw.updated_at) || (raw.scope !== "local" && raw.scope !== "global") || !safeInteger(raw.version, true) || !isRecord(raw.reference) || !isRecord(raw.arguments) || !isRecord(raw.metadata)) throw new Error("invalid_entry");
+			validateJson(raw.reference); validateJson(raw.arguments); validateJson(raw.metadata);
+			if (kind === "skill") validateSkill(raw.reference);
+			ids.add(id);
 		}
 	}
-	state.refinements = Array.isArray(legacy.refinements) ? legacy.refinements as HarnessRefinementEvent[] : [];
-	return state;
+	const refinementIds = new Set<string>();
+	for (const event of data.refinements) {
+		if (!isRecord(event) || !exactKeys(event, EVENT_KEYS) || !nfcString(event.id) || !event.id || refinementIds.has(event.id) || !nfcString(event.trigger) || !nfcString(event.evidence) || !nfcString(event.outcome) || !timestamp(event.created_at) || !Array.isArray(event.changes) || !event.changes.every(nfcString)) throw new Error("invalid_refinement");
+		refinementIds.add(event.id);
+	}
+}
+
+/* JSON.parse intentionally cannot expose duplicate keys. This tiny scanner does,
+ * before JSON.parse gives the value a chance to erase that evidence. */
+function rejectDuplicateKeys(text: string): void {
+	let i = 0;
+	const ws = () => { while (/\s/.test(text[i] ?? "")) i += 1; };
+	const string = (): string => {
+		const start = i; if (text[i++] !== '"') throw new Error("invalid_json");
+		let escaped = false;
+		while (i < text.length) { const char = text[i++]; if (!escaped && char === '"') return JSON.parse(text.slice(start, i)); if (!escaped && char === "\\") escaped = true; else escaped = false; }
+		throw new Error("invalid_json");
+	};
+	const value = (): void => { ws(); const char = text[i]; if (char === "{") { object(); return; } if (char === "[") { i += 1; ws(); if (text[i] === "]") { i += 1; return; } while (true) { value(); ws(); if (text[i] === "]") { i += 1; return; } if (text[i++] !== ",") throw new Error("invalid_json"); } } if (char === '"') { string(); return; } const match = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(text.slice(i)); if (!match) throw new Error("invalid_json"); i += match[0].length; };
+	const object = (): void => { i += 1; ws(); const seen = new Set<string>(); if (text[i] === "}") { i += 1; return; } while (true) { ws(); const key = string(); if (seen.has(key)) throw new Error("duplicate_key"); seen.add(key); ws(); if (text[i++] !== ":") throw new Error("invalid_json"); value(); ws(); if (text[i] === "}") { i += 1; return; } if (text[i++] !== ",") throw new Error("invalid_json"); } };
+	value(); ws(); if (i !== text.length) throw new Error("invalid_json");
+}
+function parseV2(raw: Buffer): { state: HarnessState; snapshot: HarnessSnapshot } {
+	let text: string; try { text = new TextDecoder("utf-8", { fatal: true }).decode(raw); } catch { throw new Error("invalid_utf8"); }
+	try { rejectDuplicateKeys(text); } catch (error) { throw error; }
+	let parsed: unknown; try { parsed = JSON.parse(text); } catch { throw new Error("invalid_json"); }
+	validateV2(parsed);
+	if (!raw.equals(canonicalBytes(parsed))) throw new Error("noncanonical_v2");
+	return { state: parsed, snapshot: { generation: parsed.generation, sha256: createHash("sha256").update(raw).digest("hex") } };
+}
+function legacyState(raw: Buffer, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot } | undefined {
+	let parsed: any; try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)); } catch { return undefined; }
+	if (!isRecord(parsed) || (parsed.schema !== undefined && parsed.schema !== 1)) return undefined;
+	const state = emptyHarnessState(); state.schema = 1; state.generation = 0;
+	for (const kind of ["prompt", "memory", "skill", "subagent"] as RefinementKind[]) {
+		const records = isRecord(parsed.entries) && isRecord(parsed.entries[kind]) ? parsed.entries[kind] : {};
+		for (const [id, value] of Object.entries(records)) if (isRecord(value) && typeof value.title === "string" && typeof value.content === "string") state.entries[kind][id] = { id, kind, title: value.title, content: value.content, path: typeof value.path === "string" ? value.path : "general", scope: value.scope === "global" ? "global" : scope, reference: isRecord(value.reference) ? value.reference : {}, arguments: isRecord(value.arguments) ? value.arguments : {}, metadata: isRecord(value.metadata) ? value.metadata : {}, source: typeof value.source === "string" ? value.source : "agent", created_at: typeof value.created_at === "string" ? value.created_at : now(), updated_at: typeof value.updated_at === "string" ? value.updated_at : now(), version: safeInteger(value.version, true) ? value.version : 1 };
+	}
+	state.refinements = Array.isArray(parsed.refinements) ? parsed.refinements.filter(isRecord).map((event: any) => ({ id: typeof event.id === "string" ? event.id : randomUUID(), trigger: typeof event.trigger === "string" ? event.trigger : "", changes: Array.isArray(event.changes) ? event.changes.filter((item: unknown): item is string => typeof item === "string") : [], evidence: typeof event.evidence === "string" ? event.evidence : "", outcome: typeof event.outcome === "string" ? event.outcome : "", created_at: typeof event.created_at === "string" ? event.created_at : now() })) : [];
+	return { state, snapshot: { generation: 0, sha256: createHash("sha256").update(raw).digest("hex") } };
 }
 function readState(path: string, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot; legacy: boolean } {
 	if (!existsSync(path)) { const state = emptyHarnessState(); return { state, snapshot: snapshotFor(state), legacy: false }; }
-	const bytes = readFileSync(path); let raw: unknown;
-	try { raw = JSON.parse(bytes.toString("utf8")); } catch { throw new HarnessRecoveryRequired("invalid harness state requires recovery"); }
-	if (validV2(raw)) { const state = raw; if (!bytes.equals(canonicalBytes(state))) throw new HarnessRecoveryRequired("noncanonical harness state requires recovery"); return { state, snapshot: snapshotFor(state), legacy: false }; }
-	const legacy = legacyState(raw, scope); if (legacy) return { state: legacy, snapshot: { generation: 0, sha256: createHash("sha256").update(bytes).digest("hex") }, legacy: true };
-	throw new HarnessRecoveryRequired("invalid harness state requires recovery");
+	const raw = readFileSync(path);
+	try { const decoded = parseV2(raw); return { ...decoded, legacy: false }; } catch (error) { const legacy = legacyState(raw, scope); if (legacy) return { ...legacy, legacy: true }; throw error; }
 }
-
-function recoverState(path: string, scope: HarnessScope): { state: HarnessState; snapshot: HarnessSnapshot } {
-	try { return readState(path, scope); } catch (error) {
-		if (!existsSync(path)) throw error;
-		const raw = readFileSync(path); const dir = join(path, "..");
-		const recovery = join(dir, `harness_state.corrupt.${Date.now()}.${randomUUID()}.${error instanceof HarnessRecoveryRequired && raw.toString("utf8").includes("�") ? "bin" : "json"}`);
-		try { writeFileSync(recovery, raw, { mode: 0o600 }); const fd = openSync(recovery, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } } catch { throw new HarnessRecoveryRequired("unable to preserve corrupt harness state"); }
-		const state = emptyHarnessState(); state.generation = 1; const bytes = canonicalBytes(state); const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-		try { const fd = openSync(temp, "wx", 0o600); try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); } renameSync(temp, path); return { state, snapshot: snapshotFor(state) }; }
-		finally { if (existsSync(temp)) unlinkSync(temp); }
-	}
+function processStart(pid: number): string | undefined {
+	try { return readFileSync(`/proc/${pid}/stat`, "utf8").trim().split(") ")[1]?.split(" ")[19]; } catch { /* macOS has no /proc */ }
+	try { const value = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); return value || undefined; } catch { return undefined; }
 }
-
-/** Read canonical v2 state (or the one legacy schema-1 compatibility input). */
-export function loadHarnessState(harnessStateDir: string = getGlobalHarnessStateDir(), scope: HarnessScope = "global"): HarnessState {
-	return recoverState(getHarnessStatePath(harnessStateDir), scope).state;
+function ensureRoot(dir: string): void {
+	try { mkdirSync(dir, { recursive: true, mode: 0o700 }); const mode = statSync(dir).mode & 0o777; if (mode !== 0o700) { chmodSync(dir, 0o700); if ((statSync(dir).mode & 0o777) !== 0o700) throw new Error("mode"); } } catch (error) { throw new HarnessAtomicWriteUnsupported("owner-only harness root unavailable"); }
 }
-
+interface LockOwner { nonce: string; pid: number; process_start: string; created_at: string; }
+function parseLock(bytes: Buffer): LockOwner | undefined { try { const raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); return isRecord(raw) && exactKeys(raw, ["nonce", "pid", "process_start", "created_at"]) && nfcString(raw.nonce) && /^[0-9a-f]{32}$/.test(raw.nonce) && safeInteger(raw.pid, true) && nfcString(raw.process_start) && timestamp(raw.created_at) ? raw as LockOwner : undefined; } catch { return undefined; } }
+function lockBytes(owner: LockOwner): Buffer { return Buffer.from(`{"nonce":"${owner.nonce}","pid":${owner.pid},"process_start":${JSON.stringify(owner.process_start)},"created_at":"${owner.created_at}"}\n`, "utf8"); }
 function withHarnessLease<T>(path: string, operation: () => T): T {
-	const lock = `${path}.lock`;
-	const nonce = randomUUID();
-	const deadline = Date.now() + 2_000;
-	while (true) {
-		try {
-			const fd = openSync(lock, "wx", 0o600);
-			try { writeFileSync(fd, JSON.stringify({ nonce, pid: process.pid, created_at: now() })); fsyncSync(fd); } finally { closeSync(fd); }
-			break;
-		} catch (error) {
-			if (Date.now() >= deadline) throw new HarnessLockBusy("harness state lease is busy");
-			// The portable cross-runtime protocol never steals an owner whose liveness
-			// cannot be proven. Yielding here is strictly per-state-file persistence.
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-		}
+	const lock = `${path}.lock`; const nonce = randomUUID().replaceAll("-", ""); const start = processStart(process.pid); if (!start) throw new HarnessAtomicWriteUnsupported("process-start identity unavailable"); const owner: LockOwner = { nonce, pid: process.pid, process_start: start, created_at: now() }; const deadline = Date.now() + 2_000;
+	while (true) try { const fd = openSync(lock, "wx", 0o600); try { writeFileSync(fd, lockBytes(owner)); fsyncSync(fd); } finally { closeSync(fd); } break; } catch (error: any) {
+		if (error?.code !== "EEXIST") throw new HarnessAtomicWriteUnsupported("exclusive lease unavailable");
+		let bytes: Buffer; try { bytes = readFileSync(lock); } catch { if (Date.now() >= deadline) throw new HarnessLockBusy("harness state lease is busy"); continue; }
+		const other = parseLock(bytes); if (!other) throw new HarnessLockBusy("harness state lease is busy"); const otherStart = processStart(other.pid);
+		if (otherStart && otherStart === other.process_start) { if (Date.now() >= deadline) throw new HarnessLockBusy("harness state lease is busy"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20); continue; }
+		if (otherStart) { try { if (readFileSync(lock).equals(bytes)) unlinkSync(lock); } catch { /* race: retry bounded */ } continue; }
+		try { process.kill(other.pid, 0); } catch (check: any) { if (check?.code === "ESRCH") { try { if (readFileSync(lock).equals(bytes)) unlinkSync(lock); } catch { /* race */ } continue; } }
+		throw new HarnessLockBusy("harness state lease is busy");
 	}
-	try { return operation(); }
-	finally {
-		try { if (readFileSync(lock, "utf8").includes(nonce)) unlinkSync(lock); } catch { /* leave unowned evidence */ }
-	}
+	try { return operation(); } finally { try { const bytes = readFileSync(lock); if (parseLock(bytes)?.nonce === nonce) unlinkSync(lock); } catch { /* never delete another owner */ } }
 }
-
-export function saveHarnessState(harnessStateDir: string, state: HarnessState, expected?: HarnessSnapshot): string {
-	const path = getHarnessStatePath(harnessStateDir);
+function writeAtomic(path: string, candidate: HarnessState, scope: HarnessScope): HarnessSnapshot {
+	const bytes = canonicalBytes(candidate); const dir = join(path, ".."); const temp = join(dir, `.${"harness_state.json"}.${process.pid}.${randomUUID().replaceAll("-", "")}.tmp`);
+	try { const fd = openSync(temp, "wx", 0o600); try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); } if ((statSync(temp).mode & 0o777) !== 0o600) throw new HarnessAtomicWriteUnsupported("owner-only temp unavailable"); renameSync(temp, path); const dirFd = openSync(dir, "r"); try { fsyncSync(dirFd); } finally { closeSync(dirFd); } const verified = parseV2(readFileSync(path)); if (verified.snapshot.generation !== candidate.generation || verified.snapshot.sha256 !== snapshotFor(candidate).sha256) throw new HarnessAtomicWriteUnsupported("post-rename verification failed"); if ((statSync(path).mode & 0o777) !== 0o600) throw new HarnessAtomicWriteUnsupported("owner-only state unavailable"); return verified.snapshot; } catch (error) { if (error instanceof HarnessAtomicWriteUnsupported) throw error; throw new HarnessAtomicWriteUnsupported("atomic harness-state write unavailable"); } finally { try { if (existsSync(temp)) unlinkSync(temp); } catch { /* only own temp; preserve original failure */ } }
+}
+function recoverLocked(path: string, scope: HarnessScope, reason: string): LoadedHarnessState {
+	const raw = readFileSync(path); const dir = join(path, ".."); const suffix = reason === "invalid_utf8" ? "bin" : "json"; const recovery = join(dir, `harness_state.corrupt.${Date.now()}.${randomUUID().replaceAll("-", "")}.${suffix}`);
+	try { const fd = openSync(recovery, "wx", 0o600); try { writeFileSync(fd, raw); fsyncSync(fd); } finally { closeSync(fd); } if ((statSync(recovery).mode & 0o777) !== 0o600) throw new Error("mode"); } catch { throw new HarnessRecoveryRequired("unable to preserve corrupt harness state"); }
+	const state = emptyHarnessState(); state.generation = 1; return { state, snapshot: writeAtomic(path, state, scope), recovered: true, recovery: reason };
+}
+/** Load returns state and its CAS snapshot. Recovery is performed only under the shared lease. */
+export function loadHarnessState(harnessStateDir: string = getGlobalHarnessStateDir(), scope: HarnessScope = "global"): LoadedHarnessState {
+	ensureRoot(harnessStateDir); const path = getHarnessStatePath(harnessStateDir);
 	return withHarnessLease(path, () => {
-	mkdirSync(harnessStateDir, { recursive: true, mode: 0o700 });
-	const actual = recoverState(path, "global").snapshot; const baseline = expected ?? actual;
-	if (actual.generation !== baseline.generation || actual.sha256 !== baseline.sha256) throw new HarnessGenerationConflict(baseline, actual);
-	const candidate = { ...state, schema: 2, generation: actual.generation + 1 }; const bytes = canonicalBytes(candidate); const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-	try {
-		const fd = openSync(temp, "wx", 0o600); try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
-		renameSync(temp, path);
-		try { const dirFd = openSync(harnessStateDir, "r"); try { fsyncSync(dirFd); } finally { closeSync(dirFd); } } catch { /* unsupported directory fsync is platform-qualified */ }
-		const verified = readState(path, "global"); if (!Buffer.from(verified.snapshot.sha256).equals(Buffer.from(snapshotFor(candidate).sha256))) throw new HarnessAtomicWriteUnsupported("post-rename verification failed");
-		state.schema = 2; state.generation = candidate.generation; return path;
-	} catch (error) { if (error instanceof HarnessGenerationConflict || error instanceof HarnessAtomicWriteUnsupported) throw error; throw new HarnessAtomicWriteUnsupported("atomic harness-state write unavailable");
-	} finally { if (existsSync(temp)) unlinkSync(temp); }
-
-	});}
+		const loaded = (() => { try { const current = readState(path, scope); return { state: current.state, snapshot: current.snapshot, recovered: false }; } catch (error) { if (!existsSync(path)) throw error; return recoverLocked(path, scope, error instanceof Error ? error.message : "invalid_json"); } })();
+		// Existing consumers received HarnessState directly. Keep that view while
+		// making the snapshot explicit and non-serializable in canonical bytes.
+		const result = loaded.state as LoadedHarnessState;
+		Object.defineProperties(result, { state: { value: loaded.state, enumerable: false }, snapshot: { value: loaded.snapshot, enumerable: false }, recovered: { value: loaded.recovered, enumerable: false }, recovery: { value: loaded.recovery, enumerable: false } });
+		return result;
+	});
+}
+/** Commit a candidate under a caller-owned planning snapshot; no last-writer-wins default exists. */
+export function saveHarnessState(harnessStateDir: string, state: HarnessState, expected?: HarnessSnapshot, scope: HarnessScope = "global"): HarnessSnapshot {
+	const planningSnapshot = expected ?? (state as Partial<LoadedHarnessState>).snapshot;
+	if (!planningSnapshot) throw new HarnessRecoveryRequired("save requires the caller planning snapshot");
+	ensureRoot(harnessStateDir); const path = getHarnessStatePath(harnessStateDir);
+	return withHarnessLease(path, () => { let actual: HarnessSnapshot; try { actual = readState(path, scope).snapshot; } catch (error) { throw new HarnessRecoveryRequired("state must be reloaded before replacing corrupt content"); } if (actual.generation !== planningSnapshot.generation || actual.sha256 !== planningSnapshot.sha256) throw new HarnessGenerationConflict(planningSnapshot, actual); const candidate: HarnessState = { schema: 2, generation: actual.generation + 1, entries: state.entries, refinements: state.refinements }; validateV2(candidate); return writeAtomic(path, candidate, scope); });
+}
 
 export function mergeHarnessStates(globalState: HarnessState, localState?: HarnessState): HarnessState {
 	const merged = emptyHarnessState();
@@ -913,8 +987,9 @@ export interface RefinementPlan {
 	id: string;
 	rollbackOf?: string;
 	rollbackScope?: HarnessScope;
-	/** Target-scope state captured before planning, used to reject conflicting edits at apply time. */
+	/** Target-root state and its exact CAS snapshot captured before model planning. */
 	baselineState?: HarnessState;
+	rootSnapshot?: HarnessSnapshot;
 }
 
 /**
