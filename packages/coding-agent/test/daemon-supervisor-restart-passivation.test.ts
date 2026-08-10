@@ -1173,6 +1173,36 @@ describe("daemon supervisor restart passivation", () => {
 		expect(supervisor.recoverWorker).toHaveBeenCalledTimes(1);
 	});
 
+	it("recovers v1 descriptors with missing or unknown lifecycle instead of hiding their roots", async () => {
+		const fixture = fixtureRoot();
+		const missing = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const unknown = persistSession(fixture.sessionDir, fixture.root, "completed");
+		const missingDescriptor = descriptor(fixture, "missing-lifecycle", missing);
+		const unknownDescriptor = { ...descriptor(fixture, "unknown-lifecycle", unknown), lifecycle: "future_state" };
+		delete (missingDescriptor as Partial<DaemonWorkerDescriptor>).lifecycle;
+		writeFileSync(join(fixture.descriptorDir, "missing-lifecycle.json"), JSON.stringify(missingDescriptor));
+		writeFileSync(join(fixture.descriptorDir, "unknown-lifecycle.json"), JSON.stringify(unknownDescriptor));
+
+		const supervisor = new DaemonSupervisor(fixture.socketPath, {
+			defaultSessionConfig: { agentDir: fixture.agentDir, cwd: fixture.root, sessionDir: fixture.sessionDir },
+			descriptorDir: fixture.descriptorDir,
+		}) as unknown as SupervisorInternals;
+		await supervisor.loadWorkerDescriptors();
+
+		// Both roots remain reachable by the restart path, but their malformed
+		// lifecycle cannot authorize adoption, passivation, or process signalling.
+		expect(supervisor.workers).toHaveLength(2);
+		for (const workerId of ["missing-lifecycle", "unknown-lifecycle"]) {
+			const worker = supervisor.workers.get(workerId);
+			expect(worker?.descriptor.lifecycle).toBe("recovering");
+			expect(worker?.descriptor.pid).toBeUndefined();
+			expect(worker?.descriptor.processStartId).toBeUndefined();
+			const persisted = JSON.parse(readFileSync(join(fixture.descriptorDir, `${workerId}.json`), "utf8"));
+			expect(persisted.lifecycle).toBe("recovering");
+			expect(persisted.pid).toBeUndefined();
+		}
+	});
+
 	it("recovers rather than passivating malformed or stale durable task verdicts", async () => {
 		const fixture = fixtureRoot();
 		const malformed = persistSession(fixture.sessionDir, fixture.root, "completed");
