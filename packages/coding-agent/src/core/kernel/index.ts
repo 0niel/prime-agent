@@ -814,7 +814,7 @@ export class KernelManager {
 			throw e;
 		}
 
-		if (this.terminal || this.state === "shutdown") {
+		if (this.terminal) {
 			this.cleanupResources();
 			throw new Error("Kernel was disposed during startup");
 		}
