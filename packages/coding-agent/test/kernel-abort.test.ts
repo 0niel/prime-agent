@@ -3,6 +3,7 @@ import {
 	AGENT_MESSAGE_DISPLAY_MIME,
 	contextAwareHostRequestHandler,
 	createHostRequestHandler,
+	type HostRequestContext,
 	KernelManager,
 	type KernelSentAgentMessage,
 } from "../src/core/kernel/index.js";
@@ -254,6 +255,78 @@ describe("KernelManager abort handling", () => {
 
 		await expect(executePromise).resolves.toMatchObject({ status: "aborted" });
 		expect(controlSend).toHaveBeenCalled();
+	});
+
+	it("revokes a settled host-request context before a retained wrapper can replay it", async () => {
+		let capturedContext: HostRequestContext | undefined;
+		const implementation = vi.fn(async (_payload: Record<string, unknown>, context: HostRequestContext) => {
+			capturedContext = context;
+			return { ok: true };
+		});
+		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const internals = manager as unknown as {
+			state: "running";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			sendCommMessage: (_commId: string, data: Record<string, unknown>) => Promise<void>;
+			inFlightHostRequests: Set<Promise<void>>;
+		};
+		internals.state = "running";
+		internals.connection = { key: "test" };
+		internals.shell = { send: async () => {}, close: () => {} };
+		internals.sendCommMessage = async () => {};
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "request", target_name: "host.request", data: { type: "test" } },
+		});
+		await vi.waitFor(() => expect(capturedContext).toBeDefined());
+		await Promise.allSettled([...internals.inFlightHostRequests]);
+		expect(capturedContext?.signal.aborted).toBe(true);
+		if (!capturedContext) throw new Error("Expected genuine host request context");
+		await expect(handler({ type: "test" }, capturedContext)).rejects.toThrow("host request context is invalid");
+		expect(implementation).toHaveBeenCalledTimes(1);
+		manager.disposeSync();
+	});
+
+	it("revokes a comm-closed host-request context before a retained wrapper can replay it", async () => {
+		let capturedContext: HostRequestContext | undefined;
+		let resolveHandler: (() => void) | undefined;
+		const implementation = vi.fn(async (_payload: Record<string, unknown>, context: HostRequestContext) => {
+			capturedContext = context;
+			await new Promise<void>((resolve) => {
+				resolveHandler = resolve;
+			});
+			return { ok: true };
+		});
+		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const internals = manager as unknown as {
+			state: "running";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			sendCommMessage: (_commId: string, data: Record<string, unknown>) => Promise<void>;
+			inFlightHostRequests: Set<Promise<void>>;
+		};
+		internals.state = "running";
+		internals.connection = { key: "test" };
+		internals.shell = { send: async () => {}, close: () => {} };
+		internals.sendCommMessage = async () => {};
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "request", target_name: "host.request", data: { type: "test" } },
+		});
+		await vi.waitFor(() => expect(capturedContext).toBeDefined());
+		internals.handleCommMessage({ header: { msg_type: "comm_close" }, content: { comm_id: "request" } });
+		expect(capturedContext?.signal.aborted).toBe(true);
+		if (!capturedContext) throw new Error("Expected genuine host request context");
+		await expect(handler({ type: "test" }, capturedContext)).rejects.toThrow("host request context is invalid");
+		expect(implementation).toHaveBeenCalledTimes(1);
+		resolveHandler?.();
+		await Promise.allSettled([...internals.inFlightHostRequests]);
+		manager.disposeSync();
 	});
 
 	it("revokes host-request authority on comm close and never reads context from payload", async () => {
