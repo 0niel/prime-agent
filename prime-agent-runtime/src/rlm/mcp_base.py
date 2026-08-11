@@ -8,15 +8,14 @@ methods, so the agent writes ordinary Python:
     import linear
     issues = await linear.list_issues(team="Engineering")
 
-OAuth credentials remain host-only. M02 deliberately has no kernel token path;
-interactive login and typed host transport ownership are host-side.
+OAuth credentials and transport remain host-only. The kernel issues typed requests
+only; it does not import an MCP SDK or construct an HTTP connection.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import AsyncExitStack
 from typing import Any
 
 from . import host_request
@@ -48,24 +47,6 @@ class McpToolError(RuntimeError):
     """Raised when an MCP tool call returns a result flagged as an error."""
 
 
-def _resolve_streamable_http():
-    """Return an SDK streamable-HTTP transport callable.
-
-    SDK versions vary: some expose ``streamablehttp_client(url, headers=...)``,
-    others ``streamable_http_client(url, *, http_client=...)``, and some expose
-    both with *different* signatures. Imported lazily so importing an integration
-    package never hard-fails when ``mcp`` is absent.
-    """
-    from mcp.client import streamable_http as mod  # noqa: PLC0415
-
-    for name in ("streamablehttp_client", "streamable_http_client"):
-        fn = getattr(mod, name, None)
-        if fn is not None:
-            return fn
-    raise ImportError(
-        "the installed `mcp` SDK exposes no streamable-HTTP client; upgrade `mcp`"
-    )
-
 
 class McpIntegration:
     """Subclass and set :attr:`server` (and :attr:`url` for remote servers).
@@ -87,80 +68,31 @@ class McpIntegration:
         self._tools: dict[str, Any] | None = None
         self._lock = asyncio.Lock()
 
-    # -- credentials --------------------------------------------------------
+    # -- host-owned transport ---------------------------------------------
 
-    @property
-    def _provider_id(self) -> str:
-        return f"mcp:{self.server}"
+    async def _request(self, method: str, params: Any = None) -> Any:
+        """Perform one typed MCP request through the host.
+
+        The kernel never opens an MCP transport or reads auth metadata.  This
+        intentionally keeps both anonymous and OAuth traffic on one host path.
+        """
+        if not isinstance(method, str) or not method:
+            raise TypeError("method must be a non-empty str")
+        reply = await host_request(
+            "mcp.request", {"server": self.server, "method": method, "params": params}
+        )
+        if not isinstance(reply, dict) or "result" not in reply:
+            raise RuntimeError("mcp.request returned an invalid response")
+        return reply["result"]
 
     async def _resolve_token(self) -> str:
-        """M02 has no kernel-visible OAuth token path. M03 owns host transport."""
+        """OAuth bearer material is host-only and cannot be resolved in Python."""
         raise NotEnabled(self.server)
-
-    # -- connection ---------------------------------------------------------
-
-    async def _resolve_config(self) -> tuple[str | None, dict[str, str], bool]:
-        """Host-resolved endpoint configuration. OAuth is never kernel-owned."""
-        try:
-            cfg = await host_request("mcp.config", {"server": self.server})
-        except RuntimeError:
-            cfg = {}
-        url = cfg.get("url") if isinstance(cfg, dict) else None
-        headers = cfg.get("headers") if isinstance(cfg, dict) else None
-        host_oauth_only = cfg.get("hostOAuthOnly") is True if isinstance(cfg, dict) else False
-        if not (isinstance(url, str) and url):
-            url = self.url
-        extra = headers if isinstance(headers, dict) else {}
-        credential_headers = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key", "x-auth-token", "x-access-token"}
-        safe_headers = {str(k): str(v) for k, v in extra.items() if str(k).lower() not in credential_headers}
-        return url, safe_headers, host_oauth_only
-
-    async def _open_session(self, stack: AsyncExitStack):
-        """Open an initialized MCP ClientSession bound to ``stack``.
-
-        Override for non-HTTP transports (e.g. stdio). The default connects over
-        credential-free streamable HTTP. OAuth endpoints fail closed until M03
-        provides the host-owned typed transport. The URL is host-resolved.
-        """
-        # Check host policy before importing the MCP SDK so an OAuth endpoint
-        # cannot create a transport or token-adjacent dependency in Python.
-        url, extra_headers, host_oauth_only = await self._resolve_config()
-        if host_oauth_only:
-            raise NotEnabled(self.server)
-        if not url:
-            raise ValueError(
-                f"{type(self).__name__} must set `url` or override `_open_session`"
-            )
-        import inspect  # noqa: PLC0415
-        from mcp import ClientSession  # noqa: PLC0415
-        transport = _resolve_streamable_http()
-        # M02 never reads OAuth secrets or manufactures authentication headers in Python.
-        # Anonymous endpoints retain only explicit non-secret host headers.
-        auth_header = dict(extra_headers)
-
-        # SDK signatures vary: some take headers=, others only http_client=.
-        params = inspect.signature(transport).parameters
-        if "headers" in params:
-            cm = transport(url, headers=auth_header)
-        elif "http_client" in params:
-            import httpx  # noqa: PLC0415
-
-            client = await stack.enter_async_context(httpx.AsyncClient(headers=auth_header))
-            cm = transport(url, http_client=client)
-        else:
-            raise RuntimeError(
-                f"unsupported mcp streamable-HTTP client signature: {tuple(params)}"
-            )
-
-        read, write, *_ = await stack.enter_async_context(cm)
-        session = await stack.enter_async_context(ClientSession(read, write))
-        await session.initialize()
-        return session
 
     # -- tools --------------------------------------------------------------
 
     async def list_tools(self) -> list[dict[str, Any]]:
-        """Return the server's tools as ``[{name, description, inputSchema}]``."""
+        """Return server tools as ``[{name, description, inputSchema}]``."""
         await self._ensure_tools()
         return [dict(t) for t in (self._tools or {}).values()]
 
@@ -170,29 +102,27 @@ class McpIntegration:
         async with self._lock:
             if self._tools is not None:
                 return
-            async with AsyncExitStack() as stack:
-                session = await self._open_session(stack)
-                resp = await session.list_tools()
-                self._tools = {
-                    t.name: {
-                        "name": t.name,
-                        "description": getattr(t, "description", "") or "",
-                        "inputSchema": getattr(t, "inputSchema", None) or {},
-                    }
-                    for t in resp.tools
+            response = await self._request("tools/list", {})
+            if not isinstance(response, dict) or not isinstance(response.get("tools"), list):
+                raise RuntimeError("MCP tools/list returned an invalid result")
+            tools: dict[str, dict[str, Any]] = {}
+            for tool in response["tools"]:
+                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                    raise RuntimeError("MCP tools/list returned an invalid tool")
+                tools[tool["name"]] = {
+                    "name": tool["name"],
+                    "description": tool.get("description") if isinstance(tool.get("description"), str) else "",
+                    "inputSchema": tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {},
                 }
+            self._tools = tools
 
     async def call_tool(self, tool: str, arguments: dict[str, Any] | None = None) -> Any:
-        """Call ``tool`` on the server and return its parsed result.
-
-        Opens a fresh session per call: MCP sessions are not safe to hold across
-        the kernel's snapshot/restore, and per-call connect keeps this robust to
-        idle sessions and token rotation at modest latency cost.
-        """
-        async with AsyncExitStack() as stack:
-            session = await self._open_session(stack)
-            result = await session.call_tool(tool, arguments or {})
-        return _parse_result(result)
+        """Call one tool through the host and normalize its JSON-RPC result."""
+        if not isinstance(tool, str) or not tool:
+            raise TypeError("tool must be a non-empty str")
+        if arguments is not None and not isinstance(arguments, dict):
+            raise TypeError("arguments must be a dict or None")
+        return _parse_host_result(await self._request("tools/call", {"name": tool, "arguments": arguments or {}}))
 
     def __getattr__(self, name: str):
         # Only reached for names not found normally; bind as an async tool call.
@@ -215,6 +145,21 @@ class McpIntegration:
             desc = self._tools[name].get("description") or ""
             _call.__doc__ = f"{desc}\n\nArguments (JSON Schema):\n{json.dumps(schema, indent=2)}"
         return _call
+
+
+def _parse_host_result(result: Any) -> Any:
+    """Normalize the JSON shape returned by host-owned MCP transport."""
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content")
+    texts = [block.get("text") for block in content if isinstance(block, dict) and isinstance(block.get("text"), str)] if isinstance(content, list) else []
+    if result.get("isError") is True:
+        raise McpToolError("\n".join(texts) or "MCP tool returned an error")
+    if "structuredContent" in result and result["structuredContent"] is not None:
+        return result["structuredContent"]
+    if texts:
+        return "\n".join(texts)
+    return content if content is not None else result
 
 
 def _parse_result(result: Any) -> Any:

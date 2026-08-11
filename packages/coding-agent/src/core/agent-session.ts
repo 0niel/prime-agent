@@ -3783,6 +3783,7 @@ export class AgentSession {
 			// aborts each request and awaits its handler before its connection closes.
 			// This prevents an old session's host handler from surviving replacement.
 			await this._ipythonKernelProvisioner?.dispose();
+			await this._mcpManager?.dispose();
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
 			await this._drainPendingRefinementForDisposal();

@@ -13,6 +13,9 @@ import type { AuthStorage } from "../auth-storage.js";
 import type { McpServerConfig } from "../settings-manager.js";
 import { MCP_OAUTH_SECRET_NAMESPACE, type McpOAuthSecretStore, type SecretReference } from "./mcp-secret-store.js";
 import type { McpOAuthBinding, McpOAuthSecretPort } from "@earendil-works/pi-ai/mcp";
+import type { HostRequestHandler } from "../kernel/index.js";
+import { McpHostBridge, type McpHostBinding } from "./mcp-host-bridge.js";
+import type { McpRuntimeDeclarationSnapshot } from "./mcp-runtime-declaration-snapshot.js";
 
 interface McpOAuthPublicRecord {
 	type: "mcp_oauth";
@@ -30,12 +33,6 @@ function canonicalEndpoint(value: string): string | undefined {
 	try { const url = new URL(value); return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash ? url.href : undefined; } catch { return undefined; }
 }
 
-const CREDENTIAL_HEADER = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token)$/i;
-
-function safeMcpHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
-	const safe = Object.fromEntries(Object.entries(headers ?? {}).filter(([name]) => !CREDENTIAL_HEADER.test(name)));
-	return Object.keys(safe).length > 0 ? safe : undefined;
-}
 
 function isS01Reference(value: unknown): value is SecretReference {
 	if (!value || typeof value !== "object") return false;
@@ -87,6 +84,8 @@ function createS01SecretPort(store: McpOAuthSecretStore): McpOAuthSecretPort {
 	};
 }
 
+
+
 export interface McpManagerOptions {
 	authStorage: AuthStorage;
 	/** Reads the current Settings.mcpServers (name → config). Re-read on refresh(). */
@@ -95,6 +94,8 @@ export interface McpManagerOptions {
 	beginLogin?: (server: string) => Promise<void>;
 	/** Core S01 store; absent is an explicit unavailable OAuth state. */
 	secretStore?: McpOAuthSecretStore;
+	/** Immutable Core admission snapshot. Its records are the only declaration inputs consumed here. */
+	runtimeDeclarationSnapshot?: McpRuntimeDeclarationSnapshot;
 }
 
 /** A resolved integration: a catalog/user entry plus its provider id. */
@@ -105,8 +106,6 @@ interface ResolvedIntegration {
 	usesOAuth: boolean;
 	bearerTokenEnvVar?: string;
 	enabled?: boolean;
-	/** Extra static HTTP headers from the user config. */
-	headers?: Record<string, string>;
 	/** True when this came from Settings.mcpServers (may override a catalog name). */
 	userDeclared?: boolean;
 }
@@ -119,12 +118,25 @@ export class McpManager {
 	private integrations = new Map<string, ResolvedIntegration>();
 	/** Provider ids we registered for user servers, so refresh can drop removed ones. */
 	private registeredUserProviderIds = new Set<string>();
+	private readonly hostBridge: McpHostBridge;
+	private readonly runtimeDeclarationSnapshot?: McpRuntimeDeclarationSnapshot;
+	/** Allows an authenticated close to use the old sealed access token before rotation. */
+	private readonly closingCredentialServers = new Set<string>();
 
 	constructor(options: McpManagerOptions) {
 		this.authStorage = options.authStorage;
 		this.getUserServers = options.getUserServers ?? (() => undefined);
 		this.beginLogin = options.beginLogin;
 		this.secretStore = options.secretStore;
+		this.runtimeDeclarationSnapshot = options.runtimeDeclarationSnapshot;
+		this.hostBridge = new McpHostBridge({
+			withOAuthAccessToken: (server, operation, forceRefresh) => this.withOAuthAccessToken(server, operation, forceRefresh),
+			resolveBinding: (binding) => {
+				const integration = this.integrations.get(binding.server);
+				const endpoint = integration && canonicalEndpoint(integration.url);
+				return integration && endpoint === binding.endpoint ? this.bindingFor(binding.server, integration, endpoint) : binding;
+			},
+		});
 		this.resolveIntegrations();
 		this.registerProviders();
 	}
@@ -158,8 +170,24 @@ export class McpManager {
 				usesOAuth: config.oauth === true,
 				bearerTokenEnvVar: config.bearerTokenEnvVar,
 				enabled: config.enabled,
-				headers: config.headers,
-				userDeclared: true,
+								userDeclared: true,
+			});
+		}
+		// M01/Core declarations are already parsed, selected, collision-checked,
+		// and frozen. Never reread project settings here: denial/collision has
+		// already made that contribution inert before this host is constructed.
+		for (const declaration of Object.values(this.runtimeDeclarationSnapshot?.declarations ?? {})) {
+			const existing = integrations.get(declaration.name);
+			integrations.set(declaration.name, {
+				server: declaration.name,
+				label: existing?.label ?? declaration.name,
+				url: declaration.endpoint,
+				// A declaration can replace a catalog endpoint. Never carry OAuth
+				// authority across endpoint bindings: a changed URL is anonymous until
+				// separately authenticated for that exact endpoint.
+				usesOAuth: existing?.usesOAuth === true && canonicalEndpoint(existing.url) === declaration.endpoint,
+				enabled: declaration.enabled,
+								userDeclared: declaration.source === "user" || existing?.userDeclared,
 			});
 		}
 		this.integrations = integrations;
@@ -228,6 +256,9 @@ export class McpManager {
 		const endpoint = canonicalEndpoint(integration.url);
 		const provider = getOAuthProvider(this.providerId(server));
 		if (!endpoint || !provider || !this.secretStore) throw new Error("MCP OAuth credentials are unavailable.");
+		this.closingCredentialServers.add(server);
+		try { await this.hostBridge.closeBinding(this.bindingFor(server, integration, endpoint)); }
+		finally { this.closingCredentialServers.delete(server); }
 		const refreshed = await provider.refreshToken({ kind: "opaque", secretReference: current.secretReference, mcpEndpoint: current.mcpEndpoint, authServer: current.authServer, tokenEndpoint: current.tokenEndpoint, clientId: current.clientId, scopes: current.scopes, expires: current.expires });
 		const rotated = toOpaqueCredential(refreshed, endpoint);
 		if (!rotated || !this.authStorage.replaceMcpOAuthCredential(this.providerId(server), current.secretReference, rotated)) throw new Error("MCP OAuth credentials changed during refresh.");
@@ -240,10 +271,19 @@ export class McpManager {
 		const endpoint = integration && canonicalEndpoint(integration.url);
 		const stored = this.authStorage.get(this.providerId(server));
 		if (!integration || !endpoint || !this.secretStore || !isBoundMcpOAuth(stored, endpoint)) throw new Error("MCP OAuth credentials are unavailable.");
-		const record = forceRefresh || Date.now() >= stored.expires ? await this.refreshOpaqueRecord(server, integration, stored) : stored;
+		const record = forceRefresh || (Date.now() >= stored.expires && !this.closingCredentialServers.has(server)) ? await this.refreshOpaqueRecord(server, integration, stored) : stored;
 		const expected: McpOAuthBinding = { mcpEndpoint: endpoint, authServer: record.authServer, tokenEndpoint: record.tokenEndpoint, clientId: record.clientId, scopes: record.scopes };
 		const accessToken = await getMcpOAuthAccessToken(record, expected, createS01SecretPort(this.secretStore));
 		return operation(accessToken);
+	}
+
+	private bindingFor(server: string, integration: ResolvedIntegration, endpoint: string): McpHostBinding {
+		const credential = this.authStorage.get(this.providerId(server));
+		return {
+			server, endpoint, oauth: integration.usesOAuth,
+			declarationRevision: this.runtimeDeclarationSnapshot?.revision ?? "legacy",
+			authRevision: integration.usesOAuth && isBoundMcpOAuth(credential, endpoint) ? credential.secretReference.revision : undefined,
+		};
 	}
 
 	/** Delete the endpoint-bound Core secret before deleting its public metadata. */
@@ -253,51 +293,32 @@ export class McpManager {
 		const credential = this.authStorage.get(this.providerId(server));
 		if (!integration || !endpoint || !isBoundMcpOAuth(credential, endpoint)) return false;
 		if (!this.secretStore) throw new Error("MCP OAuth secret storage is unavailable.");
+		await this.hostBridge.closeBinding(this.bindingFor(server, integration, endpoint));
 		await this.secretStore.delete(credential.secretReference, credential.secretReference.revision);
 		this.authStorage.remove(this.providerId(server));
 		return true;
 	}
 
 	/** Host-request handlers exposed to the kernel. */
-	hostHandlers(): Record<string, (payload: Record<string, unknown>) => Promise<Record<string, unknown>>> {
-		const handlers: Record<string, (payload: Record<string, unknown>) => Promise<Record<string, unknown>>> = {
-			"mcp.refresh": async (payload) => {
-				const server = String(payload.server ?? "");
-				if (!server) throw new Error("mcp.refresh requires a server");
-				// This only verifies host-owned credentials. It deliberately never returns
-				// a token; transports use withOAuthAccessToken() directly.
-				await this.withOAuthAccessToken(server, async () => undefined, true);
-				return {};
-			},
-			// Resolved config so the kernel skill connects to the same URL the host
-			// registered/authenticated (honors a user's mcpServers `url` override).
-			"mcp.config": async (payload) => {
-				const server = String(payload.server ?? "");
-				if (!server) throw new Error("mcp.config requires a server");
+	hostHandlers(): Record<string, HostRequestHandler> {
+		const handlers: Record<string, HostRequestHandler> = {
+			"mcp.request": async (payload, context) => {
+				const server = typeof payload.server === "string" ? payload.server : "";
+				const method = typeof payload.method === "string" ? payload.method : "";
+				if (!server || !method) throw new Error("mcp.request requires server and method");
 				const integration = this.integrations.get(server);
-				if (!integration) return {};
-				const config: Record<string, unknown> = { url: integration.url };
-				// OAuth bearer material stays host-only. M03 will supply the typed
-				// request transport; until then the kernel must fail before transport.
-				if (integration.usesOAuth) config.hostOAuthOnly = true;
-				const headers = safeMcpHeaders(integration.headers);
-				if (headers) config.headers = headers;
-				return config;
+				if (!integration || integration.enabled === false) throw new Error("MCP integration is unavailable.");
+				const endpoint = canonicalEndpoint(integration.url);
+				if (!endpoint) throw new Error("MCP integration endpoint is invalid.");
+				if (integration.usesOAuth && !this.isAuthed(integration)) throw new Error("MCP OAuth credentials are unavailable.");
+				return { result: await this.hostBridge.request(this.bindingFor(server, integration, endpoint), method, payload.params, context) };
 			},
 		};
-		// Only expose begin_login when an interactive login is actually wired, so the
-		// kernel doesn't get a handler whose only behavior is to throw.
-		const beginLogin = this.beginLogin;
-		if (beginLogin) {
-			handlers["mcp.begin_login"] = async (payload) => {
-				const server = String(payload.server ?? "");
-				if (!server) throw new Error("mcp.begin_login requires a server");
-				await beginLogin(server);
-				return {};
-			};
-		}
 		return handlers;
 	}
+
+	/** Await host transport close and fence every binding. */
+	async dispose(): Promise<void> { await this.hostBridge.dispose(); }
 
 	/** Status for the /mcp list command. */
 	listStatus(): Array<{ server: string; label: string; enabled: boolean; usesOAuth: boolean }> {

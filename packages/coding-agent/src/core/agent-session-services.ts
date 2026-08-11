@@ -12,6 +12,7 @@ import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
 import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent-state.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
+import { createMcpRuntimeDeclarationSnapshot, type McpRuntimeDeclarationSnapshot } from "./mcp/mcp-runtime-declaration-snapshot.js";
 import type { McpOAuthSecretStore } from "./mcp/mcp-secret-store.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
@@ -43,6 +44,8 @@ export interface AgentSessionRuntimeDiagnostic {
 export interface CreateAgentSessionServicesOptions {
 	/** Optional Core S01 authority. Omission intentionally fails OAuth closed. */
 	mcpOAuthSecretStore?: McpOAuthSecretStore;
+	/** Already-admitted Core declaration snapshot. Supplying it avoids all project reads here. */
+	mcpRuntimeDeclarationSnapshot?: McpRuntimeDeclarationSnapshot;
 	cwd: string;
 	agentDir?: string;
 	authStorage?: AuthStorage;
@@ -188,10 +191,17 @@ export async function createAgentSessionServices(
 
 	// MCP integrations: registers OAuth providers and gates the built-in
 	// integration skills by whether the user is logged in (enable-by-login).
+	const mcpRuntimeDeclarationSnapshot = options.mcpRuntimeDeclarationSnapshot ?? createMcpRuntimeDeclarationSnapshot({
+		// User settings are read once into an immutable Core snapshot. Project
+		// declarations require an explicit opaque admission and are therefore
+		// intentionally absent on this ordinary service-construction path.
+		userDocument: settingsManager.getMcpDeclarationDocument("user"),
+	});
 	const mcpManager = new McpManager({
 		authStorage,
 		getUserServers: () => settingsManager.getMcpServers(),
 		secretStore: options.mcpOAuthSecretStore,
+		runtimeDeclarationSnapshot: mcpRuntimeDeclarationSnapshot,
 	});
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());

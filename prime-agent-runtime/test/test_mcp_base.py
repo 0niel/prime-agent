@@ -1,14 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import sys
-import types
-import tempfile
-import time
 import unittest
-from contextlib import AsyncExitStack
-from pathlib import Path
 from unittest import mock
 
 from rlm import mcp_base
@@ -19,68 +12,12 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-class _FakeSession:
-    """Stand-in for an mcp ClientSession with canned tools/results."""
-
-    def __init__(self, tools, result):
-        self._tools = tools
-        self._result = result
-        self.calls = []
-
-    async def list_tools(self):
-        Tool = type("Tool", (), {})
-
-        def make(name, desc, schema):
-            t = Tool()
-            t.name = name
-            t.description = desc
-            t.inputSchema = schema
-            return t
-
-        resp = type("Resp", (), {})()
-        resp.tools = [make(*t) for t in self._tools]
-        return resp
-
-    async def call_tool(self, name, arguments):
-        self.calls.append((name, arguments))
-        return self._result
-
-
 class _Integration(McpIntegration):
     server = "demo"
     url = "https://example.test/mcp"
 
 
 class McpIntegrationTest(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.agent_dir = Path(self._tmp.name)
-        self.auth_path = self.agent_dir / "auth.json"
-        module = types.ModuleType("mcp")
-        module.ClientSession = object
-        httpx = types.ModuleType("httpx")
-
-        class AsyncClient:
-            def __init__(self, **kwargs): self.headers = kwargs.get("headers", {})
-            async def __aenter__(self): return self
-            async def __aexit__(self, *args): return False
-
-        httpx.AsyncClient = AsyncClient
-        self._mcp_patch = mock.patch.dict(sys.modules, {"mcp": module, "httpx": httpx})
-        self._mcp_patch.start()
-        self.addCleanup(self._mcp_patch.stop)
-        self.addCleanup(self._tmp.cleanup)
-
-    def _write_auth(self, cred):
-        self.auth_path.write_text(json.dumps({"mcp:demo": cred}))
-
-    def _patch_session(self, session):
-        # Replace _open_session so no real network/SDK is needed.
-        async def fake_open(self_, stack: AsyncExitStack):
-            return session
-
-        return mock.patch.object(_Integration, "_open_session", fake_open)
-
     def test_oauth_kernel_boundary_is_not_enabled(self):
         with self.assertRaises(NotEnabled):
             _run(_Integration()._resolve_token())
@@ -89,6 +26,7 @@ class McpIntegrationTest(unittest.TestCase):
         for payload in ({}, []):
             result = type("R", (), {"structuredContent": payload, "content": [], "isError": False})()
             self.assertEqual(mcp_base._parse_result(result), payload)
+            self.assertEqual(mcp_base._parse_host_result({"structuredContent": payload, "content": []}), payload)
 
     def test_error_result_raises(self):
         block = type("B", (), {"text": "boom"})()
@@ -96,167 +34,57 @@ class McpIntegrationTest(unittest.TestCase):
         with self.assertRaises(McpToolError) as ctx:
             mcp_base._parse_result(result)
         self.assertIn("boom", str(ctx.exception))
-
-    def test_auto_bound_tool_calls_session(self):
-        session = _FakeSession(
-            tools=[("list_issues", "List issues", {"type": "object"})],
-            result=type("R", (), {"structuredContent": {"issues": [1, 2]}})(),
-        )
-        with self._patch_session(session):
-            integration = _Integration()
-            out = _run(integration.list_issues(team="Eng"))
-        self.assertEqual(out, {"issues": [1, 2]})
-        self.assertEqual(session.calls, [("list_issues", {"team": "Eng"})])
-
-    def test_unknown_tool_raises_with_available_list(self):
-        session = _FakeSession(tools=[("list_issues", "", {})], result=None)
-        with self._patch_session(session):
-            integration = _Integration()
-            with self.assertRaises(AttributeError) as ctx:
-                _run(integration.nonexistent_tool())
-        self.assertIn("list_issues", str(ctx.exception))
-
-    def test_text_result_parsing(self):
-        block = type("B", (), {"text": "hello"})()
-        result = type("R", (), {"content": [block], "structuredContent": None})()
-        self.assertEqual(mcp_base._parse_result(result), "hello")
+        with self.assertRaises(McpToolError):
+            mcp_base._parse_host_result({"isError": True, "content": [{"text": "boom"}]})
 
     def test_requires_server_attribute(self):
         class Bad(McpIntegration):
             server = ""
-
         with self.assertRaises(ValueError):
             Bad()
 
-    def _run_open_session_with_transport(self, transport, headers=None):
-        """Drive the real _open_session against a fake transport callable.
+    def test_default_calls_are_typed_host_requests_without_sdk_or_transport(self):
+        calls = []
 
-        `transport` must declare its real parameters (headers= or http_client=)
-        so the signature inspection in _open_session is exercised faithfully.
-        """
+        async def host_request(request_type, payload):
+            calls.append((request_type, payload))
+            self.assertEqual(request_type, "mcp.request")
+            # Kernel does not receive endpoint, headers, or authorization material.
+            self.assertEqual(set(payload), {"server", "method", "params"})
+            if payload["method"] == "tools/list":
+                return {"result": {"tools": [{"name": "list_issues", "description": "x", "inputSchema": {}}]}}
+            return {"result": {"structuredContent": {"issues": [1, 2]}, "content": []}}
 
-        async def fake_host_request(req_type, payload):
-            return {"url": _Integration.url, **({"headers": headers} if headers else {})}
+        with mock.patch.object(mcp_base, "host_request", host_request):
+            integration = _Integration()
+            self.assertEqual(_run(integration.list_issues(team="Eng")), {"issues": [1, 2]})
+        self.assertEqual(calls, [
+            ("mcp.request", {"server": "demo", "method": "tools/list", "params": {}}),
+            ("mcp.request", {"server": "demo", "method": "tools/call", "params": {"name": "list_issues", "arguments": {"team": "Eng"}}}),
+        ])
 
-        with mock.patch.object(mcp_base, "host_request", fake_host_request), \
-             mock.patch.object(mcp_base, "_resolve_streamable_http", lambda: transport), \
-             mock.patch("mcp.ClientSession") as session_cls:
-            session = mock.MagicMock()
-            session.initialize = mock.AsyncMock()
-            session.call_tool = mock.AsyncMock(
-                return_value=type("R", (), {"content": [], "structuredContent": None})()
-            )
-            session_cls.return_value.__aenter__ = mock.AsyncMock(return_value=session)
-            session_cls.return_value.__aexit__ = mock.AsyncMock(return_value=False)
-            _run(_Integration().call_tool("noop", {}))
+    def test_unknown_tool_raises_with_available_list(self):
+        async def host_request(_type, payload):
+            self.assertEqual(payload["method"], "tools/list")
+            return {"result": {"tools": [{"name": "list_issues", "description": "", "inputSchema": {}}]}}
+        with mock.patch.object(mcp_base, "host_request", host_request):
+            with self.assertRaises(AttributeError) as ctx:
+                _run(_Integration().nonexistent_tool())
+        self.assertIn("list_issues", str(ctx.exception))
 
-    def test_open_session_uses_headers_signature(self):
-        # streamablehttp_client(url, headers=...)
-        captured = {}
+    def test_host_result_text_and_non_text_normalization(self):
+        self.assertEqual(mcp_base._parse_host_result({"content": [{"text": "hello"}]}), "hello")
+        self.assertEqual(mcp_base._parse_host_result({"content": [{"type": "image"}]}), [{"type": "image"}])
 
-        class _CM:
-            async def __aenter__(self_inner):
-                return ("read", "write", None)
+    def test_explicit_subclass_escape_hatch_remains_possible_but_default_never_uses_it(self):
+        class ExplicitTransportIntegration(McpIntegration):
+            server = "explicit"
+            async def _open_session(self, _stack):
+                return "custom transport"
 
-            async def __aexit__(self_inner, *a):
-                return False
-
-        def transport(url, headers=None):
-            captured["headers"] = headers
-            return _CM()
-
-        self._run_open_session_with_transport(transport)
-        self.assertEqual(captured["headers"], {})
-
-    def test_open_session_uses_http_client_signature(self):
-        # streamable_http_client(url, *, http_client=...) — must NOT pass headers=
-        captured = {}
-
-        class _CM:
-            async def __aenter__(self_inner):
-                return ("read", "write", None)
-
-            async def __aexit__(self_inner, *a):
-                return False
-
-        def transport(url, *, http_client=None):
-            captured["http_client"] = http_client
-            return _CM()
-
-        self._run_open_session_with_transport(transport)
-        self.assertIsNotNone(captured["http_client"])
-
-    def test_resolve_config_prefers_host_override_and_headers(self):
-        async def host_with_override(req_type, payload):
-            return {"url": "https://override.test/mcp", "headers": {"X-Extra": "1"}}
-
-        async def host_empty(req_type, payload):
-            return {}
-
-        with mock.patch.object(mcp_base, "host_request", host_with_override):
-            url, headers, host_oauth_only = _run(_Integration()._resolve_config())
-            self.assertEqual(url, "https://override.test/mcp")
-            self.assertEqual(headers, {"X-Extra": "1"})
-        with mock.patch.object(mcp_base, "host_request", host_empty):
-            url, headers, host_oauth_only = _run(_Integration()._resolve_config())
-            self.assertEqual(url, _Integration.url)
-            self.assertEqual(headers, {})
-
-
-    def test_host_oauth_only_fails_before_sdk_transport(self):
-        called = False
-        async def config(_kind, _payload): return {"url": _Integration.url, "hostOAuthOnly": True}
-        def transport(*args, **kwargs):
-            nonlocal called; called = True
-            raise AssertionError("OAuth must fail before SDK transport")
-        with mock.patch.object(mcp_base, "host_request", config), mock.patch.object(mcp_base, "_resolve_streamable_http", lambda: transport):
-            with self.assertRaises(NotEnabled):
-                _run(_Integration().call_tool("noop", {}))
-        self.assertFalse(called)
-
-    def test_anonymous_headers_reach_headers_transport_without_authorization(self):
-        captured = {}
-        class CM:
-            async def __aenter__(self): return ("read", "write", None)
-            async def __aexit__(self, *args): return False
-        def transport(url, headers=None): captured.update(url=url, headers=headers); return CM()
-        self._run_open_session_with_transport(transport, headers={"X-Safe": "1"})
-        self.assertEqual(captured["headers"], {"X-Safe": "1"})
-
-    def test_anonymous_headers_reach_http_client_transport_without_authorization(self):
-        captured = {}
-        class CM:
-            async def __aenter__(self): return ("read", "write", None)
-            async def __aexit__(self, *args): return False
-        def transport(url, *, http_client=None): captured["headers"] = http_client.headers; return CM()
-        self._run_open_session_with_transport(transport, headers={"X-Safe": "1"})
-        self.assertEqual(captured["headers"], {"X-Safe": "1"})
-
-    def test_config_ignores_authorization_like_header_even_if_bad_host_sends_one(self):
-        async def config(_kind, _payload): return {"url": _Integration.url, "headers": {"Authorization": "bad", "X-Safe": "1"}}
-        with mock.patch.object(mcp_base, "host_request", config):
-            _url, headers, _oauth = _run(_Integration()._resolve_config())
-        # Defense in depth: Python does not construct credentials, including bad host config.
-        self.assertEqual(headers, {"X-Safe": "1"})
-
-    def test_empty_host_config_falls_back_to_class_url(self):
-        async def config(_kind, _payload): return {}
-        with mock.patch.object(mcp_base, "host_request", config):
-            url, headers, oauth = _run(_Integration()._resolve_config())
-        self.assertEqual(url, _Integration.url); self.assertEqual(headers, {}); self.assertFalse(oauth)
-
-    def test_host_config_failure_falls_back_to_class_url(self):
-        async def config(_kind, _payload): raise RuntimeError("unavailable")
-        with mock.patch.object(mcp_base, "host_request", config):
-            url, headers, oauth = _run(_Integration()._resolve_config())
-        self.assertEqual(url, _Integration.url); self.assertEqual(headers, {}); self.assertFalse(oauth)
-
-    def test_opaque_config_never_calls_resolve_token(self):
-        async def config(_kind, _payload): return {"url": _Integration.url, "hostOAuthOnly": True}
-        resolve = mock.AsyncMock()
-        with mock.patch.object(mcp_base, "host_request", config), mock.patch.object(_Integration, "_resolve_token", resolve):
-            with self.assertRaises(NotEnabled): _run(_Integration()._open_session(AsyncExitStack()))
-        resolve.assert_not_awaited()
+        integration = ExplicitTransportIntegration()
+        self.assertEqual(_run(integration._open_session(None)), "custom transport")
+        self.assertFalse(hasattr(_Integration, "_open_session"))
 
 
 if __name__ == "__main__":

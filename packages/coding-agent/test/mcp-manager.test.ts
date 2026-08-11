@@ -95,52 +95,17 @@ describe("McpManager", () => {
 		expect(getOAuthProvider("mcp:acme")).toBeDefined();
 	});
 
-	it("exposes only mcp.refresh when no interactive login is wired", async () => {
+	it("exposes only typed mcp.request and rejects unary invocation", async () => {
 		const manager = new McpManager({ authStorage });
 		const handlers = manager.hostHandlers();
-		expect(Object.keys(handlers).sort()).toEqual(["mcp.config", "mcp.refresh"]);
-
-		// refresh with no credentials fails (so the kernel reports a refresh error,
-		// not a false success), and a missing server arg is rejected.
-		await expect(handlers["mcp.refresh"]({ server: "linear" })).rejects.toThrow("MCP OAuth credentials are unavailable");
-		await expect(handlers["mcp.refresh"]({})).rejects.toThrow("requires a server");
+		expect(Object.keys(handlers)).toEqual(["mcp.request"]);
+		await expect((handlers["mcp.request"] as unknown as (payload: Record<string, unknown>) => Promise<Record<string, unknown>>)({ server: "linear", method: "tools/list" })).rejects.toThrow();
 	});
 
-	it("exposes mcp.begin_login only when beginLogin is provided", async () => {
-		let called = "";
-		const manager = new McpManager({
-			authStorage,
-			beginLogin: async (server) => {
-				called = server;
-			},
-		});
-		const handlers = manager.hostHandlers();
-		expect(Object.keys(handlers).sort()).toEqual(["mcp.begin_login", "mcp.config", "mcp.refresh"]);
-		await handlers["mcp.begin_login"]({ server: "linear" });
-		expect(called).toBe("linear");
-	});
-
-	it("mcp.config returns the resolved URL + headers, honoring a user override of a catalog name", async () => {
-		const manager = new McpManager({
-			authStorage,
-			getUserServers: () => ({
-				linear: { type: "http", url: "https://proxy.test/mcp", oauth: true, headers: { "X-Extra": "1" } },
-			}),
-		});
-		const handlers = manager.hostHandlers();
-		expect(await handlers["mcp.config"]({ server: "linear" })).toEqual({
-			url: "https://proxy.test/mcp",
-			headers: { "X-Extra": "1" },
-			hostOAuthOnly: true,
-		});
-		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({ url: "https://mcp.notion.com/mcp", hostOAuthOnly: true });
-	});
-
-	it("strips credential-shaped settings headers before Python configuration", async () => {
-		const manager = new McpManager({ authStorage, getUserServers: () => ({
-			public: { type: "http", url: "https://public.test/mcp", headers: { Authorization: "secret", "proxy-authorization": "secret", Cookie: "secret", "X-API-Key": "secret", "X-Extra": "safe" } },
-		}) });
-		expect(await manager.hostHandlers()["mcp.config"]({ server: "public" })).toEqual({ url: "https://public.test/mcp", headers: { "X-Extra": "safe" } });
+	it("has no public configuration or header handler", () => {
+		const manager = new McpManager({ authStorage, getUserServers: () => ({ public: { type: "http", url: "https://public.test/mcp", headers: { Authorization: "secret", "X-Extra": "safe" } } }) });
+		expect(Object.keys(manager.hostHandlers())).not.toContain("mcp.config");
+		expect(JSON.stringify(manager.hostHandlers())).not.toContain("Authorization");
 	});
 
 	it("does not treat an oauth override of a catalog name as authed via the official stored cred", () => {
