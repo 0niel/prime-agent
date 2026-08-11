@@ -34,6 +34,77 @@ try:
 except Exception:
     pass
 
+import asyncio as _prime_agent_asyncio
+import subprocess as _prime_agent_subprocess
+import shutil as _prime_agent_shutil
+import os as _prime_agent_bash_os
+
+
+class _PrimeAgentBashResult:
+    """Result of an async bash command."""
+    def __init__(self, stdout: str, stderr: str, returncode: int):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+    def __str__(self) -> str:
+        parts = []
+        if self.stdout:
+            parts.append(self.stdout)
+        if self.stderr:
+            parts.append(self.stderr)
+        text = chr(10).join(parts)
+        if self.returncode != 0:
+            text += chr(10) + chr(10) + f"Command exited with code {self.returncode}"
+        return text
+
+    def __repr__(self) -> str:
+        return f"BashResult(returncode={self.returncode}, stdout={len(self.stdout)} chars)"
+
+
+async def bash(command: str, *, timeout: float | None = None, cwd: str | None = None) -> _PrimeAgentBashResult:
+    """Run a shell command asynchronously without blocking the IPython kernel event loop.
+
+    Unlike %%bash cells (which block the kernel), 'await bash("...")' uses
+    asyncio.create_subprocess_exec so the kernel stays responsive to interrupts
+    and other messages while the command runs.
+
+    Args:
+        command: Shell command string.
+        timeout: Optional timeout in seconds. Raises TimeoutError if exceeded.
+        cwd: Working directory (defaults to kernel cwd).
+
+    Returns:
+        _PrimeAgentBashResult with stdout, stderr, and returncode.
+    """
+    shell = _prime_agent_shutil.which("bash") or "/bin/bash"
+    env = dict(_prime_agent_bash_os.environ)
+    work_dir = cwd or _prime_agent_bash_os.getcwd()
+
+    proc = await _prime_agent_asyncio.create_subprocess_exec(
+        shell, "-c", command,
+        stdout=_prime_agent_subprocess.PIPE,
+        stderr=_prime_agent_subprocess.PIPE,
+        cwd=work_dir,
+        env=env,
+    )
+
+    try:
+        stdout_bytes, stderr_bytes = await _prime_agent_asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+    except _prime_agent_asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise TimeoutError(f"bash command timed out after {timeout}s: {command}")
+
+    return _PrimeAgentBashResult(
+        stdout=stdout_bytes.decode("utf-8", errors="replace"),
+        stderr=stderr_bytes.decode("utf-8", errors="replace"),
+        returncode=proc.returncode if proc.returncode is not None else -1,
+    )
+
+
 try:
     import rlm as _prime_agent_rlm_module
     rlm = _prime_agent_rlm_module.rlm
