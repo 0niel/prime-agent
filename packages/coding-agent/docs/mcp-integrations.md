@@ -68,7 +68,9 @@ result = await linear.list_issues(team="Engineering")
 - A tool whose name isn't a valid Python identifier (e.g. Notion's `notion-search`)
   is called via the escape hatch: `await notion.call_tool("notion-search", {...})`.
 - A call against an integration with no credentials raises `NotEnabled` (telling
-  the user to `/mcp login`); a tool that returns an error raises `McpToolError`.
+  the user to `/mcp login`). A server explicitly disabled in settings raises
+  `McpDisabled` (tell the user to enable it in settings and run `/reload`); a tool
+  that returns an error raises `McpToolError`.
 
 ## Authoring your own integration
 
@@ -104,7 +106,7 @@ server fields:
 | `oauth` | `true` to use the browser OAuth flow (requires the server to support dynamic client registration) |
 | `bearerTokenEnvVar` | Name of an env var holding a static bearer token, instead of OAuth |
 | `headers` | Extra static HTTP headers sent on every request |
-| `enabled` | Set `false` to force-disable even when credentials exist |
+| `enabled` | Set `false` to force-disable even when credentials exist; calls raise `McpDisabled` until it is enabled and `/reload` runs |
 
 Omit both `oauth` and `bearerTokenEnvVar` for a server that accepts
 unauthenticated requests.
@@ -204,6 +206,8 @@ Methods:
 Exceptions (both importable from `rlm`):
 
 - `NotEnabled` — raised when an authenticated server has no usable credentials.
+- `McpDisabled` — raised when the host configuration explicitly sets `enabled: false`;
+  enable it in settings and run `/reload` rather than logging in.
 - `McpToolError` — raised when a tool call returns a result flagged as an error.
 
 ## Enable-by-login lifecycle

@@ -26,7 +26,7 @@ from typing import Any
 
 from . import host_request
 
-__all__ = ["McpIntegration", "McpToolError", "NotEnabled"]
+__all__ = ["McpDisabled", "McpIntegration", "McpToolError", "NotEnabled"]
 
 # Stored access tokens are treated as expired this many seconds early so a token
 # never dies mid-request. Mirrors the host's refresh buffer.
@@ -46,6 +46,18 @@ class NotEnabled(RuntimeError):
             f"The '{server}' integration is not enabled: no credentials found. "
             f"Tell the user to run `/mcp login {server}` in Prime Agent to connect it. "
             f"Do not ask them to set environment variables."
+        )
+
+
+class McpDisabled(RuntimeError):
+    """Raised when the host explicitly disables an integration in settings."""
+
+    def __init__(self, server: str):
+        self.server = server
+        super().__init__(
+            f"The '{server}' integration is disabled in settings. "
+            f"Tell the user to enable it in MCP settings and run `/reload`. "
+            f"Do not ask them to log in or set environment variables."
         )
 
 
@@ -207,7 +219,7 @@ class McpIntegration:
         # An explicit host disable takes precedence over every connection path.
         # Keep a missing signal backward-compatible with older hosts.
         if isinstance(cfg, dict) and cfg.get("enabled") is False:
-            raise NotEnabled(self.server)
+            raise McpDisabled(self.server)
         url = cfg.get("url") if isinstance(cfg, dict) else None
         headers = cfg.get("headers") if isinstance(cfg, dict) else None
         requires_auth = cfg.get("requiresAuth") if isinstance(cfg, dict) else None

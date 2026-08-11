@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from rlm import mcp_base
-from rlm.mcp_base import McpIntegration, McpToolError, NotEnabled
+from rlm.mcp_base import McpDisabled, McpIntegration, McpToolError, NotEnabled
 
 
 def _run(coro):
@@ -241,17 +241,12 @@ class McpIntegrationTest(unittest.TestCase):
         self._run_open_session_with_transport(transport)
         self.assertEqual(captured["headers"], {"Authorization": "Bearer tok-xyz"})
 
-    def test_open_session_rejects_explicit_host_disable_before_token_or_transport(self):
+    def _assert_explicit_host_disable_stops_before_auth_or_transport(self, config):
         calls = []
 
         async def fake_host_request(req_type, payload):
             calls.append((req_type, payload))
-            return {
-                "enabled": False,
-                "url": "https://host.test/mcp",
-                "requiresAuth": False,
-                "headers": {"Authorization": "Basic explicit"},
-            }
+            return config
 
         def unexpected_transport(*args, **kwargs):
             raise AssertionError("disabled integration must not create a transport")
@@ -259,9 +254,31 @@ class McpIntegrationTest(unittest.TestCase):
         with mock.patch.object(mcp_base, "host_request", fake_host_request), \
              mock.patch.object(mcp_base, "_resolve_streamable_http", unexpected_transport), \
              mock.patch.object(_Integration, "_resolve_token", side_effect=AssertionError("disabled integration must not resolve a token")):
-            with self.assertRaises(NotEnabled):
+            with self.assertRaises(McpDisabled) as ctx:
                 _run(_Integration()._open_session(AsyncExitStack()))
         self.assertEqual(calls, [("mcp.config", {"server": "demo"})])
+        self.assertIn("settings", str(ctx.exception))
+        self.assertIn("/reload", str(ctx.exception))
+        self.assertNotIn("login", str(ctx.exception).lower())
+        self.assertNotIn("token", str(ctx.exception).lower())
+
+    def test_open_session_disabled_anonymous_server_stops_before_auth_or_transport(self):
+        self._assert_explicit_host_disable_stops_before_auth_or_transport(
+            {"enabled": False, "url": "https://host.test/mcp", "requiresAuth": False}
+        )
+
+    def test_open_session_disabled_server_with_credentials_stops_before_auth_or_transport(self):
+        self._write_auth(
+            {"type": "oauth", "access": "tok", "refresh": "r", "expires": (time.time() + 3600) * 1000}
+        )
+        self._assert_explicit_host_disable_stops_before_auth_or_transport(
+            {"enabled": False, "url": "https://host.test/mcp", "requiresAuth": True}
+        )
+
+    def test_mcp_disabled_is_lazily_exported_from_rlm(self):
+        from rlm import McpDisabled as lazy_export
+
+        self.assertIs(lazy_export, McpDisabled)
 
     def test_open_session_missing_enabled_signal_remains_backward_compatible(self):
         captured = {}
