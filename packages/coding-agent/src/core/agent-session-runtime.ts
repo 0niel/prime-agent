@@ -223,8 +223,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		});
 		await flushAgentTraceUpload(this.session.sessionManager).catch(() => undefined);
 		this.beforeSessionInvalidate?.();
-		// AgentSession first revokes and awaits kernel host-request handlers before
-		// this replacement can invalidate the old session's authority.
+		// Await the kernel's final snapshot flush before invalidating the session.
 		await this.session.disposeAsync();
 		await this.disposeHostedSubagentRuntimes();
 	}
@@ -725,8 +724,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			disposeError ??= error;
 		}
 		try {
-			// AgentSession revokes and awaits kernel host-request handlers before
-			// runtime disposal can release this session's resources.
+			// Await the kernel's final snapshot flush before tearing the session down.
 			await this.session.disposeAsync();
 		} catch (error) {
 			disposeError ??= error;
