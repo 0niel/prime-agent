@@ -192,6 +192,33 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(disposed).toBe(true);
 	});
 
+	it("starts the refinement drain before awaiting a deferred kernel provisioner dispose", async () => {
+		createSession();
+		const order: string[] = [];
+		let releaseKernelDispose: () => void = () => {};
+		const kernelDisposeGate = new Promise<void>((resolve) => {
+			releaseKernelDispose = resolve;
+		});
+		const internals = session as unknown as {
+			_drainPendingRefinementForDisposal: () => Promise<void>;
+			_ipythonKernelProvisioner?: { dispose(): Promise<void> };
+		};
+		vi.spyOn(internals, "_drainPendingRefinementForDisposal").mockImplementation(async () => {
+			order.push("drain");
+		});
+		internals._ipythonKernelProvisioner = {
+			dispose: vi.fn(async () => {
+				order.push("kernel-dispose");
+				await kernelDisposeGate;
+			}),
+		};
+
+		const disposal = session.disposeAsync();
+		expect(order).toEqual(["drain", "kernel-dispose"]);
+		releaseKernelDispose();
+		await disposal;
+	});
+
 	it("should throw when prompt() called while streaming", async () => {
 		createSession();
 

@@ -2877,6 +2877,93 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(stopWorker).not.toHaveBeenCalled();
 	});
 
+	it("persists a sanitized descriptor before adopting it for recovery", () => {
+		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-descriptor-sanitize-"));
+		const descriptorPath = join(descriptorDir, "worker-1.json");
+		const descriptor = {
+			version: 1,
+			supervisorSocketPath: "/tmp/supervisor.sock",
+			workerId: "worker-1",
+			pid: process.pid,
+			socketPath: "/tmp/worker-1.sock",
+			authenticationToken: "token",
+			rootActiveSessionId: "active-1",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			consecutiveFailures: 0,
+			createCommand: { type: "create" },
+			launchEnv: { TSX_TSCONFIG_PATH: "/tmp/tsconfig.json", SECRET_TOKEN: "must-not-persist" },
+		};
+		try {
+			writeFileSync(descriptorPath, `${JSON.stringify(descriptor)}\n`);
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				descriptorDir,
+				socketPath: "/tmp/supervisor.sock",
+				workers: new Map(),
+				log: vi.fn(),
+				persistWorker(worker: { descriptor: object }) {
+					writeFileSync(descriptorPath, `${JSON.stringify(worker.descriptor)}\n`);
+				},
+			}) as {
+				workers: Map<string, { descriptor: { launchEnv?: object }; launchEnv?: object }>;
+				loadWorkerDescriptors(): void;
+			};
+
+			supervisor.loadWorkerDescriptors();
+
+			expect(supervisor.workers.get("worker-1")?.descriptor.launchEnv).toEqual({
+				TSX_TSCONFIG_PATH: "/tmp/tsconfig.json",
+			});
+			expect(supervisor.workers.get("worker-1")?.launchEnv).toEqual({ TSX_TSCONFIG_PATH: "/tmp/tsconfig.json" });
+			expect(JSON.parse(readFileSync(descriptorPath, "utf8"))).toMatchObject({
+				launchEnv: { TSX_TSCONFIG_PATH: "/tmp/tsconfig.json" },
+			});
+			expect(readFileSync(descriptorPath, "utf8")).not.toContain("SECRET_TOKEN");
+		} finally {
+			rmSync(descriptorDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not adopt a descriptor when sanitization persistence fails", () => {
+		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-descriptor-sanitize-fail-"));
+		const descriptorPath = join(descriptorDir, "worker-1.json");
+		const original = {
+			version: 1,
+			supervisorSocketPath: "/tmp/supervisor.sock",
+			workerId: "worker-1",
+			pid: process.pid,
+			socketPath: "/tmp/worker-1.sock",
+			authenticationToken: "token",
+			rootActiveSessionId: "active-1",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			consecutiveFailures: 0,
+			createCommand: { type: "create" },
+			launchEnv: { TSX_TSCONFIG_PATH: "/tmp/tsconfig.json", SECRET_TOKEN: "secret" },
+		};
+		try {
+			writeFileSync(descriptorPath, `${JSON.stringify(original)}\n`);
+			const log = vi.fn();
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				descriptorDir,
+				socketPath: "/tmp/supervisor.sock",
+				workers: new Map(),
+				log,
+				persistWorker: () => {
+					throw new Error("disk full");
+				},
+			}) as { workers: Map<string, unknown>; loadWorkerDescriptors(): void };
+
+			supervisor.loadWorkerDescriptors();
+
+			expect(supervisor.workers.size).toBe(0);
+			expect(readFileSync(descriptorPath, "utf8")).toBe(`${JSON.stringify(original)}\n`);
+			expect(log).toHaveBeenCalledWith(expect.stringContaining("disk full"));
+		} finally {
+			rmSync(descriptorDir, { recursive: true, force: true });
+		}
+	});
+
 	it("ignores malformed persisted worker descriptors", () => {
 		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-descriptor-test-"));
 		try {

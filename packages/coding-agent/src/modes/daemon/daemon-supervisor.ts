@@ -953,10 +953,12 @@ export class DaemonSupervisor {
 					stopRevision: 0,
 					launchEnv: descriptor.launchEnv,
 				};
-				this.workers.set(descriptor.workerId, worker);
+				// Sanitization is a durable admission boundary. Do not expose a worker to
+				// recovery/adoption until its descriptor no longer contains caller secrets.
 				if (JSON.stringify(storedLaunchEnv) !== JSON.stringify(descriptor.launchEnv)) {
 					this.persistWorker(worker);
 				}
+				this.workers.set(descriptor.workerId, worker);
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
 			}
@@ -2156,11 +2158,18 @@ export class DaemonSupervisor {
 			throw new Error("Session is not owned by this client");
 		}
 		const previousDescriptor = worker.descriptor;
-		worker.descriptor = { ...previousDescriptor, ownerClientId: undefined, launchEnv: undefined };
+		const previousLaunchEnv = worker.launchEnv;
+		const persistedLaunchEnv = filterPersistedDaemonLaunchEnv(previousLaunchEnv);
+		worker.descriptor = {
+			...previousDescriptor,
+			ownerClientId: undefined,
+			...(persistedLaunchEnv ? { launchEnv: persistedLaunchEnv } : { launchEnv: undefined }),
+		};
 		try {
 			this.persistWorker(worker);
 		} catch (error) {
 			worker.descriptor = previousDescriptor;
+			worker.launchEnv = previousLaunchEnv;
 			throw error;
 		}
 		worker.promotedOwnerClientId = clientId;
@@ -2168,7 +2177,7 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
-		worker.launchEnv = undefined;
+		worker.launchEnv = persistedLaunchEnv;
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 	}
 

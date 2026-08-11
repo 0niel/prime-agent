@@ -651,6 +651,8 @@ export class KernelManager {
 	private readonly handledHostRequestCommIds = new Set<string>();
 	/** Monotonically revokes all host-request authority across kernel lifecycles. */
 	private hostRequestGeneration = 0;
+	/** Closed synchronously before teardown can await a final snapshot. */
+	private hostRequestAdmissionOpen = true;
 	private readonly activeHostRequests = new Map<string, ActiveHostRequest>();
 	private readonly hostRequestIdsByComm = new Map<string, string>();
 	private kernel?: ChildProcess;
@@ -845,6 +847,7 @@ export class KernelManager {
 		}
 
 		this.state = "running";
+		this.hostRequestAdmissionOpen = true;
 		this.startForkedLivenessMonitor();
 	}
 
@@ -1356,6 +1359,11 @@ export class KernelManager {
 	}
 
 	private startHostRequestFromComm(commId: string, data: unknown): void {
+		// A snapshot keeps the kernel running long enough for an internal execute;
+		// teardown nonetheless must not admit newly injected comm work in that gap.
+		if (!this.hostRequestAdmissionOpen) {
+			return;
+		}
 		if (this.handledHostRequestCommIds.has(commId)) {
 			return;
 		}
@@ -1429,6 +1437,7 @@ export class KernelManager {
 
 	/** Abort every active request before a kernel connection is replaced or closed. */
 	private revokeHostRequests(): void {
+		this.hostRequestAdmissionOpen = false;
 		this.hostRequestGeneration += 1;
 		for (const request of this.activeHostRequests.values()) {
 			request.controller.abort();
@@ -1610,11 +1619,10 @@ export class KernelManager {
 	}
 
 	async kill(): Promise<void> {
+		// Force kill must not wait on a handler that ignores its abort signal.
 		this.revokeHostRequests();
-		const inFlightHostRequests = [...this.inFlightHostRequests];
 		this.state = "shutdown";
 		liveKernels.delete(this);
-		await this.waitForHostRequestsToSettle(inFlightHostRequests);
 		this.cleanupResources("SIGKILL");
 	}
 

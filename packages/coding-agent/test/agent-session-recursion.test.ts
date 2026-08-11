@@ -3097,6 +3097,66 @@ print(_result.name)
 		}
 	});
 
+	it("force kills without awaiting an abort-ignoring host handler", async () => {
+		let started = false;
+		let releaseHandler: () => void = () => {};
+		const handlerGate = new Promise<void>((resolve) => {
+			releaseHandler = resolve;
+		});
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: {
+				"rlm.run": createRlmRunHostHandler(async () => {
+					started = true;
+					await handlerGate;
+					return {
+						answer: "unused",
+						usage: { prompt_tokens: 1, completion_tokens: 1 },
+						turns: 1,
+						session_dir: null,
+						model: "test/model",
+					};
+				}),
+			},
+		});
+		const kernel = manager as unknown as KernelCommTestApi & {
+			kernel?: { kill(signal: NodeJS.Signals): void };
+		};
+		const kill = vi.fn();
+		kernel.kernel = { kill };
+		try {
+			kernel.handleCommMessage(rlmCommOpen("comm-force-kill", "slow child"));
+			expect(started).toBe(true);
+			await expectSettlesWithin(manager.kill(), 100);
+			expect(kill).toHaveBeenCalledWith("SIGKILL");
+		} finally {
+			releaseHandler();
+		}
+	});
+
+	it("does not admit a host comm injected while dispose awaits its final snapshot", async () => {
+		const handler = vi.fn(async () => ({
+			answer: "unused",
+			usage: { prompt_tokens: 1, completion_tokens: 1 },
+			turns: 1,
+			session_dir: null,
+			model: "test/model",
+		}));
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: { "rlm.run": createRlmRunHostHandler(handler) },
+		});
+		const kernel = manager as unknown as KernelCommTestApi & {
+			flushSnapshotForDispose(): Promise<void>;
+		};
+		kernel.flushSnapshotForDispose = async () => {
+			kernel.handleCommMessage(rlmCommOpen("comm-injected-during-snapshot", "denied"));
+		};
+
+		await manager.dispose();
+		expect(handler).not.toHaveBeenCalled();
+	});
+
 	it("rejects removed background rlm comm request types", async () => {
 		const replies: CapturedCommReply[] = [];
 		const manager = new KernelManager({

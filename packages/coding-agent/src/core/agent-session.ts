@@ -3791,10 +3791,14 @@ export class AgentSession {
 			// refinement work. The provisioner forwards this to KernelManager, which
 			// aborts each request and awaits its handler before its connection closes.
 			// This prevents an old session's host handler from surviving replacement.
-			await this._ipythonKernelProvisioner?.dispose();
+			// Capture the refinement drain before the first await: this preserves a
+			// final agent_end's serialized work while kernel disposal is pending.
+			const drain = this._drainPendingRefinementForDisposal();
+			const kernelDispose = this._ipythonKernelProvisioner?.dispose();
+			if (kernelDispose) await kernelDispose;
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
-			await this._drainPendingRefinementForDisposal();
+			await drain;
 			if (this._disposed) {
 				return this._disposeCallbacksPromise;
 			}
