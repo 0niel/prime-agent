@@ -682,16 +682,16 @@ describe("AgentSession rlm recursion", () => {
 				child: expect.objectContaining({ id: childId, status: "cancelled" }),
 			}),
 		);
-		expect(root.getRlmChildSnapshots()).toEqual([
-			expect.objectContaining({ id: childId, status: "cancelled" }),
-		]);
+		expect(root.getRlmChildSnapshots()).toEqual([expect.objectContaining({ id: childId, status: "cancelled" })]);
 		const connection = new InProcessAgentConnection({
 			session: root,
 			setRebindSession() {},
 			setBeforeSessionInvalidate() {},
 			dispose: async () => {},
 		} as unknown as AgentSessionRuntime);
-		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({ children: [expect.objectContaining({ id: childId, status: "cancelled" })] });
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+			children: [expect.objectContaining({ id: childId, status: "cancelled" })],
+		});
 		await expect(root.deleteRlmSubagent("cancelled-cleanup-worker")).resolves.toMatchObject({
 			subagent: { rlm_child_id: childId },
 		});
