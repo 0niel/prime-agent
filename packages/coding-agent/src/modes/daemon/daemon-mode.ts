@@ -2873,6 +2873,7 @@ export class AgentDaemon {
 
 	private async createAgentObserveListResult(currentState: ActiveSessionState): Promise<AgentObserveListResult> {
 		const catalog = await this.agentFamilyCatalogEntries();
+		this.authoritativeAgentFamilyEntry(currentState, catalog);
 		const agents = this.listTargetableSessionStates(currentState)
 			.filter((state) => {
 				if (state.activeSessionId === currentState.activeSessionId) return true;

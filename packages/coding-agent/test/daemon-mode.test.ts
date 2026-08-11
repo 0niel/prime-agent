@@ -2823,10 +2823,12 @@ describe("daemon mode helpers", () => {
 			{ id: targetId, depth: 1, status: "running" as const, parentSessionId: parentId },
 		];
 
+		// The current observer must be resolved from the immutable catalog before
+		// self inclusion. Either duplicate ordering is ambiguous and must fail closed.
 		for (const catalog of [entries, [...entries.slice(0, 1), entries[2]!, entries[1]!, entries[3]!]]) {
 			internals.agentFamilyCatalogEntries = vi.fn(async () => Object.freeze(catalog));
 			const observe = internals.createAgentObserveController(() => source.state);
-			expect((await observe.listAgents()).agents.map((agent) => agent.activeSessionId)).toEqual(["source"]);
+			await expect(observe.listAgents()).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
 			await expect(observe.getAgent(target.state.activeSessionId)).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
 			await expect(observe.recentMessages({ target: target.state.activeSessionId })).rejects.toThrow(
 				AGENT_FAMILY_REACH_ERROR,
