@@ -82,10 +82,10 @@ export interface HostRequestHandlerOptions {
 /** The stable marker makes default/rest callbacks unambiguous without Function.length. */
 export const contextAwareHostRequestHandler: HostRequestHandlerOptions = Object.freeze({ contextAware: true });
 
-/** Implementations may use binary, rest, or default parameters; the marker is the authority contract. */
+/** Implementations receive dispatcher-minted context; the marker makes rest/default callbacks unambiguous. */
 export type HostRequestHandlerImplementation = (
 	payload: HostRequestPayload,
-	context?: HostRequestContext,
+	context: HostRequestContext,
 ) => Promise<Record<string, unknown>>;
 
 /** Public registration shape; provenance is always checked at dispatch time. */
@@ -121,21 +121,6 @@ function mintHostRequestContext(
 		{ once: true },
 	);
 	return context;
-}
-
-/** Test harness only: invokes through a freshly dispatcher-minted, immediately-live authority. */
-export async function invokeHostRequestHandlerForTest(
-	handler: HostRequestHandler,
-	payload: HostRequestPayload,
-): Promise<Record<string, unknown>> {
-	assertHostRequestHandler(handler);
-	const controller = new AbortController();
-	const context = mintHostRequestContext(uuid(), 0, controller);
-	try {
-		return await handler(payload, context);
-	} finally {
-		controller.abort();
-	}
 }
 
 /**

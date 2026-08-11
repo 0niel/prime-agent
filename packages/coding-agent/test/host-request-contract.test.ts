@@ -4,8 +4,8 @@ import {
 	contextAwareHostRequestHandler,
 	createHostRequestHandler,
 	type HostRequestContext,
-	invokeHostRequestHandlerForTest,
 } from "../src/core/kernel/index.js";
+import { invokeHostRequestThroughKernelForTest as invokeHostRequestHandlerForTest } from "./host-request-context.js";
 
 describe("staged host-request handler authority", () => {
 	it("rejects unary factory inputs before they run", () => {
@@ -30,7 +30,9 @@ describe("staged host-request handler authority", () => {
 		}, contextAwareHostRequestHandler);
 
 		assertHostRequestHandler(handler);
-		await expect(handler({})).rejects.toThrow("host request context is invalid");
+		await expect(handler({}, undefined as unknown as HostRequestContext)).rejects.toThrow(
+			"host request context is invalid",
+		);
 		await expect(handler({}, {} as HostRequestContext)).rejects.toThrow("host request context is invalid");
 		await expect(invokeHostRequestHandlerForTest(handler, {})).resolves.toEqual({});
 		expect(calls).toBe(1);
@@ -66,7 +68,7 @@ describe("staged host-request handler authority", () => {
 			contextAwareHostRequestHandler,
 		);
 		expect((await invokeHostRequestHandlerForTest(rest, {})).requestId).toEqual(expect.any(String));
-		expect((await invokeHostRequestHandlerForTest(defaulted, {})).generation).toBe(0);
+		expect((await invokeHostRequestHandlerForTest(defaulted, {})).generation).toBe(1);
 	});
 
 	it("does not accept a structural or payload-supplied context", async () => {

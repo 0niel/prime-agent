@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { getOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import { invokeHostRequestHandlerForTest } from "../src/core/kernel/index.js";
 import { McpManager } from "../src/core/mcp/mcp-manager.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import type { McpServerConfig } from "../src/core/settings-manager.js";
+import { invokeHostRequestThroughKernelForTest as invokeHostRequestHandlerForTest } from "./host-request-context.js";
 
 describe("McpManager", () => {
 	let tempDir: string;
