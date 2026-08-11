@@ -702,3 +702,8 @@ MIT
 - [Prime Agent AI](../ai): Core LLM toolkit
 - [Prime Agent Core](../agent): Agent framework
 - [Prime Agent TUI](../tui): Terminal UI components
+
+
+## Platform support
+
+Persistent continual-harness storage and `/refine` require POSIX filesystem semantics. On Windows, Prime Agent disables persistent harness reads and auto-refine and rejects `/refine` before model work; in-memory session features remain available.

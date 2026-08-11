@@ -201,6 +201,7 @@ import {
 	getRefinementHistory,
 	type HarnessState,
 	inferRefinementResultScope,
+	isPersistentHarnessStorageSupported,
 	loadGlobalRefinementHistory,
 	loadHarnessState,
 	mergeHarnessStates,
@@ -211,6 +212,7 @@ import {
 	type RefinementResult,
 	reviewAutoRefine,
 	saveHarnessState,
+	WINDOWS_HARNESS_PERSISTENCE_UNSUPPORTED_ERROR,
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
@@ -7270,7 +7272,9 @@ export class AgentSession {
 	}
 
 	private _autoRefineAllowedForSession(): boolean {
-		return this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined;
+		return (
+			isPersistentHarnessStorageSupported() && this._rlmDepth === 0 && this._localHarnessStateDir() !== undefined
+		);
 	}
 
 	private _cancelPostCompactionContinue(): void {
@@ -7676,6 +7680,9 @@ export class AgentSession {
 		} = {},
 		internal: { skipAbort?: boolean } = {},
 	): Promise<RefinementResult> {
+		if (!isPersistentHarnessStorageSupported()) {
+			throw new Error(WINDOWS_HARNESS_PERSISTENCE_UNSUPPORTED_ERROR);
+		}
 		// Queued /refine executes from the session-input pump between turns;
 		// refine never aborts the agent (planning is backgrounded and the apply
 		// phase waits for quiescence), so skipAbort only asserts the pump's
@@ -11094,7 +11101,7 @@ export class AgentSession {
 
 	/** RLM session dir holding sub-* child sessions, without creating directories. */
 	private _rlmSessionDirForReading(): string | undefined {
-		return this._rlmSessionDir ?? this.sessionManager.getSessionArtifactDir();
+		return this._rlmSessionDir ?? this.sessionManager.getSessionArtifactDir({ create: false });
 	}
 
 	private _contextWindowResolver(): ContextWindowResolver {

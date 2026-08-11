@@ -1,7 +1,6 @@
 import {
 	appendFileSync,
 	chmodSync,
-	type chownSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -19,14 +18,12 @@ import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 type ChmodSync = typeof chmodSync;
-type ChownSync = typeof chownSync;
 type RenameSync = typeof renameSync;
 type WriteFileSync = typeof writeFileSync;
 
 const fsMocks = vi.hoisted(() => ({
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
 	chmodSync: vi.fn<ChmodSync>(),
-	chownSync: vi.fn<ChownSync>(),
 	renameSync: vi.fn<RenameSync>(),
 	writeFileSync: vi.fn<WriteFileSync>(),
 }));
@@ -34,13 +31,11 @@ vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
 	fsMocks.chmodSync.mockImplementation(actual.chmodSync);
-	fsMocks.chownSync.mockImplementation(actual.chownSync);
 	fsMocks.renameSync.mockImplementation(actual.renameSync);
 	fsMocks.writeFileSync.mockImplementation(actual.writeFileSync);
 	return {
 		...actual,
 		chmodSync: fsMocks.chmodSync,
-		chownSync: fsMocks.chownSync,
 		renameSync: fsMocks.renameSync,
 		writeFileSync: fsMocks.writeFileSync,
 	};
@@ -115,66 +110,23 @@ describe("SessionManager.flushNow", () => {
 		);
 	});
 
-	it("preserves live-file metadata before atomically replacing it", () => {
+	it("replaces a permissive session file atomically with private mode", () => {
 		const dir = createTempDir();
 		const mgr = SessionManager.create(dir, join(dir, "sessions"));
 		mgr.appendCustomEntry("before_metadata_check");
 		mgr.flushNow();
 		const file = mgr.getSessionFile()!;
 		chmodSync(file, 0o660);
-		const before = statSync(file);
-		fsMocks.chownSync.mockClear();
-		fsMocks.chownSync.mockImplementationOnce(() => undefined);
-		fsMocks.chmodSync.mockClear();
 		fsMocks.renameSync.mockClear();
 
 		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
 		mgr.flushNow();
 
-		const tempPath = fsMocks.chownSync.mock.calls[0]?.[0];
-		expect(tempPath).toEqual(expect.any(String));
-		expect(fsMocks.chownSync).toHaveBeenCalledWith(tempPath, before.uid, before.gid);
-		expect(fsMocks.chmodSync).toHaveBeenCalledWith(tempPath, before.mode & 0o777);
-		expect(fsMocks.renameSync).toHaveBeenCalledWith(tempPath, join(dirname(tempPath as string), basename(file)));
-		expect(fsMocks.chownSync.mock.invocationCallOrder[0]!).toBeLessThan(
-			fsMocks.chmodSync.mock.invocationCallOrder[0]!,
-		);
-		expect(fsMocks.chmodSync.mock.invocationCallOrder[0]!).toBeLessThan(
-			fsMocks.renameSync.mock.invocationCallOrder[0]!,
-		);
-		const after = statSync(file);
-		expect({ mode: after.mode & 0o777, uid: after.uid, gid: after.gid }).toEqual({
-			mode: before.mode & 0o777,
-			uid: before.uid,
-			gid: before.gid,
-		});
+		expect(fsMocks.renameSync).toHaveBeenCalledWith(expect.any(String), file);
+		expect(statSync(file).mode & 0o777).toBe(0o600);
 	});
 
-	it("preserves live bytes and cleans the temp file when restoring ownership fails", () => {
-		const dir = createTempDir();
-		const mgr = SessionManager.create(dir, join(dir, "sessions"));
-		mgr.appendCustomEntry("before_ownership_failure");
-		mgr.flushNow();
-		const file = mgr.getSessionFile()!;
-		const before = readFileSync(file);
-		const tempPrefix = `.${basename(file)}.`;
-		const permissionError = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
-		fsMocks.chownSync.mockImplementationOnce(() => {
-			throw permissionError;
-		});
-		fsMocks.renameSync.mockClear();
-
-		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
-
-		expect(() => mgr.flushNow()).toThrow(permissionError);
-		expect(fsMocks.renameSync).not.toHaveBeenCalled();
-		expect(readFileSync(file)).toEqual(before);
-		expect(readdirSync(dirname(file)).filter((name) => name.startsWith(tempPrefix) && name.endsWith(".tmp"))).toEqual(
-			[],
-		);
-	});
-
-	it("rewrites a cross-directory symlink target without replacing the alias", () => {
+	it("refuses a cross-directory symlink instead of rewriting its target", () => {
 		const dir = createTempDir();
 		const targetDir = join(dir, "targets");
 		const aliasDir = join(dir, "aliases");
@@ -195,11 +147,9 @@ describe("SessionManager.flushNow", () => {
 		chmodSync(target, 0o640);
 		symlinkSync(target, alias);
 
-		const mgr = SessionManager.open(alias);
-
-		expect(mgr.getSessionFile()).toBe(alias);
+		expect(() => SessionManager.open(alias)).toThrow("non-regular private file");
 		expect(lstatSync(alias).isSymbolicLink()).toBe(true);
-		expect(JSON.parse(readFileSync(target, "utf8")).version).toBe(3);
+		expect(JSON.parse(readFileSync(target, "utf8")).version).toBe(2);
 		expect(statSync(target).mode & 0o777).toBe(0o640);
 	});
 

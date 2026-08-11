@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -34,6 +34,18 @@ describe("SessionManager flat storage", () => {
 			expect(continued.getSessionId()).toBe(sessionA.getSessionId());
 
 			expect(sessionA.getSessionArtifactDir()).toBe(join(tempDir, "session-artifacts", sessionA.getSessionId()));
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("computes an artifact path without creating it when requested", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "session-artifact-read-"));
+		try {
+			const session = SessionManager.create(tempDir, join(tempDir, "sessions"));
+			const artifactPath = session.getSessionArtifactDir({ create: false })!;
+			expect(artifactPath).toBe(join(tempDir, "session-artifacts", session.getSessionId()));
+			expect(existsSync(artifactPath)).toBe(false);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

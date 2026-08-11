@@ -328,7 +328,7 @@ function createUniqueSessionFileTarget(sessionDir: string): { sessionId: string;
 	throw new Error("Unable to create a unique session file");
 }
 
-function getSessionArtifactPath(sessionDir: string, sessionId: string): string {
+function getSessionArtifactPath(sessionDir: string, sessionId: string, create = true): string {
 	assertValidSessionId(sessionId);
 	const artifactRoot = resolve(dirname(sessionDir), "session-artifacts");
 	const artifactPath = resolve(artifactRoot, sessionId);
@@ -337,6 +337,7 @@ function getSessionArtifactPath(sessionDir: string, sessionId: string): string {
 		throw new Error(`Session artifact path escapes its root: ${artifactPath}`);
 	}
 
+	if (!create) return artifactPath;
 	ensurePrivateDirectory(artifactRoot);
 	ensurePrivateDirectory(artifactPath);
 	const canonicalRoot = realpathSync(artifactRoot);
@@ -1237,9 +1238,15 @@ export class SessionManager {
 	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			const firstHeader = readSessionHeader(this.sessionFile);
-			if (firstHeader?.type === "session" && typeof firstHeader.id === "string") {
-				assertValidSessionId(firstHeader.id);
+			try {
+				const firstHeader = readSessionHeader(this.sessionFile);
+				if (firstHeader?.type === "session" && typeof firstHeader.id === "string") {
+					assertValidSessionId(firstHeader.id);
+				}
+			} catch (error) {
+				// A malformed first line is handled by the existing corrupt-file recovery
+				// path below. Preserve errors from filesystem safety checks and invalid IDs.
+				if (!(error instanceof SyntaxError)) throw error;
 			}
 			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
 
@@ -1434,8 +1441,8 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	getSessionArtifactDir(): string | undefined {
-		return this.persist ? getSessionArtifactPath(this.sessionDir, this.sessionId) : undefined;
+	getSessionArtifactDir(options: { create?: boolean } = {}): string | undefined {
+		return this.persist ? getSessionArtifactPath(this.sessionDir, this.sessionId, options.create ?? true) : undefined;
 	}
 
 	/**

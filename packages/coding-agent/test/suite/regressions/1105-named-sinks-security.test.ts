@@ -1,4 +1,5 @@
 import {
+	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -21,7 +22,12 @@ import {
 	saveHarnessState,
 } from "../../../src/core/refinement/refinement.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
-import { createPrivateTempFile } from "../../../src/utils/private-files.js";
+import {
+	appendPrivateFile,
+	createPrivateTempFile,
+	ensurePrivateFile,
+	writePrivateFileAtomic,
+} from "../../../src/utils/private-files.js";
 
 const describePosix = process.platform === "win32" ? describe.skip : describe;
 
@@ -34,6 +40,15 @@ describePosix("issue #1105 named sink security", () => {
 
 	afterEach(() => {
 		rmSync(tempRoot, { recursive: true, force: true });
+	});
+
+	it("makes existing private files private after an exclusive-create race", () => {
+		const path = join(tempRoot, "race.json");
+		writeFileSync(path, "created elsewhere");
+		ensurePrivateFile(path, "ignored");
+		appendPrivateFile(path, "\nnext");
+		expect(readFileSync(path, "utf8")).toBe("created elsewhere\nnext");
+		expect(statSync(path).mode & 0o777).toBe(0o600);
 	});
 
 	it("creates unpredictable private editor/share temp files", () => {
@@ -69,6 +84,22 @@ describePosix("issue #1105 named sink security", () => {
 		symlinkSync(target, output);
 		await expect(exportFromFile(sessionFile, output)).rejects.toThrow("non-regular private file");
 		expect(readFileSync(target, "utf8")).toBe("sentinel");
+	});
+
+	it("refuses private paths below a symlinked ancestor", () => {
+		const outside = join(tempRoot, "outside");
+		const linkedRoot = join(tempRoot, "linked-root");
+		mkdirSync(outside);
+		symlinkSync(outside, linkedRoot);
+		expect(() => ensurePrivateFile(join(linkedRoot, "nested", "secret.json"))).toThrow("non-directory private path");
+		expect(() => appendPrivateFile(join(linkedRoot, "nested", "secret.json"), "secret")).toThrow(
+			"non-directory private path",
+		);
+		expect(() =>
+			writePrivateFileAtomic(join(linkedRoot, "export", "secret.json"), "secret", { privateParent: false }),
+		).toThrow("non-directory private path");
+		expect(existsSync(join(outside, "nested", "secret.json"))).toBe(false);
+		expect(existsSync(join(outside, "export", "secret.json"))).toBe(false);
 	});
 
 	it("repairs harness modes and refuses state/history symlinks", () => {

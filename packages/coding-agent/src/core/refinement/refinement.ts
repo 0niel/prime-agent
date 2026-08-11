@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
@@ -12,6 +12,16 @@ import type { CustomEntry } from "../session-manager.js";
 export const REFINEMENT_CUSTOM_TYPE = "prime-agent.refinement";
 
 export const REFINE_SKILL_NAME = "refine";
+
+export const WINDOWS_HARNESS_PERSISTENCE_UNSUPPORTED_ERROR = "Persistent harness storage is unsupported on Windows";
+
+export function isPersistentHarnessStorageSupported(): boolean {
+	return process.platform !== "win32";
+}
+
+function assertPersistentHarnessStorageSupported(): void {
+	if (!isPersistentHarnessStorageSupported()) throw new Error(WINDOWS_HARNESS_PERSISTENCE_UNSUPPORTED_ERROR);
+}
 const HARNESS_STATE_DIR_NAME = "harness";
 const REFINEMENT_HISTORY_FILE_NAME = "refinements.jsonl";
 const DEFAULT_OVERVIEW_ENTRY_LIMIT = 6;
@@ -273,9 +283,13 @@ export function loadHarnessState(
 	harnessStateDir: string = getGlobalHarnessStateDir(),
 	scope: HarnessScope = "global",
 ): HarnessState {
+	if (!isPersistentHarnessStorageSupported()) return emptyHarnessState();
 	const statePath = getHarnessStatePath(harnessStateDir);
 	if (!existsSync(statePath)) {
 		return emptyHarnessState();
+	}
+	if (lstatSync(statePath).isSymbolicLink()) {
+		throw new Error(`Refusing to use non-regular private file: ${statePath}`);
 	}
 	let parsed: Partial<HarnessState>;
 	try {
@@ -334,6 +348,7 @@ export function mergeHarnessStates(globalState: HarnessState, localState?: Harne
 }
 
 export function saveHarnessState(harnessStateDir: string, state: HarnessState): string {
+	assertPersistentHarnessStorageSupported();
 	const statePath = getHarnessStatePath(harnessStateDir);
 	writePrivateFileAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`);
 	return statePath;
@@ -353,12 +368,14 @@ function isRefinementResult(data: unknown): data is RefinementResult {
  * session JSONL and roll back via their recorded harnessStatePath.
  */
 export function appendGlobalRefinement(harnessStateDir: string, result: RefinementResult): string {
+	assertPersistentHarnessStorageSupported();
 	const historyPath = getRefinementHistoryPath(harnessStateDir);
 	appendPrivateFile(historyPath, `${JSON.stringify(result)}\n`);
 	return historyPath;
 }
 
 export function loadGlobalRefinementHistory(harnessStateDir: string = getGlobalHarnessStateDir()): RefinementResult[] {
+	if (!isPersistentHarnessStorageSupported()) return [];
 	const historyPath = getRefinementHistoryPath(harnessStateDir);
 	if (!existsSync(historyPath)) {
 		return [];

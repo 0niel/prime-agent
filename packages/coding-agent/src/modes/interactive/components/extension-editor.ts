@@ -133,10 +133,13 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 				this.editor.setText(newContent);
 			}
 		} finally {
-			fs.rmSync(temp.directory, { recursive: true, force: true });
-			this.tui.start();
-			// Force full re-render since external editor uses alternate screen
-			this.tui.requestRender(true);
+			try {
+				fs.rmSync(temp.directory, { recursive: true, force: true });
+			} finally {
+				this.tui.start();
+				// Force full re-render since external editor uses alternate screen
+				this.tui.requestRender(true);
+			}
 		}
 	}
 }

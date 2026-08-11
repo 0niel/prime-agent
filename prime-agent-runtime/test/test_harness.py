@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import stat
@@ -134,6 +135,20 @@ class HarnessStateTest(unittest.TestCase):
             self.assertIn("await rlm.list_subagents()", overview)
             self.assertIn("receiver_role='child'", overview)
             self.assertIn("refinements: 1", reloaded.overview())
+
+    def test_windows_harness_proxy_never_resolves_or_writes(self) -> None:
+        from unittest.mock import patch
+
+        harness_module = importlib.import_module("rlm.harness")
+        with patch.object(harness_module.os, "name", "nt"), patch.object(
+            harness_module, "_state_file", side_effect=AssertionError("state path must not resolve")
+        ):
+            state = harness_module.get_harness_state(Path("should-not-be-read"))
+            self.assertEqual(state.list(), [])
+            with self.assertRaisesRegex(RuntimeError, "Persistent harness storage is unsupported on Windows"):
+                state.create_memory("blocked", "blocked")
+            with self.assertRaisesRegex(RuntimeError, "Persistent harness storage is unsupported on Windows"):
+                state.save()
 
     @unittest.skipIf(os.name == "nt", "POSIX permissions and symlink semantics")
     def test_private_atomic_state_rejects_symlink_destination(self) -> None:

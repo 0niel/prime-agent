@@ -7334,17 +7334,18 @@ export class InteractiveMode {
 			}
 			// On non-zero exit, keep original text (no action needed)
 		} finally {
-			// Clean up temp file
-			fs.rmSync(temp.directory, { recursive: true, force: true });
-
-			// Restart TUI
-			this.ui.start();
-			// ui.stop() left fullscreen so the editor got a clean terminal
-			if (this.fullscreenEnabled) {
-				this.applyFullscreen(true);
+			try {
+				// Cleanup failures must not leave the terminal UI stopped.
+				fs.rmSync(temp.directory, { recursive: true, force: true });
+			} finally {
+				this.ui.start();
+				// ui.stop() left fullscreen so the editor got a clean terminal
+				if (this.fullscreenEnabled) {
+					this.applyFullscreen(true);
+				}
+				// Force full re-render since external editor uses alternate screen
+				this.ui.requestRender(true);
 			}
-			// Force full re-render since external editor uses alternate screen
-			this.ui.requestRender(true);
 		}
 	}
 
