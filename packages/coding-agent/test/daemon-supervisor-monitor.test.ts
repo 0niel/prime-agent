@@ -20,7 +20,6 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
-import { DAEMON_SUPERVISOR_REGISTRY_DIR_ENV } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
@@ -39,7 +38,7 @@ const workerLaunchTestState = vi.hoisted(() => ({
 	gateMarkerPath: "",
 	tsxCliPath: "",
 	cliEntrypoint: "",
-	spawned: [] as Array<{ child: ChildProcess; args: readonly string[]; env: NodeJS.ProcessEnv | undefined }>,
+	spawned: [] as Array<{ child: ChildProcess; args: readonly string[] }>,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -51,7 +50,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 		spawn(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
 			const child = actual.spawn(command, args, options);
 			if (workerLaunchTestState.capture) {
-				workerLaunchTestState.spawned.push({ child, args, env: options.env });
+				workerLaunchTestState.spawned.push({ child, args });
 			}
 			return child;
 		},
@@ -115,7 +114,7 @@ vi.mock("../src/core/session-lease.js", async (importOriginal) => {
 	};
 });
 
-const supervisorRegistryDirEnv = DAEMON_SUPERVISOR_REGISTRY_DIR_ENV;
+const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const previousSupervisorRegistryDir = process.env[supervisorRegistryDirEnv];
 const supervisorRegistryDirs = new Set<string>();
 
@@ -641,9 +640,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-committed-gate-test-"));
 		const descriptorDir = join(root, "descriptors");
 		const markerPath = join(root, "startup-marker");
-		const registryDir = join(root, "isolated-supervisor-registry");
 		mkdirSync(descriptorDir, { recursive: true });
-		mkdirSync(registryDir, { recursive: true });
 		supervisorRegistryDirs.add(root);
 		workerLaunchTestState.capture = true;
 		workerLaunchTestState.forceMissingProcessStartId = true;
@@ -668,7 +665,6 @@ describe("daemon worker supervisor monitoring", () => {
 			...createSupervisorSnapshotState(),
 			defaultSessionConfig: { cwd: root, agentDir: root },
 			descriptorDir,
-			supervisorRegistryDir: registryDir,
 			socketPath: join(root, "supervisor.sock"),
 			workers,
 			shuttingDown: false,
@@ -679,37 +675,16 @@ describe("daemon worker supervisor monitoring", () => {
 			syncAgentPeers: vi.fn(async () => undefined),
 			log: vi.fn(),
 		}) as {
-			launchWorker(
-				command: { type: "create"; config: { cwd: string; agentDir: string }; launchEnv?: Record<string, string> },
-				existing?: {
-					descriptor: {
-						lifecycle: string;
-						createCommand: { type: "create"; config: { cwd: string; agentDir: string } };
-						launchEnv?: Record<string, string>;
-					};
-				},
-			): Promise<{
-				descriptor: {
-					lifecycle: string;
-					createCommand: { type: "create"; config: { cwd: string; agentDir: string } };
-					launchEnv?: Record<string, string>;
-				};
-			}>;
+			launchWorker(command: {
+				type: "create";
+				config: { cwd: string; agentDir: string };
+			}): Promise<{ descriptor: { lifecycle: string } }>;
 		};
 
-		const worker = await supervisor.launchWorker({
-			type: "create",
-			config: { cwd: root, agentDir: root },
-			launchEnv: { [DAEMON_SUPERVISOR_REGISTRY_DIR_ENV]: join(root, "untrusted-registry") },
-		});
-		await supervisor.launchWorker(worker.descriptor.createCommand, worker);
+		const worker = await supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } });
 
-		expect(
-			workerLaunchTestState.spawned.slice(-2).map(({ env }) => env?.[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV]),
-		).toEqual([registryDir, registryDir]);
 		expect(readFileSync(markerPath, "utf8")).toBe("start\n");
-		expect(worker.descriptor.launchEnv?.[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV]).toBeUndefined();
-		expect(connectWorker).toHaveBeenCalledTimes(2);
+		expect(connectWorker).toHaveBeenCalledOnce();
 		expect(worker.descriptor.lifecycle).toBe("ready");
 		expect(workers.size).toBe(1);
 		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
@@ -1479,82 +1454,6 @@ describe("daemon worker supervisor monitoring", () => {
 		await stopping;
 	});
 
-	it("keeps a root kill registration through a synchronous shutdown event until exact cleanup", async () => {
-		const worker = {
-			descriptor: {
-				workerId: "worker-root-kill",
-				pid: 123_456,
-				processStartId: "proc:entry",
-				rootActiveSessionId: "root-active",
-				lifecycle: "ready" as const,
-			},
-			summaries: new Map<string, SessionSummary>([
-				[
-					"root-active",
-					{ id: "root-active", sessionId: "root-session", activeSessionId: "root-active" } as SessionSummary,
-				],
-			]),
-			snapshotCache: new Map(),
-			transcriptCaches: new Map(),
-			snapshotGenerations: new Map(),
-			snapshotLoads: new Map(),
-			intentionalStop: false,
-			stopRevision: 0,
-		};
-		const workers = new Map([[worker.descriptor.workerId, worker]]);
-		const deleteWorkerDescriptor = vi.fn();
-		const stopWorkerUntracked = vi.fn(async (target: typeof worker, removeDescriptor: boolean) => {
-			// The root-kill ownership and this exact stop are both active here.
-			expect(supervisor.workerStopCounts.get(target)).toBe(2);
-			expect(workers.get(target.descriptor.workerId)).toBe(target);
-			workers.delete(target.descriptor.workerId);
-			if (removeDescriptor) deleteWorkerDescriptor(target);
-		});
-		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			workers,
-			workerStopCounts: new Map(),
-			clients: new Set(),
-			shuttingDown: false,
-			streamReconstructor: { observe: vi.fn() },
-			invalidateWorkerSnapshot: vi.fn(),
-			refreshWorkerSummaries: vi.fn(async () => undefined),
-			syncAgentPeers: vi.fn(async () => undefined),
-			persistWorkerStopTombstone: vi.fn(),
-			deleteWorkerDescriptor,
-			broadcastHeartbeatsChanged: vi.fn(),
-			findWorkerForClient: vi.fn(async () => ({
-				worker,
-				summary: worker.summaries.get("root-active"),
-			})),
-			forwardToWorker: vi.fn(async () => {
-				supervisor.handleWorkerFrame(worker, {
-					header: { kind: "outbound", outboundType: "session_closed", activeSessionId: "root-active" },
-					payload: Buffer.from(JSON.stringify({ type: "session_closed", reason: "shutdown" })),
-				});
-				// The event arrives before the forwarded kill resolves.
-				expect(workers.get(worker.descriptor.workerId)).toBe(worker);
-				expect(deleteWorkerDescriptor).not.toHaveBeenCalled();
-				return success(undefined, "kill");
-			}),
-			stopWorkerUntracked,
-		}) as {
-			workers: typeof workers;
-			workerStopCounts: Map<typeof worker, number>;
-			handleCommand(
-				client: DaemonSocketClient,
-				command: { type: "kill"; activeSessionId: string },
-			): Promise<unknown>;
-			handleWorkerFrame(target: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
-		};
-
-		await expect(
-			supervisor.handleCommand({} as DaemonSocketClient, { type: "kill", activeSessionId: "root-active" }),
-		).resolves.toEqual(success(undefined, "kill"));
-		expect(stopWorkerUntracked).toHaveBeenCalledWith(worker, true, false, true, false, undefined);
-		expect(workers.has(worker.descriptor.workerId)).toBe(false);
-		expect(deleteWorkerDescriptor).toHaveBeenCalledWith(worker);
-		expect(supervisor.workerStopCounts.has(worker)).toBe(false);
-	});
 	it("cancels an in-flight recovery after an intentional stop tombstone", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
@@ -2904,93 +2803,6 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(false);
 		expect(stopWorker).not.toHaveBeenCalled();
-	});
-
-	it("persists a sanitized descriptor before adopting it for recovery", () => {
-		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-descriptor-sanitize-"));
-		const descriptorPath = join(descriptorDir, "worker-1.json");
-		const descriptor = {
-			version: 1,
-			supervisorSocketPath: "/tmp/supervisor.sock",
-			workerId: "worker-1",
-			pid: process.pid,
-			socketPath: "/tmp/worker-1.sock",
-			authenticationToken: "token",
-			rootActiveSessionId: "active-1",
-			createdAt: "2026-01-01T00:00:00.000Z",
-			updatedAt: "2026-01-01T00:00:00.000Z",
-			consecutiveFailures: 0,
-			createCommand: { type: "create" },
-			launchEnv: { TSX_TSCONFIG_PATH: "/tmp/tsconfig.json", SECRET_TOKEN: "must-not-persist" },
-		};
-		try {
-			writeFileSync(descriptorPath, `${JSON.stringify(descriptor)}\n`);
-			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-				descriptorDir,
-				socketPath: "/tmp/supervisor.sock",
-				workers: new Map(),
-				log: vi.fn(),
-				persistWorker(worker: { descriptor: object }) {
-					writeFileSync(descriptorPath, `${JSON.stringify(worker.descriptor)}\n`);
-				},
-			}) as {
-				workers: Map<string, { descriptor: { launchEnv?: object }; launchEnv?: object }>;
-				loadWorkerDescriptors(): void;
-			};
-
-			supervisor.loadWorkerDescriptors();
-
-			expect(supervisor.workers.get("worker-1")?.descriptor.launchEnv).toEqual({
-				TSX_TSCONFIG_PATH: "/tmp/tsconfig.json",
-			});
-			expect(supervisor.workers.get("worker-1")?.launchEnv).toEqual({ TSX_TSCONFIG_PATH: "/tmp/tsconfig.json" });
-			expect(JSON.parse(readFileSync(descriptorPath, "utf8"))).toMatchObject({
-				launchEnv: { TSX_TSCONFIG_PATH: "/tmp/tsconfig.json" },
-			});
-			expect(readFileSync(descriptorPath, "utf8")).not.toContain("SECRET_TOKEN");
-		} finally {
-			rmSync(descriptorDir, { recursive: true, force: true });
-		}
-	});
-
-	it("does not adopt a descriptor when sanitization persistence fails", () => {
-		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-descriptor-sanitize-fail-"));
-		const descriptorPath = join(descriptorDir, "worker-1.json");
-		const original = {
-			version: 1,
-			supervisorSocketPath: "/tmp/supervisor.sock",
-			workerId: "worker-1",
-			pid: process.pid,
-			socketPath: "/tmp/worker-1.sock",
-			authenticationToken: "token",
-			rootActiveSessionId: "active-1",
-			createdAt: "2026-01-01T00:00:00.000Z",
-			updatedAt: "2026-01-01T00:00:00.000Z",
-			consecutiveFailures: 0,
-			createCommand: { type: "create" },
-			launchEnv: { TSX_TSCONFIG_PATH: "/tmp/tsconfig.json", SECRET_TOKEN: "secret" },
-		};
-		try {
-			writeFileSync(descriptorPath, `${JSON.stringify(original)}\n`);
-			const log = vi.fn();
-			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-				descriptorDir,
-				socketPath: "/tmp/supervisor.sock",
-				workers: new Map(),
-				log,
-				persistWorker: () => {
-					throw new Error("disk full");
-				},
-			}) as { workers: Map<string, unknown>; loadWorkerDescriptors(): void };
-
-			supervisor.loadWorkerDescriptors();
-
-			expect(supervisor.workers.size).toBe(0);
-			expect(readFileSync(descriptorPath, "utf8")).toBe(`${JSON.stringify(original)}\n`);
-			expect(log).toHaveBeenCalledWith(expect.stringContaining("disk full"));
-		} finally {
-			rmSync(descriptorDir, { recursive: true, force: true });
-		}
 	});
 
 	it("ignores malformed persisted worker descriptors", () => {

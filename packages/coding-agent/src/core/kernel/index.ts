@@ -29,8 +29,8 @@ const READY_TIMEOUT_MS = 5000;
 // Loopback PUB/SUB subscription propagation is usually sub-ms, but keep a small guard before first execute.
 const IOPUB_SUBSCRIBE_DELAY_MS = 50;
 const DEFAULT_MAX_OUTPUT_CHARS = 65536;
+const HOST_REQUEST_DISPOSE_TIMEOUT_MS = 5000;
 const DEFAULT_SNAPSHOT_DEBOUNCE_MS = 1500;
-const HOST_REQUEST_SETTLE_TIMEOUT_MS = 5000;
 // How often to poll a forked kernel's pid for unexpected death.
 const FORKED_LIVENESS_POLL_MS = 1000;
 // Snapshot/restore cells can be large to (de)serialize; give them room beyond the user cap.
@@ -56,94 +56,10 @@ export class KernelBusyAfterInterruptError extends Error {
 export const HOST_COMM_TARGET = "host.request";
 
 /**
- * Per-call authority supplied only by the kernel host-request dispatcher.
- * `requestId` is an opaque host-minted correlation token, never accepted from
- * the kernel payload. `isCurrent()` fences completions after a comm disconnect,
- * kernel replacement, or disposal.
+ * Handles one typed request from Python code running in the kernel.
+ * The returned record is sent back verbatim as the comm reply payload.
  */
-export interface HostRequestContext {
-	readonly requestId: string;
-	readonly generation: number;
-	readonly signal: AbortSignal;
-	isCurrent(): boolean;
-}
-
-/**
- * Handles one authenticated typed request from Python code running in the
- * kernel. The returned record is sent back verbatim as the comm reply payload.
- */
-const hostRequestHandlerBrand = Symbol("hostRequestHandler");
-
-/** A dispatcher-minted host handler capability. */
-export type HostRequestHandler = ((
-	payload: Record<string, unknown>,
-	context: HostRequestContext,
-) => Promise<Record<string, unknown>>) & { readonly [hostRequestHandlerBrand]: true };
-
-export type HostRequestHandlerImplementation = (
-	payload: Record<string, unknown>,
-	context: HostRequestContext,
-) => Promise<Record<string, unknown>>;
-
-/** Runtime provenance cannot be recreated by copying the nominal symbol property. */
-const factoryCreatedHostRequestHandlers = new WeakSet<object>();
-
-type ContextAware<T extends (...args: any[]) => unknown> = Parameters<T> extends [
-	infer Payload,
-	infer Context,
-	...unknown[],
-]
-	? Record<string, unknown> extends Payload
-		? HostRequestContext extends Context
-			? unknown
-			: never
-		: never
-	: never;
-
-function assertGenuineHostRequestContext(context: unknown): asserts context is HostRequestContext {
-	if (
-		typeof context !== "object" ||
-		context === null ||
-		typeof (context as HostRequestContext).requestId !== "string" ||
-		!(context as HostRequestContext).requestId ||
-		!Number.isSafeInteger((context as HostRequestContext).generation) ||
-		typeof (context as HostRequestContext).isCurrent !== "function" ||
-		typeof (context as HostRequestContext).signal !== "object" ||
-		(context as HostRequestContext).signal === null ||
-		typeof (context as HostRequestContext).signal.aborted !== "boolean" ||
-		typeof (context as HostRequestContext).signal.addEventListener !== "function"
-	) {
-		throw new Error("host request context is invalid");
-	}
-}
-
-/**
- * Creates a branded wrapper rather than mutating its implementation. Both its
- * generic shape and runtime arity reject unary callbacks before they can run.
- */
-export function createHostRequestHandler<
-	Result extends Promise<Record<string, unknown>>,
-	T extends (...args: any[]) => Result,
->(implementation: T & ContextAware<T>): HostRequestHandler {
-	if (implementation.length < 2) throw new Error("host request handlers must accept payload and context");
-	const handler = async (payload: Record<string, unknown>, context: HostRequestContext) => {
-		assertGenuineHostRequestContext(context);
-		return (implementation as unknown as HostRequestHandlerImplementation)(payload, context);
-	};
-	factoryCreatedHostRequestHandlers.add(handler);
-	return Object.defineProperty(handler, hostRequestHandlerBrand, { value: true }) as HostRequestHandler;
-}
-
-/** Reject copied-symbol and raw-function forgeries before they observe authenticated payloads. */
-export function assertHostRequestHandler(value: unknown): asserts value is HostRequestHandler {
-	if (
-		typeof value !== "function" ||
-		(value as Partial<HostRequestHandler>)[hostRequestHandlerBrand] !== true ||
-		!factoryCreatedHostRequestHandlers.has(value)
-	) {
-		throw new Error("host request handler is not a dispatcher-created capability");
-	}
-}
+export type HostRequestHandler = (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
 /** Host request handlers keyed by request type (e.g. "rlm.run", "goal.complete"). */
 export type HostRequestHandlers = Record<string, HostRequestHandler>;
@@ -412,60 +328,12 @@ interface Deferred<T> {
 	reject: (error: Error) => void;
 }
 
-interface ActiveHostRequest {
-	requestId: string;
-	commId: string;
-	generation: number;
-	controller: AbortController;
-	callerSignal?: AbortSignal;
-	onCallerAbort?: () => void;
-	settled: boolean;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
-}
-
-const MAX_HOST_REQUEST_PAYLOAD_BYTES = 64 * 1024;
-const MAX_HOST_REQUEST_PAYLOAD_DEPTH = 8;
-const MAX_HOST_REQUEST_PAYLOAD_NODES = 1024;
-const MAX_HOST_REQUEST_PAYLOAD_KEYS = 128;
-
-/** Reject pathological comm data before a typed handler can observe it. */
-function assertBoundedHostRequestPayload(value: unknown): void {
-	let estimatedBytes = 0;
-	let nodes = 0;
-	const visit = (item: unknown, depth: number): void => {
-		if (depth > MAX_HOST_REQUEST_PAYLOAD_DEPTH) throw new Error("host request payload is too deeply nested");
-		nodes += 1;
-		if (nodes > MAX_HOST_REQUEST_PAYLOAD_NODES) throw new Error("host request payload has too many values");
-		if (typeof item === "string") {
-			estimatedBytes += Buffer.byteLength(item);
-		} else if (typeof item === "number") {
-			if (!Number.isFinite(item)) throw new Error("host request payload numbers must be finite");
-			estimatedBytes += 16;
-		} else if (typeof item === "boolean" || item === null) {
-			estimatedBytes += 8;
-		} else if (Array.isArray(item)) {
-			for (const entry of item) visit(entry, depth + 1);
-		} else if (isRecord(item)) {
-			const entries = Object.entries(item);
-			if (entries.length > MAX_HOST_REQUEST_PAYLOAD_KEYS)
-				throw new Error("host request payload has too many object keys");
-			for (const [key, entry] of entries) {
-				estimatedBytes += Buffer.byteLength(key);
-				visit(entry, depth + 1);
-			}
-		} else {
-			throw new Error("host request payload must contain JSON-compatible values");
-		}
-		if (estimatedBytes > MAX_HOST_REQUEST_PAYLOAD_BYTES) throw new Error("host request payload is too large");
-	};
-	visit(value, 0);
 }
 
 function createDeferred<T>(): Deferred<T> {
@@ -649,12 +517,6 @@ export class KernelManager {
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
 	private readonly handledHostRequestCommIds = new Set<string>();
-	/** Monotonically revokes all host-request authority across kernel lifecycles. */
-	private hostRequestGeneration = 0;
-	/** Closed synchronously before teardown can await a final snapshot. */
-	private hostRequestAdmissionOpen = true;
-	private readonly activeHostRequests = new Map<string, ActiveHostRequest>();
-	private readonly hostRequestIdsByComm = new Map<string, string>();
 	private kernel?: ChildProcess;
 	// Set instead of `kernel` when the kernel was forked from the forkserver: it is
 	// not a direct child, so it has no ChildProcess handle and is killed by pid.
@@ -847,7 +709,6 @@ export class KernelManager {
 		}
 
 		this.state = "running";
-		this.hostRequestAdmissionOpen = true;
 		this.startForkedLivenessMonitor();
 	}
 
@@ -1336,7 +1197,6 @@ export class KernelManager {
 		if (msgType === "comm_close") {
 			this.commTargets.delete(commId);
 			this.handledHostRequestCommIds.delete(commId);
-			this.revokeHostRequestForComm(commId);
 			return;
 		}
 
@@ -1359,119 +1219,39 @@ export class KernelManager {
 	}
 
 	private startHostRequestFromComm(commId: string, data: unknown): void {
-		// A snapshot keeps the kernel running long enough for an internal execute;
-		// teardown nonetheless must not admit newly injected comm work in that gap.
-		if (!this.hostRequestAdmissionOpen) {
-			return;
-		}
 		if (this.handledHostRequestCommIds.has(commId)) {
 			return;
 		}
 		this.handledHostRequestCommIds.add(commId);
 
-		const callerSignal = this.activeExecution?.opts.signal;
-		const request: ActiveHostRequest = {
-			requestId: uuid(),
-			commId,
-			generation: this.hostRequestGeneration,
-			controller: new AbortController(),
-			callerSignal,
-			settled: false,
-		};
-		request.onCallerAbort = () => request.controller.abort();
-		callerSignal?.addEventListener("abort", request.onCallerAbort, { once: true });
-		if (callerSignal?.aborted) request.controller.abort();
-		this.activeHostRequests.set(request.requestId, request);
-		this.hostRequestIdsByComm.set(commId, request.requestId);
-
 		const task = (async () => {
 			try {
-				const result = await this.handleHostRequest(data, this.hostRequestContext(request));
-				await this.replyToHostRequest(request, { status: "ok", ...result });
+				const result = await this.handleHostRequest(data);
+				try {
+					await this.sendCommMessage(commId, { status: "ok", ...result });
+				} catch (replyError) {
+					this.appendKernelDiagnostic(
+						`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,
+					);
+				}
 			} catch (error) {
-				// Teardown revokes reply authority, but it must not discard a failure
-				// already observed by an in-flight handler. `dispose()` waits for this
-				// task specifically so the manager retains this diagnostic after sockets
-				// have been revoked.
 				this.appendKernelDiagnostic(`host request failed for comm ${commId}: ${errorMessage(error)}`);
-				await this.replyToHostRequest(request, { status: "error", error: errorMessage(error) });
+				try {
+					await this.sendCommMessage(commId, { status: "error", error: errorMessage(error) });
+				} catch (replyError) {
+					this.appendKernelDiagnostic(
+						`failed to send host request error reply for comm ${commId}: ${errorMessage(replyError)}`,
+					);
+				}
 			}
 		})();
 		this.inFlightHostRequests.add(task);
 		void task.finally(() => {
 			this.inFlightHostRequests.delete(task);
-			request.callerSignal?.removeEventListener("abort", request.onCallerAbort!);
-			this.activeHostRequests.delete(request.requestId);
-			if (this.hostRequestIdsByComm.get(commId) === request.requestId) {
-				this.hostRequestIdsByComm.delete(commId);
-			}
 		});
 	}
 
-	private hostRequestContext(request: ActiveHostRequest): HostRequestContext {
-		const context: HostRequestContext = {
-			requestId: request.requestId,
-			generation: request.generation,
-			signal: request.controller.signal,
-			isCurrent: () => this.isHostRequestCurrent(request),
-		};
-		return context;
-	}
-
-	private isHostRequestCurrent(request: ActiveHostRequest): boolean {
-		return (
-			this.state !== "shutdown" &&
-			this.hostRequestGeneration === request.generation &&
-			this.commTargets.get(request.commId) === HOST_COMM_TARGET &&
-			this.hostRequestIdsByComm.get(request.commId) === request.requestId &&
-			!request.controller.signal.aborted
-		);
-	}
-
-	private revokeHostRequestForComm(commId: string): void {
-		const requestId = this.hostRequestIdsByComm.get(commId);
-		if (!requestId) return;
-		this.hostRequestIdsByComm.delete(commId);
-		this.activeHostRequests.get(requestId)?.controller.abort();
-	}
-
-	/** Abort every active request before a kernel connection is replaced or closed. */
-	private revokeHostRequests(): void {
-		this.hostRequestAdmissionOpen = false;
-		this.hostRequestGeneration += 1;
-		for (const request of this.activeHostRequests.values()) {
-			request.controller.abort();
-		}
-		this.hostRequestIdsByComm.clear();
-	}
-
-	private async replyToHostRequest(request: ActiveHostRequest, data: Record<string, unknown>): Promise<void> {
-		// Claim the one reply before awaiting I/O so a late handler cannot double-send.
-		if (request.settled) return;
-		if (!this.isHostRequestCurrent(request)) {
-			// Revocation intentionally prevents a stale handler from sending into a
-			// replaced or closed comm. Still retain the failed error-reply diagnostic:
-			// disposal waits for this task and callers need its failure trail after
-			// the transport has been cleaned up.
-			if (data.status === "error") {
-				this.appendKernelDiagnostic(
-					`failed to send host request error reply for comm ${request.commId}: host request authority was revoked`,
-				);
-			}
-			return;
-		}
-		request.settled = true;
-		try {
-			await this.sendCommMessage(request.commId, data);
-		} catch (replyError) {
-			this.appendKernelDiagnostic(
-				`failed to send host request ${data.status === "error" ? "error " : ""}reply for comm ${request.commId}: ${errorMessage(replyError)}`,
-			);
-		}
-	}
-
-	private async handleHostRequest(data: unknown, context: HostRequestContext): Promise<Record<string, unknown>> {
-		assertBoundedHostRequestPayload(data);
+	private async handleHostRequest(data: unknown): Promise<Record<string, unknown>> {
 		if (!isRecord(data)) {
 			throw new Error("host request payload must be an object");
 		}
@@ -1483,12 +1263,11 @@ export class KernelManager {
 		if (!handler) {
 			throw new Error(`host request type "${data.type}" is not available in this session`);
 		}
-		assertHostRequestHandler(handler);
 		// Tag the request with the cell that triggered it. A blocking call is still
 		// the in-flight execution; detached spawns (asyncio.create_task) fire after
 		// the scheduling cell goes idle, so fall back to that last cell's source.
 		const cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;
-		return handler({ ...data, cellSourceCode }, context);
+		return handler({ ...data, cellSourceCode });
 	}
 
 	private async sendCommMessage(commId: string, data: Record<string, unknown>): Promise<void> {
@@ -1507,9 +1286,6 @@ export class KernelManager {
 	}
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
-		this.revokeHostRequests();
-		this.commTargets.clear();
-		this.handledHostRequestCommIds.clear();
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		if (this.forkedLivenessTimer) {
@@ -1549,30 +1325,29 @@ export class KernelManager {
 		this.startPromise = undefined;
 	}
 
-	/** All active typed handlers must observe revocation and settle before teardown continues. */
-	private async waitForHostRequestsToSettle(tasks: Promise<void>[]): Promise<void> {
-		if (tasks.length === 0) return;
-		let timeout: ReturnType<typeof setTimeout> | undefined;
-		const settled = Promise.allSettled(tasks).then(() => "settled" as const);
-		const timedOut = new Promise<"timeout">((resolve) => {
-			timeout = setTimeout(() => resolve("timeout"), HOST_REQUEST_SETTLE_TIMEOUT_MS);
-			timeout.unref?.();
+	private async waitForHostRequestsToSettle(tasks: Promise<void>[], timeoutMs: number): Promise<void> {
+		let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+		const timeoutPromise = new Promise<"timeout">((resolve) => {
+			timeout = globalThis.setTimeout(() => resolve("timeout"), timeoutMs);
+			if (timeout && typeof timeout === "object" && "unref" in timeout) {
+				timeout.unref();
+			}
 		});
-		const outcome = await Promise.race([settled, timedOut]);
-		if (timeout) clearTimeout(timeout);
-		if (outcome === "timeout") {
+
+		const result = await Promise.race([Promise.allSettled(tasks).then(() => "settled" as const), timeoutPromise]);
+		if (timeout) {
+			globalThis.clearTimeout(timeout);
+		}
+		if (result === "timeout") {
 			this.appendKernelDiagnostic(
-				`timed out waiting ${HOST_REQUEST_SETTLE_TIMEOUT_MS}ms for ${tasks.length} host request task(s) after revocation`,
+				`timed out waiting ${timeoutMs}ms for ${tasks.length} host request task(s) during dispose`,
 			);
 		}
 	}
 
 	async shutdown(opts: { snapshot?: boolean } = {}): Promise<void> {
-		this.revokeHostRequests();
-		const inFlightHostRequests = [...this.inFlightHostRequests];
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
-			await this.waitForHostRequestsToSettle(inFlightHostRequests);
 			this.cleanupResources();
 			return;
 		}
@@ -1596,7 +1371,6 @@ export class KernelManager {
 			);
 		}
 
-		await this.waitForHostRequestsToSettle(inFlightHostRequests);
 		this.cleanupResources();
 	}
 
@@ -1619,8 +1393,6 @@ export class KernelManager {
 	}
 
 	async kill(): Promise<void> {
-		// Force kill must not wait on a handler that ignores its abort signal.
-		this.revokeHostRequests();
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
@@ -1724,17 +1496,19 @@ export class KernelManager {
 		}
 	}
 
-	/** Graceful cleanup. Revokes and awaits every in-flight typed host handler before closing sockets. */
+	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
 	dispose(): Promise<void> {
 		return (async () => {
-			this.revokeHostRequests();
-			const inFlightHostRequests = [...this.inFlightHostRequests];
 			// Final namespace flush while the kernel is still live (session end / reload).
 			await this.flushSnapshotForDispose();
 			this.state = "shutdown";
 			liveKernels.delete(this);
+			const inFlightHostRequests = [...this.inFlightHostRequests];
+			// TODO: plumb AbortSignal through AgentSession.prompt so disposal can cancel long-running child loops.
 			try {
-				await this.waitForHostRequestsToSettle(inFlightHostRequests);
+				if (inFlightHostRequests.length > 0) {
+					await this.waitForHostRequestsToSettle(inFlightHostRequests, HOST_REQUEST_DISPOSE_TIMEOUT_MS);
+				}
 			} finally {
 				this.cleanupResources();
 			}
@@ -1743,7 +1517,6 @@ export class KernelManager {
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	disposeSync(): void {
-		this.revokeHostRequests();
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.

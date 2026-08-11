@@ -14,7 +14,7 @@ import lockfile from "proper-lockfile";
 import { getProcessStartId } from "../../core/session-lease.js";
 import { defaultDaemonSocketDir } from "./daemon-socket.js";
 
-export const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
+const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 
 const OWNER_VERSION = 1;
 const REGISTRY_LOCK_STALE_MS = 5000;
@@ -246,7 +246,7 @@ class DaemonShutdownAdmission {
 	}
 }
 
-export function getDaemonSupervisorRegistryDir(environment: NodeJS.ProcessEnv = process.env): string {
+function defaultDaemonSupervisorRegistryDir(environment: NodeJS.ProcessEnv = process.env): string {
 	return environment[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV] ?? resolve(defaultDaemonSocketDir(), "supervisor-owners");
 }
 
@@ -275,7 +275,7 @@ async function mutateDaemonSupervisorOwner(
 	generation: string,
 	expectedToken: string,
 	mutation: (owner: DaemonSupervisorOwnerRecord) => void,
-	registryDir: string = getDaemonSupervisorRegistryDir(),
+	registryDir: string = defaultDaemonSupervisorRegistryDir(),
 ): Promise<DaemonSupervisorOwnerRecord | undefined> {
 	return withDaemonSupervisorRegistryGuard(registryDir, () => {
 		const directory = ownerDirectoryPath(registryDir, generation);
@@ -303,7 +303,7 @@ async function mutateDaemonSupervisorOwner(
 export async function acquireDaemonSupervisorOwnership(
 	options: AcquireDaemonSupervisorOwnershipOptions,
 ): Promise<DaemonSupervisorOwnership> {
-	const registryDir = options.registryDir ?? getDaemonSupervisorRegistryDir();
+	const registryDir = options.registryDir ?? defaultDaemonSupervisorRegistryDir();
 	mkdirSync(registryDir, { recursive: true, mode: 0o700 });
 	const token = randomUUID();
 	const processStartId = getProcessStartId(process.pid);
@@ -371,7 +371,7 @@ export async function assertDaemonSupervisorOwnerCurrent(
 	},
 	validatedFingerprint?: string,
 ): Promise<string> {
-	const registryDir = getDaemonSupervisorRegistryDir();
+	const registryDir = defaultDaemonSupervisorRegistryDir();
 	const current = readOwnerRecord(ownerDirectoryPath(registryDir, owner.generation));
 	if (
 		!current ||
@@ -390,7 +390,7 @@ export async function assertDaemonSupervisorOwnerCurrent(
 }
 
 export async function acquireDaemonShutdownAdmission(): Promise<DaemonShutdownAdmission> {
-	const registryDir = getDaemonSupervisorRegistryDir();
+	const registryDir = defaultDaemonSupervisorRegistryDir();
 	const processStartId = getProcessStartId(process.pid);
 	while (true) {
 		let acquired: DaemonShutdownAdmissionRecord | undefined;
@@ -418,14 +418,14 @@ export async function acquireDaemonShutdownAdmission(): Promise<DaemonShutdownAd
 }
 
 export async function isDaemonShutdownAdmissionActive(): Promise<boolean> {
-	const registryDir = getDaemonSupervisorRegistryDir();
+	const registryDir = defaultDaemonSupervisorRegistryDir();
 	return withDaemonSupervisorRegistryGuard(registryDir, () => readActiveShutdownAdmission(registryDir) !== undefined);
 }
 
 export async function persistDaemonStartupFenceFromOwner(
 	socketPath: string,
 	hello: DaemonSupervisorHelloIdentity,
-	registryDir: string = getDaemonSupervisorRegistryDir(),
+	registryDir: string = defaultDaemonSupervisorRegistryDir(),
 ): Promise<void> {
 	mkdirSync(registryDir, { recursive: true, mode: 0o700 });
 	const fenceDirectory = resolve(registryDir, "startup-fences");
@@ -482,7 +482,7 @@ export async function persistDaemonStartupFenceFromOwner(
 export async function waitForDaemonStartupFence(
 	socketPath: string,
 	timeoutMs = 10_000,
-	registryDir: string = getDaemonSupervisorRegistryDir(),
+	registryDir: string = defaultDaemonSupervisorRegistryDir(),
 ): Promise<void> {
 	const path = startupFencePath(resolve(registryDir, "startup-fences"), socketPath);
 	const deadline = Date.now() + timeoutMs;
