@@ -1964,21 +1964,15 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 	});
 
-	it("does not retain an attachment when snapshot loading fails", async () => {
-		type AttachClient = {
-			id: string;
-			capabilities: Set<string>;
-			supportsExtensionUi: boolean;
-			attachedActiveSessionIds: Set<string>;
-		};
-		const activeSessionId = "active-failed-attach";
+	it("rejects an unavailable worker when attach needs an uncached snapshot", async () => {
+		const activeSessionId = "active-unavailable-attach";
 		const summary = {
 			id: activeSessionId,
 			activeSessionId,
 			lifecycle: "live",
 			activity: "idle",
 			isSessionActive: false,
-			sessionId: "session-failed-attach",
+			sessionId: "session-unavailable-attach",
 			cwd: "/tmp/project",
 			isStreaming: false,
 			isCompacting: false,
@@ -1987,12 +1981,7 @@ describe("daemon worker supervisor monitoring", () => {
 			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		} satisfies SessionSummary;
 		const worker = {
-			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
-			client: {
-				request: vi.fn(async () => {
-					throw new Error("snapshot failed");
-				}),
-			},
+			descriptor: { workerId: "worker-unavailable-attach", lifecycle: "ready", pid: 1234 },
 			summaries: new Map([[activeSessionId, summary]]),
 			snapshotCache: new Map(),
 			transcriptCaches: new Map(),
@@ -2000,7 +1989,7 @@ describe("daemon worker supervisor monitoring", () => {
 			snapshotTransferFrames: new Map(),
 			snapshotLoads: new Map(),
 		};
-		const client: AttachClient = {
+		const client = {
 			id: "client-1",
 			capabilities: new Set<string>(),
 			supportsExtensionUi: false,
@@ -2010,11 +1999,11 @@ describe("daemon worker supervisor monitoring", () => {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			clients: new Set([client]),
 		}) as {
-			attachClient(client: AttachClient, command: { type: "attach"; activeSessionId: string }): Promise<unknown>;
+			attachClient(client: typeof client, command: { type: "attach"; activeSessionId: string }): Promise<unknown>;
 		};
 
 		await expect(supervisor.attachClient(client, { type: "attach", activeSessionId })).rejects.toThrow(
-			"snapshot failed",
+			"Session worker is recovering",
 		);
 		expect(client.attachedActiveSessionIds).toEqual(new Set());
 	});
