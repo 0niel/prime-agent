@@ -1496,9 +1496,13 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		projectTrusted: isWorkspaceTrusted(cwd, agentDir),
 	});
 	reportSettingsErrors(settingsManager, "package command");
-	// Gated getter: an aliased (project-controlled) global npmCommand must not
-	// drive self-update in an untrusted workspace.
-	const selfUpdateNpmCommand = settingsManager.getNpmCommand();
+	// Self-update is a global operation: use the user's own (global) npmCommand,
+	// never a project-scoped one. When the global file is project-controlled
+	// (aliased agentDir) it only applies to trusted workspaces.
+	const selfUpdateNpmCommand =
+		settingsManager.isGlobalConfigAliasedToProject() && !settingsManager.isProjectTrusted()
+			? undefined
+			: settingsManager.getGlobalSettings().npmCommand;
 
 	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
 
