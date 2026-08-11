@@ -2054,7 +2054,7 @@ describe("daemon worker supervisor monitoring", () => {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			clients: new Set([client]),
 		}) as {
-			attachClient(client: typeof client, command: { type: "attach"; activeSessionId: string }): Promise<unknown>;
+			attachClient(inputClient: typeof client, command: { type: "attach"; activeSessionId: string }): Promise<unknown>;
 		};
 
 		await expect(supervisor.attachClient(client, { type: "attach", activeSessionId })).rejects.toThrow(
