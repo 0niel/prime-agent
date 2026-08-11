@@ -10,6 +10,8 @@ import { acpUpdatesForSessionEvent } from "../src/modes/acp/acp-events.js";
 import { PRIME_AGENT_META_NAMESPACE } from "../src/modes/acp/acp-meta.js";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/types.js";
 
+import { createTestHostHandlers } from "./host-request-context.js";
+
 /**
  * Real-kernel verification for ACP mode.
  *
@@ -157,39 +159,39 @@ print(json.dumps({
 		});
 	});
 
-	it("exposes rlm depth and subagent APIs to the kernel behind the ACP front end", {
-		tags: ["kernel-heavy"],
-		timeout: 180_000,
-	}, async () => {
-		provisioner = new IpythonKernelProvisioner(tempDir, {
-			pythonSkills: [AGENT_MESSAGE_SKILL],
-			env: { RLM_DEPTH: "0", RLM_MAX_DEPTH: "1" },
-			hostHandlers: {
-				"rlm.list_subagents": async () => ({
-					subagents: [
-						{
-							rlm_child_id: "child-1",
-							active_session_id: "active-1",
+	it(
+		"exposes rlm depth and subagent APIs to the kernel behind the ACP front end",
+		{ tags: ["kernel-heavy"], timeout: 180_000 },
+		async () => {
+			provisioner = new IpythonKernelProvisioner(tempDir, {
+				pythonSkills: [AGENT_MESSAGE_SKILL],
+				env: { RLM_DEPTH: "0", RLM_MAX_DEPTH: "1" },
+				hostHandlers: createTestHostHandlers({
+					"rlm.list_subagents": async () => ({
+						subagents: [
+							{
+								rlm_child_id: "child-1",
+								active_session_id: "active-1",
+								session_id: "session-1",
+								session_name: "reviewer",
+								session_dir: tempDir,
+								status: "completed",
+							},
+						],
+					}),
+					"rlm.delete_subagent": async (payload) => ({
+						subagent: {
+							rlm_child_id: String(payload.target),
+							active_session_id: null,
 							session_id: "session-1",
 							session_name: "reviewer",
 							session_dir: tempDir,
 							status: "completed",
 						},
-					],
+					}),
 				}),
-				"rlm.delete_subagent": async (payload) => ({
-					subagent: {
-						rlm_child_id: String(payload.target),
-						active_session_id: null,
-						session_id: "session-1",
-						session_name: "reviewer",
-						session_dir: tempDir,
-						status: "completed",
-					},
-				}),
-			},
-		});
-		const manager = await provisioner.ensure();
+			});
+			const manager = await provisioner.ensure();
 
 		const result = await manager.execute(`
 import json, os
@@ -210,30 +212,30 @@ print(json.dumps({
 		expect(payload.max_depth).toBe("1");
 	});
 
-	it("sends an agent-to-agent message from the kernel and surfaces it over ACP", {
-		tags: ["kernel-heavy"],
-		timeout: 180_000,
-	}, async () => {
-		provisioner = new IpythonKernelProvisioner(tempDir, {
-			pythonSkills: [AGENT_MESSAGE_SKILL],
-			hostHandlers: {
-				// The family roster: parent, siblings, and children of this agent.
-				"agent_message.list_agents": async () => ({
-					current: { name: "root", id: "session-alpha", depth: 0 },
-					entries: [{ relationship: "child", name: "reviewer", id: "session-beta", depth: 1, status: "idle" }],
+	it(
+		"sends an agent-to-agent message from the kernel and surfaces it over ACP",
+		{ tags: ["kernel-heavy"], timeout: 180_000 },
+		async () => {
+			provisioner = new IpythonKernelProvisioner(tempDir, {
+				pythonSkills: [AGENT_MESSAGE_SKILL],
+				hostHandlers: createTestHostHandlers({
+					// The family roster: parent, siblings, and children of this agent.
+					"agent_message.list_agents": async () => ({
+						current: { name: "root", id: "session-alpha", depth: 0 },
+						entries: [{ relationship: "child", name: "reviewer", id: "session-beta", depth: 1, status: "idle" }],
+					}),
+					"agent_message.send": async (payload) => ({
+						id: "agentmsg-acp",
+						source: "agent_message",
+						target: { activeSessionId: "beta", sessionId: "session-beta", sessionName: "reviewer" },
+						message: payload.message,
+						deliveryStatus: "queued",
+						queuedAt: "2026-08-04T00:00:00.000Z",
+						deliveryMode: payload.mode ?? "auto",
+					}),
 				}),
-				"agent_message.send": async (payload) => ({
-					id: "agentmsg-acp",
-					source: "agent_message",
-					target: { activeSessionId: "beta", sessionId: "session-beta", sessionName: "reviewer" },
-					message: payload.message,
-					deliveryStatus: "queued",
-					queuedAt: "2026-08-04T00:00:00.000Z",
-					deliveryMode: payload.mode ?? "auto",
-				}),
-			},
-		});
-		const manager = await provisioner.ensure();
+			});
+			const manager = await provisioner.ensure();
 
 		// The kernel venv is shared across test files. If a concurrently running
 		// file rebuilt it without this skill, say so plainly rather than failing

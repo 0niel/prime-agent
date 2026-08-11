@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { HostRequestHandler } from "./kernel/index.js";
+import { contextAwareHostRequestHandler, createHostRequestHandler, type HostRequestHandler } from "./kernel/index.js";
 import type { CustomMessage } from "./messages.js";
 import { canonicalSessionPath } from "./session-lease.js";
 
@@ -526,11 +526,11 @@ export function createAgentMessageHostHandlers(
 	controller: Pick<AgentSessionMessageController, "roster" | "sendAgentMessage" | "awaitPendingChildPublication">,
 ): Record<string, HostRequestHandler> {
 	return {
-		"agent_message.list_agents": async () => {
+		"agent_message.list_agents": createHostRequestHandler(async (_payload, _context) => {
 			if (!controller.roster) throw new Error("agent family roster is not available in this session");
 			return (await controller.roster()) as unknown as Record<string, unknown>;
-		},
-		"agent_message.send": async (payload) => {
+		}, contextAwareHostRequestHandler),
+		"agent_message.send": createHostRequestHandler(async (payload, _context) => {
 			if (typeof payload.message !== "string") {
 				throw new Error("agent_message.send message must be a string");
 			}
@@ -602,7 +602,7 @@ export function createAgentMessageHostHandlers(
 				message: payload.message,
 				receiverRole: payload.receiver_role as AgentFamilyRelationship,
 			})) as unknown as Record<string, unknown>;
-		},
+		}, contextAwareHostRequestHandler),
 	};
 }
 

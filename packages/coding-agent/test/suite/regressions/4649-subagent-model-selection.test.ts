@@ -1,6 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import type { HostRequestHandlers } from "../../../src/core/kernel/index.js";
+import { type HostRequestHandlers, invokeHostRequestHandlerForTest } from "../../../src/core/kernel/index.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
 import { createHarness } from "../harness.js";
 
@@ -27,7 +27,7 @@ describe("ENG-4649 subagent model selection", () => {
 			)._createKernelHostHandlers();
 			const findModels = handlers["rlm.find_models"];
 			if (!findModels) throw new Error("Missing rlm.find_models host handler");
-			await expect(findModels({ query: "model 319", limit: 5 })).resolves.toEqual({
+			await expect(invokeHostRequestHandlerForTest(findModels!, { query: "model 319", limit: 5 })).resolves.toEqual({
 				models: [
 					{
 						provider,
@@ -37,7 +37,9 @@ describe("ENG-4649 subagent model selection", () => {
 					},
 				],
 			});
-			await expect(findModels({ query: "model", limit: 21 })).rejects.toThrow("integer from 1 to 20");
+			await expect(invokeHostRequestHandlerForTest(findModels!, { query: "model", limit: 21 })).rejects.toThrow(
+				"integer from 1 to 20",
+			);
 			harness.setResponses([fauxAssistantMessage("resolved child answer")]);
 
 			const result = await harness.session.runRlmChild("use the requested model", {

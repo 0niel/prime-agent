@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-ai/mcp";
 import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { AuthStorage } from "../auth-storage.js";
+import { contextAwareHostRequestHandler, createHostRequestHandler, type HostRequestHandlers } from "../kernel/index.js";
 import type { McpServerConfig } from "../settings-manager.js";
 
 export interface McpManagerOptions {
@@ -153,9 +154,9 @@ export class McpManager {
 	}
 
 	/** Host-request handlers exposed to the kernel. */
-	hostHandlers(): Record<string, (payload: Record<string, unknown>) => Promise<Record<string, unknown>>> {
-		const handlers: Record<string, (payload: Record<string, unknown>) => Promise<Record<string, unknown>>> = {
-			"mcp.refresh": async (payload) => {
+	hostHandlers(): HostRequestHandlers {
+		const handlers: HostRequestHandlers = {
+			"mcp.refresh": createHostRequestHandler(async (payload, _context) => {
 				const server = String(payload.server ?? "");
 				if (!server) throw new Error("mcp.refresh requires a server");
 				// getApiKey refreshes + rewrites auth.json under lock; Python re-reads.
@@ -164,10 +165,10 @@ export class McpManager {
 				const key = await this.authStorage.getApiKey(this.providerId(server));
 				if (!key) throw new Error(`Could not refresh credentials for ${server}`);
 				return {};
-			},
+			}, contextAwareHostRequestHandler),
 			// Resolved config so the kernel skill connects to the same URL the host
 			// registered/authenticated (honors a user's mcpServers `url` override).
-			"mcp.config": async (payload) => {
+			"mcp.config": createHostRequestHandler(async (payload, _context) => {
 				const server = String(payload.server ?? "");
 				if (!server) throw new Error("mcp.config requires a server");
 				const integration = this.integrations.get(server);
@@ -177,18 +178,18 @@ export class McpManager {
 					config.headers = integration.headers;
 				}
 				return config;
-			},
+			}, contextAwareHostRequestHandler),
 		};
 		// Only expose begin_login when an interactive login is actually wired, so the
 		// kernel doesn't get a handler whose only behavior is to throw.
 		const beginLogin = this.beginLogin;
 		if (beginLogin) {
-			handlers["mcp.begin_login"] = async (payload) => {
+			handlers["mcp.begin_login"] = createHostRequestHandler(async (payload, _context) => {
 				const server = String(payload.server ?? "");
 				if (!server) throw new Error("mcp.begin_login requires a server");
 				await beginLogin(server);
 				return {};
-			};
+			}, contextAwareHostRequestHandler);
 		}
 		return handlers;
 	}
