@@ -318,9 +318,10 @@ See [packages.md](packages.md) for package management details.
 
 Project settings (`.prime/agent/settings.json`) override global settings, with one exception: in
 workspaces that are not trusted (see [Workspace Trust](extensions.md#workspace-trust)), the
-project-scoped keys that can execute commands or redirect resources are ignored —
-`extensions`, `skills`, `packages`, `mcpServers`, `shellCommandPrefix`, `shellPath`,
-`npmCommand`, and `sessionDir`. Cosmetic and behavioral project settings still apply.
+project-scoped keys that execute commands or auto-load resources are ignored —
+`extensions`, `skills`, `prompts`, `themes`, `packages`, `mcpServers`, `shellCommandPrefix`,
+`shellPath`, `npmCommand`, and `sessionDir`. Cosmetic and behavioral project settings
+(theme, model preferences, and so on) still apply.
 Nested objects are merged:
 
 ```json

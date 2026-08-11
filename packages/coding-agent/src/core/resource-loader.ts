@@ -19,7 +19,7 @@ import { SettingsManager } from "./settings-manager.js";
 import type { Skill } from "./skills.js";
 import { loadSkills } from "./skills.js";
 import { createSourceInfo, type SourceInfo } from "./source-info.js";
-import { isWorkspaceTrusted } from "./workspace-trust.js";
+import { isWithinProjectConfigDir, isWorkspaceTrusted } from "./workspace-trust.js";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -219,6 +219,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 			SettingsManager.create(this.cwd, this.agentDir, {
 				projectTrusted: isWorkspaceTrusted(this.cwd, this.agentDir),
 			});
+		// Narrowing applies to caller-provided managers too: a manager at its
+		// trusted default must not bypass an untrusted workspace.
+		if (!isWorkspaceTrusted(this.cwd, this.agentDir)) {
+			this.settingsManager.setProjectTrusted(false);
+		}
 		this.eventBus = options.eventBus ?? createEventBus();
 		this.bundledSkillsDir = options.bundledSkillsDir === undefined ? getBundledSkillsDir() : options.bundledSkillsDir;
 		this.packageManager = new DefaultPackageManager({
@@ -873,7 +878,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		const globalPath = join(this.agentDir, "SYSTEM.md");
-		if (existsSync(globalPath)) {
+		// When untrusted, a "global" prompt file inside the project config
+		// directory (portable agentDir) is project-controlled; skip it.
+		if (
+			existsSync(globalPath) &&
+			(this.settingsManager.isProjectTrusted() || !isWithinProjectConfigDir(globalPath, this.cwd))
+		) {
 			return globalPath;
 		}
 
@@ -887,7 +897,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		const globalPath = join(this.agentDir, "APPEND_SYSTEM.md");
-		if (existsSync(globalPath)) {
+		// See discoverSystemPromptFile: project-controlled "global" files are
+		// skipped for untrusted workspaces.
+		if (
+			existsSync(globalPath) &&
+			(this.settingsManager.isProjectTrusted() || !isWithinProjectConfigDir(globalPath, this.cwd))
+		) {
 			return globalPath;
 		}
 

@@ -1017,6 +1017,11 @@ export class DefaultPackageManager implements PackageManager {
 	async update(source?: string): Promise<void> {
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
+		// Workspace trust: updating installs package-controlled code (npm
+		// lifecycle scripts, git checkouts), so untrusted projects contribute
+		// no package sources.
+		const projectTrusted = this.settingsManager.isProjectTrusted();
+		const projectPackages = projectTrusted ? (projectSettings.packages ?? []) : [];
 		const identity = source ? this.getPackageIdentity(source) : undefined;
 		let matched = false;
 		const updateSources: ConfiguredUpdateSource[] = [];
@@ -1027,7 +1032,7 @@ export class DefaultPackageManager implements PackageManager {
 			matched = true;
 			updateSources.push({ source: sourceStr, scope: "user" });
 		}
-		for (const pkg of projectSettings.packages ?? []) {
+		for (const pkg of projectPackages) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			if (identity && this.getPackageIdentity(sourceStr, "project") !== identity) continue;
 			matched = true;
@@ -1036,10 +1041,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		if (source && !matched) {
 			throw new Error(
-				this.buildNoMatchingPackageMessage(source, [
-					...(globalSettings.packages ?? []),
-					...(projectSettings.packages ?? []),
-				]),
+				this.buildNoMatchingPackageMessage(source, [...(globalSettings.packages ?? []), ...projectPackages]),
 			);
 		}
 
@@ -1152,8 +1154,10 @@ export class DefaultPackageManager implements PackageManager {
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
-		for (const pkg of projectSettings.packages ?? []) {
-			allPackages.push({ pkg, scope: "project" });
+		if (this.settingsManager.isProjectTrusted()) {
+			for (const pkg of projectSettings.packages ?? []) {
+				allPackages.push({ pkg, scope: "project" });
+			}
 		}
 		for (const pkg of globalSettings.packages ?? []) {
 			allPackages.push({ pkg, scope: "user" });

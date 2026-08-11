@@ -4,6 +4,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import { isWithinProjectConfigDir } from "./workspace-trust.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -215,6 +216,13 @@ export interface SettingsManagerOptions {
 	 * workspace-trust decision explicitly.
 	 */
 	projectTrusted?: boolean;
+	/**
+	 * Set when the global settings file lives inside the project config
+	 * directory (portable agentDir). In untrusted workspaces such "global"
+	 * values are project-controlled, so executable keys are ignored too.
+	 * Computed by SettingsManager.create; rarely set directly.
+	 */
+	globalConfigAliasedToProject?: boolean;
 }
 
 export interface SettingsStorage {
@@ -316,6 +324,7 @@ export class SettingsManager {
 	private projectSettings: Settings;
 	private settings: Settings;
 	private projectTrusted: boolean;
+	private globalConfigAliasedToProject: boolean;
 	private runtimeOverrides: Settings = {};
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -334,11 +343,13 @@ export class SettingsManager {
 		projectLoadError: Error | null = null,
 		initialErrors: SettingsError[] = [],
 		projectTrusted = true,
+		globalConfigAliasedToProject = false,
 	) {
 		this.storage = storage;
 		this.globalSettings = initialGlobal;
 		this.projectSettings = initialProject;
 		this.projectTrusted = projectTrusted;
+		this.globalConfigAliasedToProject = globalConfigAliasedToProject;
 		this.globalSettingsLoadError = globalLoadError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
@@ -348,7 +359,8 @@ export class SettingsManager {
 	/** Create a SettingsManager that loads from files */
 	static create(cwd: string, agentDir: string = getAgentDir(), options?: SettingsManagerOptions): SettingsManager {
 		const storage = new FileSettingsStorage(cwd, agentDir);
-		return SettingsManager.fromStorage(storage, options);
+		const globalConfigAliasedToProject = isWithinProjectConfigDir(join(agentDir, "settings.json"), cwd);
+		return SettingsManager.fromStorage(storage, { globalConfigAliasedToProject, ...options });
 	}
 
 	/** Create a SettingsManager from an arbitrary storage backend */
@@ -371,6 +383,7 @@ export class SettingsManager {
 			projectLoad.error,
 			initialErrors,
 			options?.projectTrusted ?? true,
+			options?.globalConfigAliasedToProject ?? false,
 		);
 	}
 
@@ -386,6 +399,15 @@ export class SettingsManager {
 
 	setProjectTrusted(trusted: boolean): void {
 		this.projectTrusted = trusted;
+	}
+
+	/**
+	 * Global settings as a source of executable configuration for untrusted
+	 * workspaces. Empty when the global file is project-controlled (agentDir
+	 * aliased into the project), because then "global" is attacker-committed.
+	 */
+	private untrustedGlobalSettings(): Settings {
+		return this.globalConfigAliasedToProject ? {} : this.globalSettings;
 	}
 
 	/** Create an in-memory SettingsManager (no file I/O) */
@@ -694,7 +716,7 @@ export class SettingsManager {
 	getSessionDir(): string | undefined {
 		// Project sessionDir redirects where session files are written; untrusted
 		// projects keep the global/default location.
-		const sessionDir = (this.projectTrusted ? this.settings : this.globalSettings).sessionDir;
+		const sessionDir = (this.projectTrusted ? this.settings : this.untrustedGlobalSettings()).sessionDir;
 		if (!sessionDir) {
 			return sessionDir;
 		}
@@ -977,7 +999,7 @@ export class SettingsManager {
 	}
 
 	getShellPath(): string | undefined {
-		return this.projectTrusted ? this.settings.shellPath : this.globalSettings.shellPath;
+		return this.projectTrusted ? this.settings.shellPath : this.untrustedGlobalSettings().shellPath;
 	}
 
 	setShellPath(path: string | undefined): void {
@@ -997,7 +1019,7 @@ export class SettingsManager {
 	}
 
 	getShellCommandPrefix(): string | undefined {
-		return this.projectTrusted ? this.settings.shellCommandPrefix : this.globalSettings.shellCommandPrefix;
+		return this.projectTrusted ? this.settings.shellCommandPrefix : this.untrustedGlobalSettings().shellCommandPrefix;
 	}
 
 	setShellCommandPrefix(prefix: string | undefined): void {
@@ -1007,7 +1029,7 @@ export class SettingsManager {
 	}
 
 	getNpmCommand(): string[] | undefined {
-		const command = this.projectTrusted ? this.settings.npmCommand : this.globalSettings.npmCommand;
+		const command = this.projectTrusted ? this.settings.npmCommand : this.untrustedGlobalSettings().npmCommand;
 		return command ? [...command] : undefined;
 	}
 
@@ -1240,7 +1262,7 @@ export class SettingsManager {
 	}
 
 	getMcpServers(): Record<string, McpServerConfig> | undefined {
-		return this.projectTrusted ? this.settings.mcpServers : this.globalSettings.mcpServers;
+		return this.projectTrusted ? this.settings.mcpServers : this.untrustedGlobalSettings().mcpServers;
 	}
 
 	setEnabledModels(patterns: string[] | undefined): void {

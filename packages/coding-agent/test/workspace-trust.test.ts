@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DefaultPackageManager } from "../src/core/package-manager.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import {
@@ -63,6 +64,22 @@ describe("workspace trust", () => {
 			expect(store.isTrusted(join(projectDir, "."))).toBe(true);
 			expect(isWorkspaceTrusted(projectDir, agentDir)).toBe(true);
 		});
+
+		it("merges concurrent mutations instead of clobbering with stale snapshots", () => {
+			const otherDir = join(tempDir, "other");
+			mkdirSync(otherDir, { recursive: true });
+			WorkspaceTrustStore.create(agentDir).trust(projectDir);
+
+			// Two processes load the same snapshot, then interleave mutations.
+			const processA = WorkspaceTrustStore.create(agentDir);
+			const processB = WorkspaceTrustStore.create(agentDir);
+			processB.untrust(projectDir); // revoke first...
+			processA.trust(otherDir); // ...then a stale-snapshot writer must not resurrect it
+
+			const result = WorkspaceTrustStore.create(agentDir);
+			expect(result.isTrusted(projectDir)).toBe(false);
+			expect(result.isTrusted(otherDir)).toBe(true);
+		});
 	});
 
 	describe("SettingsManager project trust", () => {
@@ -112,6 +129,22 @@ describe("workspace trust", () => {
 			const manager = SettingsManager.create(projectDir, agentDir, { projectTrusted: false });
 
 			expect(manager.getShellCommandPrefix()).toBe("global-prefix");
+		});
+
+		it("ignores executable settings when the global file is the project file (aliased agentDir)", () => {
+			// Portable setup: agentDir points at the project config directory, so
+			// global and project settings are the same attacker-committed file.
+			const aliasedAgentDir = configDir;
+			writeProjectSettings({
+				shellCommandPrefix: "echo pwned",
+				mcpServers: { evil: { type: "stdio", command: "./evil" } },
+			});
+			const untrusted = SettingsManager.create(projectDir, aliasedAgentDir, { projectTrusted: false });
+			expect(untrusted.getShellCommandPrefix()).toBeUndefined();
+			expect(untrusted.getMcpServers()).toBeUndefined();
+
+			const trusted = SettingsManager.create(projectDir, aliasedAgentDir, { projectTrusted: true });
+			expect(trusted.getShellCommandPrefix()).toBe("echo pwned");
 		});
 	});
 
@@ -192,9 +225,37 @@ export default function () {}
 			expect(trustedLoader.getSystemPrompt()).toContain("project system prompt");
 		});
 
-		it("respects an explicitly trusted settings manager passed by the caller", async () => {
+		it("does not fall back to a project-controlled global SYSTEM.md when untrusted", async () => {
+			// agentDir aliased into the project: the global fallback path is the
+			// same committed file and must not bypass the project-trust guard.
+			const aliasedAgentDir = configDir;
+			writeFileSync(join(configDir, "SYSTEM.md"), "project system prompt");
+			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir: aliasedAgentDir });
+			await loader.reload();
+			expect(loader.getSystemPrompt()).toBeUndefined();
+
+			WorkspaceTrustStore.create(aliasedAgentDir).trust(projectDir);
+			const trustedLoader = new DefaultResourceLoader({ cwd: projectDir, agentDir: aliasedAgentDir });
+			await trustedLoader.reload();
+			expect(trustedLoader.getSystemPrompt()).toContain("project system prompt");
+		});
+
+		it("narrows a caller-provided trusted manager when the store is untrusted", async () => {
 			const canaryPath = writeEvilExtension();
 			const settingsManager = SettingsManager.create(projectDir, agentDir, { projectTrusted: true });
+			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir, settingsManager });
+
+			await loader.reload();
+
+			expect(settingsManager.isProjectTrusted()).toBe(false);
+			expect(existsSync(canaryPath)).toBe(false);
+			expect(loader.getExtensions().extensions).toEqual([]);
+		});
+
+		it("loads project extensions with a caller-provided manager when the store is trusted", async () => {
+			const canaryPath = writeEvilExtension();
+			trustProject();
+			const settingsManager = SettingsManager.create(projectDir, agentDir);
 			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir, settingsManager });
 
 			await loader.reload();
@@ -217,7 +278,7 @@ export default function () {}
 			const findings = detectProjectScopedConfig(projectDir);
 			const text = findings.map((finding) => finding.summary).join("\n");
 
-			expect(text).toContain("project extensions (1 file)");
+			expect(text).toContain("project extensions (1 entry)");
 			expect(text).toContain("shellCommandPrefix");
 			expect(text).not.toContain("theme");
 			expect(text).toContain("SYSTEM.md");
@@ -226,6 +287,76 @@ export default function () {}
 		it("ignores malformed project settings", () => {
 			writeFileSync(join(configDir, "settings.json"), "{ not json");
 			expect(detectProjectScopedConfig(projectDir)).toEqual([]);
+		});
+
+		it("reports prompts and themes directories", () => {
+			mkdirSync(join(configDir, "prompts"), { recursive: true });
+			writeFileSync(join(configDir, "prompts", "review.md"), "prompt");
+			mkdirSync(join(configDir, "themes"), { recursive: true });
+			writeFileSync(join(configDir, "themes", "dark.json"), "{}");
+
+			const text = detectProjectScopedConfig(projectDir)
+				.map((finding) => finding.summary)
+				.join("\n");
+
+			expect(text).toContain("project prompt templates are auto-discovered");
+			expect(text).toContain("project themes are auto-discovered");
+		});
+
+		it("reports manifest-based extensions", () => {
+			const pkgDir = join(configDir, "extensions", "pkg-ext");
+			mkdirSync(pkgDir, { recursive: true });
+			writeFileSync(join(pkgDir, "main.ts"), "export default function () {}\n");
+			writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ pi: { extensions: ["./main.ts"] } }));
+
+			const findings = detectProjectScopedConfig(projectDir);
+
+			expect(findings.some((finding) => finding.summary.includes("project extensions (1 entry)"))).toBe(true);
+		});
+
+		it("reports .agents/skills from ancestor directories up to the git root", () => {
+			// Launch from a subdirectory; skills committed at the repo root are
+			// discovered by the loader and must produce a finding.
+			mkdirSync(join(projectDir, ".git"));
+			mkdirSync(join(projectDir, ".agents", "skills", "evil"), { recursive: true });
+			writeFileSync(join(projectDir, ".agents", "skills", "evil", "SKILL.md"), "---\nname: evil\n---\n");
+			const subDir = join(projectDir, "packages", "sub");
+			mkdirSync(subDir, { recursive: true });
+
+			const findings = detectProjectScopedConfig(subDir);
+
+			expect(findings.some((finding) => finding.summary.includes(".agents/skills"))).toBe(true);
+		});
+	});
+
+	describe("package updates", () => {
+		it("skips project package sources when untrusted", async () => {
+			writeProjectSettings({ packages: ["npm:some-pkg"] });
+			const untrusted = new DefaultPackageManager({
+				cwd: projectDir,
+				agentDir,
+				settingsManager: SettingsManager.create(projectDir, agentDir, { projectTrusted: false }),
+			});
+			// The project-committed source is invisible, so it cannot be matched.
+			await expect(untrusted.update("npm:some-pkg")).rejects.toThrow();
+
+			const previousOffline = process.env.PI_OFFLINE;
+			process.env.PI_OFFLINE = "1";
+			try {
+				const trusted = new DefaultPackageManager({
+					cwd: projectDir,
+					agentDir,
+					settingsManager: SettingsManager.create(projectDir, agentDir, { projectTrusted: true }),
+				});
+				// Trusted: the source matches; offline mode short-circuits before npm.
+				await expect(trusted.update("npm:some-pkg")).resolves.toBeUndefined();
+			} finally {
+				if (previousOffline === undefined) {
+					delete process.env.PI_OFFLINE;
+				} else {
+					process.env.PI_OFFLINE = previousOffline;
+				}
+			}
 		});
 	});
 });

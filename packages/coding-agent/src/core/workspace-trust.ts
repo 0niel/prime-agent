@@ -26,15 +26,23 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve, sep } from "node:path";
+import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME } from "../config.js";
 
 const TRUST_FILE_NAME = "trusted-workspaces.json";
 
-/** Project settings keys that can turn committed config into executed commands. */
+/**
+ * Project settings keys that turn committed config into executed commands or
+ * auto-loaded resources. Used for detection and documentation; enforcement
+ * lives in SettingsManager and DefaultPackageManager.
+ */
 export const RISKY_PROJECT_SETTINGS_KEYS = [
 	"extensions",
 	"skills",
+	"prompts",
+	"themes",
 	"packages",
 	"mcpServers",
 	"shellCommandPrefix",
@@ -53,33 +61,48 @@ export function canonicalizeWorkspacePath(path: string): string {
 	}
 }
 
+/**
+ * Whether `target` lies inside the project's committed config directory.
+ * Guards against portable setups that point the global agent dir into the
+ * workspace: such "global" files are project-controlled and must not be
+ * treated as trusted user configuration.
+ */
+export function isWithinProjectConfigDir(target: string, cwd: string): boolean {
+	const root = canonicalizeWorkspacePath(join(cwd, CONFIG_DIR_NAME));
+	const resolved = canonicalizeWorkspacePath(target);
+	return resolved === root || resolved.startsWith(root + sep);
+}
+
 interface WorkspaceTrustFile {
 	version: 1;
 	trusted: string[];
 }
 
+function readTrustFile(filePath: string): Set<string> {
+	const trusted = new Set<string>();
+	try {
+		const parsed = JSON.parse(readFileSync(filePath, "utf-8")) as Partial<WorkspaceTrustFile>;
+		if (Array.isArray(parsed.trusted)) {
+			for (const entry of parsed.trusted) {
+				if (typeof entry === "string") {
+					trusted.add(entry);
+				}
+			}
+		}
+	} catch {
+		// Missing or unreadable trust file means nothing is trusted.
+	}
+	return trusted;
+}
+
 export class WorkspaceTrustStore {
 	private constructor(
 		private readonly filePath: string,
-		private readonly trusted: Set<string>,
+		private trusted: Set<string>,
 	) {}
 
 	static create(agentDir: string): WorkspaceTrustStore {
-		const filePath = join(agentDir, TRUST_FILE_NAME);
-		const trusted = new Set<string>();
-		try {
-			const parsed = JSON.parse(readFileSync(filePath, "utf-8")) as Partial<WorkspaceTrustFile>;
-			if (Array.isArray(parsed.trusted)) {
-				for (const entry of parsed.trusted) {
-					if (typeof entry === "string") {
-						trusted.add(entry);
-					}
-				}
-			}
-		} catch {
-			// Missing or unreadable trust file means nothing is trusted.
-		}
-		return new WorkspaceTrustStore(filePath, trusted);
+		return new WorkspaceTrustStore(join(agentDir, TRUST_FILE_NAME), readTrustFile(join(agentDir, TRUST_FILE_NAME)));
 	}
 
 	isTrusted(cwd: string): boolean {
@@ -87,15 +110,18 @@ export class WorkspaceTrustStore {
 	}
 
 	trust(cwd: string): void {
-		this.trusted.add(canonicalizeWorkspacePath(cwd));
-		this.save();
+		const canonical = canonicalizeWorkspacePath(cwd);
+		this.mutate((trusted) => {
+			trusted.add(canonical);
+		});
 	}
 
 	untrust(cwd: string): boolean {
-		const removed = this.trusted.delete(canonicalizeWorkspacePath(cwd));
-		if (removed) {
-			this.save();
-		}
+		const canonical = canonicalizeWorkspacePath(cwd);
+		let removed = false;
+		this.mutate((trusted) => {
+			removed = trusted.delete(canonical);
+		});
 		return removed;
 	}
 
@@ -103,12 +129,57 @@ export class WorkspaceTrustStore {
 		return [...this.trusted].sort();
 	}
 
-	private save(): void {
+	/**
+	 * Locked read-modify-write against the shared file. Re-reading under the
+	 * lock keeps concurrent processes from clobbering each other's trust and
+	 * untrust operations with stale snapshots.
+	 */
+	private mutate(apply: (trusted: Set<string>) => void): void {
 		mkdirSync(dirname(this.filePath), { recursive: true });
-		const contents: WorkspaceTrustFile = { version: 1, trusted: this.list() };
+		if (!existsSync(this.filePath)) {
+			this.writeFile(this.trusted);
+		}
+		const release = this.acquireLock();
+		try {
+			const trusted = readTrustFile(this.filePath);
+			apply(trusted);
+			this.writeFile(trusted);
+			this.trusted = trusted;
+		} finally {
+			release();
+		}
+	}
+
+	private writeFile(trusted: Set<string>): void {
+		const contents: WorkspaceTrustFile = { version: 1, trusted: [...trusted].sort() };
 		const tmpPath = `${this.filePath}.tmp`;
 		writeFileSync(tmpPath, `${JSON.stringify(contents, null, 2)}\n`, "utf-8");
 		renameSync(tmpPath, this.filePath);
+	}
+
+	private acquireLock(): () => void {
+		const maxAttempts = 10;
+		const delayMs = 20;
+		let lastError: unknown;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				return lockfile.lockSync(this.filePath, { realpath: false });
+			} catch (error) {
+				const code =
+					typeof error === "object" && error !== null && "code" in error
+						? String((error as { code?: unknown }).code)
+						: undefined;
+				if (code !== "ELOCKED" || attempt === maxAttempts) {
+					throw error;
+				}
+				lastError = error;
+				const start = Date.now();
+				while (Date.now() - start < delayMs) {
+					// Sleep synchronously to avoid changing callers to async.
+				}
+			}
+		}
+		throw (lastError as Error) ?? new Error("Failed to acquire workspace trust lock");
 	}
 }
 
@@ -130,45 +201,102 @@ function isNonEmptyDirectory(dir: string): boolean {
 	}
 }
 
-function collectExtensionFiles(dir: string): string[] {
-	const files: string[] = [];
-	let entries: Dirent[];
+interface PiManifestLike {
+	extensions?: string[];
+}
+
+function readPiManifest(packageJsonPath: string): PiManifestLike | null {
 	try {
-		entries = readdirSync(dir, { withFileTypes: true });
+		const pkg = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as { pi?: PiManifestLike };
+		return pkg.pi ?? null;
 	} catch {
-		return files;
+		return null;
 	}
-	for (const entry of entries) {
-		if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-		if (entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
-			files.push(join(dir, entry.name));
-		} else if (entry.isDirectory()) {
-			for (const indexName of ["index.ts", "index.js"]) {
-				const indexPath = join(dir, entry.name, indexName);
-				if (existsSync(indexPath)) {
-					files.push(indexPath);
-					break;
-				}
-			}
+}
+
+/** Mirrors the discovery rules of DefaultPackageManager's extension collection. */
+function hasExtensionEntry(dir: string): boolean {
+	const packageJsonPath = join(dir, "package.json");
+	if (existsSync(packageJsonPath)) {
+		const manifest = readPiManifest(packageJsonPath);
+		if (manifest?.extensions?.some((entry) => existsSync(resolve(dir, entry)))) {
+			return true;
 		}
 	}
-	return files;
+	return existsSync(join(dir, "index.ts")) || existsSync(join(dir, "index.js"));
+}
+
+function countExtensionEntries(extensionsDir: string): number {
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(extensionsDir, { withFileTypes: true });
+	} catch {
+		return 0;
+	}
+	let count = 0;
+	for (const entry of entries) {
+		if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "package.json") continue;
+		const fullPath = join(extensionsDir, entry.name);
+		if (entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
+			count++;
+		} else if (entry.isDirectory() && hasExtensionEntry(fullPath)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+function findGitRepoRoot(startDir: string): string | null {
+	let dir = resolve(startDir);
+	while (true) {
+		if (existsSync(join(dir, ".git"))) {
+			return dir;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) {
+			return null;
+		}
+		dir = parent;
+	}
+}
+
+/** Mirrors DefaultPackageManager's ancestor `.agents/skills` discovery (cwd up to the git root). */
+function collectAncestorAgentsSkillDirs(cwd: string): string[] {
+	const dirs: string[] = [];
+	const gitRepoRoot = findGitRepoRoot(cwd);
+	const userAgentsSkillsDir = join(homedir(), ".agents", "skills");
+	let dir = resolve(cwd);
+	while (true) {
+		const candidate = join(dir, ".agents", "skills");
+		if (resolve(candidate) !== resolve(userAgentsSkillsDir)) {
+			dirs.push(candidate);
+		}
+		if (gitRepoRoot && dir === gitRepoRoot) {
+			break;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) {
+			break;
+		}
+		dir = parent;
+	}
+	return dirs;
 }
 
 /**
  * Synchronously detect project-committed configuration that workspace trust
- * gates. Used for the interactive consent prompt and headless notices; the
- * enforcement itself lives in SettingsManager/DefaultPackageManager.
+ * gates. Used for the interactive consent prompt; the enforcement itself
+ * lives in SettingsManager/DefaultPackageManager/DefaultResourceLoader.
  */
 export function detectProjectScopedConfig(cwd: string): ProjectScopedConfigFinding[] {
 	const findings: ProjectScopedConfigFinding[] = [];
 	const configDir = join(cwd, CONFIG_DIR_NAME);
 
-	const extensionFiles = collectExtensionFiles(join(configDir, "extensions"));
-	if (extensionFiles.length > 0) {
+	const extensionCount = countExtensionEntries(join(configDir, "extensions"));
+	if (extensionCount > 0) {
 		findings.push({
 			path: join(configDir, "extensions"),
-			summary: `project extensions (${extensionFiles.length} file${extensionFiles.length === 1 ? "" : "s"}) execute automatically at session start`,
+			summary: `project extensions (${extensionCount} ${extensionCount === 1 ? "entry" : "entries"}) execute automatically at session start`,
 		});
 	}
 
@@ -204,12 +332,26 @@ export function detectProjectScopedConfig(cwd: string): ProjectScopedConfigFindi
 		});
 	}
 
-	const agentsSkillsDir = join(cwd, ".agents", "skills");
-	if (isNonEmptyDirectory(agentsSkillsDir)) {
-		findings.push({
-			path: agentsSkillsDir,
-			summary: ".agents/skills is auto-discovered (Python skills install code into the agent kernel environment)",
-		});
+	for (const ancestorSkillsDir of collectAncestorAgentsSkillDirs(cwd)) {
+		if (isNonEmptyDirectory(ancestorSkillsDir)) {
+			findings.push({
+				path: ancestorSkillsDir,
+				summary: ".agents/skills is auto-discovered (Python skills install code into the agent kernel environment)",
+			});
+		}
+	}
+
+	for (const [dirName, label] of [
+		["prompts", "prompt templates"],
+		["themes", "themes"],
+	] as const) {
+		const dir = join(configDir, dirName);
+		if (isNonEmptyDirectory(dir)) {
+			findings.push({
+				path: dir,
+				summary: `project ${label} are auto-discovered`,
+			});
+		}
 	}
 
 	return findings;

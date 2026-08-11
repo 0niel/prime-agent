@@ -1137,6 +1137,11 @@ export async function main(args: string[], options?: MainOptions) {
 	time("runMigrations");
 
 	const agentDir = getAgentDir();
+	// Early workspace-trust consent gate: accepting here makes trust effective
+	// for this launch (project sessionDir, settings, and service creation all
+	// read the store afterwards). A second gate runs after session resolution
+	// in case --resume selected a session from a different project.
+	await gateWorkspaceTrustOnStartup({ cwd, agentDir, interactive: appMode === "interactive" });
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir, {
 		projectTrusted: isWorkspaceTrusted(cwd, agentDir),
 	});
@@ -1246,9 +1251,9 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createSessionManager");
 
-	// Workspace-trust consent gate: must run before any runtime services are
-	// created for the effective session cwd (daemon workers read the shared
-	// trust store at session creation).
+	// Second workspace-trust gate for the effective session cwd, which may
+	// differ from the startup cwd when --resume selects another project's
+	// session. No-op when both are the same directory.
 	await gateWorkspaceTrustOnStartup({
 		cwd: sessionManager.getCwd(),
 		agentDir,
