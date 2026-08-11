@@ -1,9 +1,12 @@
 import chalk from "chalk";
 import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { executeMcpDeclarationCommand, parseMcpDeclarationCommand } from "../core/mcp/mcp-declaration-command.js";
-import { createMcpProjectTrustAuthority } from "../core/index.js";
-import { admitProjectMcpDeclarations } from "../core/mcp/mcp-project-trust.js";
-import { SettingsManager, type Settings } from "../core/settings-manager.js";
+import {
+	admitGlobalMcpProjectDeclarations,
+	McpProjectDeclarationReader,
+} from "../core/mcp/mcp-project-declaration-reader.js";
+import { releaseProjectMcpDeclarationAdmission } from "../core/mcp/mcp-project-trust.js";
+import { type Settings, SettingsManager } from "../core/settings-manager.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
 import {
@@ -151,7 +154,6 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 	}
 }
 
-
 /**
  * Sole public-command composition point for project MCP policy. It receives a
  * SettingsManager already loaded by the CLI and reads only its global snapshot.
@@ -163,17 +165,9 @@ export function composeMcpProjectDeclarationAdmission(
 	workingDirectory: string,
 ) {
 	if (command.scope !== "project") return undefined;
-	const globalPolicy = globalSettings.mcpProjectTrustPolicy;
-	const authority = createMcpProjectTrustAuthority({
-		revision: typeof globalPolicy?.revision === "string" ? globalPolicy.revision : "",
-		allowedProjectDirectories:
-			Array.isArray(globalPolicy?.allowedProjectDirectories) && globalPolicy.allowedProjectDirectories.every((path) => typeof path === "string")
-				? globalPolicy.allowedProjectDirectories
-				: [],
-	});
 	// The only raw-path authorization. Downstream receives no path or authority
-	// policy, only the opaque admission returned here.
-	return admitProjectMcpDeclarations(workingDirectory, authority);
+	// policy, only the opaque admission returned by the shared global composer.
+	return admitGlobalMcpProjectDeclarations(globalSettings, workingDirectory);
 }
 
 async function runMcpDeclarationCommand(args: string[]): Promise<PublicCommandResult> {
@@ -188,11 +182,18 @@ async function runMcpDeclarationCommand(args: string[]): Promise<PublicCommandRe
 			workingDirectory,
 		);
 		if (!admission) throw new Error("Project MCP declarations are unavailable.");
-		const settings = SettingsManager.create(workingDirectory);
-		const result = await executeMcpDeclarationCommand(command, settings, admission);
-		await settings.flush();
-		console.log(JSON.stringify(result, null, 2));
-		return HANDLED;
+		// Do not construct SettingsManager here: it eagerly reads project scope.
+		// This capability-scoped adapter validates around every declaration I/O.
+		try {
+			const reader = await McpProjectDeclarationReader.create(admission);
+			const settings = reader.asCommandSettings();
+			const result = await executeMcpDeclarationCommand(command, settings as SettingsManager, admission);
+			await settings.flush();
+			console.log(JSON.stringify(result, null, 2));
+			return HANDLED;
+		} finally {
+			releaseProjectMcpDeclarationAdmission(admission);
+		}
 	}
 	// User declarations retain the existing full settings behavior.
 	const settings = SettingsManager.create(workingDirectory);

@@ -78,6 +78,13 @@ export {
 	type WorkingIndicatorOptions,
 } from "./extensions/index.js";
 export {
+	type CreateMcpRuntimeDeclarationSnapshotInput,
+	createMcpRuntimeDeclarationSnapshot,
+	type McpRuntimeDeclaration,
+	type McpRuntimeDeclarationSnapshot,
+	type McpRuntimeDeclarationSource,
+} from "./mcp/mcp-runtime-declaration-snapshot.js";
+export {
 	createMcpProjectTrustAuthority,
 	type McpProjectTrustAuthority,
 	type McpProjectTrustAuthorityInput,

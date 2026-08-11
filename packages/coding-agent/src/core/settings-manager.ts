@@ -5,9 +5,9 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import {
-	parseMcpDeclarationDocument,
 	type McpDeclarationDocument,
 	type McpDeclarationScope,
+	parseMcpDeclarationDocument,
 } from "./mcp/mcp-declarations.js";
 
 const RECENT_MODELS_LIMIT = 20;
@@ -1237,8 +1237,17 @@ export class SettingsManager {
 		return this.settings.enabledModels;
 	}
 
+	/** Legacy/UI view: project values continue to override global values here. */
 	getMcpServers(): Record<string, McpServerConfig> | undefined {
 		return this.settings.mcpServers;
+	}
+
+	/**
+	 * Host-owned MCP integrations use only this global view. Project settings
+	 * remain a UI/legacy overlay and cannot redirect host integration endpoints.
+	 */
+	getGlobalMcpServers(): Record<string, McpServerConfig> | undefined {
+		return structuredClone(this.globalSettings.mcpServers);
 	}
 
 	/** Read one M01 declaration document without merging user and project scope. */
