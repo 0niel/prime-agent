@@ -688,6 +688,8 @@ export class KernelManager {
 
 	private async doStart(startOptions: KernelStartOptions): Promise<void> {
 		if (this.state !== "idle") return;
+		if (this.terminal) throw new Error("Kernel was disposed");
+		this.hostRequestsClosed = false;
 		this.state = "starting";
 		installSignalHandlersOnce();
 		// Tracked from the moment startup begins so session cleanup and signal
