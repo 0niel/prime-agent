@@ -3177,6 +3177,8 @@ print(_result.name)
 
 		try {
 			const kernel = manager as unknown as KernelCommTestApi;
+			const sendCommMessage = vi.fn(async () => {});
+			kernel.sendCommMessage = sendCommMessage;
 
 			kernel.handleCommMessage(rlmCommOpen("comm-dispose", "slow child"));
 
@@ -3196,7 +3198,8 @@ print(_result.name)
 
 			const kernelStderr = (manager as unknown as { kernelStderr: string }).kernelStderr;
 			expect(kernelStderr).toContain("[kernel] host request failed for comm comm-dispose");
-			expect(kernelStderr).toContain("[kernel] failed to send host request error reply for comm comm-dispose");
+			expect(sendCommMessage).not.toHaveBeenCalled();
+			expect(kernelStderr).not.toContain("[kernel] failed to send host request error reply for comm comm-dispose");
 			expect(stderrSpy).not.toHaveBeenCalled();
 		} finally {
 			releaseChild();
