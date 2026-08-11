@@ -38,6 +38,7 @@ function fakeAcpConnection(
 		onInitialSnapshot?: (subscribed: boolean) => void;
 		onPromptAndWait?: () => void | Promise<void>;
 		onWaitForHeadlessCompletion?: () => void | Promise<void>;
+		headlessStatus?: Record<string, unknown>;
 		onFinalSnapshot?: () => void | Promise<void>;
 		onUnsubscribe?: () => void;
 	} = {},
@@ -82,6 +83,7 @@ function fakeAcpConnection(
 				turnsUsed: 0,
 				tokensUsed: 0,
 				limits: { maxContinuations: 0 },
+				...options.headlessStatus,
 			};
 		},
 		emitChild(child: any) {
@@ -179,6 +181,31 @@ describe("ACP mode end to end", () => {
 		harness.cleanup();
 	}, 30_000);
 
+	it("treats unused autonomous capacity as terminal lifecycle telemetry", async () => {
+		const connection = fakeAcpConnection({
+			headlessStatus: {
+				enabled: true,
+				continuationsUsed: 1,
+				limits: { maxContinuations: 3 },
+			},
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "finish" }],
+		});
+		const meta = updates.map((item) => item.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(meta.filter((item) => item.phase === "responseBoundary")).toHaveLength(1);
+		expect(meta.filter((item) => item.phase === "terminalQuiescence")).toEqual([
+			expect.objectContaining({
+				quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 2 },
+			}),
+		]);
+		close();
+	});
+
 	it("reports a live in-process child that spawned after ACP attached", async () => {
 		const harness = await createHarness({ rlmDepth: 0, rlmMaxDepth: 1 });
 		let releaseChild!: () => void;
@@ -266,6 +293,44 @@ describe("ACP mode end to end", () => {
 		await expect(client.request("session/new", { cwd: process.cwd(), mcpServers: [] })).rejects.toThrow();
 		releaseSnapshot();
 		await expect(first).resolves.toMatchObject({ sessionId: expect.any(String) });
+		close();
+	});
+
+	it("buffers subscription updates until the session/new response commits", async () => {
+		let emitChild: (child: any) => void = () => {};
+		let releaseSnapshot!: () => void;
+		let snapshotEventEmitted!: () => void;
+		const snapshotReleased = new Promise<void>((resolve) => {
+			releaseSnapshot = resolve;
+		});
+		const snapshotEvent = new Promise<void>((resolve) => {
+			snapshotEventEmitted = resolve;
+		});
+		const connection = fakeAcpConnection({
+			initialSnapshot: async () => {
+				emitChild({ id: "during-snapshot", label: "during snapshot", status: "running", sessionDir: "/tmp/child" });
+				snapshotEventEmitted();
+				await snapshotReleased;
+				return { state: { cwd: process.cwd() }, messages: [], children: [] };
+			},
+		});
+		const originalSubscribe = connection.subscribe.bind(connection);
+		connection.subscribe = (listener: (event: any) => void) => {
+			emitChild = (child) => listener({ type: "session_event", event: { type: "rlm_child_update", child } });
+			return originalSubscribe(listener);
+		};
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const pending = client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await snapshotEvent;
+		expect(updates).toHaveLength(0);
+		releaseSnapshot();
+		const session = await pending;
+		await vi.waitFor(() => expect(updates).toHaveLength(1));
+		expect(updates[0]).toMatchObject({
+			sessionId: session.sessionId,
+			update: { _meta: { [PRIME_AGENT_META_NAMESPACE]: { eventSequence: 1, promptTurnId: 0 } } },
+		});
 		close();
 	});
 

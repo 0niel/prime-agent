@@ -68,6 +68,19 @@ function canonicalCwd(path: string): string {
 	return normalizeWindowsDriveLetter(canonical);
 }
 
+/** A response cannot be confused with a peer request that reuses a JSON-RPC id. */
+function isJsonRpcResponse(message: unknown, requestId: unknown): boolean {
+	if (typeof message !== "object" || message === null) return false;
+	const record = message as Record<string, unknown>;
+	const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(record, key);
+	return (
+		record.jsonrpc === "2.0" &&
+		record.id === requestId &&
+		!has("method") &&
+		(has("result") !== has("error"))
+	);
+}
+
 function sameCwd(left: string, right: string): boolean {
 	const canonicalLeft = canonicalCwd(left);
 	const canonicalRight = canonicalCwd(right);
@@ -125,12 +138,36 @@ class AcpUpdateProducer {
 	private tail: Promise<void> = Promise.resolve();
 	private readonly childOriginTurnIds = new Map<string, number>();
 	private readonly terminalTurns = new Set<number>();
+	private readonly admissionReady: Promise<void>;
+	private releaseAdmission!: () => void;
+	private admissionOpen = false;
+	private admissionClosed = false;
 
 	constructor(
 		private readonly sessionId: string,
 		private readonly client: { notify(method: unknown, params: unknown): Promise<unknown> },
 		private readonly beforePublish?: (update: Record<string, unknown>) => Promise<void> | void,
-	) {}
+	) {
+		// Subscribe before the initial snapshot, but do not let that subscription
+		// publish a session-bound update before session/new has replied.
+		this.admissionReady = new Promise<void>((resolve) => {
+			this.releaseAdmission = resolve;
+		});
+	}
+
+	/** Open the initial update gate only after session/new reached the transport. */
+	commitSessionNewResponse(): void {
+		if (this.admissionClosed) return;
+		this.admissionOpen = true;
+		this.releaseAdmission();
+	}
+
+	/** Settle a failed admission without allowing its buffered updates to publish. */
+	failSessionNewAdmission(): void {
+		if (this.admissionOpen || this.admissionClosed) return;
+		this.admissionClosed = true;
+		this.releaseAdmission();
+	}
 
 	beginPrompt(): number {
 		this.activePromptTurnId = ++this.nextPromptTurnId;
@@ -199,6 +236,8 @@ class AcpUpdateProducer {
 		// Keep the chain alive after a disconnect, while preserving the order of
 		// every later notification and allowing callers to await its drain.
 		this.tail = this.tail.then(async () => {
+			await this.admissionReady;
+			if (!this.admissionOpen) return;
 			await this.beforePublish?.(correlatedUpdate);
 			await this.client
 				.notify(acp.methods.client.session.update, { sessionId: this.sessionId, update: correlatedUpdate })
@@ -376,8 +415,68 @@ export async function runAcpModeWithConnection(
 	let sessionNewInFlight = false;
 	let bound = false;
 
-	const stream =
+	const baseStream =
 		options.stream ?? acp.ndJsonStream(rawStdoutSink(), Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>);
+	// ACP's public request handler only returns a response; it has no response
+	// commit callback. Observe the outgoing response at the supplied stream
+	// boundary instead. The SDK serializes every write, so opening the producer
+	// after this write resolves puts buffered notifications strictly behind it.
+	let pendingSessionNewResponse:
+		| { requestId: unknown; producer: AcpUpdateProducer }
+		| undefined;
+	const failPendingSessionNewResponse = (): void => {
+		const admission = pendingSessionNewResponse;
+		pendingSessionNewResponse = undefined;
+		admission?.producer.failSessionNewAdmission();
+	};
+	const stream: typeof baseStream = {
+		readable: baseStream.readable,
+		writable: new WritableStream<any>({
+			async write(message) {
+				let writer: WritableStreamDefaultWriter<any> | undefined;
+				try {
+					writer = baseStream.writable.getWriter();
+					await writer.write(message);
+				} catch (error) {
+					failPendingSessionNewResponse();
+					throw error;
+				} finally {
+					writer?.releaseLock();
+				}
+				if (pendingSessionNewResponse && isJsonRpcResponse(message, pendingSessionNewResponse.requestId)) {
+					const admission = pendingSessionNewResponse;
+					pendingSessionNewResponse = undefined;
+					admission.producer.commitSessionNewResponse();
+				}
+			},
+			async close() {
+				let writer: WritableStreamDefaultWriter<any> | undefined;
+				try {
+					writer = baseStream.writable.getWriter();
+					await writer.close();
+				} catch (error) {
+					failPendingSessionNewResponse();
+					throw error;
+				} finally {
+					writer?.releaseLock();
+				}
+				failPendingSessionNewResponse();
+			},
+			async abort(reason) {
+				let writer: WritableStreamDefaultWriter<any> | undefined;
+				try {
+					writer = baseStream.writable.getWriter();
+					await writer.abort(reason);
+				} catch (error) {
+					failPendingSessionNewResponse();
+					throw error;
+				} finally {
+					writer?.releaseLock();
+				}
+				failPendingSessionNewResponse();
+			},
+		}),
+	};
 
 	const handle = acp
 		.agent({ name: "prime-agent" })
@@ -463,7 +562,8 @@ export async function runAcpModeWithConnection(
 					await connection.getInitialSnapshot();
 				} catch (error) {
 					// A failed setup never claims the session slot, but it must still release
-					// the listener installed above.
+					// the listener installed above and settle buffered producers.
+					producer.failSessionNewAdmission();
 					unsubscribe();
 					throw error;
 				}
@@ -471,10 +571,14 @@ export async function runAcpModeWithConnection(
 				// ready, so a failed setup cannot leave it occupied and unusable.
 				entry.unsubscribe = unsubscribe;
 				session = entry;
-				return {
+				const response = {
 					sessionId,
 					...(cwdMismatch ? { _meta: primeAgentMeta({ cwd: cwdMismatch }) } : {}),
 				};
+				// The stream wrapper commits this gate after this exact response has
+				// written. Buffered subscription updates retain producer order.
+				pendingSessionNewResponse = { requestId: ctx.requestId, producer: entry.producer };
+				return response;
 			} finally {
 				sessionNewInFlight = false;
 			}
@@ -520,9 +624,9 @@ export async function runAcpModeWithConnection(
 				}
 				const outcome = failure ? "error" : "result";
 				const terminalQuiescence = quiescenceMeta(status, liveSnapshot.children);
-				const terminal =
-					terminalQuiescence.outstandingSubagents === 0 &&
-					terminalQuiescence.remainingAutonomousContinuations === 0;
+				// Lifecycle completion is authoritative here: unused autonomous
+				// continuation capacity is telemetry, not outstanding work.
+				const terminal = terminalQuiescence.outstandingSubagents === 0;
 				// The zero-terminal completion pair linearizes here, before either
 				// notification is queued. A cancellation before this cut produces no
 				// boundary/terminal; a cancellation after it cannot relabel a durable

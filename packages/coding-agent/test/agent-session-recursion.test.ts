@@ -41,6 +41,7 @@ import { SettingsManager, type SettingsStorage } from "../src/core/settings-mana
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
+import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { invokeHostRequest } from "./host-request-context.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
@@ -654,6 +655,46 @@ describe("AgentSession rlm recursion", () => {
 		await expect(root.runRlmChild("replacement", { name: "retained-retry-worker" })).resolves.toMatchObject({
 			name: "retained-retry-worker",
 		});
+	});
+
+	it("keeps a failed runtime deletion cancelled in direct and connection snapshots until retry", async () => {
+		const childId = "cancelled-cleanup-child";
+		const child = createSession({ rlmSessionDir: join(tempDir, childId) });
+		child.setSessionName("cancelled-cleanup-worker");
+		let deleteAttempts = 0;
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				deleteRlmSubagentRuntime: async (_id, session) => {
+					if (++deleteAttempts === 1) throw new Error("runtime deletion failed");
+					await session?.disposeAsync();
+				},
+			},
+		});
+		expect(root.registerRlmChildSession(childId, child)).toBe(true);
+		const events: AgentSessionEvent[] = [];
+		root.subscribe((event) => events.push(event));
+		await expect(root.deleteRlmSubagent("cancelled-cleanup-worker")).rejects.toThrow("runtime deletion failed");
+		expect(events).toContainEqual(
+			expect.objectContaining({ type: "rlm_child_update", child: { id: childId, status: "cancelled" } }),
+		);
+		expect(root.getRlmChildSnapshots()).toEqual([
+			expect.objectContaining({ id: childId, status: "cancelled" }),
+		]);
+		const connection = new InProcessAgentConnection({
+			session: root,
+			setRebindSession() {},
+			setBeforeSessionInvalidate() {},
+			dispose: async () => {},
+		} as unknown as AgentSessionRuntime);
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+			children: [expect.objectContaining({ id: childId, status: "cancelled" })],
+		});
+		await expect(root.deleteRlmSubagent("cancelled-cleanup-worker")).resolves.toMatchObject({
+			subagent: { rlm_child_id: childId },
+		});
+		expect(deleteAttempts).toBe(2);
+		expect(root.getRlmChildSnapshots()).toEqual([]);
 	});
 
 	it("makes an orchestrator-chosen name override a custom runtime's preexisting name", async () => {

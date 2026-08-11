@@ -9602,7 +9602,9 @@ export class AgentSession {
 				sessionName: child.sessionName,
 				model: child.model ? `${child.model.provider}/${child.model.id}` : undefined,
 				label: child.sessionName ?? "child agent",
-				status: "done",
+				// A failed delete retains the session solely for cleanup retry. Preserve
+				// its cancellation truth in snapshots rather than reviving it as done.
+				status: this._rlmChildCleanupFailures.has(childId) ? "cancelled" : "done",
 				sessionDir: child._rlmSessionDir ?? child.sessionManager.getSessionDir(),
 			});
 			snapshots.push(...child.getRlmChildSnapshots());
