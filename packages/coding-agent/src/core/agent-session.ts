@@ -169,7 +169,12 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
+import {
+	createHostRequestHandler,
+	type HostRequestContext,
+	type HostRequestHandler,
+	type KernelSentAgentMessage,
+} from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -238,6 +243,10 @@ import {
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type DeliveryRecord,
+	type QueuedMessageLane,
+	type QueuedMessageMutation,
+	type QueuedMessageMutationStatus,
+	queuedMessageLaneDeliveryPolicy,
 	type RuntimeActivity,
 	type SessionAction,
 	type SessionActionSnapshot,
@@ -1062,6 +1071,12 @@ function waitForPromiseOrAbort<T>(
 	});
 }
 
+function resolveLegacySystemPromptSource(
+	systemPrompt: string | undefined,
+): BuildSystemPromptOptions["systemPromptSource"] {
+	return systemPrompt === undefined ? { provenance: "built_in" } : { provenance: "custom", content: systemPrompt };
+}
+
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	const parentContextTokens =
 		parentUsage.totalTokens ||
@@ -1076,10 +1091,6 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 // ============================================================================
 // AgentSession Class
 // ============================================================================
-
-function resolveLegacySystemPromptSource(systemPrompt: string | undefined): BuildSystemPromptOptions["systemPromptSource"] {
-	return systemPrompt === undefined ? { provenance: "built_in" } : { provenance: "custom", content: systemPrompt };
-}
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -3782,9 +3793,18 @@ export class AgentSession {
 			return this._disposeAsyncPromise;
 		}
 		this._disposeAsyncPromise = (async () => {
+			// Revoke kernel-originated host requests before awaiting unrelated
+			// refinement work. The provisioner forwards this to KernelManager, which
+			// aborts each request and awaits its handler before its connection closes.
+			// This prevents an old session's host handler from surviving replacement.
+			// Capture the refinement drain before the first await: this preserves a
+			// final agent_end's serialized work while kernel disposal is pending.
+			const drain = this._drainPendingRefinementForDisposal();
+			const kernelDispose = this._ipythonKernelProvisioner?.dispose();
+			if (kernelDispose) await kernelDispose;
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
-			await this._drainPendingRefinementForDisposal();
+			await drain;
 			if (this._disposed) {
 				return this._disposeCallbacksPromise;
 			}
@@ -4289,9 +4309,9 @@ export class AgentSession {
 			}
 		}
 
-		const loaderSystemPromptSource = this._resourceLoader.getSystemPromptSource?.().source ?? resolveLegacySystemPromptSource(
-			this._resourceLoader.getSystemPrompt(),
-		);
+		const loaderSystemPromptSource =
+			this._resourceLoader.getSystemPromptSource?.().source ??
+			resolveLegacySystemPromptSource(this._resourceLoader.getSystemPrompt());
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
 		const appendSystemPrompt =
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
@@ -6109,12 +6129,88 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
+	/**
+	 * Mutate a single visible queued message, addressed by its position in the same
+	 * projection the session-action snapshot publishes. expectedText must match the
+	 * item's current preview so clients never edit a shifted queue by accident.
+	 */
+	mutateQueuedMessage(
+		lane: QueuedMessageLane,
+		index: number,
+		expectedText: string,
+		mutation: QueuedMessageMutation,
+	): QueuedMessageMutationStatus {
+		const policy = queuedMessageLaneDeliveryPolicy(lane);
+		const projection = visibleSessionActionProjection(this._actionStore.queuedActions(policy));
+		const item = projection[index];
+		if (!item || queuedAgentMessagePreview(item) !== expectedText) return "rejected";
+		if (mutation.type === "delete") {
+			const error = new Error("Queued prompt was deleted before delivery.");
+			this._rejectAgentMessage(item.agentMessageId, error);
+			this._cancelSessionActions((candidate) => candidate === item, error);
+			this._emitQueueUpdate();
+			this.resumeQueuedWork();
+			return "applied";
+		}
+		if (mutation.type === "move") {
+			const neighbor = projection[index + mutation.direction];
+			if (!neighbor) return "rejected";
+			this._actionStore.swapQueued(item, neighbor);
+			this._emitQueueUpdate();
+			return "applied";
+		}
+		if (
+			item.payload.kind === "turn" &&
+			(item.payload.acceptedAgentMessage ||
+				item.payload.records.some((record) => record.role === "primary" && record.message.role !== "user"))
+		) {
+			return "rejected";
+		}
+		const images = mutation.images?.map((image) => ({ ...image }));
+		if (item.payload.kind === "session_command") {
+			const command = parseSessionSlashCommand(mutation.text);
+			if (!command) return "invalid";
+			item.payload.text = mutation.text;
+			item.payload.command = command;
+			if (mutation.images !== undefined) item.payload.images = images?.length ? images : undefined;
+		} else {
+			item.payload.text = mutation.text;
+			const text = { type: "text" as const, text: mutation.text };
+			if (mutation.images !== undefined) {
+				item.payload.images = images?.length ? images : undefined;
+				item.payload.content = [text, ...(images?.map((image) => ({ ...image })) ?? [])];
+			} else if (item.payload.content) {
+				item.payload.content = [text, ...item.payload.content.filter((block) => block.type !== "text")];
+			}
+			item.payload.preview = undefined;
+			item.payload.prepared = undefined;
+			for (const record of item.payload.records) {
+				if (record.role === "primary" && record.message.role === "user") {
+					record.message.content = item.payload.content?.map((block) => ({ ...block })) ?? mutation.text;
+				}
+			}
+		}
+		const targetPolicy = queuedMessageLaneDeliveryPolicy(mutation.lane);
+		if (targetPolicy !== policy) {
+			item.queueKey = undefined;
+			item.wake = mutation.lane === "steering" ? "on_lower_boundary" : "external_resume";
+			this._actionStore.moveQueued(item, targetPolicy, this._actionStore.queuedActions(targetPolicy).length);
+		}
+		this.resumeQueuedWork();
+		this._emitQueueUpdate();
+		return "applied";
+	}
+
 	get queuedActionCount(): number {
 		return visibleSessionActionProjection(this._actionStore.queuedActions()).length;
 	}
 
 	get unfinishedActionCount(): number {
 		return this._actionStore.unfinishedActions().length;
+	}
+
+	get isQueuedWorkSuspended(): boolean {
+		return this._sessionInputPumpSuspended;
 	}
 
 	get isSessionActive(): boolean {
@@ -8684,33 +8780,44 @@ export class AgentSession {
 	}
 
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
-	private _createKernelHostHandlers(): HostRequestHandlers {
-		const handlers: HostRequestHandlers = {
+	private _createKernelHostHandlers(): Record<string, HostRequestHandler> {
+		const handlers: Record<string, HostRequestHandler> = {
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
 			})),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
-			"model.info": async () => ({
-				id: this.model?.id ?? null,
-				provider: this.model?.provider ?? null,
-				input: this.model?.input ?? [],
-			}),
+			"model.info": createHostRequestHandler(
+				async (_payload: Record<string, unknown>, _context: HostRequestContext) => ({
+					id: this.model?.id ?? null,
+					provider: this.model?.provider ?? null,
+					input: this.model?.input ?? [],
+				}),
+			),
 		};
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
-				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
+				handlers[type] = createHostRequestHandler(
+					async (payload: Record<string, unknown>, _context: HostRequestContext) =>
+						this.handleGoalHostRequest(type, payload),
+				);
 			}
 		}
 		if (this._includeCompactSkill) {
 			for (const type of ["compact.run", "compact.status"]) {
-				handlers[type] = async (payload) => this.handleCompactHostRequest(type, payload);
+				handlers[type] = createHostRequestHandler(
+					async (payload: Record<string, unknown>, _context: HostRequestContext) =>
+						this.handleCompactHostRequest(type, payload),
+				);
 			}
 		}
 		if (this._autoRefineAllowedForSession()) {
 			for (const type of ["refine.run", "refine.status"]) {
-				handlers[type] = async (payload) => this.handleRefineHostRequest(type, payload);
+				handlers[type] = createHostRequestHandler(
+					async (payload: Record<string, unknown>, _context: HostRequestContext) =>
+						this.handleRefineHostRequest(type, payload),
+				);
 			}
 		}
 		if (this._rlmHeartbeatController) {
@@ -8720,7 +8827,10 @@ export class AgentSession {
 				"rlm_heartbeat.update",
 				"rlm_heartbeat.delete",
 			]) {
-				handlers[type] = async (payload) => this.handleRlmHeartbeatHostRequest(type, payload);
+				handlers[type] = createHostRequestHandler(
+					async (payload: Record<string, unknown>, _context: HostRequestContext) =>
+						this.handleRlmHeartbeatHostRequest(type, payload),
+				);
 			}
 		}
 		const visibleKernelSkillNames = new Set(

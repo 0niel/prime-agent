@@ -664,7 +664,8 @@ describe("buildSystemPrompt", () => {
 	});
 
 	test("does not inject built-in content for a built-in-lookalike custom prompt", () => {
-		const content = "Built-in system prompt lookalike: You are a general purpose agent that uses code to solve tasks.";
+		const content =
+			"Built-in system prompt lookalike: You are a general purpose agent that uses code to solve tasks.";
 		const prompt = buildSystemPrompt({
 			systemPromptSource: { provenance: "custom", content },
 			selectedTools: [],

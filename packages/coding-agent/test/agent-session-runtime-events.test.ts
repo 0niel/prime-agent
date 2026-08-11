@@ -82,18 +82,27 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 	it.each([
 		{ label: "present-empty", systemPrompt: "", expectedPrefix: "\nCurrent date: " },
-		{ label: "CRLF custom", systemPrompt: "runtime-route\r\ncustom-bytes", expectedPrefix: "runtime-route\r\ncustom-bytes" },
-	])("preserves $label prompt provenance through runtime assembly and replacement", async ({ systemPrompt, expectedPrefix }) => {
-		const { runtimeHost } = await createRuntimeHost(() => undefined, { systemPrompt });
-		const assertCustomPrompt = () => {
-			expect(runtimeHost.session.systemPrompt.startsWith(expectedPrefix)).toBe(true);
-			expect(runtimeHost.session.systemPrompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
-		};
+		{
+			label: "CRLF custom",
+			systemPrompt: "runtime-route\r\ncustom-bytes",
+			expectedPrefix: "runtime-route\r\ncustom-bytes",
+		},
+	])(
+		"preserves $label prompt provenance through runtime assembly and replacement",
+		async ({ systemPrompt, expectedPrefix }) => {
+			const { runtimeHost } = await createRuntimeHost(() => undefined, { systemPrompt });
+			const assertCustomPrompt = () => {
+				expect(runtimeHost.session.systemPrompt.startsWith(expectedPrefix)).toBe(true);
+				expect(runtimeHost.session.systemPrompt).not.toContain(
+					"You are a general purpose agent that uses code to solve tasks.",
+				);
+			};
 
-		assertCustomPrompt();
-		await runtimeHost.newSession();
-		assertCustomPrompt();
-	});
+			assertCustomPrompt();
+			await runtimeHost.newSession();
+			assertCustomPrompt();
+		},
+	);
 
 	it("runs beforeSessionInvalidate after session_shutdown and before rebindSession", async () => {
 		const phases: string[] = [];

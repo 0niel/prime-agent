@@ -1,5 +1,6 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, TextContent, Transport } from "@earendil-works/pi-ai";
+import { ENV_AGENT_DIR } from "../../config.js";
 import type {
 	AgentSessionMessageDeliveryMode,
 	AgentSessionMessageReceipt,
@@ -18,6 +19,7 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { InputSource } from "../../core/extensions/types.js";
 import type { CustomMessage } from "../../core/messages.js";
+import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type {
@@ -57,8 +59,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
-export const DAEMON_SCHEMA_REVISION = 14;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-816309b1cd50";
+// Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
+// Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
+export const DAEMON_SCHEMA_REVISION = 16;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-1bcb9e7f1a49";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -96,7 +100,8 @@ export type DaemonServerCapability =
 	// identity). Clients must check before sending.
 	| "transient_bash"
 	| "session_input_admission"
-	| "prompt_admission_cancellation";
+	| "prompt_admission_cancellation"
+	| "queue_message_mutation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -134,6 +139,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"transient_bash",
 	"session_input_admission",
 	"prompt_admission_cancellation",
+	"queue_message_mutation",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -198,6 +204,58 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 	return Object.keys(env).length > 0 ? env : undefined;
 }
 
+/**
+ * Non-secret launch settings that may survive a supervisor restart in a
+ * resident worker descriptor. Model credentials deliberately do not belong
+ * here: the first worker launch inherits the caller environment, but a JSON
+ * descriptor must never become an at-rest copy of a caller's credentials.
+ */
+export const DAEMON_PERSISTED_LAUNCH_ENV_KEYS = [
+	// Process/runtime locations needed to relaunch the same installed CLI.
+	"HOME",
+	"PATH",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+	"XDG_CACHE_HOME",
+	"XDG_CONFIG_HOME",
+	"XDG_DATA_HOME",
+	"XDG_RUNTIME_DIR",
+	"XDG_STATE_HOME",
+	// Source/development installs may relaunch through tsx after recovery.
+	"TSX_TSCONFIG_PATH",
+	// ENV_AGENT_DIR is the current application's configurable agent directory.
+	// PI_CODING_AGENT_DIR remains for compatibility with the upstream CLI.
+	ENV_AGENT_DIR,
+	"PI_CODING_AGENT_DIR",
+	// Deliberately non-secret Prime Agent behavior, telemetry, and package settings.
+	"PI_OFFLINE",
+	"PI_PACKAGE_DIR",
+	"PI_SKIP_VERSION_CHECK",
+	"DO_NOT_TRACK",
+	"PRIME_AGENT_TELEMETRY",
+	"PRIME_AGENT_TELEMETRY_ENDPOINT",
+	"PRIME_AGENT_TRACES_BASE_URL",
+	"PRIME_AGENT_DOWNLOAD_BASE_URL",
+] as const;
+
+/** Select the explicitly non-secret launch settings safe to persist on disk. */
+export function filterPersistedDaemonLaunchEnv(
+	source: Readonly<Record<string, string>> | undefined,
+): Record<string, string> | undefined {
+	if (!source) return undefined;
+	const env: Record<string, string> = {};
+	for (const key of DAEMON_PERSISTED_LAUNCH_ENV_KEYS) {
+		const value = source[key];
+		if (value !== undefined) env[key] = value;
+	}
+	return Object.keys(env).length > 0 ? env : undefined;
+}
+
+/**
+ * Collect the caller environment for the initial worker spawn. The
+ * supervisor filters it before it is written to a resident-worker descriptor.
+ */
 export function collectDaemonLaunchEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(source)) {
@@ -508,6 +566,15 @@ export type DaemonCommand =
 	| { id?: string; type: "get_model_catalog"; activeSessionId: string }
 	| { id?: string; type: "get_available_models"; activeSessionId: string }
 	| { id?: string; type: "get_queue"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "mutate_queued_message";
+			activeSessionId: string;
+			lane: QueuedMessageLane;
+			index: number;
+			expectedText: string;
+			mutation: QueuedMessageMutation;
+	  }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
@@ -682,6 +749,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_model_catalog: { minProtocol: 7, capability: "model_catalog" },
 	get_available_models: LEGACY_DAEMON_COMMAND,
 	get_queue: LEGACY_DAEMON_COMMAND,
+	mutate_queued_message: { minProtocol: 7, minSchemaRevision: 15, capability: "queue_message_mutation" },
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,

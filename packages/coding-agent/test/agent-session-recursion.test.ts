@@ -22,7 +22,12 @@ import {
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
-import { type HostRequestHandlers, KernelManager } from "../src/core/kernel/index.js";
+import {
+	createHostRequestHandler,
+	type HostRequestContext,
+	type HostRequestHandlers,
+	KernelManager,
+} from "../src/core/kernel/index.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import {
@@ -37,6 +42,7 @@ import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
+import { invokeHostRequest } from "./host-request-context.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -328,7 +334,7 @@ describe("AgentSession rlm recursion", () => {
 			outcome: "skipped_running",
 		}));
 
-		await expect(deleteHandler({ target: subagent.rlm_child_id })).resolves.toEqual({
+		await expect(invokeHostRequest(deleteHandler, { target: subagent.rlm_child_id })).resolves.toEqual({
 			subagent,
 			outcome: "skipped_running",
 		});
@@ -743,7 +749,7 @@ describe("AgentSession rlm recursion", () => {
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
 		expect(child.repliedToParentSinceTask).toBe(false);
-		await expect(send({ message: "done", receiver_role: "parent" })).resolves.toMatchObject({
+		await expect(invokeHostRequest(send, { message: "done", receiver_role: "parent" })).resolves.toMatchObject({
 			message: "done",
 		});
 		expect(sendAgentMessage).toHaveBeenCalledWith(
@@ -802,7 +808,7 @@ describe("AgentSession rlm recursion", () => {
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
-		const pendingSend = send({
+		const pendingSend = invokeHostRequest(send, {
 			message: "hello",
 			receiver_role: "child",
 			receiver_name: spawned.rlm_child_id,
@@ -865,7 +871,7 @@ describe("AgentSession rlm recursion", () => {
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
 		await expect(
-			send({ message: "follow-up", receiver_role: "child", receiver_name: spawned.rlm_child_id }),
+			invokeHostRequest(send, { message: "follow-up", receiver_role: "child", receiver_name: spawned.rlm_child_id }),
 		).resolves.toMatchObject({ message: "follow-up" });
 		expect(sendAgentMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ target: child.sessionId, message: "follow-up" }),
@@ -901,7 +907,11 @@ describe("AgentSession rlm recursion", () => {
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
-		const pendingSend = send({ message: "hello", receiver_role: "child", receiver_name: spawned.name });
+		const pendingSend = invokeHostRequest(send, {
+			message: "hello",
+			receiver_role: "child",
+			receiver_name: spawned.name,
+		});
 		rejectStartup?.(new Error("child startup failed"));
 
 		await expect(pendingSend).rejects.toThrow("child startup failed");
@@ -957,7 +967,7 @@ describe("AgentSession rlm recursion", () => {
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
 		await expect(
-			send({ message: "hello", receiver_role: "child", receiver_name: "shared-child" }),
+			invokeHostRequest(send, { message: "hello", receiver_role: "child", receiver_name: "shared-child" }),
 		).resolves.toMatchObject({ message: "hello" });
 		expect(sendAgentMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ target: "healthy-child-session", message: "hello" }),
@@ -999,9 +1009,9 @@ describe("AgentSession rlm recursion", () => {
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
-		await expect(send({ message: "hello", receiver_role: "child", receiver_name: "deleted-child" })).rejects.toThrow(
-			'No child matches "deleted-child"',
-		);
+		await expect(
+			invokeHostRequest(send, { message: "hello", receiver_role: "child", receiver_name: "deleted-child" }),
+		).rejects.toThrow('No child matches "deleted-child"');
 		releaseRuntimeCreation();
 		await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
 	});
@@ -1038,7 +1048,7 @@ describe("AgentSession rlm recursion", () => {
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
-		await expect(send({ target: "all", message: "status" })).resolves.toMatchObject({
+		await expect(invokeHostRequest(send, { target: "all", message: "status" })).resolves.toMatchObject({
 			receipts: [{ message: "status" }],
 		});
 		expect(roster).toHaveBeenCalledTimes(1);
@@ -1263,7 +1273,7 @@ describe("AgentSession rlm recursion", () => {
 		vi.spyOn(child, "promptAndWait").mockImplementation(async () => {
 			const send = (child as unknown as InspectableRlmSession)._createKernelHostHandlers()["agent_message.send"];
 			if (!send) throw new Error("Missing agent_message.send host handler");
-			await send({ message: "done", receiver_role: "parent" });
+			await invokeHostRequest(send, { message: "done", receiver_role: "parent" });
 			const followUp = createAgentSessionMessage({
 				id: "agentmsg-parent-follow-up-after-reply",
 				source: "agent_message",
@@ -1509,13 +1519,15 @@ describe("AgentSession rlm recursion", () => {
 		if (!listHandler || !deleteHandler) {
 			throw new Error("Missing RLM subagent registry host handlers");
 		}
-		await expect(listHandler({})).resolves.toEqual(expectedRegistry);
-		await expect(deleteHandler({ target: expectedSessionName })).resolves.toEqual({
+		await expect(invokeHostRequest(listHandler, {})).resolves.toEqual(expectedRegistry);
+		await expect(invokeHostRequest(deleteHandler, { target: expectedSessionName })).resolves.toEqual({
 			subagent: expectedRegistry.subagents[0],
 		});
 		expect(root.getRlmChildSession(daemonChildId)).toBeUndefined();
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-		await expect(deleteHandler({ target: expectedSessionName })).rejects.toThrow("No direct RLM subagent matches");
+		await expect(invokeHostRequest(deleteHandler, { target: expectedSessionName })).rejects.toThrow(
+			"No direct RLM subagent matches",
+		);
 
 		root.dispose();
 
@@ -3085,6 +3097,66 @@ print(_result.name)
 		}
 	});
 
+	it("force kills without awaiting an abort-ignoring host handler", async () => {
+		let started = false;
+		let releaseHandler: () => void = () => {};
+		const handlerGate = new Promise<void>((resolve) => {
+			releaseHandler = resolve;
+		});
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: {
+				"rlm.run": createRlmRunHostHandler(async () => {
+					started = true;
+					await handlerGate;
+					return {
+						answer: "unused",
+						usage: { prompt_tokens: 1, completion_tokens: 1 },
+						turns: 1,
+						session_dir: null,
+						model: "test/model",
+					};
+				}),
+			},
+		});
+		const kernel = manager as unknown as KernelCommTestApi & {
+			kernel?: { kill(signal: NodeJS.Signals): void };
+		};
+		const kill = vi.fn();
+		kernel.kernel = { kill };
+		try {
+			kernel.handleCommMessage(rlmCommOpen("comm-force-kill", "slow child"));
+			expect(started).toBe(true);
+			await expectSettlesWithin(manager.kill(), 100);
+			expect(kill).toHaveBeenCalledWith("SIGKILL");
+		} finally {
+			releaseHandler();
+		}
+	});
+
+	it("does not admit a host comm injected while dispose awaits its final snapshot", async () => {
+		const handler = vi.fn(async () => ({
+			answer: "unused",
+			usage: { prompt_tokens: 1, completion_tokens: 1 },
+			turns: 1,
+			session_dir: null,
+			model: "test/model",
+		}));
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: { "rlm.run": createRlmRunHostHandler(handler) },
+		});
+		const kernel = manager as unknown as KernelCommTestApi & {
+			flushSnapshotForDispose(): Promise<void>;
+		};
+		kernel.flushSnapshotForDispose = async () => {
+			kernel.handleCommMessage(rlmCommOpen("comm-injected-during-snapshot", "denied"));
+		};
+
+		await manager.dispose();
+		expect(handler).not.toHaveBeenCalled();
+	});
+
 	it("rejects removed background rlm comm request types", async () => {
 		const replies: CapturedCommReply[] = [];
 		const manager = new KernelManager({
@@ -3119,6 +3191,136 @@ print(_result.name)
 			});
 		} finally {
 			await manager.dispose();
+		}
+	});
+
+	it("retains an in-flight host reply-send failure while dispose waits", async () => {
+		let replySendStarted = false;
+		let releaseReplySend: () => void = () => {};
+		const replySendGate = new Promise<void>((resolve) => {
+			releaseReplySend = resolve;
+		});
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: {
+				"rlm.run": createRlmRunHostHandler(async () => ({
+					answer: "unused",
+					usage: { prompt_tokens: 1, completion_tokens: 1 },
+					turns: 1,
+					session_dir: null,
+					model: "test/model",
+				})),
+			},
+		});
+
+		try {
+			const kernel = manager as unknown as KernelCommTestApi;
+			kernel.sendCommMessage = async () => {
+				replySendStarted = true;
+				await replySendGate;
+				throw new Error("reply transport failed");
+			};
+			kernel.handleCommMessage(rlmCommOpen("comm-reply-dispose", "child"));
+
+			await waitFor(() => replySendStarted);
+			const disposePromise = manager.dispose();
+			let disposeSettled = false;
+			void disposePromise.then(() => {
+				disposeSettled = true;
+			});
+			await sleep(25);
+			expect(disposeSettled).toBe(false);
+
+			releaseReplySend();
+			await expectSettlesWithin(disposePromise, 1000);
+			expect((manager as unknown as { kernelStderr: string }).kernelStderr).toContain(
+				"[kernel] failed to send host request reply for comm comm-reply-dispose: reply transport failed",
+			);
+		} finally {
+			releaseReplySend();
+			await manager.dispose();
+		}
+	});
+
+	it("times out noncooperative host handlers during dispose and retains late failures", async () => {
+		let started = false;
+		let releaseHandler: () => void = () => {};
+		const handlerGate = new Promise<void>((resolve) => {
+			releaseHandler = resolve;
+		});
+		let resolveLateFailureDiagnostic: () => void = () => {};
+		const lateFailureDiagnostic = new Promise<void>((resolve) => {
+			resolveLateFailureDiagnostic = resolve;
+		});
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: {
+				"rlm.run": createHostRequestHandler(
+					async (_payload: Record<string, unknown>, _context: HostRequestContext) => {
+						started = true;
+						await handlerGate;
+						throw new Error("noncooperative handler failed after disposal");
+					},
+				),
+			},
+		});
+		const kernel = manager as unknown as KernelCommTestApi;
+		const sendCommMessage = vi.fn(async () => {});
+		kernel.sendCommMessage = sendCommMessage;
+		const diagnosticTarget = manager as unknown as {
+			appendKernelDiagnostic(message: string): void;
+			commTargets: Map<string, string>;
+			kernelStderr: string;
+			state: string;
+		};
+		const appendKernelDiagnostic = diagnosticTarget.appendKernelDiagnostic.bind(manager);
+		const diagnosticSpy = vi.spyOn(diagnosticTarget, "appendKernelDiagnostic").mockImplementation((message) => {
+			appendKernelDiagnostic(message);
+			if (
+				message === "host request failed for comm comm-noncooperative: noncooperative handler failed after disposal"
+			) {
+				resolveLateFailureDiagnostic();
+			}
+		});
+
+		vi.useFakeTimers();
+		try {
+			kernel.handleCommMessage(rlmCommOpen("comm-noncooperative", "slow child"));
+			expect(started).toBe(true);
+
+			const disposePromise = manager.dispose();
+			let disposeSettled = false;
+			void disposePromise.then(() => {
+				disposeSettled = true;
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(4999);
+			expect(disposeSettled).toBe(false);
+
+			await vi.advanceTimersByTimeAsync(1);
+			await disposePromise;
+			expect(disposeSettled).toBe(true);
+			expect(diagnosticTarget.state).toBe("shutdown");
+			expect(diagnosticTarget.commTargets).toEqual(new Map());
+			expect(diagnosticTarget.kernelStderr).toBe(
+				"[kernel] timed out waiting 5000ms for 1 host request task(s) after revocation\n",
+			);
+
+			releaseHandler();
+			await lateFailureDiagnostic;
+			await Promise.resolve();
+			expect(diagnosticTarget.kernelStderr).toContain(
+				"[kernel] host request failed for comm comm-noncooperative: noncooperative handler failed after disposal",
+			);
+			expect(diagnosticTarget.kernelStderr).toContain(
+				"[kernel] failed to send host request error reply for comm comm-noncooperative: host request authority was revoked",
+			);
+			expect(sendCommMessage).not.toHaveBeenCalled();
+		} finally {
+			releaseHandler();
+			vi.useRealTimers();
+			await manager.dispose();
+			diagnosticSpy.mockRestore();
 		}
 	});
 

@@ -69,7 +69,12 @@ function isSystemPromptSource(value: unknown): value is SystemPromptSource {
 	if (source.provenance === "built_in" || source.provenance === "unknown") {
 		return keys.length === 1 && keys[0] === "provenance";
 	}
-	return source.provenance === "custom" && typeof source.content === "string" && keys.length === 2 && keys.includes("content");
+	return (
+		source.provenance === "custom" &&
+		typeof source.content === "string" &&
+		keys.length === 2 &&
+		keys.includes("content")
+	);
 }
 
 function loadContextFileFromDir(dir: string): { path: string; content: string } | null {
@@ -527,9 +532,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				? [{ type: "error", message: "System prompt provenance unavailable" }]
 				: [];
 		this.systemPrompt =
-			this.resolvedSystemPromptSource.provenance === "custom"
-				? this.resolvedSystemPromptSource.content
-				: undefined;
+			this.resolvedSystemPromptSource.provenance === "custom" ? this.resolvedSystemPromptSource.content : undefined;
 
 		const appendSources =
 			this.appendSystemPromptSource ??

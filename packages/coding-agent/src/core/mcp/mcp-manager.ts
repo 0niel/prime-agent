@@ -9,7 +9,9 @@ import {
 } from "@earendil-works/pi-ai/mcp";
 import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { AuthStorage } from "../auth-storage.js";
+import { createHostRequestHandler, type HostRequestContext, type HostRequestHandler } from "../kernel/index.js";
 import type { McpServerConfig } from "../settings-manager.js";
+import type { McpRuntimeDeclarationSnapshot } from "./mcp-runtime-declaration-snapshot.js";
 
 export interface McpManagerOptions {
 	authStorage: AuthStorage;
@@ -17,6 +19,8 @@ export interface McpManagerOptions {
 	getUserServers?: () => Record<string, McpServerConfig> | undefined;
 	/** Start an interactive host-side login for a server. Provided by the UI mode. */
 	beginLogin?: (server: string) => Promise<void>;
+	/** Immutable declaration-only snapshot; never becomes integration config. */
+	getRuntimeDeclarations?: () => McpRuntimeDeclarationSnapshot;
 }
 
 /** A resolved integration: a catalog/user entry plus its provider id. */
@@ -37,6 +41,7 @@ export class McpManager {
 	private readonly authStorage: AuthStorage;
 	private readonly getUserServers: () => Record<string, McpServerConfig> | undefined;
 	private readonly beginLogin?: (server: string) => Promise<void>;
+	private readonly getRuntimeDeclarations: () => McpRuntimeDeclarationSnapshot | undefined;
 	private integrations = new Map<string, ResolvedIntegration>();
 	/** Provider ids we registered for user servers, so refresh can drop removed ones. */
 	private registeredUserProviderIds = new Set<string>();
@@ -45,8 +50,17 @@ export class McpManager {
 		this.authStorage = options.authStorage;
 		this.getUserServers = options.getUserServers ?? (() => undefined);
 		this.beginLogin = options.beginLogin;
+		this.getRuntimeDeclarations = options.getRuntimeDeclarations ?? (() => undefined);
 		this.resolveIntegrations();
 		this.registerProviders();
+	}
+
+	/**
+	 * Narrow internal declaration consumer. This deliberately returns no raw
+	 * settings and is never consulted by OAuth, host handlers, or transports.
+	 */
+	getDeclarationSnapshot(): McpRuntimeDeclarationSnapshot | undefined {
+		return this.getRuntimeDeclarations();
 	}
 
 	/** Re-read settings and re-register providers; call after a session reload. */
@@ -153,42 +167,51 @@ export class McpManager {
 	}
 
 	/** Host-request handlers exposed to the kernel. */
-	hostHandlers(): Record<string, (payload: Record<string, unknown>) => Promise<Record<string, unknown>>> {
-		const handlers: Record<string, (payload: Record<string, unknown>) => Promise<Record<string, unknown>>> = {
-			"mcp.refresh": async (payload) => {
-				const server = String(payload.server ?? "");
-				if (!server) throw new Error("mcp.refresh requires a server");
-				// getApiKey refreshes + rewrites auth.json under lock; Python re-reads.
-				// Surface failure (throw) instead of a false success so the kernel can
-				// report a refresh error rather than a misleading "not enabled".
-				const key = await this.authStorage.getApiKey(this.providerId(server));
-				if (!key) throw new Error(`Could not refresh credentials for ${server}`);
-				return {};
-			},
+	hostHandlers(): Record<string, HostRequestHandler> {
+		const handlers: Record<string, HostRequestHandler> = {
+			"mcp.refresh": createHostRequestHandler(
+				async (payload: Record<string, unknown>, context: HostRequestContext) => {
+					void context; // Credentials are refreshed atomically by AuthStorage; no per-request state is needed.
+					const server = String(payload.server ?? "");
+					if (!server) throw new Error("mcp.refresh requires a server");
+					// getApiKey refreshes + rewrites auth.json under lock; Python re-reads.
+					// Surface failure (throw) instead of a false success so the kernel can
+					// report a refresh error rather than a misleading "not enabled".
+					const key = await this.authStorage.getApiKey(this.providerId(server));
+					if (!key) throw new Error(`Could not refresh credentials for ${server}`);
+					return {};
+				},
+			),
 			// Resolved config so the kernel skill connects to the same URL the host
 			// registered/authenticated (honors a user's mcpServers `url` override).
-			"mcp.config": async (payload) => {
-				const server = String(payload.server ?? "");
-				if (!server) throw new Error("mcp.config requires a server");
-				const integration = this.integrations.get(server);
-				if (!integration) return {};
-				const config: Record<string, unknown> = { url: integration.url };
-				if (integration.headers && Object.keys(integration.headers).length > 0) {
-					config.headers = integration.headers;
-				}
-				return config;
-			},
+			"mcp.config": createHostRequestHandler(
+				async (payload: Record<string, unknown>, context: HostRequestContext) => {
+					void context; // Config is a synchronous snapshot of this manager's resolved integrations.
+					const server = String(payload.server ?? "");
+					if (!server) throw new Error("mcp.config requires a server");
+					const integration = this.integrations.get(server);
+					if (!integration) return {};
+					const config: Record<string, unknown> = { url: integration.url };
+					if (integration.headers && Object.keys(integration.headers).length > 0) {
+						config.headers = integration.headers;
+					}
+					return config;
+				},
+			),
 		};
 		// Only expose begin_login when an interactive login is actually wired, so the
 		// kernel doesn't get a handler whose only behavior is to throw.
 		const beginLogin = this.beginLogin;
 		if (beginLogin) {
-			handlers["mcp.begin_login"] = async (payload) => {
-				const server = String(payload.server ?? "");
-				if (!server) throw new Error("mcp.begin_login requires a server");
-				await beginLogin(server);
-				return {};
-			};
+			handlers["mcp.begin_login"] = createHostRequestHandler(
+				async (payload: Record<string, unknown>, context: HostRequestContext) => {
+					void context; // The UI-owned login flow has no request-scoped cancellation hook.
+					const server = String(payload.server ?? "");
+					if (!server) throw new Error("mcp.begin_login requires a server");
+					await beginLogin(server);
+					return {};
+				},
+			);
 		}
 		return handlers;
 	}

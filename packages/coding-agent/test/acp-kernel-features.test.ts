@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
+import { createTestHostHandlers } from "./host-request-context.js";
 import type { KernelManager } from "../src/core/kernel/index.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
@@ -166,8 +167,8 @@ print(json.dumps({
 			provisioner = new IpythonKernelProvisioner(tempDir, {
 				pythonSkills: [AGENT_MESSAGE_SKILL],
 				env: { RLM_DEPTH: "0", RLM_MAX_DEPTH: "1" },
-				hostHandlers: {
-					"rlm.list_subagents": async () => ({
+				hostHandlers: createTestHostHandlers({
+					"rlm.list_subagents": async (_payload, _context) => ({
 						subagents: [
 							{
 								rlm_child_id: "child-1",
@@ -179,7 +180,7 @@ print(json.dumps({
 							},
 						],
 					}),
-					"rlm.delete_subagent": async (payload) => ({
+					"rlm.delete_subagent": async (payload, _context) => ({
 						subagent: {
 							rlm_child_id: String(payload.target),
 							active_session_id: null,
@@ -189,7 +190,7 @@ print(json.dumps({
 							status: "completed",
 						},
 					}),
-				},
+				}),
 			});
 			const manager = await provisioner.ensure();
 
@@ -219,13 +220,13 @@ print(json.dumps({
 		async () => {
 			provisioner = new IpythonKernelProvisioner(tempDir, {
 				pythonSkills: [AGENT_MESSAGE_SKILL],
-				hostHandlers: {
+				hostHandlers: createTestHostHandlers({
 					// The family roster: parent, siblings, and children of this agent.
-					"agent_message.list_agents": async () => ({
+					"agent_message.list_agents": async (_payload, _context) => ({
 						current: { name: "root", id: "session-alpha", depth: 0 },
 						entries: [{ relationship: "child", name: "reviewer", id: "session-beta", depth: 1, status: "idle" }],
 					}),
-					"agent_message.send": async (payload) => ({
+					"agent_message.send": async (payload, _context) => ({
 						id: "agentmsg-acp",
 						source: "agent_message",
 						target: { activeSessionId: "beta", sessionId: "session-beta", sessionName: "reviewer" },
@@ -234,7 +235,7 @@ print(json.dumps({
 						queuedAt: "2026-08-04T00:00:00.000Z",
 						deliveryMode: payload.mode ?? "auto",
 					}),
-				},
+				}),
 			});
 			const manager = await provisioner.ensure();
 

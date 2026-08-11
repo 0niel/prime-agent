@@ -6,11 +6,11 @@ import { AuthStorage } from "../src/core/auth-storage.js";
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
-import type { SystemPromptSource } from "../src/core/system-prompt.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+import type { SystemPromptSource } from "../src/core/system-prompt.js";
 
 describe("DefaultResourceLoader", () => {
 	let tempDir: string;
@@ -614,7 +614,7 @@ Explicit override.`,
 			const loader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
-				systemPromptSourceOverride: () => ({ provenance: "custom" } as unknown as SystemPromptSource),
+				systemPromptSourceOverride: () => ({ provenance: "custom" }) as unknown as SystemPromptSource,
 			});
 			await loader.reload();
 

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
+import { createTestHostHandlers } from "./host-request-context.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
@@ -35,8 +36,8 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledRlmHeartbeatSkill()],
-			hostHandlers: {
-				"rlm_heartbeat.create": async (payload) => {
+			hostHandlers: createTestHostHandlers({
+				"rlm_heartbeat.create": async (payload, _context) => {
 					requests.push({ type: "rlm_heartbeat.create", payload });
 					return {
 						heartbeat: {
@@ -50,7 +51,7 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 						},
 					};
 				},
-				"rlm_heartbeat.list": async (payload) => {
+				"rlm_heartbeat.list": async (payload, _context) => {
 					requests.push({ type: "rlm_heartbeat.list", payload });
 					return {
 						heartbeats: [
@@ -63,7 +64,7 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 						],
 					};
 				},
-				"rlm_heartbeat.update": async (payload) => {
+				"rlm_heartbeat.update": async (payload, _context) => {
 					requests.push({ type: "rlm_heartbeat.update", payload });
 					return {
 						heartbeat: {
@@ -74,7 +75,7 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 						},
 					};
 				},
-				"rlm_heartbeat.delete": async (payload) => {
+				"rlm_heartbeat.delete": async (payload, _context) => {
 					requests.push({ type: "rlm_heartbeat.delete", payload });
 					return {
 						heartbeat: {
@@ -85,7 +86,7 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 						},
 					};
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -131,7 +132,7 @@ print(json.dumps({
 	it("surfaces missing host handlers as Python exceptions", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledRlmHeartbeatSkill()],
-			hostHandlers: {},
+			hostHandlers: createTestHostHandlers({}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -151,12 +152,12 @@ except RuntimeError as error:
 		let hostRequestCount = 0;
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledRlmHeartbeatSkill()],
-			hostHandlers: {
-				"rlm_heartbeat.create": async () => {
+			hostHandlers: createTestHostHandlers({
+				"rlm_heartbeat.create": async (_payload, _context) => {
 					hostRequestCount++;
 					return {};
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();

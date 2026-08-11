@@ -191,14 +191,15 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(calls[1]?.sessionConfig).toBe(sessionConfig);
 	});
 
-	it("copies depth across new-session parent reference edges", async () => {
+	it("increments depth across new-session parent reference edges", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		const parentSession = runtime.session.sessionFile;
 		if (!parentSession) throw new Error("Missing parent session file");
 
 		await runtime.newSession({ parentSession });
 
-		expect(runtime.session.sessionManager.getHeader()).toMatchObject({ parentSession, rlmDepth: 0 });
+		expect(runtime.session.sessionManager.getHeader()).toMatchObject({ parentSession, rlmDepth: 1 });
+		expect(runtime.session.rlmDepth).toBe(1);
 	});
 
 	it("uses effective runtime depth for a parented new session from a legacy header", async () => {
@@ -415,7 +416,9 @@ describe("AgentSessionRuntime characterization", () => {
 		});
 		const assertCustomPrompt = () => {
 			expect(childRuntime.session.systemPrompt.startsWith(content)).toBe(true);
-			expect(childRuntime.session.systemPrompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
+			expect(childRuntime.session.systemPrompt).not.toContain(
+				"You are a general purpose agent that uses code to solve tasks.",
+			);
 		};
 
 		assertCustomPrompt();
