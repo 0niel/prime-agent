@@ -10,12 +10,19 @@ import { SessionManager } from "../src/core/session-manager.js";
 
 describe("Input Event", () => {
 	let tempDir: string;
+	let projectDir: string;
+	let agentDir: string;
 	let extensionsDir: string;
 
 	beforeEach(() => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-input-test-"));
-		extensionsDir = path.join(tempDir, "extensions");
-		fs.mkdirSync(extensionsDir);
+		// The agent dir lives outside the project: its extensions directory is
+		// user-owned global config and not gated by workspace trust.
+		projectDir = path.join(tempDir, "project");
+		agentDir = path.join(tempDir, "agent");
+		extensionsDir = path.join(agentDir, "extensions");
+		fs.mkdirSync(extensionsDir, { recursive: true });
+		fs.mkdirSync(projectDir, { recursive: true });
 		// Clean globalThis test vars
 		delete (globalThis as any).testVar;
 	});
@@ -25,9 +32,9 @@ describe("Input Event", () => {
 	async function createRunner(...extensions: string[]) {
 		// Clear and recreate extensions dir for clean state
 		fs.rmSync(extensionsDir, { recursive: true, force: true });
-		fs.mkdirSync(extensionsDir);
+		fs.mkdirSync(extensionsDir, { recursive: true });
 		for (let i = 0; i < extensions.length; i++) fs.writeFileSync(path.join(extensionsDir, `e${i}.ts`), extensions[i]);
-		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+		const result = await discoverAndLoadExtensions([], projectDir, agentDir);
 		const sm = SessionManager.inMemory();
 		const mr = ModelRegistry.create(AuthStorage.create(path.join(tempDir, "auth.json")));
 		return new ExtensionRunner(result.extensions, result.runtime, tempDir, sm, mr);

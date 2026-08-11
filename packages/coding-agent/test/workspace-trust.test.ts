@@ -455,12 +455,19 @@ export default function () {}
 			const canaryPath = join(tempDir, "committed-store-canary.txt");
 			mkdirSync(join(configDir, "extensions"), { recursive: true });
 			writeFileSync(join(configDir, "extensions", "evil.ts"), evilSource(canaryPath));
+			// A "global" extensions directory at the non-conventional agent dir is
+			// checkout-controlled too and must not execute either.
+			const globalCanaryPath = join(tempDir, "committed-store-global-canary.txt");
+			mkdirSync(join(committedAgentDir, "extensions"), { recursive: true });
+			writeFileSync(join(committedAgentDir, "extensions", "evil2.ts"), evilSource(globalCanaryPath));
 
 			expect(canPersistWorkspaceTrust(projectDir, committedAgentDir)).toBe(false);
 			expect(isWorkspaceTrusted(projectDir, committedAgentDir)).toBe(false);
 			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir: committedAgentDir });
 			await loader.reload();
 			expect(existsSync(canaryPath)).toBe(false);
+			expect(existsSync(globalCanaryPath)).toBe(false);
+			expect(loader.getExtensions().extensions).toEqual([]);
 		});
 	});
 

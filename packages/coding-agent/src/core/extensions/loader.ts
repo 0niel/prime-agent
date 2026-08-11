@@ -15,8 +15,8 @@ import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
 import { createSyntheticSourceInfo } from "../source-info.js";
 import {
+	isAgentDirWithinWorkspace,
 	isProjectConfigDirTheUserGlobalDir,
-	isWithinProjectConfigDir,
 	isWorkspaceTrusted,
 } from "../workspace-trust.js";
 import type {
@@ -587,13 +587,13 @@ export async function discoverAndLoadExtensions(
 		addPaths(discoverExtensionsInDir(localExtDir));
 	}
 
-	// 2. Global extensions: agentDir/extensions/. Skipped when agentDir is
-	// project-controlled (portable agentDir) and the workspace is untrusted;
+	// 2. Global extensions: agentDir/extensions/. Skipped when agentDir lives
+	// inside the workspace (portable agentDir) and the workspace is untrusted;
 	// the user's own home-based global directory is exempt.
 	const globalExtDir = path.join(agentDir, "extensions");
 	if (
 		isWorkspaceTrusted(cwd, agentDir) ||
-		!isWithinProjectConfigDir(globalExtDir, cwd) ||
+		!isAgentDirWithinWorkspace(agentDir, cwd) ||
 		isProjectConfigDirTheUserGlobalDir(cwd)
 	) {
 		addPaths(discoverExtensionsInDir(globalExtDir));

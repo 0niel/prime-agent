@@ -10,11 +10,18 @@ import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 
 describe("createAgentSession skills option", () => {
 	let tempDir: string;
+	let projectDir: string;
+	let agentDir: string;
 	let skillsDir: string;
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `pi-sdk-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		skillsDir = join(tempDir, "skills", "test-skill");
+		// The agent dir lives outside the project so its resources count as
+		// user-owned global configuration (workspace trust).
+		projectDir = join(tempDir, "project");
+		agentDir = join(tempDir, "agent");
+		mkdirSync(projectDir, { recursive: true });
+		skillsDir = join(agentDir, "skills", "test-skill");
 		mkdirSync(skillsDir, { recursive: true });
 
 		// Create a test skill in the pi skills directory
@@ -40,8 +47,8 @@ This is a test skill.
 
 	it("should discover skills by default and expose them on session.skills", async () => {
 		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir: tempDir,
+			cwd: projectDir,
+			agentDir,
 			sessionManager: SessionManager.inMemory(),
 		});
 

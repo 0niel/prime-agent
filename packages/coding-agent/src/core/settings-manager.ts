@@ -4,7 +4,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
-import { isProjectConfigDirTheUserGlobalDir, isWithinProjectConfigDir } from "./workspace-trust.js";
+import { isAgentDirWithinWorkspace, isProjectConfigDirTheUserGlobalDir } from "./workspace-trust.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -359,8 +359,11 @@ export class SettingsManager {
 	/** Create a SettingsManager that loads from files */
 	static create(cwd: string, agentDir: string = getAgentDir(), options?: SettingsManagerOptions): SettingsManager {
 		const storage = new FileSettingsStorage(cwd, agentDir);
+		// Any agent dir inside the workspace tree is checkout-controlled (not
+		// just the conventional config path), except the user's own home-based
+		// global directory.
 		const globalConfigAliasedToProject =
-			isWithinProjectConfigDir(join(agentDir, "settings.json"), cwd) && !isProjectConfigDirTheUserGlobalDir(cwd);
+			isAgentDirWithinWorkspace(agentDir, cwd) && !isProjectConfigDirTheUserGlobalDir(cwd);
 		return SettingsManager.fromStorage(storage, { globalConfigAliasedToProject, ...options });
 	}
 

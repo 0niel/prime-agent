@@ -14,11 +14,16 @@ import { allToolNames, createAllToolDefinitions } from "../../../src/core/tools/
 describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 	let tempDir: string;
 	let agentDir: string;
+	let projectDir: string;
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `pi-remove-legacy-tools-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");
+		// The workspace is a subdirectory, so the agent dir stays outside it and
+		// counts as user-owned global configuration (workspace trust).
+		projectDir = join(tempDir, "project");
 		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(projectDir, { recursive: true });
 	});
 
 	afterEach(() => {
@@ -40,17 +45,17 @@ describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 	});
 
 	it("does not expose removed built-in tool names when only they are requested", async () => {
-		const settingsManager = SettingsManager.create(tempDir, agentDir);
-		const sessionManager = SessionManager.inMemory(tempDir);
+		const settingsManager = SettingsManager.create(projectDir, agentDir);
+		const sessionManager = SessionManager.inMemory(projectDir);
 		const resourceLoader = new DefaultResourceLoader({
-			cwd: tempDir,
+			cwd: projectDir,
 			agentDir,
 			settingsManager,
 		});
 		await resourceLoader.reload();
 
 		const { session } = await createAgentSession({
-			cwd: tempDir,
+			cwd: projectDir,
 			agentDir,
 			model: getModel("anthropic", "claude-sonnet-5")!,
 			settingsManager,
@@ -66,10 +71,10 @@ describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 	});
 
 	it("allowlists an extension tool that reuses a legacy built-in name", async () => {
-		const settingsManager = SettingsManager.create(tempDir, agentDir);
-		const sessionManager = SessionManager.inMemory(tempDir);
+		const settingsManager = SettingsManager.create(projectDir, agentDir);
+		const sessionManager = SessionManager.inMemory(projectDir);
 		const resourceLoader = new DefaultResourceLoader({
-			cwd: tempDir,
+			cwd: projectDir,
 			agentDir,
 			settingsManager,
 			extensionFactories: [
@@ -93,7 +98,7 @@ describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 		await resourceLoader.reload();
 
 		const { session } = await createAgentSession({
-			cwd: tempDir,
+			cwd: projectDir,
 			agentDir,
 			model: getModel("anthropic", "claude-sonnet-5")!,
 			settingsManager,
@@ -113,19 +118,19 @@ describe("regression #4428: remove legacy pi-mono built-in tools", () => {
 		writeFileSync(shellPath, "#!/bin/sh\nprintf 'custom-shell\\n'\nexec /bin/sh \"$@\"\n");
 		chmodSync(shellPath, 0o755);
 
-		const settingsManager = SettingsManager.create(tempDir, agentDir);
+		const settingsManager = SettingsManager.create(projectDir, agentDir);
 		settingsManager.setShellCommandPrefix("echo prefix-from-settings");
 		settingsManager.setShellPath(shellPath);
-		const sessionManager = SessionManager.inMemory(tempDir);
+		const sessionManager = SessionManager.inMemory(projectDir);
 		const resourceLoader = new DefaultResourceLoader({
-			cwd: tempDir,
+			cwd: projectDir,
 			agentDir,
 			settingsManager,
 		});
 		await resourceLoader.reload();
 
 		const { session } = await createAgentSession({
-			cwd: tempDir,
+			cwd: projectDir,
 			agentDir,
 			model: getModel("anthropic", "claude-sonnet-5")!,
 			settingsManager,

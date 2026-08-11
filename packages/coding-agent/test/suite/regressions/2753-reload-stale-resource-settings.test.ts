@@ -24,6 +24,10 @@ describe("issue #2753 reload stale resource settings", () => {
 	it("applies updated top-level prompt settings on reload after startup", async () => {
 		const tempDir = join(tmpdir(), `pi-2753-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const agentDir = join(tempDir, "agent");
+		// The workspace is a subdirectory, so the agent dir stays outside it and
+		// counts as user-owned global configuration (workspace trust).
+		const projectDir = join(tempDir, "project");
+		mkdirSync(projectDir, { recursive: true });
 		const promptsDir = join(agentDir, "prompts");
 		mkdirSync(promptsDir, { recursive: true });
 		writeFileSync(join(promptsDir, "test.md"), "Echo test prompt\n");
@@ -75,9 +79,9 @@ describe("issue #2753 reload stale resource settings", () => {
 			};
 		};
 		const runtime = await createAgentSessionRuntime(createRuntime, {
-			cwd: tempDir,
+			cwd: projectDir,
 			agentDir,
-			sessionManager: SessionManager.create(tempDir),
+			sessionManager: SessionManager.create(projectDir),
 		});
 
 		cleanups.push(() => {

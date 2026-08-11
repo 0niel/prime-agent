@@ -92,6 +92,17 @@ export function isWithinProjectConfigDir(target: string, cwd: string): boolean {
 }
 
 /**
+ * Whether the agent dir lives inside the workspace tree. Everything under it
+ * is then checkout-controlled content, regardless of whether it sits at the
+ * conventional config path.
+ */
+export function isAgentDirWithinWorkspace(agentDir: string, cwd: string): boolean {
+	const canonicalCwd = canonicalizeWorkspacePath(cwd);
+	const canonicalAgentDir = canonicalizeWorkspacePath(agentDir);
+	return canonicalAgentDir === canonicalCwd || canonicalAgentDir.startsWith(canonicalCwd + sep);
+}
+
+/**
  * Whether the project's config directory is the user's own global config
  * directory (home-directory cwd with the default agent dir). Those files are
  * the user's own configuration, not checkout-controlled content, so the
@@ -258,9 +269,7 @@ export class WorkspaceTrustStore {
  * repository could commit `trusted-workspaces.json` and trust itself.
  */
 export function canPersistWorkspaceTrust(cwd: string, agentDir: string): boolean {
-	const canonicalCwd = canonicalizeWorkspacePath(cwd);
-	const storePath = join(canonicalizeWorkspacePath(agentDir), TRUST_FILE_NAME);
-	return storePath !== canonicalCwd && !storePath.startsWith(canonicalCwd + sep);
+	return !isAgentDirWithinWorkspace(agentDir, cwd);
 }
 
 /**

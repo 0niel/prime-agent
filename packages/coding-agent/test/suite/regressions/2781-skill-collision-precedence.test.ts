@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DefaultResourceLoader } from "../../../src/core/resource-loader.js";
+import { WorkspaceTrustStore } from "../../../src/core/workspace-trust.js";
 
 describe("issue #2781 skill collision precedence: user skills should override package skills", () => {
 	let tempDir: string;
@@ -15,6 +16,8 @@ describe("issue #2781 skill collision precedence: user skills should override pa
 		cwd = join(tempDir, "project");
 		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(cwd, { recursive: true });
+		// These tests exercise project-scoped resources, which require trust.
+		WorkspaceTrustStore.create(agentDir).trust(cwd);
 	});
 
 	afterEach(() => {

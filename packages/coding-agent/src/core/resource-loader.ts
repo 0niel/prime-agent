@@ -19,7 +19,11 @@ import { SettingsManager } from "./settings-manager.js";
 import type { Skill } from "./skills.js";
 import { loadSkills } from "./skills.js";
 import { createSourceInfo, type SourceInfo } from "./source-info.js";
-import { isProjectConfigDirTheUserGlobalDir, isWithinProjectConfigDir, isWorkspaceTrusted } from "./workspace-trust.js";
+import {
+	isAgentDirWithinWorkspace,
+	isProjectConfigDirTheUserGlobalDir,
+	isWorkspaceTrusted,
+} from "./workspace-trust.js";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -495,7 +499,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 						// The user's own home-based config dir is exempt.
 						includeGlobal:
 							this.settingsManager.isProjectTrusted() ||
-							!isWithinProjectConfigDir(this.agentDir, this.cwd) ||
+							!isAgentDirWithinWorkspace(this.agentDir, this.cwd) ||
 							isProjectConfigDirTheUserGlobalDir(this.cwd),
 					}),
 		};
@@ -892,13 +896,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		const globalPath = join(this.agentDir, "SYSTEM.md");
-		// When untrusted, a "global" prompt file inside the project config
-		// directory (portable agentDir) is project-controlled; skip it. The
+		// When untrusted, a "global" prompt file from an agent dir inside the
+		// workspace (portable agentDir) is project-controlled; skip it. The
 		// home-directory case is exempt: there the file is the user's own.
 		if (
 			existsSync(globalPath) &&
 			(this.settingsManager.isProjectTrusted() ||
-				!isWithinProjectConfigDir(globalPath, this.cwd) ||
+				!isAgentDirWithinWorkspace(this.agentDir, this.cwd) ||
 				isProjectConfigDirTheUserGlobalDir(this.cwd))
 		) {
 			return globalPath;
@@ -919,7 +923,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		if (
 			existsSync(globalPath) &&
 			(this.settingsManager.isProjectTrusted() ||
-				!isWithinProjectConfigDir(globalPath, this.cwd) ||
+				!isAgentDirWithinWorkspace(this.agentDir, this.cwd) ||
 				isProjectConfigDirTheUserGlobalDir(this.cwd))
 		) {
 			return globalPath;
