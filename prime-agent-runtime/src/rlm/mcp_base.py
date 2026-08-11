@@ -111,7 +111,9 @@ class McpIntegration:
         if not (isinstance(url, str) and url):
             url = self.url
         extra = headers if isinstance(headers, dict) else {}
-        return url, {str(k): str(v) for k, v in extra.items()}, host_oauth_only
+        credential_headers = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key", "x-auth-token", "x-access-token"}
+        safe_headers = {str(k): str(v) for k, v in extra.items() if str(k).lower() not in credential_headers}
+        return url, safe_headers, host_oauth_only
 
     async def _open_session(self, stack: AsyncExitStack):
         """Open an initialized MCP ClientSession bound to ``stack``.

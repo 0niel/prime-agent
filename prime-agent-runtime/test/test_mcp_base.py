@@ -128,7 +128,7 @@ class McpIntegrationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Bad()
 
-    def _run_open_session_with_transport(self, transport):
+    def _run_open_session_with_transport(self, transport, headers=None):
         """Drive the real _open_session against a fake transport callable.
 
         `transport` must declare its real parameters (headers= or http_client=)
@@ -136,7 +136,7 @@ class McpIntegrationTest(unittest.TestCase):
         """
 
         async def fake_host_request(req_type, payload):
-            return {"url": _Integration.url}
+            return {"url": _Integration.url, **({"headers": headers} if headers else {})}
 
         with mock.patch.object(mcp_base, "host_request", fake_host_request), \
              mock.patch.object(mcp_base, "_resolve_streamable_http", lambda: transport), \
@@ -201,6 +201,62 @@ class McpIntegrationTest(unittest.TestCase):
             url, headers, host_oauth_only = _run(_Integration()._resolve_config())
             self.assertEqual(url, _Integration.url)
             self.assertEqual(headers, {})
+
+
+    def test_host_oauth_only_fails_before_sdk_transport(self):
+        called = False
+        async def config(_kind, _payload): return {"url": _Integration.url, "hostOAuthOnly": True}
+        def transport(*args, **kwargs):
+            nonlocal called; called = True
+            raise AssertionError("OAuth must fail before SDK transport")
+        with mock.patch.object(mcp_base, "host_request", config), mock.patch.object(mcp_base, "_resolve_streamable_http", lambda: transport):
+            with self.assertRaises(NotEnabled):
+                _run(_Integration().call_tool("noop", {}))
+        self.assertFalse(called)
+
+    def test_anonymous_headers_reach_headers_transport_without_authorization(self):
+        captured = {}
+        class CM:
+            async def __aenter__(self): return ("read", "write", None)
+            async def __aexit__(self, *args): return False
+        def transport(url, headers=None): captured.update(url=url, headers=headers); return CM()
+        self._run_open_session_with_transport(transport, headers={"X-Safe": "1"})
+        self.assertEqual(captured["headers"], {"X-Safe": "1"})
+
+    def test_anonymous_headers_reach_http_client_transport_without_authorization(self):
+        captured = {}
+        class CM:
+            async def __aenter__(self): return ("read", "write", None)
+            async def __aexit__(self, *args): return False
+        def transport(url, *, http_client=None): captured["headers"] = http_client.headers; return CM()
+        self._run_open_session_with_transport(transport, headers={"X-Safe": "1"})
+        self.assertEqual(captured["headers"], {"X-Safe": "1"})
+
+    def test_config_ignores_authorization_like_header_even_if_bad_host_sends_one(self):
+        async def config(_kind, _payload): return {"url": _Integration.url, "headers": {"Authorization": "bad", "X-Safe": "1"}}
+        with mock.patch.object(mcp_base, "host_request", config):
+            _url, headers, _oauth = _run(_Integration()._resolve_config())
+        # Defense in depth: Python does not construct credentials, including bad host config.
+        self.assertEqual(headers, {"X-Safe": "1"})
+
+    def test_empty_host_config_falls_back_to_class_url(self):
+        async def config(_kind, _payload): return {}
+        with mock.patch.object(mcp_base, "host_request", config):
+            url, headers, oauth = _run(_Integration()._resolve_config())
+        self.assertEqual(url, _Integration.url); self.assertEqual(headers, {}); self.assertFalse(oauth)
+
+    def test_host_config_failure_falls_back_to_class_url(self):
+        async def config(_kind, _payload): raise RuntimeError("unavailable")
+        with mock.patch.object(mcp_base, "host_request", config):
+            url, headers, oauth = _run(_Integration()._resolve_config())
+        self.assertEqual(url, _Integration.url); self.assertEqual(headers, {}); self.assertFalse(oauth)
+
+    def test_opaque_config_never_calls_resolve_token(self):
+        async def config(_kind, _payload): return {"url": _Integration.url, "hostOAuthOnly": True}
+        resolve = mock.AsyncMock()
+        with mock.patch.object(mcp_base, "host_request", config), mock.patch.object(_Integration, "_resolve_token", resolve):
+            with self.assertRaises(NotEnabled): _run(_Integration()._open_session(AsyncExitStack()))
+        resolve.assert_not_awaited()
 
 
 if __name__ == "__main__":
