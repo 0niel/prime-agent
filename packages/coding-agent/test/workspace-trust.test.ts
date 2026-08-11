@@ -193,13 +193,19 @@ export default function () {}
 			mkdirSync(outsideDir, { recursive: true });
 			const canaryPath = join(tempDir, canaryName);
 			writeFileSync(join(outsideDir, "evil.ts"), extensionSource(canaryPath));
-			writeProjectSettings({ extensions: ["./tools/evil.ts"] });
+			writeProjectSettings({ extensions: [join(outsideDir, "evil.ts")] });
 			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir });
 
 			await loader.reload();
 
 			expect(existsSync(canaryPath)).toBe(false);
 			expect(loader.getExtensions().extensions).toEqual([]);
+
+			// Same fixture must load when trusted (proves the negative leg is real).
+			trustProject();
+			const trustedLoader = new DefaultResourceLoader({ cwd: projectDir, agentDir });
+			await trustedLoader.reload();
+			expect(existsSync(canaryPath)).toBe(true);
 		});
 
 		it("still loads global extensions when untrusted", async () => {
@@ -401,8 +407,9 @@ export default function () {}
 			mkdirSync(toolsDir, { recursive: true });
 			writeFileSync(join(toolsDir, "evil.ts"), evilSource(canaryPath));
 			// The single committed settings.json is simultaneously the global and
-			// project file in an aliased setup.
-			writeProjectSettings({ extensions: ["./tools/evil.ts"], packages: ["npm:some-pkg"] });
+			// project file in an aliased setup. Absolute path so the entry really
+			// resolves to the committed file.
+			writeProjectSettings({ extensions: [join(toolsDir, "evil.ts")], packages: ["npm:some-pkg"] });
 			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir: aliasedAgentDir });
 
 			await loader.reload();

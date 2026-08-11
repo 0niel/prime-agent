@@ -1496,7 +1496,9 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		projectTrusted: isWorkspaceTrusted(cwd, agentDir),
 	});
 	reportSettingsErrors(settingsManager, "package command");
-	const selfUpdateNpmCommand = settingsManager.getGlobalSettings().npmCommand;
+	// Gated getter: an aliased (project-controlled) global npmCommand must not
+	// drive self-update in an untrusted workspace.
+	const selfUpdateNpmCommand = settingsManager.getNpmCommand();
 
 	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
 

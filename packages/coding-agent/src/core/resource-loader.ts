@@ -19,7 +19,7 @@ import { SettingsManager } from "./settings-manager.js";
 import type { Skill } from "./skills.js";
 import { loadSkills } from "./skills.js";
 import { createSourceInfo, type SourceInfo } from "./source-info.js";
-import { isWithinProjectConfigDir, isWorkspaceTrusted } from "./workspace-trust.js";
+import { isProjectConfigDirTheUserGlobalDir, isWithinProjectConfigDir, isWorkspaceTrusted } from "./workspace-trust.js";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -492,8 +492,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 						agentDir: this.agentDir,
 						// A "global" context file inside the project config directory
 						// (portable agentDir) is project-controlled; skip it when untrusted.
+						// The user's own home-based config dir is exempt.
 						includeGlobal:
-							this.settingsManager.isProjectTrusted() || !isWithinProjectConfigDir(this.agentDir, this.cwd),
+							this.settingsManager.isProjectTrusted() ||
+							!isWithinProjectConfigDir(this.agentDir, this.cwd) ||
+							isProjectConfigDirTheUserGlobalDir(this.cwd),
 					}),
 		};
 		const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(agentsFiles) : agentsFiles;
@@ -890,10 +893,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		const globalPath = join(this.agentDir, "SYSTEM.md");
 		// When untrusted, a "global" prompt file inside the project config
-		// directory (portable agentDir) is project-controlled; skip it.
+		// directory (portable agentDir) is project-controlled; skip it. The
+		// home-directory case is exempt: there the file is the user's own.
 		if (
 			existsSync(globalPath) &&
-			(this.settingsManager.isProjectTrusted() || !isWithinProjectConfigDir(globalPath, this.cwd))
+			(this.settingsManager.isProjectTrusted() ||
+				!isWithinProjectConfigDir(globalPath, this.cwd) ||
+				isProjectConfigDirTheUserGlobalDir(this.cwd))
 		) {
 			return globalPath;
 		}
@@ -909,10 +915,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		const globalPath = join(this.agentDir, "APPEND_SYSTEM.md");
 		// See discoverSystemPromptFile: project-controlled "global" files are
-		// skipped for untrusted workspaces.
+		// skipped for untrusted workspaces, except the user's own home config.
 		if (
 			existsSync(globalPath) &&
-			(this.settingsManager.isProjectTrusted() || !isWithinProjectConfigDir(globalPath, this.cwd))
+			(this.settingsManager.isProjectTrusted() ||
+				!isWithinProjectConfigDir(globalPath, this.cwd) ||
+				isProjectConfigDirTheUserGlobalDir(this.cwd))
 		) {
 			return globalPath;
 		}
