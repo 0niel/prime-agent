@@ -19,7 +19,8 @@ import {
 	createAgentSessionMessage,
 	isAgentSessionMessage,
 } from "../src/core/agent-messages.js";
-import { AgentSession } from "../src/core/agent-session.js";
+import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.js";
+import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
 import {
@@ -676,7 +677,10 @@ describe("AgentSession rlm recursion", () => {
 		root.subscribe((event) => events.push(event));
 		await expect(root.deleteRlmSubagent("cancelled-cleanup-worker")).rejects.toThrow("runtime deletion failed");
 		expect(events).toContainEqual(
-			expect.objectContaining({ type: "rlm_child_update", child: { id: childId, status: "cancelled" } }),
+			expect.objectContaining({
+				type: "rlm_child_update",
+				child: { id: childId, status: "cancelled" },
+			}),
 		);
 		expect(root.getRlmChildSnapshots()).toEqual([
 			expect.objectContaining({ id: childId, status: "cancelled" }),
