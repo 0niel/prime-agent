@@ -313,6 +313,42 @@ describe("daemon supervisor passive subagent topology", () => {
 		);
 	});
 
+	it("fails closed when a saved sibling catalog has conflicting identity or topology", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-saved-sibling-conflict-"));
+		tempDirs.push(directory);
+		const parentSessionPath = join(directory, "parent.jsonl");
+		const base = {
+			cwd: directory,
+			created: new Date(0),
+			modified: new Date(0),
+			messageCount: 0,
+			firstMessage: "",
+			allMessagesText: "",
+			parentSessionPath,
+			rlmDepth: 1,
+		};
+		const target = { ...base, id: "target", path: join(directory, "target.jsonl") };
+		const sibling = { ...base, id: "sibling", path: join(directory, "sibling.jsonl"), name: "taken" };
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+
+		for (const conflictingSiblings of [
+			[target, { ...sibling, id: target.id }],
+			[target, { ...sibling, path: target.path }],
+			[target, { ...sibling, parentSessionPath: join(directory, "other-parent.jsonl") }],
+			[target, { ...sibling, rlmDepth: 2 }],
+		]) {
+			expect(() => supervisor.assertSavedSiblingNameAvailable(conflictingSiblings, target, "taken")).toThrow(
+				"Saved sibling catalog is structurally ambiguous",
+			);
+		}
+		expect(() => supervisor.assertSavedSiblingNameAvailable([sibling], target, "taken")).toThrow(
+			"Saved sibling catalog does not contain its target",
+		);
+	});
+
 	it("publishes an opening reservation before named create validation awaits", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-named-create-race-"));
 		tempDirs.push(directory);

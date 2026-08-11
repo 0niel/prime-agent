@@ -3181,23 +3181,66 @@ export class DaemonSupervisor {
 
 	private assertSavedSiblingNameAvailable(siblings: SessionInfo[], target: SessionInfo, name: string): void {
 		const setDepth = target.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0;
+		const targetPath = canonicalSessionPath(target.path);
+		const parentSessionPath = target.parentSessionPath ? canonicalSessionPath(target.parentSessionPath) : undefined;
+		if (setDepth <= 0 || !parentSessionPath) {
+			throw new Error("Saved sibling catalog has no direct parent");
+		}
+
+		// catalog.siblings() is deliberately bounded: it returns the child set, not
+		// its parent. Preserve that boundary while supplying a local structural
+		// anchor to Core03's immutable exact-one-parent catalog validation. Reject
+		// ambiguous persisted rows rather than letting a malformed saved catalog
+		// weaken a name reservation.
+		const parentId = `saved-sibling-parent:${parentSessionPath}`;
+		const ids = new Set<string>();
+		const paths = new Set<string>();
+		let targetCount = 0;
+		for (const sibling of siblings) {
+			const siblingPath = canonicalSessionPath(sibling.path);
+			const siblingParentPath = sibling.parentSessionPath
+				? canonicalSessionPath(sibling.parentSessionPath)
+				: undefined;
+			if (
+				ids.has(sibling.id) ||
+				paths.has(siblingPath) ||
+				sibling.id === parentId ||
+				siblingParentPath !== parentSessionPath ||
+				(sibling.rlmDepth !== undefined && sibling.rlmDepth !== setDepth)
+			) {
+				throw new Error("Saved sibling catalog is structurally ambiguous");
+			}
+			ids.add(sibling.id);
+			paths.add(siblingPath);
+			if (sibling.id === target.id && siblingPath === targetPath) targetCount += 1;
+		}
+		if (targetCount !== 1) {
+			throw new Error("Saved sibling catalog does not contain its target");
+		}
+
 		assertAgentSessionNameAvailable(
-			siblings.map((info) => {
-				const summary = summaryForInactiveSession(info);
-				return {
-					id: summary.sessionId,
-					...(summary.sessionName ? { name: summary.sessionName } : {}),
-					depth: setDepth,
-					status: classifySessionRosterStatus(summary),
-					...(summary.parentSessionPath
-						? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
-						: {}),
-				};
-			}),
+			[
+				{
+					id: parentId,
+					depth: setDepth - 1,
+					status: "inactive" as const,
+					sessionPath: parentSessionPath,
+				},
+				...siblings.map((info) => {
+					const summary = summaryForInactiveSession(info);
+					return {
+						id: summary.sessionId,
+						...(summary.sessionName ? { name: summary.sessionName } : {}),
+						depth: setDepth,
+						status: classifySessionRosterStatus(summary),
+						parentSessionPath,
+					};
+				}),
+			],
 			{
 				name,
 				depth: setDepth,
-				parentSessionPath: target.parentSessionPath ? canonicalSessionPath(target.parentSessionPath) : undefined,
+				parentSessionPath,
 				ignoreSessionId: target.id,
 			},
 		);
