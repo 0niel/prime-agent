@@ -636,6 +636,8 @@ export class KernelManager {
 	private readonly inFlightHostRequests = new Set<Promise<void>>();
 	/** Active requests own revocable dispatcher authority, keyed by comm identity. */
 	private readonly activeHostRequestControllers = new Map<string, AbortController>();
+	/** Monotonic terminal admission gate: shutdown never grants new host-request authority. */
+	private hostRequestsClosed = false;
 	private hostRequestGeneration = 0;
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Memoized so concurrent callers all await the same in-flight startup. */
@@ -1325,7 +1327,14 @@ export class KernelManager {
 		for (const commId of this.activeHostRequestControllers.keys()) this.revokeHostRequest(commId, reason);
 	}
 
+	/** Close host-request admission before any terminal await can admit fresh authority. */
+	private beginHostRequestShutdown(reason: string): void {
+		this.hostRequestsClosed = true;
+		this.revokeAllHostRequests(reason);
+	}
+
 	private startHostRequestFromComm(commId: string, data: unknown): void {
+		if (this.hostRequestsClosed) return;
 		if (this.handledHostRequestCommIds.has(commId)) return;
 		this.handledHostRequestCommIds.add(commId);
 		const controller = new AbortController();
@@ -1384,7 +1393,7 @@ export class KernelManager {
 	}
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
-		this.revokeAllHostRequests("kernel resources are being cleaned up");
+		this.beginHostRequestShutdown("kernel resources are being cleaned up");
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		if (this.forkedLivenessTimer) {
@@ -1445,6 +1454,7 @@ export class KernelManager {
 	}
 
 	async shutdown(opts: { snapshot?: boolean } = {}): Promise<void> {
+		this.beginHostRequestShutdown("kernel is shutting down");
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
 			this.cleanupResources();
@@ -1492,6 +1502,7 @@ export class KernelManager {
 	}
 
 	async kill(): Promise<void> {
+		this.beginHostRequestShutdown("kernel is being killed");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
@@ -1598,11 +1609,11 @@ export class KernelManager {
 	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
 	dispose(): Promise<void> {
 		return (async () => {
+			this.beginHostRequestShutdown("kernel is being disposed");
 			// Final namespace flush while the kernel is still live (session end / reload).
 			await this.flushSnapshotForDispose();
 			this.state = "shutdown";
 			liveKernels.delete(this);
-			this.revokeAllHostRequests("kernel is being disposed");
 			const inFlightHostRequests = [...this.inFlightHostRequests];
 			// TODO: plumb AbortSignal through AgentSession.prompt so disposal can cancel long-running child loops.
 			try {
@@ -1617,9 +1628,9 @@ export class KernelManager {
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	disposeSync(): void {
+		this.beginHostRequestShutdown("kernel is being disposed");
 		this.state = "shutdown";
 		liveKernels.delete(this);
-		this.revokeAllHostRequests("kernel is being disposed");
 		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.
 		this.cleanupResources();
 	}
