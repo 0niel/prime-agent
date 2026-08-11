@@ -370,7 +370,82 @@ describe("KernelManager abort handling", () => {
 		expect(contextSignal?.aborted).toBe(true);
 		resolveHandler?.();
 		await Promise.allSettled([...internals.inFlightHostRequests]);
-		expect(sent).toContainEqual(expect.objectContaining({ status: "error" }));
+		expect(sent).toEqual([]);
+		manager.disposeSync();
+	});
+
+	it("does not send a stale error to a reopened comm with the same id", async () => {
+		let firstContext: HostRequestContext | undefined;
+		let releaseFirst: (() => void) | undefined;
+		const handler = createHostRequestHandler(async (_payload, context) => {
+			if (!firstContext) {
+				firstContext = context;
+				await new Promise<void>((resolve) => {
+					releaseFirst = resolve;
+				});
+				throw new Error("first request failed after close");
+			}
+			return { request: "second" };
+		}, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const sent: Record<string, unknown>[] = [];
+		const internals = manager as unknown as {
+			state: "running";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			sendCommMessage: (_commId: string, data: Record<string, unknown>) => Promise<void>;
+			inFlightHostRequests: Set<Promise<void>>;
+		};
+		internals.state = "running";
+		internals.connection = { key: "test" };
+		internals.shell = { send: async () => {}, close: () => {} };
+		internals.sendCommMessage = async (_commId, data) => {
+			sent.push(data);
+		};
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "reused", target_name: "host.request", data: { type: "test" } },
+		});
+		await vi.waitFor(() => expect(firstContext).toBeDefined());
+		internals.handleCommMessage({ header: { msg_type: "comm_close" }, content: { comm_id: "reused" } });
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "reused", target_name: "host.request", data: { type: "test" } },
+		});
+		await vi.waitFor(() => expect(sent).toContainEqual({ status: "ok", request: "second" }));
+		releaseFirst?.();
+		await Promise.allSettled([...internals.inFlightHostRequests]);
+		expect(sent).toEqual([{ status: "ok", request: "second" }]);
+		manager.disposeSync();
+	});
+
+	it("sends one error reply when a current host request throws", async () => {
+		const handler = createHostRequestHandler(async () => {
+			throw new Error("handler failed");
+		}, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const sent: Record<string, unknown>[] = [];
+		const internals = manager as unknown as {
+			state: "running";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			sendCommMessage: (_commId: string, data: Record<string, unknown>) => Promise<void>;
+			inFlightHostRequests: Set<Promise<void>>;
+		};
+		internals.state = "running";
+		internals.connection = { key: "test" };
+		internals.shell = { send: async () => {}, close: () => {} };
+		internals.sendCommMessage = async (_commId, data) => {
+			sent.push(data);
+		};
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "current", target_name: "host.request", data: { type: "test" } },
+		});
+		await Promise.allSettled([...internals.inFlightHostRequests]);
+		expect(sent).toEqual([{ status: "error", error: "handler failed" }]);
 		manager.disposeSync();
 	});
 
