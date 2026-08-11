@@ -1,21 +1,14 @@
 import type { SettingsManager } from "../settings-manager.js";
 import {
 	addMcpDeclaration,
+	type McpDeclarationScope,
 	parseMcpDeclarationDocument,
 	previewMcpProbe,
 	removeMcpDeclaration,
-	type McpDeclarationScope,
 } from "./mcp-declarations.js";
+import { type McpDeclarationProbeOptions, type McpProbeTransport, runMcpDeclarationProbe } from "./mcp-probe.js";
+import { type ProjectMcpDeclarationAdmission, requireProjectMcpDeclarationAdmission } from "./mcp-project-trust.js";
 import { redactMcpDeclaration, redactMcpDeclarationDocument } from "./mcp-redaction.js";
-import {
-	runMcpDeclarationProbe,
-	type McpDeclarationProbeOptions,
-	type McpProbeTransport,
-} from "./mcp-probe.js";
-import {
-	requireProjectMcpDeclarationAdmission,
-	type ProjectMcpDeclarationAdmission,
-} from "./mcp-project-trust.js";
 
 export type McpDeclarationCommand =
 	| { kind: "list"; scope: McpDeclarationScope }
@@ -30,7 +23,10 @@ function usage(): never {
 }
 
 function parseScope(words: string[]): { words: string[]; scope: McpDeclarationScope } {
-	const projectIndexes = words.reduce<number[]>((indexes, word, index) => (word === "--project" ? [...indexes, index] : indexes), []);
+	const projectIndexes: number[] = [];
+	for (const [index, word] of words.entries()) {
+		if (word === "--project") projectIndexes.push(index);
+	}
 	if (projectIndexes.length > 1 || (projectIndexes.length === 1 && projectIndexes[0] !== words.length - 1)) usage();
 	return { words: words.filter((word) => word !== "--project"), scope: projectIndexes.length ? "project" : "user" };
 }
@@ -41,7 +37,12 @@ export function parseMcpDeclarationCommand(args: string[]): McpDeclarationComman
 	const [kind, ...operands] = words;
 	if (kind === "list" && operands.length === 0) return { kind, scope };
 	if (
-		(kind === "inspect" || kind === "preview" || kind === "test" || kind === "enable" || kind === "disable" || kind === "remove") &&
+		(kind === "inspect" ||
+			kind === "preview" ||
+			kind === "test" ||
+			kind === "enable" ||
+			kind === "disable" ||
+			kind === "remove") &&
 		operands.length === 1
 	) {
 		return { kind, scope, name: operands[0]! };

@@ -59,7 +59,9 @@ function withDeadline<T>(promise: Promise<T> | T, signal: AbortSignal): Promise<
 		const abort = () => reject(publicProbeError("timeout"));
 		if (signal.aborted) abort();
 		else signal.addEventListener("abort", abort, { once: true });
-		Promise.resolve(promise).then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+		Promise.resolve(promise)
+			.then(resolve, reject)
+			.finally(() => signal.removeEventListener("abort", abort));
 	});
 }
 
@@ -82,9 +84,12 @@ export async function runMcpDeclarationProbe(
 	const controller = new AbortController();
 	const deadlineTimer = setTimeout(() => controller.abort(), timeoutMs);
 	let session: McpProbeSession | undefined;
-	let failure = false;
+	let failure: Error | undefined;
 	try {
-		session = await withDeadline(transport.open({ url: declaration.url, signal: controller.signal }), controller.signal);
+		session = await withDeadline(
+			transport.open({ url: declaration.url, signal: controller.signal }),
+			controller.signal,
+		);
 		await withDeadline(
 			session.request({
 				method: "initialize",
@@ -98,13 +103,9 @@ export async function runMcpDeclarationProbe(
 			controller.signal,
 		);
 		await withDeadline(session.request({ method: "tools/list", signal: controller.signal }), controller.signal);
-		return { initialized: true, toolsListed: true };
 	} catch (error) {
-		failure = true;
 		controller.abort();
-		throw error instanceof Error && error.message === "MCP probe timed out."
-			? error
-			: publicProbeError("failed");
+		failure = error instanceof Error && error.message === "MCP probe timed out." ? error : publicProbeError("failed");
 	} finally {
 		if (session) {
 			try {
@@ -115,11 +116,12 @@ export async function runMcpDeclarationProbe(
 				// A close failure must never disclose transport data. Preserve an
 				// earlier request failure, but do not report a false success when
 				// cleanup itself failed or exceeded the total deadline.
-				if (!failure) {
-					throw controller.signal.aborted ? publicProbeError("timeout") : publicProbeError("failed");
-				}
+				if (!failure)
+					failure = controller.signal.aborted ? publicProbeError("timeout") : publicProbeError("failed");
 			}
 		}
 		clearTimeout(deadlineTimer);
 	}
+	if (failure) throw failure;
+	return { initialized: true, toolsListed: true };
 }
