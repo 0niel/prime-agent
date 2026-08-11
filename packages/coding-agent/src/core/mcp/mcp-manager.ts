@@ -136,6 +136,7 @@ export class McpManager {
 				const endpoint = integration && canonicalEndpoint(integration.url);
 				return integration && endpoint === binding.endpoint ? this.bindingFor(binding.server, integration, endpoint) : binding;
 			},
+			beforeForceRefresh: (binding) => this.hostBridge.closeBinding(binding),
 		});
 		this.resolveIntegrations();
 		this.registerProviders();
@@ -258,6 +259,7 @@ export class McpManager {
 		if (!endpoint || !provider || !this.secretStore) throw new Error("MCP OAuth credentials are unavailable.");
 		this.closingCredentialServers.add(server);
 		try { await this.hostBridge.closeBinding(this.bindingFor(server, integration, endpoint)); }
+		catch { /* old-session cleanup is non-authoritative; refresh remains authoritative */ }
 		finally { this.closingCredentialServers.delete(server); }
 		const refreshed = await provider.refreshToken({ kind: "opaque", secretReference: current.secretReference, mcpEndpoint: current.mcpEndpoint, authServer: current.authServer, tokenEndpoint: current.tokenEndpoint, clientId: current.clientId, scopes: current.scopes, expires: current.expires });
 		const rotated = toOpaqueCredential(refreshed, endpoint);

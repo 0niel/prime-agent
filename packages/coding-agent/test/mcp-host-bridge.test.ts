@@ -36,6 +36,7 @@ describe("MCP host bridge", () => {
 	it("drains 401 then refreshes once with OAuth and never downgrades", async () => {
 		let requests = 0;
 		let refreshes = 0;
+		const order: string[] = [];
 		const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
 			const message = JSON.parse(String(init?.body));
 			requests++;
@@ -43,7 +44,12 @@ describe("MCP host bridge", () => {
 			if (message.method === "initialize") return json({ jsonrpc: "2.0", id: message.id, result: {} });
 			return requests === 3 ? new Response("expired", { status: 401, headers: { "mcp-session-id": "untrusted-401" } }) : json({ jsonrpc: "2.0", id: message.id, result: { tools: [] } });
 		});
-		const bridge = new McpHostBridge({ fetch: fetch as unknown as typeof globalThis.fetch, resolveBinding: (value) => ({ ...value, authRevision: "secret-r2" }), withOAuthAccessToken: async (_server, run, force) => { if (force) refreshes++; return run(force ? "fresh" : "old"); } });
+		const bridge = new McpHostBridge({
+			fetch: fetch as unknown as typeof globalThis.fetch,
+			resolveBinding: (value) => ({ ...value, authRevision: "secret-r2" }),
+			beforeForceRefresh: async () => { order.push("delete"); },
+			withOAuthAccessToken: async (_server, run, force) => { if (force) { refreshes++; order.push("refresh"); } return run(force ? "fresh" : "old"); },
+		});
 		await expect(bridge.request(binding, "tools/list", {}, context())).resolves.toEqual({ tools: [] });
 		expect(refreshes).toBe(1);
 		const auth = fetch.mock.calls.map((call) => new Headers(call[1]?.headers).get("authorization"));
@@ -53,6 +59,7 @@ describe("MCP host bridge", () => {
 		const methods = fetch.mock.calls.map((call) => JSON.parse(String(call[1]?.body)) as { method: string });
 		expect(methods.filter((message) => message.method === "tools/list")).toHaveLength(2);
 		expect(methods.filter((message) => message.method === "initialize")).toHaveLength(2);
+		expect(order).toEqual(["delete", "refresh"]);
 	});
 
 	it("bounds oversize bodies and sends matching cancellation on context abort", async () => {

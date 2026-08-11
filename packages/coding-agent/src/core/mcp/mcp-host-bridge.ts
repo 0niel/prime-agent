@@ -13,6 +13,8 @@ export interface McpHostBridgeOptions {
 	withOAuthAccessToken: <T>(server: string, operation: (token: string) => Promise<T>, forceRefresh?: boolean) => Promise<T>;
 	/** Resolves the post-refresh sealed-reference revision before the retry is sent. */
 	resolveBinding?: (binding: McpHostBinding) => McpHostBinding;
+	/** Retires the old epoch/session before a forced credential refresh. Cleanup failures are non-authoritative. */
+	beforeForceRefresh?: (binding: McpHostBinding) => Promise<void>;
 	fetch?: typeof fetch;
 	maxResponseBytes?: number;
 	requestTimeoutMs?: number;
@@ -79,9 +81,9 @@ export class McpHostBridge {
 	}
 	private id(state: State): string { return `prime-agent-${randomUUID()}-${++state.nextId}`; }
 	private current(state: State, context?: HostRequestContext, epoch?: number): boolean { return !this.disposed && state.generation === this.generation && (epoch === undefined || state.epoch === epoch) && (!context || (!context.signal.aborted && context.isCurrent())); }
-	private rekey(state: State, binding: McpHostBinding): void {
+	private rekey(state: State, binding: McpHostBinding, preserveInitialize = false): void {
 		const oldKey = bindingKey(state.binding); if (this.states.get(oldKey) === state) this.states.delete(oldKey);
-		state.binding = binding; state.sessionId = undefined; state.initialize = undefined; state.generation = this.generation; state.epoch += 1;
+		state.binding = binding; state.sessionId = undefined; if (!preserveInitialize) state.initialize = undefined; state.generation = this.generation; state.epoch += 1;
 		for (const controller of state.controllers) controller.abort();
 		this.states.set(bindingKey(binding), state);
 	}
@@ -115,9 +117,12 @@ export class McpHostBridge {
 		catch (error) {
 			if (!state.binding.oauth || (error as { status?: number }).status !== 401 || !this.current(state, context)) throw error;
 			const priorRevision = state.binding.authRevision;
+			// Old-session cleanup precedes token rotation/rekey. A failed DELETE must
+			// never block the authoritative OAuth refresh path.
+			try { await this.options.beforeForceRefresh?.(state.binding); } catch { /* cleanup is non-authoritative */ }
 			return this.authenticated(state, async (token) => {
 				const renewed = this.options.resolveBinding?.(state.binding);
-				if (renewed && renewed.authRevision !== priorRevision) this.rekey(state, renewed);
+				if (renewed && renewed.authRevision !== priorRevision) this.rekey(state, renewed, message.method === "initialize");
 				if (state.binding.authRevision === priorRevision) throw new Error("MCP OAuth refresh did not rotate its binding revision.");
 				if (message.method !== "initialize") await this.initialize(state, context);
 				return this.post(state, message, context, token, response, allowCancelled);
@@ -126,8 +131,9 @@ export class McpHostBridge {
 	}
 	private async initialize(state: State, context: HostRequestContext): Promise<void> {
 		if (state.initialize) return state.initialize;
-		state.initialize = (async () => { const id = this.id(state); const result = await this.send(state, { jsonrpc: "2.0", id, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "Prime Agent", version: "0" } } }, context); if (!result || result.error) throw new Error("MCP initialize failed."); await this.send(state, { jsonrpc: "2.0", method: "notifications/initialized" }, context, false); })();
-		try { await state.initialize; } catch (error) { state.initialize = undefined; throw error; }
+		const initialization = (async () => { const id = this.id(state); const result = await this.send(state, { jsonrpc: "2.0", id, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "Prime Agent", version: "0" } } }, context); if (!result || result.error) throw new Error("MCP initialize failed."); await this.send(state, { jsonrpc: "2.0", method: "notifications/initialized" }, context, false); })();
+		state.initialize = initialization;
+		try { await initialization; } catch (error) { if (state.initialize === initialization) state.initialize = undefined; throw error; }
 	}
 	async request(binding: McpHostBinding, method: string, params: unknown, context: HostRequestContext): Promise<unknown> {
 		if (!/^[A-Za-z0-9_.\-/]+$/.test(method) || method === "initialize" || method.startsWith("notifications/")) throw new Error("MCP method is unavailable.");
