@@ -2755,10 +2755,9 @@ export class DaemonSupervisor {
 						return;
 					}
 					const observedProcessStartId = processAlive ? getProcessStartId(worker.descriptor.pid) : undefined;
-					if (processAlive && observedProcessStartId === undefined) {
-						requireManualRecovery();
-						return;
-					}
+					// A descriptor that has an identity but cannot currently observe it
+					// is not legacy. Do not connect or signal it, but retain the bounded
+					// recovery retry path below in case the observation outage clears.
 					const processIdentityMatches =
 						worker.descriptor.processStartId !== undefined &&
 						observedProcessStartId === worker.descriptor.processStartId;

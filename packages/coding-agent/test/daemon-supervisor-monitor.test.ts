@@ -1557,6 +1557,61 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it("retries a known worker identity whose observation is transiently unavailable without adopting or signalling", async () => {
+		vi.useFakeTimers();
+		const worker = {
+			descriptor: {
+				workerId: "worker-transient-identity-outage",
+				pid: process.pid,
+				processStartId: "known-generation",
+				rootActiveSessionId: "active-1",
+				createCommand: { type: "create" as const },
+				consecutiveFailures: 0,
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			connectWorker: vi.fn(),
+			recoverUncertainWorkerOperations: vi.fn(async () => {}),
+			launchWorker: vi.fn(async () => worker),
+			persistWorker: vi.fn(),
+			syncAgentPeers: vi.fn(async () => {}),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+			assertRecoveryAllowed: vi.fn(async () => {}),
+		}) as {
+			connectWorker: ReturnType<typeof vi.fn>;
+			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
+			launchWorker: ReturnType<typeof vi.fn>;
+			persistWorker: ReturnType<typeof vi.fn>;
+			recoverWorker(target: object): Promise<void>;
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const sessionLeaseModule = await import("../src/core/session-lease.js");
+		const signalSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue(undefined);
+		try {
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.runAllTimersAsync();
+			await recovery;
+
+			expect(startIdSpy).toHaveBeenCalledTimes(3);
+			expect(supervisor.connectWorker).not.toHaveBeenCalled();
+			expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
+			expect(supervisor.launchWorker).not.toHaveBeenCalled();
+			expect(signalSpy).not.toHaveBeenCalled();
+			expect(worker.descriptor.processStartId).toBe("known-generation");
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect(supervisor.persistWorker).toHaveBeenCalledTimes(4);
+		} finally {
+			startIdSpy.mockRestore();
+			signalSpy.mockRestore();
+		}
+	});
+
 	it("keeps a recovered worker ready when peer synchronization fails", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
