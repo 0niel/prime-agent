@@ -147,7 +147,7 @@ export class McpOAuthSecretStore {
 	async get(reference: SecretReference): Promise<Uint8Array | undefined> {
 		try {
 			const current = await this.current(reference);
-			return Buffer.from(current.envelope.value, "base64");
+			return Uint8Array.from(Buffer.from(current.envelope.value, "base64"));
 		} catch (cause) {
 			if (cause instanceof McpSecretStoreError && (cause.code === "SECRET_NOT_FOUND" || cause.code === "REVISION_CONFLICT")) return undefined;
 			throw cause;
