@@ -29,6 +29,10 @@ function grantedBinding(result: McpProjectTrustAuthorization): McpProjectTrustBi
 	return result.binding;
 }
 
+function validate(authority: McpProjectTrustAuthority, binding: unknown): "denied" | "granted" {
+	return authority.validateBinding(binding).kind;
+}
+
 afterEach(() => {
 	for (const directory of tempDirectories.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
@@ -43,14 +47,45 @@ describe("MCP project trust authority", () => {
 		expect(authorize(authority, project)).toEqual({ kind: "denied" });
 	});
 
-	it("grants an exact directory only from the explicit global allowlist", () => {
+	it("grants and validates an exact directory only from the explicit global allowlist", () => {
 		const project = tempDirectory();
 		const authority = createMcpProjectTrustAuthority({ revision: "global-1", allowedProjectDirectories: [project] });
 		const binding = grantedBinding(authorize(authority, project));
 
 		expect(Object.isFrozen(binding)).toBe(true);
 		expect(Object.keys(binding)).toEqual([]);
+		expect(validate(authority, binding)).toBe("granted");
 		expect(authorize(authority, join(project, "child"))).toEqual({ kind: "denied" });
+	});
+
+	it("denies a forged frozen binding at the privileged validation boundary", () => {
+		const project = tempDirectory();
+		const authority = createMcpProjectTrustAuthority({ revision: "global-1", allowedProjectDirectories: [project] });
+		const binding = grantedBinding(authorize(authority, project));
+		const forged = Object.freeze(Object.create(null));
+
+		expect(validate(authority, forged)).toBe("denied");
+		expect(validate(authority, binding)).toBe("granted");
+		expect(Object.keys(authority)).toEqual(["authorizeProjectDirectory", "validateBinding"]);
+	});
+
+	it("denies foreign, forged, and non-object bindings without exposing grant metadata", () => {
+		const project = tempDirectory();
+		const authority = createMcpProjectTrustAuthority({ revision: "global-1", allowedProjectDirectories: [project] });
+		const otherAuthority = createMcpProjectTrustAuthority({
+			revision: "global-1",
+			allowedProjectDirectories: [project],
+		});
+		const foreignBinding = grantedBinding(authorize(otherAuthority, project));
+		const binding = grantedBinding(authorize(authority, project));
+
+		for (const candidate of [undefined, null, true, "grant", 1, Object.freeze({}), foreignBinding]) {
+			expect(validate(authority, candidate)).toBe("denied");
+		}
+		const validation = authority.validateBinding(binding);
+		expect(validation).toEqual({ kind: "granted" });
+		expect(Object.keys(validation)).toEqual(["kind"]);
+		expect(Object.isFrozen(validation)).toBe(true);
 	});
 
 	it("does not accept a project-owned override as an authority input", () => {
@@ -95,23 +130,38 @@ describe("MCP project trust authority", () => {
 		expect(authorize(authority, project)).toEqual({ kind: "denied" });
 	});
 
-	it("pins the supplied policy and rejects a replaced directory after a grant", () => {
+	it("pins factory policy input and invalidates a pre-granted binding after directory replacement", () => {
 		const parent = tempDirectory();
 		const project = join(parent, "project");
 		const replacement = join(parent, "replacement");
 		mkdirSync(project);
 		const globalPolicy = { revision: "global-1", allowedProjectDirectories: [project] };
 		const authority = createMcpProjectTrustAuthority(globalPolicy);
-		grantedBinding(authorize(authority, project));
+		const binding = grantedBinding(authorize(authority, project));
 
 		globalPolicy.revision = "mutated";
 		globalPolicy.allowedProjectDirectories.length = 0;
-		// The grant is opaque; a later authorization proves the original
-		// revision/allowlist was copied rather than read again from mutable input.
-		expect(authorize(authority, project).kind).toBe("granted");
+		// Revision is factory input only. Mutating the caller-owned policy cannot
+		// alter the opaque snapshot or surface that revision to a consumer.
+		expect(validate(authority, binding)).toBe("granted");
 		mkdirSync(replacement);
 		rmSync(project, { recursive: true });
 		renameSync(replacement, project);
 		expect(authorize(authority, project)).toEqual({ kind: "denied" });
+		expect(validate(authority, binding)).toBe("denied");
+	});
+
+	it("invalidates a pre-granted binding when its directory is mutated into a symlink", () => {
+		const parent = tempDirectory();
+		const project = join(parent, "project");
+		const target = join(parent, "target");
+		mkdirSync(project);
+		mkdirSync(target);
+		const authority = createMcpProjectTrustAuthority({ revision: "global-1", allowedProjectDirectories: [project] });
+		const binding = grantedBinding(authorize(authority, project));
+
+		rmSync(project, { recursive: true });
+		symlinkSync(target, project, "dir");
+		expect(validate(authority, binding)).toBe("denied");
 	});
 });

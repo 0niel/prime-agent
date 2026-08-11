@@ -143,6 +143,7 @@ export {
 	type McpProjectTrustAuthorityInput,
 	type McpProjectTrustAuthorization,
 	type McpProjectTrustBinding,
+	type McpProjectTrustBindingValidation,
 } from "./core/mcp/project-trust-authority.js";
 export { convertToLlm } from "./core/messages.js";
 export { ModelRegistry } from "./core/model-registry.js";

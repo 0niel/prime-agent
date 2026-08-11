@@ -13,7 +13,7 @@ export interface McpProjectTrustAuthorityInput {
 	readonly allowedProjectDirectories: readonly string[];
 }
 
-/** An opaque, one-shot grant for a single project authority snapshot. */
+/** An opaque grant bound to a single project authority snapshot. */
 declare const mcpProjectTrustBindingBrand: unique symbol;
 export interface McpProjectTrustBinding {
 	readonly [mcpProjectTrustBindingBrand]: never;
@@ -23,12 +23,17 @@ export type McpProjectTrustAuthorization =
 	| { readonly kind: "denied" }
 	| { readonly kind: "granted"; readonly binding: McpProjectTrustBinding };
 
+/** Safe, opaque verification result for a privileged boundary. */
+export type McpProjectTrustBindingValidation = { readonly kind: "denied" } | { readonly kind: "granted" };
+
 /**
- * A project trust authority exposes no policy, path, digest, or boolean
- * authorization surface. Consumers retain a grant and may only validate it.
+ * A project trust authority exposes no policy, path, digest, revision, or
+ * boolean authorization surface. A revision is factory input only; consumers
+ * retain a grant and may only ask whether it is still valid.
  */
 export interface McpProjectTrustAuthority {
 	authorizeProjectDirectory(projectDirectory: string): McpProjectTrustAuthorization;
+	validateBinding(binding: unknown): McpProjectTrustBindingValidation;
 }
 
 interface DirectoryIdentity {
@@ -44,6 +49,8 @@ interface BindingRecord {
 }
 
 const DENIED: McpProjectTrustAuthorization = Object.freeze({ kind: "denied" });
+const BINDING_DENIED: McpProjectTrustBindingValidation = Object.freeze({ kind: "denied" });
+const BINDING_GRANTED: McpProjectTrustBindingValidation = Object.freeze({ kind: "granted" });
 
 /**
  * Reads a directory only when the supplied spelling is already its exact
@@ -126,6 +133,29 @@ export function createMcpProjectTrustAuthority(input: McpProjectTrustAuthorityIn
 			bindings.add(binding);
 			records.set(binding, Object.freeze({ revision, digest: snapshotDigest, identity: requested }));
 			return Object.freeze({ kind: "granted", binding });
+		},
+		validateBinding(binding: unknown): McpProjectTrustBindingValidation {
+			if (typeof binding !== "object" || binding === null || !bindings.has(binding)) {
+				return BINDING_DENIED;
+			}
+			const record = records.get(binding);
+			const currentSnapshot = snapshot.map(({ canonicalPath }) => exactDirectoryIdentity(canonicalPath));
+			if (currentSnapshot.some((identity) => identity === undefined)) {
+				return BINDING_DENIED;
+			}
+			const currentIdentities = currentSnapshot as DirectoryIdentity[];
+			if (
+				!record ||
+				record.revision !== revision ||
+				record.digest !== snapshotDigest ||
+				!currentIdentities.every((identity, index) => sameIdentity(snapshot[index], identity)) ||
+				digestSnapshot(revision, currentIdentities) !== snapshotDigest ||
+				!snapshot.some((approved) => sameIdentity(approved, record.identity))
+			) {
+				return BINDING_DENIED;
+			}
+
+			return BINDING_GRANTED;
 		},
 	});
 }

@@ -83,6 +83,7 @@ export {
 	type McpProjectTrustAuthorityInput,
 	type McpProjectTrustAuthorization,
 	type McpProjectTrustBinding,
+	type McpProjectTrustBindingValidation,
 } from "./mcp/project-trust-authority.js";
 export type { RefinementResult } from "./refinement/index.js";
 export type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
