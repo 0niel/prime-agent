@@ -495,6 +495,60 @@ describe("KernelManager abort handling", () => {
 		await disposePromise;
 	});
 
+	it("restart reopens host-request admission only after shutdown settles", async () => {
+		let capturedContext: HostRequestContext | undefined;
+		let releaseShutdown: (() => void) | undefined;
+		const shutdownSettled = new Promise<void>((resolve) => {
+			releaseShutdown = resolve;
+		});
+		const implementation = vi.fn(async (_payload: Record<string, unknown>, context: HostRequestContext) => {
+			capturedContext = context;
+			return { ok: true };
+		});
+		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const internals = manager as unknown as {
+			hostRequestsClosed: boolean;
+			state: "idle" | "running" | "shutdown";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			shutdown: () => Promise<void>;
+			start: () => Promise<void>;
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			sendCommMessage: (_commId: string, data: Record<string, unknown>) => Promise<void>;
+			activeHostRequestControllers: Map<string, AbortController>;
+			inFlightHostRequests: Set<Promise<void>>;
+		};
+		internals.hostRequestsClosed = true;
+		internals.shutdown = async () => {
+			expect(internals.hostRequestsClosed).toBe(true);
+			internals.state = "shutdown";
+			await shutdownSettled;
+		};
+		internals.start = async () => {
+			expect(internals.hostRequestsClosed).toBe(false);
+			internals.state = "running";
+			internals.connection = { key: "test" };
+			internals.shell = { send: async () => {}, close: () => {} };
+			internals.sendCommMessage = async () => {};
+			internals.handleCommMessage({
+				header: { msg_type: "comm_open" },
+				content: { comm_id: "restarted-request", target_name: "host.request", data: { type: "test" } },
+			});
+		};
+
+		const restartPromise = manager.restart();
+		await Promise.resolve();
+		expect(internals.hostRequestsClosed).toBe(true);
+		releaseShutdown?.();
+		await restartPromise;
+		await Promise.allSettled([...internals.inFlightHostRequests]);
+
+		expect(implementation).toHaveBeenCalledTimes(1);
+		expect(capturedContext?.signal.aborted).toBe(true);
+		expect(internals.activeHostRequestControllers.has("restarted-request")).toBe(false);
+	});
+
 	it("fails a later execution fast when the interrupted cell never idles", async () => {
 		vi.useFakeTimers();
 		const manager = new KernelManager({ cwd: process.cwd() });
