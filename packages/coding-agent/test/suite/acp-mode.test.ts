@@ -371,7 +371,7 @@ describe("ACP mode end to end", () => {
 				sessionId: session.sessionId,
 				prompt: [{ type: "text", text: "finish" }],
 			}),
-		).rejects.toThrow("autonomous continuation failed");
+		).rejects.toThrow("Internal error");
 		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
 		expect(metadata.filter((meta) => meta.phase === "responseBoundary")).toEqual([
 			expect.objectContaining({ outcome: "error" }),
