@@ -9,6 +9,8 @@ export interface AgentActivityStatus {
 	direction: "down" | "up";
 	/** Output tokens accumulated since the user's last message. */
 	tokens: number;
+	/** Output tokens per second since the first token of the current turn, or 0 if not measurable. */
+	tokensPerSecond: number;
 }
 
 export const AGENT_ACTIVITY_LABELS: Record<AgentActivity, string> = {
@@ -37,6 +39,10 @@ export class AgentActivityTracker {
 	// live count leans on the character estimate in between. Keeping the reported value
 	// monotonic prevents it from dipping when authoritative usage arrives at message end.
 	private reportedTokens = 0;
+	// Timestamp (ms) when the first output token of the current turn arrived, for tokens/sec.
+	private streamingStartedAt: number | undefined = undefined;
+	// Token count at the moment streamingStartedAt was recorded, for tokens/sec.
+	private streamingStartTokens = 0;
 
 	handleEvent(event: AgentConnectionSessionEvent): void {
 		switch (event.type) {
@@ -78,6 +84,11 @@ export class AgentActivityTracker {
 					this.streamingChars += streamEvent.delta.length;
 				}
 				this.streamingUsageTokens = event.message.usage.output;
+				// Record the start of output for tokens/sec calculation.
+				if (this.streamingStartedAt === undefined && this.currentTokens() > 0) {
+					this.streamingStartedAt = Date.now();
+					this.streamingStartTokens = this.completedTokens;
+				}
 				break;
 			}
 
@@ -113,7 +124,17 @@ export class AgentActivityTracker {
 			activity: this.activity,
 			direction: this.activity === "waiting" || this.activity === "executing" ? "up" : "down",
 			tokens: this.reportedTokens,
+			tokensPerSecond: this.computeTokensPerSecond(),
 		};
+	}
+
+	private computeTokensPerSecond(): number {
+		if (this.streamingStartedAt === undefined) return 0;
+		const elapsedMs = Date.now() - this.streamingStartedAt;
+		if (elapsedMs < 500) return 0; // need at least half a second for a meaningful rate
+		const delta = this.reportedTokens - this.streamingStartTokens;
+		if (delta <= 0) return 0;
+		return Math.round((delta / elapsedMs) * 1000);
 	}
 
 	private currentTokens(): number {
@@ -127,6 +148,8 @@ export class AgentActivityTracker {
 		this.streamingChars = 0;
 		this.runningToolCount = 0;
 		this.reportedTokens = 0;
+		this.streamingStartedAt = undefined;
+		this.streamingStartTokens = 0;
 	}
 
 	private estimatedStreamingTokens(): number {

@@ -33,7 +33,7 @@ function update(message: AssistantMessage, assistantMessageEvent: AssistantMessa
 describe("AgentActivityTracker", () => {
 	test("starts waiting with no tokens", () => {
 		const tracker = new AgentActivityTracker();
-		expect(tracker.getStatus()).toEqual({ activity: "waiting", direction: "up", tokens: 0 });
+		expect(tracker.getStatus()).toEqual({ activity: "waiting", direction: "up", tokens: 0, tokensPerSecond: 0 });
 	});
 
 	test("derives activity from streaming delta types", () => {
@@ -101,10 +101,10 @@ describe("AgentActivityTracker", () => {
 		tracker.handleEvent({ type: "message_start", message: first });
 		tracker.handleEvent(update(first, { type: "toolcall_delta", contentIndex: 0, delta: "code", partial: first }));
 		tracker.handleEvent({ type: "message_end", message: first });
-		expect(tracker.getStatus()).toEqual({ activity: "waiting", direction: "up", tokens: 500 });
+		expect(tracker.getStatus()).toEqual({ activity: "waiting", direction: "up", tokens: 500, tokensPerSecond: 0 });
 
 		tracker.handleEvent({ type: "tool_execution_start", toolCallId: "t1", toolName: "ipython", args: {} });
-		expect(tracker.getStatus()).toEqual({ activity: "executing", direction: "up", tokens: 500 });
+		expect(tracker.getStatus()).toEqual({ activity: "executing", direction: "up", tokens: 500, tokensPerSecond: 0 });
 
 		tracker.handleEvent({
 			type: "tool_execution_end",
@@ -151,7 +151,7 @@ describe("AgentActivityTracker", () => {
 		expect(tracker.getStatus().tokens).toBe(500);
 
 		tracker.handleEvent({ type: "message_start", message: createUserMessage() });
-		expect(tracker.getStatus()).toEqual({ activity: "waiting", direction: "up", tokens: 0 });
+		expect(tracker.getStatus()).toEqual({ activity: "waiting", direction: "up", tokens: 0, tokensPerSecond: 0 });
 	});
 });
 

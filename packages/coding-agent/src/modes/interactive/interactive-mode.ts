@@ -3136,7 +3136,10 @@ export class InteractiveMode {
 			parts.push(elapsed);
 		}
 		if (status.tokens > 0) {
-			parts.push(`${status.direction === "down" ? "↓" : "↑"} ${formatTokenCount(status.tokens)} tokens`);
+			const arrow = status.direction === "down" ? "↓" : "↑";
+			const tokenPart = `${arrow} ${formatTokenCount(status.tokens)} tokens`;
+			const ratePart = status.tokensPerSecond > 0 ? ` (${status.tokensPerSecond} tok/s)` : "";
+			parts.push(`${tokenPart}${ratePart}`);
 		}
 		return parts.join(" · ");
 	}
