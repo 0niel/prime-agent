@@ -337,12 +337,12 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const sessionManager = options.parentSession.sessionManager.isPersisted()
 			? SessionManager.create(childCwd, options.sessionDir)
 			: SessionManager.inMemory(childCwd, options.sessionDir);
-		if (options.parentSession.sessionFile) {
-			sessionManager.newSession({
-				parentSession: options.parentSession.sessionFile,
-				rlmDepth: options.rlmDepth,
-			});
-		}
+		// Explicit depth is required for in-memory children too: their initial manager
+		// header otherwise defaults to root depth when there is no parent session file.
+		sessionManager.newSession({
+			parentSession: options.parentSession.sessionFile,
+			rlmDepth: options.rlmDepth,
+		});
 		const runtime = await this.scopedBuild(() =>
 			createAgentSessionRuntime(this.createRuntime, {
 				cwd: sessionManager.getCwd(),

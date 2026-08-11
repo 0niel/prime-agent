@@ -69,7 +69,7 @@ Commands and third-party resources can write anywhere permitted by the operating
 
 ### What `--no-session` does
 
-`--no-session` uses in-memory session managers for the root run and every RLM descendant, so none of them creates a normal persisted session JSONL or per-session artifact tree. RLM execution can still create private temporary working directories for kernel snapshots and local harness state; Prime Agent does not currently remove them, so they can remain until OS temporary-file cleanup or manual removal. The process still reads global/project configuration and resources. Logs, authentication state, the kernel environment, package caches, other temporary files, telemetry state, and files created by commands may still be read or written.
+`--no-session` uses in-memory session managers for the root run and every RLM descendant, so none of them creates a normal persisted session JSONL or per-session artifact tree. RLM execution can still create private temporary working directories for local harness state; Prime Agent does not currently remove them, so they can remain until OS temporary-file cleanup or manual removal. The process still reads global/project configuration and resources. Logs, authentication state, the kernel environment, package caches, other temporary files, telemetry state, and files created by commands may still be read or written.
 
 For disposable behavior, use a fresh container or VM with an ephemeral `HOME` and XDG config/cache/state directories. Redirecting `PRIME_AGENT_CODING_AGENT_DIR` can isolate the Prime Agent config directory, but it does not redirect every third-party cache or command output.
 

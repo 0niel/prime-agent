@@ -2309,12 +2309,12 @@ export class AgentDaemon {
 		const sessionManager = options.parentSession.sessionManager.isPersisted()
 			? SessionManager.create(childCwd, options.sessionDir)
 			: SessionManager.inMemory(childCwd, options.sessionDir);
-		if (options.parentSession.sessionFile) {
-			sessionManager.newSession({
-				parentSession: options.parentSession.sessionFile,
-				rlmDepth: options.rlmDepth,
-			});
-		}
+		// Explicit depth is required for in-memory children too: their initial manager
+		// header otherwise defaults to root depth when there is no parent session file.
+		sessionManager.newSession({
+			parentSession: options.parentSession.sessionFile,
+			rlmDepth: options.rlmDepth,
+		});
 		let stateRef: ActiveSessionState | undefined;
 		// Subagents inherit the parent's client env (e.g. herdr pane identity).
 		const runtime = await withClientEnv(parentState.clientEnv, () =>
