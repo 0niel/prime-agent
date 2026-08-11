@@ -136,6 +136,13 @@ describe("McpManager", () => {
 		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({ url: "https://mcp.notion.com/mcp", hostOAuthOnly: true });
 	});
 
+	it("strips credential-shaped settings headers before Python configuration", async () => {
+		const manager = new McpManager({ authStorage, getUserServers: () => ({
+			public: { type: "http", url: "https://public.test/mcp", headers: { Authorization: "secret", "proxy-authorization": "secret", Cookie: "secret", "X-API-Key": "secret", "X-Extra": "safe" } },
+		}) });
+		expect(await manager.hostHandlers()["mcp.config"]({ server: "public" })).toEqual({ url: "https://public.test/mcp", headers: { "X-Extra": "safe" } });
+	});
+
 	it("does not treat an oauth override of a catalog name as authed via the official stored cred", () => {
 		// Pre-existing official Linear cred from a prior login.
 		authStorage.set("mcp:linear", {

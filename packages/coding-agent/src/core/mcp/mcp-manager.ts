@@ -30,6 +30,13 @@ function canonicalEndpoint(value: string): string | undefined {
 	try { const url = new URL(value); return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash ? url.href : undefined; } catch { return undefined; }
 }
 
+const CREDENTIAL_HEADER = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token)$/i;
+
+function safeMcpHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+	const safe = Object.fromEntries(Object.entries(headers ?? {}).filter(([name]) => !CREDENTIAL_HEADER.test(name)));
+	return Object.keys(safe).length > 0 ? safe : undefined;
+}
+
 function isS01Reference(value: unknown): value is SecretReference {
 	if (!value || typeof value !== "object") return false;
 	const reference = value as Partial<SecretReference>;
@@ -273,9 +280,8 @@ export class McpManager {
 				// OAuth bearer material stays host-only. M03 will supply the typed
 				// request transport; until then the kernel must fail before transport.
 				if (integration.usesOAuth) config.hostOAuthOnly = true;
-				if (integration.headers && Object.keys(integration.headers).length > 0) {
-					config.headers = integration.headers;
-				}
+				const headers = safeMcpHeaders(integration.headers);
+				if (headers) config.headers = headers;
 				return config;
 			},
 		};
