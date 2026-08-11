@@ -19,6 +19,12 @@ import { SettingsManager } from "./settings-manager.js";
 import type { Skill } from "./skills.js";
 import { loadSkills } from "./skills.js";
 import { createSourceInfo, type SourceInfo } from "./source-info.js";
+import type { SystemPromptSource } from "./system-prompt.js";
+
+export interface SystemPromptLoadResult {
+	source: SystemPromptSource;
+	diagnostics: ResourceDiagnostic[];
+}
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -33,6 +39,7 @@ export interface ResourceLoader {
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
 	getSystemPrompt(): string | undefined;
+	getSystemPromptSource?(): SystemPromptLoadResult;
 	getAppendSystemPrompt(): string[];
 	extendResources(paths: ResourceExtensionPaths): void;
 	reload(): Promise<void>;
@@ -53,6 +60,21 @@ function resolvePromptInput(input: string | undefined, description: string): str
 	}
 
 	return input;
+}
+
+function isSystemPromptSource(value: unknown): value is SystemPromptSource {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const source = value as Record<string, unknown>;
+	const keys = Object.keys(source);
+	if (source.provenance === "built_in" || source.provenance === "unknown") {
+		return keys.length === 1 && keys[0] === "provenance";
+	}
+	return (
+		source.provenance === "custom" &&
+		typeof source.content === "string" &&
+		keys.length === 2 &&
+		keys.includes("content")
+	);
 }
 
 function loadContextFileFromDir(dir: string): { path: string; content: string } | null {
@@ -151,6 +173,7 @@ export interface DefaultResourceLoaderOptions {
 		agentsFiles: Array<{ path: string; content: string }>;
 	};
 	systemPromptOverride?: (base: string | undefined) => string | undefined;
+	systemPromptSourceOverride?: (base: SystemPromptSource) => SystemPromptSource;
 	appendSystemPromptOverride?: (base: string[]) => string[];
 }
 
@@ -190,6 +213,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		agentsFiles: Array<{ path: string; content: string }>;
 	};
 	private systemPromptOverride?: (base: string | undefined) => string | undefined;
+	private systemPromptSourceOverride?: (base: SystemPromptSource) => SystemPromptSource;
 	private appendSystemPromptOverride?: (base: string[]) => string[];
 
 	private extensionsResult: LoadExtensionsResult;
@@ -202,6 +226,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private themeDiagnostics: ResourceDiagnostic[];
 	private agentsFiles: Array<{ path: string; content: string }>;
 	private systemPrompt?: string;
+	private resolvedSystemPromptSource: SystemPromptSource = { provenance: "built_in" };
+	private systemPromptDiagnostics: ResourceDiagnostic[] = [];
 	private appendSystemPrompt: string[];
 	private lastSkillPaths: string[];
 	private extensionSkillSourceInfos: Map<string, SourceInfo>;
@@ -241,6 +267,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.themesOverride = options.themesOverride;
 		this.agentsFilesOverride = options.agentsFilesOverride;
 		this.systemPromptOverride = options.systemPromptOverride;
+		this.systemPromptSourceOverride = options.systemPromptSourceOverride;
 		this.appendSystemPromptOverride = options.appendSystemPromptOverride;
 
 		this.extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
@@ -287,6 +314,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getSystemPrompt(): string | undefined {
 		return this.systemPrompt;
+	}
+
+	getSystemPromptSource(): SystemPromptLoadResult {
+		return { source: this.resolvedSystemPromptSource, diagnostics: [...this.systemPromptDiagnostics] };
 	}
 
 	getAppendSystemPrompt(): string[] {
@@ -478,11 +509,30 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(agentsFiles) : agentsFiles;
 		this.agentsFiles = resolvedAgentsFiles.agentsFiles;
 
-		const baseSystemPrompt = resolvePromptInput(
-			this.systemPromptSource ?? this.discoverSystemPromptFile(),
-			"system prompt",
-		);
-		this.systemPrompt = this.systemPromptOverride ? this.systemPromptOverride(baseSystemPrompt) : baseSystemPrompt;
+		const configuredSystemPrompt = this.systemPromptSource;
+		const baseSystemPrompt =
+			configuredSystemPrompt === undefined
+				? resolvePromptInput(this.discoverSystemPromptFile(), "system prompt")
+				: configuredSystemPrompt === ""
+					? ""
+					: resolvePromptInput(configuredSystemPrompt, "system prompt");
+		const legacySystemPrompt = this.systemPromptOverride
+			? this.systemPromptOverride(baseSystemPrompt)
+			: baseSystemPrompt;
+		const baseSystemPromptSource: SystemPromptSource =
+			legacySystemPrompt === undefined
+				? { provenance: "built_in" }
+				: { provenance: "custom", content: legacySystemPrompt };
+		const source = this.systemPromptSourceOverride
+			? this.systemPromptSourceOverride(baseSystemPromptSource)
+			: baseSystemPromptSource;
+		this.resolvedSystemPromptSource = isSystemPromptSource(source) ? source : { provenance: "unknown" };
+		this.systemPromptDiagnostics =
+			this.resolvedSystemPromptSource.provenance === "unknown"
+				? [{ type: "error", message: "System prompt provenance unavailable" }]
+				: [];
+		this.systemPrompt =
+			this.resolvedSystemPromptSource.provenance === "custom" ? this.resolvedSystemPromptSource.content : undefined;
 
 		const appendSources =
 			this.appendSystemPromptSource ??

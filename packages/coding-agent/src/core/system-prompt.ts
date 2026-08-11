@@ -6,8 +6,21 @@ import { buildChildAgentDoctrine, buildRlmPrompt, buildSubagentGuidance } from "
 import { formatHarnessStateForPrompt, type HarnessState, REFINE_SKILL_NAME } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
+export type SystemPromptSource =
+	| { provenance: "built_in" }
+	| { provenance: "custom"; content: string }
+	| { provenance: "unknown" };
+
 export interface BuildSystemPromptOptions {
-	/** Custom system prompt (replaces default). */
+	/**
+	 * Authoritative origin and content for the system prompt.
+	 * Unknown provenance fails closed rather than assembling a default prompt.
+	 */
+	systemPromptSource?: SystemPromptSource;
+	/**
+	 * Legacy custom prompt input. Prefer systemPromptSource for callers that
+	 * retain source presence independently from prompt content.
+	 */
 	customPrompt?: string;
 	/** Active tools. Tool schemas carry tool descriptions outside the prompt body. */
 	selectedTools?: string[];
@@ -38,6 +51,7 @@ export interface BuildSystemPromptOptions {
 /** Build the system prompt with tools, guidelines, and context */
 export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const {
+		systemPromptSource,
 		customPrompt,
 		selectedTools,
 		promptGuidelines,
@@ -49,6 +63,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		allowRecursion,
 		harnessState,
 	} = options;
+	const resolvedSystemPromptSource = resolveSystemPromptSource(systemPromptSource, customPrompt);
+	if (resolvedSystemPromptSource.provenance === "unknown") {
+		return "";
+	}
 	const promptCwd = cwd.replace(/\\/g, "/");
 	const promptMessagesPath = (messagesPath ?? "not persisted").replace(/\\/g, "/");
 
@@ -69,8 +87,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const visiblePythonSkillImportNames = getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName);
 	const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
 
-	if (customPrompt) {
-		let prompt = customPrompt;
+	if (resolvedSystemPromptSource.provenance === "custom") {
+		let prompt = resolvedSystemPromptSource.content;
 
 		// Append project context files
 		if (contextFiles.length > 0) {
@@ -166,6 +184,31 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	}
 
 	return prompt;
+}
+
+function resolveSystemPromptSource(
+	systemPromptSource: SystemPromptSource | undefined,
+	customPrompt: string | undefined,
+): SystemPromptSource {
+	if (systemPromptSource !== undefined) {
+		return isSystemPromptSource(systemPromptSource) ? systemPromptSource : { provenance: "unknown" };
+	}
+	return customPrompt === undefined ? { provenance: "built_in" } : { provenance: "custom", content: customPrompt };
+}
+
+function isSystemPromptSource(value: unknown): value is SystemPromptSource {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const source = value as Record<string, unknown>;
+	const keys = Object.keys(source);
+	if (source.provenance === "built_in" || source.provenance === "unknown") {
+		return keys.length === 1 && keys[0] === "provenance";
+	}
+	return (
+		source.provenance === "custom" &&
+		typeof source.content === "string" &&
+		keys.length === 2 &&
+		keys.includes("content")
+	);
 }
 
 function formatPromptGuidelines(promptGuidelines: string[] | undefined): string {

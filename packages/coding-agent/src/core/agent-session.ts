@@ -1071,6 +1071,12 @@ function waitForPromiseOrAbort<T>(
 	});
 }
 
+function resolveLegacySystemPromptSource(
+	systemPrompt: string | undefined,
+): BuildSystemPromptOptions["systemPromptSource"] {
+	return systemPrompt === undefined ? { provenance: "built_in" } : { provenance: "custom", content: systemPrompt };
+}
+
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	const parentContextTokens =
 		parentUsage.totalTokens ||
@@ -4303,7 +4309,9 @@ export class AgentSession {
 			}
 		}
 
-		const loaderSystemPrompt = this._resourceLoader.getSystemPrompt();
+		const loaderSystemPromptSource =
+			this._resourceLoader.getSystemPromptSource?.().source ??
+			resolveLegacySystemPromptSource(this._resourceLoader.getSystemPrompt());
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
 		const appendSystemPrompt =
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
@@ -4314,7 +4322,7 @@ export class AgentSession {
 			cwd: this._cwd,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
-			customPrompt: loaderSystemPrompt,
+			systemPromptSource: loaderSystemPromptSource,
 			appendSystemPrompt,
 			messagesPath: this.sessionManager.getSessionFile(),
 			selectedTools: validToolNames,
