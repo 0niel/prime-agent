@@ -2740,12 +2740,23 @@ export class DaemonSupervisor {
 				try {
 					await this.assertRecoveryAllowed();
 					const processAlive = isProcessAlive(worker.descriptor.pid);
+					const requireManualRecovery = () => {
+						// Do not bind identity retrospectively. A live legacy descriptor
+						// could name a recycled pid, so it may only be explicitly
+						// recovered after an operator establishes its provenance.
+						worker.descriptor.lifecycle = "failed";
+						worker.descriptor.lastError = "Manual recovery required: live worker process identity is unavailable";
+						this.persistWorker(worker);
+					};
+					// Crucially, fail legacy descriptors before even asking the OS for
+					// a start-id. Do not let an observation mutate their authority.
+					if (processAlive && worker.descriptor.processStartId === undefined) {
+						requireManualRecovery();
+						return;
+					}
 					const observedProcessStartId = processAlive ? getProcessStartId(worker.descriptor.pid) : undefined;
-					// A live legacy or unobservable descriptor cannot be adopted,
-					// reaped, or re-bound after the fact: its pid may be recycled.
-					// Leave it for explicit operator recovery without mutating it.
-					if (processAlive && (worker.descriptor.processStartId === undefined || observedProcessStartId === undefined)) {
-						this.log(`Cannot safely recover live session worker ${worker.descriptor.workerId} without a verified process identity`);
+					if (processAlive && observedProcessStartId === undefined) {
+						requireManualRecovery();
 						return;
 					}
 					const processIdentityMatches =

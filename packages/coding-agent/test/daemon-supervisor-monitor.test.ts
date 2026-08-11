@@ -1532,17 +1532,29 @@ describe("daemon worker supervisor monitoring", () => {
 			assertRecoveryAllowed: vi.fn(async () => {}),
 		}) as RecoveryHarness;
 
-		const recovery = supervisor.recoverWorker(worker);
-		await vi.runAllTimersAsync();
-		await recovery;
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const signalSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		try {
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.runAllTimersAsync();
+			await recovery;
 
-		// A live descriptor without a start identity is a possible recycled pid.
-		// Recovery must leave it untouched rather than connect, persist, or reap it.
-		expect(supervisor.connectWorker).not.toHaveBeenCalled();
-		expect(supervisor.persistWorker).not.toHaveBeenCalled();
-		expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
-		expect(supervisor.launchWorker).not.toHaveBeenCalled();
-		expect(worker.descriptor.lifecycle).toBeUndefined();
+			// A live descriptor without a start identity is a possible recycled pid.
+			// It is failed exactly once for manual recovery, without connection,
+			// adoption, signalling, replacement, or identity mutation.
+			expect(supervisor.connectWorker).not.toHaveBeenCalled();
+			expect(supervisor.persistWorker).toHaveBeenCalledOnce();
+			expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
+			expect(supervisor.launchWorker).not.toHaveBeenCalled();
+			expect(signalSpy).not.toHaveBeenCalled();
+			expect(worker.descriptor.processStartId).toBeUndefined();
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect(worker.descriptor.lastError).toBe(
+				"Manual recovery required: live worker process identity is unavailable",
+			);
+		} finally {
+			signalSpy.mockRestore();
+		}
 	});
 
 	it("keeps a recovered worker ready when peer synchronization fails", async () => {
