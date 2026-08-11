@@ -153,7 +153,7 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 async function runMcpDeclarationCommand(args: string[]): Promise<PublicCommandResult> {
 	const command = parseMcpDeclarationCommand(args);
 	const settings = SettingsManager.create(process.cwd());
-	const result = executeMcpDeclarationCommand(command, settings, process.cwd());
+	const result = await executeMcpDeclarationCommand(command, settings, process.cwd());
 	await settings.flush();
 	console.log(JSON.stringify(result, null, 2));
 	return HANDLED;

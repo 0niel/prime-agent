@@ -152,9 +152,9 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["mcp"],
-		usage: "mcp <list|inspect|preview|add|enable|disable|remove> ... [--project]",
+		usage: "mcp <list|inspect|preview|test|add|enable|disable|remove> ... [--project]",
 		summary: "Manage declarative MCP endpoint records",
-		description: "Commands only read or write credential-free declarations. They never start an MCP runtime or authentication flow.",
+		description: "Commands only read or write credential-free declarations. They never start an MCP runtime or authentication flow. A test probe requires an injected local transport.",
 	},
 ];
 

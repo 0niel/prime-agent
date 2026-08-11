@@ -5,7 +5,8 @@ import {
 	parseMcpDeclarationDocument,
 	previewMcpProbe,
 } from "../src/core/mcp/mcp-declarations.js";
-import { parseMcpDeclarationCommand } from "../src/core/mcp/mcp-declaration-command.js";
+import { executeMcpDeclarationCommand, parseMcpDeclarationCommand } from "../src/core/mcp/mcp-declaration-command.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import { redactMcpValue } from "../src/core/mcp/mcp-redaction.js";
 import { resolveProjectMcpDeclarations } from "../src/core/mcp/mcp-project-trust.js";
 
@@ -39,6 +40,25 @@ describe("M01 declarative MCP contract", () => {
 			scope: "project",
 			name: "catalog",
 		});
+	});
+
+	it("routes a test only through an explicitly injected local transport", async () => {
+		const settings = SettingsManager.inMemory({
+			mcpDeclarations: { version: 1, servers: { catalog: { name: "catalog", url: "https://catalog.test/mcp", enabled: true } } },
+		});
+		const command = parseMcpDeclarationCommand(["test", "catalog"]);
+		await expect(executeMcpDeclarationCommand(command, settings, "/project")).rejects.toThrow("unavailable");
+		const methods: string[] = [];
+		await expect(
+			executeMcpDeclarationCommand(command, settings, "/project", undefined, {
+				probeTransport: {
+					async open() {
+						return { request: async ({ method }) => void methods.push(method), close: () => undefined };
+					},
+				},
+			}),
+		).resolves.toEqual({ initialized: true, toolsListed: true });
+		expect(methods).toEqual(["initialize", "tools/list"]);
 	});
 
 	it("fails closed for project declarations without an admitted C05 capability", () => {

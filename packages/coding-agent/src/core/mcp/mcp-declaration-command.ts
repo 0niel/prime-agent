@@ -8,6 +8,11 @@ import {
 } from "./mcp-declarations.js";
 import { redactMcpDeclaration, redactMcpDeclarationDocument } from "./mcp-redaction.js";
 import {
+	runMcpDeclarationProbe,
+	type McpDeclarationProbeOptions,
+	type McpProbeTransport,
+} from "./mcp-probe.js";
+import {
 	resolveProjectMcpDeclarations,
 	type C05ProjectMcpTrustCapability,
 } from "./mcp-project-trust.js";
@@ -16,11 +21,12 @@ export type McpDeclarationCommand =
 	| { kind: "list"; scope: McpDeclarationScope }
 	| { kind: "inspect"; scope: McpDeclarationScope; name: string }
 	| { kind: "preview"; scope: McpDeclarationScope; name: string }
+	| { kind: "test"; scope: McpDeclarationScope; name: string }
 	| { kind: "add"; scope: McpDeclarationScope; name: string; url: string }
 	| { kind: "enable" | "disable" | "remove"; scope: McpDeclarationScope; name: string };
 
 function usage(): never {
-	throw new Error("Usage: prime-agent mcp <list|inspect|preview|add|enable|disable|remove> ... [--project]");
+	throw new Error("Usage: prime-agent mcp <list|inspect|preview|test|add|enable|disable|remove> ... [--project]");
 }
 
 function parseScope(words: string[]): { words: string[]; scope: McpDeclarationScope } {
@@ -34,7 +40,10 @@ export function parseMcpDeclarationCommand(args: string[]): McpDeclarationComman
 	const { words, scope } = parseScope(args);
 	const [kind, ...operands] = words;
 	if (kind === "list" && operands.length === 0) return { kind, scope };
-	if ((kind === "inspect" || kind === "preview" || kind === "enable" || kind === "disable" || kind === "remove") && operands.length === 1) {
+	if (
+		(kind === "inspect" || kind === "preview" || kind === "test" || kind === "enable" || kind === "disable" || kind === "remove") &&
+		operands.length === 1
+	) {
 		return { kind, scope, name: operands[0]! };
 	}
 	if (kind === "add" && operands.length === 2) return { kind, scope, name: operands[0]!, url: operands[1]! };
@@ -56,12 +65,18 @@ function documentForScope(
 	return resolved.document;
 }
 
-export function executeMcpDeclarationCommand(
+export interface McpDeclarationCommandOptions extends McpDeclarationProbeOptions {
+	/** Deliberately supplied only by a local caller or test; no default transport exists. */
+	probeTransport?: McpProbeTransport;
+}
+
+export async function executeMcpDeclarationCommand(
 	command: McpDeclarationCommand,
 	settings: SettingsManager,
 	projectDirectory: string,
 	capability?: C05ProjectMcpTrustCapability,
-): unknown {
+	options: McpDeclarationCommandOptions = {},
+): Promise<unknown> {
 	const document = documentForScope(settings, command.scope, projectDirectory, capability);
 	if (command.kind === "list") return redactMcpDeclarationDocument(document);
 	const declaration = document.servers[command.name];
@@ -73,6 +88,16 @@ export function executeMcpDeclarationCommand(
 	if (!declaration) throw new Error("No MCP declaration has that name.");
 	if (command.kind === "inspect") return redactMcpDeclaration(declaration);
 	if (command.kind === "preview") return previewMcpProbe(redactMcpDeclaration(declaration));
+	if (command.kind === "test") {
+		if (!options.probeTransport) {
+			throw new Error("MCP probe is unavailable in this command context.");
+		}
+		return runMcpDeclarationProbe(declaration, options.probeTransport, {
+			offline: options.offline,
+			trusted: command.scope === "user" || capability?.allowsProjectMcpDeclarations(projectDirectory) === true,
+			timeoutMs: options.timeoutMs,
+		});
+	}
 	if (command.kind === "remove") {
 		settings.setMcpDeclarationDocument(command.scope, removeMcpDeclaration(document, command.name));
 		return { removed: command.name };
