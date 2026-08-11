@@ -22,7 +22,7 @@ import {
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
-import { type HostRequestHandlers, invokeHostRequestHandlerForTest, KernelManager } from "../src/core/kernel/index.js";
+import { type HostRequestHandlers, KernelManager } from "../src/core/kernel/index.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import {
@@ -37,7 +37,10 @@ import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
-import { createTestHostHandlers } from "./host-request-context.js";
+import {
+	createTestHostHandlers,
+	invokeHostRequestThroughKernelForTest as invokeHostRequestHandlerForTest,
+} from "./host-request-context.js";
 
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
