@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { createHostRequestHandler, type HostRequestContext, type HostRequestHandler } from "./kernel/index.js";
 
 export const AGENT_OBSERVE_SKILL_NAME = "agent-observe";
 export const AGENT_OBSERVE_IMPORT_NAME = "agent_observe";
@@ -67,26 +68,42 @@ export interface AgentObserveController {
 	): AgentObserveRecentMessagesResult | Promise<AgentObserveRecentMessagesResult>;
 }
 
-export function createAgentObserveHostHandlers(controller: AgentObserveController) {
-	return {
-		"agent_observe.list": async () => controller.listAgents() as unknown as Record<string, unknown>,
-		"agent_observe.get": async (payload: Record<string, unknown> = {}) => {
-			if (typeof payload.target !== "string") {
-				throw new Error("agent_observe.get target must be a string");
-			}
-			return (await controller.getAgent(payload.target)) as unknown as Record<string, unknown>;
-		},
-		"agent_observe.recent": async (payload: Record<string, unknown> = {}) => {
-			if (typeof payload.target !== "string") {
-				throw new Error("agent_observe.recent target must be a string");
-			}
-			return (await controller.recentMessages({
-				target: payload.target,
-				limit: normalizeOptionalInteger(payload.limit, "agent_observe.recent limit"),
-				maxChars: normalizeOptionalInteger(payload.max_chars ?? payload.maxChars, "agent_observe.recent max_chars"),
-			})) as unknown as Record<string, unknown>;
-		},
+export function createAgentObserveHostHandlers(controller: AgentObserveController): Record<string, HostRequestHandler> {
+	const handlers: Record<string, HostRequestHandler> = {
+		"agent_observe.list": createHostRequestHandler(
+			async (payload: Record<string, unknown>, context: HostRequestContext) => {
+				void payload;
+				void context; // Listing observes the controller's current bounded snapshot only.
+				return controller.listAgents() as unknown as Record<string, unknown>;
+			},
+		),
+		"agent_observe.get": createHostRequestHandler(
+			async (payload: Record<string, unknown>, context: HostRequestContext) => {
+				void context; // The controller validates reachability; this adapter needs no extra request state.
+				if (typeof payload.target !== "string") {
+					throw new Error("agent_observe.get target must be a string");
+				}
+				return (await controller.getAgent(payload.target)) as unknown as Record<string, unknown>;
+			},
+		),
+		"agent_observe.recent": createHostRequestHandler(
+			async (payload: Record<string, unknown>, context: HostRequestContext) => {
+				void context; // Bounds are enforced below before delegating to the controller.
+				if (typeof payload.target !== "string") {
+					throw new Error("agent_observe.recent target must be a string");
+				}
+				return (await controller.recentMessages({
+					target: payload.target,
+					limit: normalizeOptionalInteger(payload.limit, "agent_observe.recent limit"),
+					maxChars: normalizeOptionalInteger(
+						payload.max_chars ?? payload.maxChars,
+						"agent_observe.recent max_chars",
+					),
+				})) as unknown as Record<string, unknown>;
+			},
+		),
 	};
+	return handlers;
 }
 
 export function normalizeObserveLimit(limit: number | undefined, defaultLimit = 8): number {

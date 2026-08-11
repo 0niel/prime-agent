@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
+import { createTestHostHandlers } from "./host-request-context.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner, imageBlocksFromAttachments } from "../src/core/tools/ipython.js";
 
@@ -40,9 +41,12 @@ describe("attach-image skill over the kernel host bridge", () => {
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
-			hostHandlers: {
-				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
-			},
+			hostHandlers: createTestHostHandlers({
+				"model.info": async (_payload, _context) => ({
+					id: "anthropic/claude-haiku-4.5",
+					input: ["text", "image"],
+				}),
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -63,9 +67,12 @@ describe("attach-image skill over the kernel host bridge", () => {
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
-			hostHandlers: {
-				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
-			},
+			hostHandlers: createTestHostHandlers({
+				"model.info": async (_payload, _context) => ({
+					id: "anthropic/claude-haiku-4.5",
+					input: ["text", "image"],
+				}),
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -88,9 +95,12 @@ print(await attach_image(${JSON.stringify(imagePath)}))
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
-			hostHandlers: {
-				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
-			},
+			hostHandlers: createTestHostHandlers({
+				"model.info": async (_payload, _context) => ({
+					id: "anthropic/claude-haiku-4.5",
+					input: ["text", "image"],
+				}),
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -113,9 +123,12 @@ print(await attach_image(${JSON.stringify(imagePath)}))
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
-			hostHandlers: {
-				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
-			},
+			hostHandlers: createTestHostHandlers({
+				"model.info": async (_payload, _context) => ({
+					id: "anthropic/claude-haiku-4.5",
+					input: ["text", "image"],
+				}),
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -140,9 +153,12 @@ print(await attach_image(${JSON.stringify(imagePath)}))
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
-			hostHandlers: {
-				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
-			},
+			hostHandlers: createTestHostHandlers({
+				"model.info": async (_payload, _context) => ({
+					id: "anthropic/claude-haiku-4.5",
+					input: ["text", "image"],
+				}),
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -178,9 +194,12 @@ except ValueError as error:
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
-			hostHandlers: {
-				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
-			},
+			hostHandlers: createTestHostHandlers({
+				"model.info": async (_payload, _context) => ({
+					id: "anthropic/claude-haiku-4.5",
+					input: ["text", "image"],
+				}),
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -215,9 +234,9 @@ except ValueError as error:
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
-			hostHandlers: {
-				"model.info": async () => ({ id: "openai/gpt-oss-120b", input: ["text"] }),
-			},
+			hostHandlers: createTestHostHandlers({
+				"model.info": async (_payload, _context) => ({ id: "openai/gpt-oss-120b", input: ["text"] }),
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -242,9 +261,12 @@ except RuntimeError as error:
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAttachImageSkill()],
-			hostHandlers: {
-				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
-			},
+			hostHandlers: createTestHostHandlers({
+				"model.info": async (_payload, _context) => ({
+					id: "anthropic/claude-haiku-4.5",
+					input: ["text", "image"],
+				}),
+			}),
 		});
 
 		const manager = await provisioner.ensure();

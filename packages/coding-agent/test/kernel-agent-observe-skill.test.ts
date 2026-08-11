@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
+import { createTestHostHandlers } from "./host-request-context.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
@@ -35,8 +36,8 @@ describe("agent-observe skill over the kernel host bridge", () => {
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentObserveSkill()],
-			hostHandlers: {
-				"agent_observe.list": async (payload) => {
+			hostHandlers: createTestHostHandlers({
+				"agent_observe.list": async (payload, _context) => {
 					requests.push({ type: "agent_observe.list", payload });
 					return {
 						current: { activeSessionId: "alpha", sessionId: "session-alpha", isCurrent: true },
@@ -46,11 +47,11 @@ describe("agent-observe skill over the kernel host bridge", () => {
 						],
 					};
 				},
-				"agent_observe.get": async (payload) => {
+				"agent_observe.get": async (payload, _context) => {
 					requests.push({ type: "agent_observe.get", payload });
 					return { agent: { activeSessionId: payload.target, sessionId: "session-beta", status: "model" } };
 				},
-				"agent_observe.recent": async (payload) => {
+				"agent_observe.recent": async (payload, _context) => {
 					requests.push({ type: "agent_observe.recent", payload });
 					return {
 						agent: { activeSessionId: payload.target, sessionId: "session-beta" },
@@ -60,7 +61,7 @@ describe("agent-observe skill over the kernel host bridge", () => {
 						truncated: false,
 					};
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -93,11 +94,11 @@ print(json.dumps({"agents": agents, "agent": agent, "recent": recent}, sort_keys
 	it("validates argument types before sending to the host", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentObserveSkill()],
-			hostHandlers: {
-				"agent_observe.get": async () => {
+			hostHandlers: createTestHostHandlers({
+				"agent_observe.get": async (_payload, _context) => {
 					throw new Error("should not reach host");
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();

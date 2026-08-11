@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	AGENT_FAMILY_REACH_ERROR,
 	type AgentSessionMessageController,
+	assertAgentFamilyReach,
 	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
@@ -46,6 +47,25 @@ import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js"
 import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon mode helpers", () => {
+	const installDeterministicAgentFamilyCatalog = (internals: object, states: readonly ActiveSessionState[]) => {
+		const catalogTarget = internals as {
+			agentFamilyCatalogEntries?: () => Promise<
+				readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]
+			>;
+		};
+		catalogTarget.agentFamilyCatalogEntries = vi.fn(async () =>
+			Object.freeze(
+				states.map((state) => ({
+					id: state.runtime.session.sessionId,
+					depth: state.runtime.session.rlmDepth ?? 0,
+					status: "running" as const,
+					...(state.runtime.metadata.parentSessionId
+						? { parentSessionId: state.runtime.metadata.parentSessionId }
+						: {}),
+				})),
+			),
+		);
+	};
 	it("preserves envelope client identity while registering prompt admission", () => {
 		const daemon = new AgentDaemon("/tmp/unused-daemon.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
@@ -241,6 +261,7 @@ describe("daemon mode helpers", () => {
 		};
 		internals.sessions.set(fromState.activeSessionId, fromState);
 		internals.sessions.set(targetState.activeSessionId, targetState);
+		installDeterministicAgentFamilyCatalog(internals, [fromState, targetState]);
 
 		const send = internals.sendAgentSessionMessage({
 			targetSelector: targetState.activeSessionId,
@@ -248,8 +269,9 @@ describe("daemon mode helpers", () => {
 			fromState,
 			origin: "agent",
 		});
-		await Promise.resolve();
-		await Promise.resolve();
+		for (let attempt = 0; attempt < 200 && acceptAgentMessagePrompt.mock.calls.length === 0; attempt++) {
+			await Promise.resolve();
+		}
 
 		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
 		resolvePrompt();
@@ -1833,6 +1855,7 @@ describe("daemon mode helpers", () => {
 		internals.sessions.set(fromState.activeSessionId, fromState);
 		internals.sessions.set(targetA.activeSessionId, targetA);
 		internals.sessions.set(targetB.activeSessionId, targetB);
+		installDeterministicAgentFamilyCatalog(internals, [fromState, targetA, targetB]);
 
 		for (let i = 0; i < 3; i++) {
 			await expect(
@@ -2124,6 +2147,7 @@ describe("daemon mode helpers", () => {
 		};
 		internals.sessions.set(fromState.activeSessionId, fromState);
 		internals.sessions.set(targetState.activeSessionId, targetState);
+		installDeterministicAgentFamilyCatalog(internals, [fromState, targetState]);
 
 		const first = internals.sendAgentSessionMessage({
 			targetSelector: targetState.activeSessionId,
@@ -2201,18 +2225,22 @@ describe("daemon mode helpers", () => {
 			return fromState;
 		});
 
+		installDeterministicAgentFamilyCatalog(internals, [...senders, targetState]);
+		const sends: Promise<unknown>[] = [];
 		const errors: unknown[] = [];
 		for (const [i, fromState] of senders.entries()) {
-			void internals
-				.sendAgentSessionMessage({
-					targetSelector: targetState.activeSessionId,
-					message: `message ${i}`,
-					fromState,
-					origin: "agent",
-				})
-				.catch((error) => {
-					errors.push(error);
-				});
+			sends.push(
+				internals
+					.sendAgentSessionMessage({
+						targetSelector: targetState.activeSessionId,
+						message: `message ${i}`,
+						fromState,
+						origin: "agent",
+					})
+					.catch((error) => {
+						errors.push(error);
+					}),
+			);
 		}
 		for (let attempt = 0; attempt < 200 && queueAgentMessagePrompt.mock.calls.length < 12; attempt++) {
 			await Promise.resolve();
@@ -2220,6 +2248,7 @@ describe("daemon mode helpers", () => {
 
 		// With reservations held past queue time, 12 concurrent senders would
 		// count as 24 against the 20-slot cap and the tail would reject.
+		await Promise.all(sends);
 		expect(errors).toEqual([]);
 		expect(queueAgentMessagePrompt).toHaveBeenCalledTimes(12);
 	});
@@ -2714,6 +2743,163 @@ describe("daemon mode helpers", () => {
 		);
 	});
 
+	it("authorizes depth-two passive siblings only from the persisted daemon topology", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-deep-passive-acl-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const secondGrandchildDir = join(fixture.childSessionDir, "sibling-grandchild");
+			const secondGrandchild = SessionManager.create(tempDir, secondGrandchildDir);
+			secondGrandchild.newSession({ parentSession: fixture.childSessionFile, rlmDepth: 2 });
+			secondGrandchild.flushNow();
+			const secondGrandchildFile = secondGrandchild.getSessionFile();
+			if (!secondGrandchildFile) throw new Error("Missing sibling grandchild session");
+			const childRegistry = join(fixture.childArtifactDir, "rlm-subagents.jsonl");
+			writeFileSync(
+				childRegistry,
+				`${readFileSync(childRegistry, "utf8")}${JSON.stringify({
+					type: "rlm_subagent",
+					childId: "sibling-grandchild",
+					sessionName: "sibling-grandchild",
+					sessionDir: secondGrandchildDir,
+					sessionFile: secondGrandchildFile,
+					parentSessionId: fixture.childSessionId,
+					parentSessionFile: fixture.childSessionFile,
+					rlmDepth: 2,
+					status: "completed",
+					createdAt: 2,
+					updatedAt: "2026-01-01T00:00:02.000Z",
+				})}\n`,
+			);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				agentFamilyCatalogEntries(): Promise<
+					readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]
+				>;
+			};
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const catalog = await internals.agentFamilyCatalogEntries();
+			const first = catalog.find((entry) => entry.id === fixture.grandchildSessionId);
+			const second = catalog.find((entry) => entry.id === secondGrandchild.getSessionId());
+			expect(first).toBeDefined();
+			expect(second).toBeDefined();
+			expect(catalog).toContainEqual(expect.objectContaining({ id: fixture.childSessionId, depth: 1 }));
+			expect(assertAgentFamilyReach(first!, second!, catalog)).toBe("sibling");
+
+			// A depth-two pair claiming the root cannot manufacture the missing depth-one edge.
+			expect(() =>
+				assertAgentFamilyReach(
+					{ ...first!, parentSessionId: fixture.parentSessionId, parentSessionPath: fixture.parentSessionFile },
+					{ ...second!, parentSessionId: fixture.parentSessionId, parentSessionPath: fixture.parentSessionFile },
+					catalog,
+				),
+			).toThrow(AGENT_FAMILY_REACH_ERROR);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("observes residents from the captured family catalog rather than live endpoint fields", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-observe-captured-family.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const source = makeState("source");
+		const target = makeState("target");
+		for (const state of [source, target]) {
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				diagnostics: [],
+				session: {
+					...state.runtime.session,
+					messages: [],
+					hasRunningRlmChildren: vi.fn(() => false),
+					sessionManager: {
+						getHeader: vi.fn(() => ({})),
+						getCwd: vi.fn(() => "/tmp"),
+						getSessionArtifactDir: vi.fn(() => undefined),
+					},
+					getSessionActionSnapshot: vi.fn(() => ({ queuedCount: 0, steering: [], followUps: [] })),
+					state: { streamingMessage: undefined, pendingToolCalls: new Map() },
+					sessionId: `session-${state.activeSessionId}`,
+					sessionFile: `/tmp/${state.activeSessionId}.jsonl`,
+					rlmDepth: 0,
+				},
+			} as never;
+		}
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries(): Promise<
+				readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]
+			>;
+			createAgentObserveController(getCurrentState: () => ActiveSessionState): AgentObserveController;
+		};
+		internals.sessions.set(source.activeSessionId, source);
+		internals.sessions.set(target.activeSessionId, target);
+		Object.assign(internals, {
+			agentFamilyCatalogEntries: vi.fn(async () =>
+				Object.freeze([
+					{ id: "left-parent", depth: 0, status: "inactive", sessionPath: "/tmp/left.jsonl" },
+					{ id: "right-parent", depth: 0, status: "inactive", sessionPath: "/tmp/right.jsonl" },
+					{ id: "session-source", depth: 1, status: "running", parentSessionId: "left-parent" },
+					{ id: "session-target", depth: 1, status: "running", parentSessionId: "right-parent" },
+				]),
+			),
+		});
+
+		// The live root summaries would otherwise be sibling roots. Their conflicting
+		// topology cannot override the captured snapshot's unrelated parent edges.
+		const observed = await internals.createAgentObserveController(() => source).listAgents();
+		expect(observed.agents.map((agent) => agent.activeSessionId)).toEqual(["source"]);
+	});
+
+	it("fails closed for every agent ACL surface when the captured catalog duplicates a stable session ID", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-duplicate-captured-family.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeAgentFamilyState("parent", "parent");
+		const source = makeAgentFamilyState("source", "source", parent.state);
+		const target = makeAgentFamilyState("target", "target", parent.state);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries(): Promise<
+				readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]
+			>;
+			createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
+			createAgentObserveController(getCurrentState: () => ActiveSessionState): AgentObserveController;
+		};
+		for (const fixture of [parent, source, target])
+			internals.sessions.set(fixture.state.activeSessionId, fixture.state);
+		const sourceId = source.state.runtime.session.sessionId;
+		const parentId = parent.state.runtime.session.sessionId;
+		const targetId = target.state.runtime.session.sessionId;
+		const entries = [
+			{ id: parentId, depth: 0, status: "running" as const },
+			{ id: sourceId, depth: 1, status: "running" as const, parentSessionId: parentId },
+			{ id: sourceId, depth: 1, status: "running" as const, parentSessionId: "forged-parent" },
+			{ id: targetId, depth: 1, status: "running" as const, parentSessionId: parentId },
+		];
+
+		// The current observer must be resolved from the immutable catalog before
+		// self inclusion. Either duplicate ordering is ambiguous and must fail closed.
+		for (const catalog of [entries, [...entries.slice(0, 1), entries[2]!, entries[1]!, entries[3]!]]) {
+			internals.agentFamilyCatalogEntries = vi.fn(async () => Object.freeze(catalog));
+			const observe = internals.createAgentObserveController(() => source.state);
+			await expect(observe.listAgents()).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
+			await expect(observe.getAgent(target.state.activeSessionId)).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
+			await expect(observe.recentMessages({ target: target.state.activeSessionId })).rejects.toThrow(
+				AGENT_FAMILY_REACH_ERROR,
+			);
+			await expect(
+				internals
+					.createAgentMessageController(() => source.state)
+					.sendAgentMessage({ target: target.state.activeSessionId, message: "must not deliver" }),
+			).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
+		}
+		expect(target.acceptAgentMessagePrompt).not.toHaveBeenCalled();
+	});
+
 	it("resolves a duplicate session name to the only family-reachable agent", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-family-name-resolution.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
@@ -2858,6 +3044,7 @@ describe("daemon mode helpers", () => {
 		};
 		internals.sessions.set(fromState.activeSessionId, fromState);
 		internals.sessions.set(targetState.activeSessionId, targetState);
+		installDeterministicAgentFamilyCatalog(internals, [fromState, targetState]);
 
 		const first = internals.sendAgentSessionMessage({
 			targetSelector: targetState.activeSessionId,
@@ -2871,15 +3058,17 @@ describe("daemon mode helpers", () => {
 			fromState,
 			origin: "agent",
 		});
-		await Promise.resolve();
-		await Promise.resolve();
+		for (let attempt = 0; attempt < 200 && prompt.mock.calls.length === 0; attempt++) {
+			await Promise.resolve();
+		}
 
 		expect(prompt).toHaveBeenCalledTimes(1);
 
 		promptResolves[0]?.();
 		await expect(first).resolves.toMatchObject({ message: "first" });
-		await Promise.resolve();
-		await Promise.resolve();
+		for (let attempt = 0; attempt < 200 && prompt.mock.calls.length < 2; attempt++) {
+			await Promise.resolve();
+		}
 
 		expect(prompt).toHaveBeenCalledTimes(2);
 		expect(followUp).not.toHaveBeenCalled();
@@ -3213,6 +3402,7 @@ describe("daemon mode helpers", () => {
 		};
 		internals.sessions.set(fromState.activeSessionId, fromState);
 		internals.sessions.set(targetState.activeSessionId, targetState);
+		installDeterministicAgentFamilyCatalog(internals, [fromState, targetState]);
 
 		const first = internals.sendAgentSessionMessage({
 			targetSelector: targetState.activeSessionId,
@@ -3226,15 +3416,17 @@ describe("daemon mode helpers", () => {
 			fromState,
 			origin: "agent",
 		});
-		await Promise.resolve();
-		await Promise.resolve();
+		for (let attempt = 0; attempt < 200 && prompt.mock.calls.length === 0; attempt++) {
+			await Promise.resolve();
+		}
 
 		expect(prompt).toHaveBeenCalledTimes(1);
 		(targetState.runtime.session as { isStreaming: boolean }).isStreaming = true;
 		promptResolves[0]?.();
 		await expect(first).resolves.toMatchObject({ message: "first" });
-		await Promise.resolve();
-		await Promise.resolve();
+		for (let attempt = 0; attempt < 200 && queueAgentMessagePrompt.mock.calls.length === 0; attempt++) {
+			await Promise.resolve();
+		}
 
 		expect(prompt).toHaveBeenCalledTimes(1);
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
@@ -3667,6 +3859,7 @@ describe("daemon mode helpers", () => {
 		};
 		internals.sessions.set(fromState.activeSessionId, fromState);
 		internals.sessions.set(targetState.activeSessionId, targetState);
+		installDeterministicAgentFamilyCatalog(internals, [fromState, targetState]);
 
 		const first = internals.sendAgentSessionMessage({
 			targetSelector: targetState.activeSessionId,
@@ -3680,8 +3873,9 @@ describe("daemon mode helpers", () => {
 			fromState,
 			origin: "agent",
 		});
-		await Promise.resolve();
-		await Promise.resolve();
+		for (let attempt = 0; attempt < 200 && acceptAgentMessagePrompt.mock.calls.length === 0; attempt++) {
+			await Promise.resolve();
+		}
 		(targetState.runtime.session as { unfinishedActionCount: number }).unfinishedActionCount = 20;
 
 		resolveFirstPrompt();
@@ -4024,6 +4218,7 @@ describe("daemon mode helpers", () => {
 			}): Promise<unknown>;
 		};
 		internals.sessions.set(state.activeSessionId, state);
+		installDeterministicAgentFamilyCatalog(internals, [state]);
 
 		await expect(
 			internals.sendAgentSessionMessage({
@@ -5745,13 +5940,15 @@ describe("daemon mode helpers", () => {
 				sessionPath: fixture.parentSessionFile,
 			});
 
-			await internals
-				.createAgentMessageController(() => parentState)
-				.sendAgentMessage({ target: "renamed-worker", message: "report progress" });
-
-			// The nested header depth must win over the legacy depth-1 default so the
-			// woken child does not come up shallower than persisted.
-			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions?.rlmDepth).toBe(2);
+			// A root may not directly reach a depth-two child. The persisted header
+			// is authoritative even when legacy registry metadata omits depth, and denial
+			// must happen before hydration.
+			await expect(
+				internals
+					.createAgentMessageController(() => parentState)
+					.sendAgentMessage({ target: "renamed-worker", message: "report progress" }),
+			).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
+			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -9694,7 +9891,7 @@ function makePersistedRlmDaemonFixture(
 	const childId = "child-1";
 	const childSessionDir = join(parentArtifactDir, "sub-1234abcd");
 	const childManager = SessionManager.create(tempDir, childSessionDir);
-	childManager.newSession({ parentSession: parentSessionFile });
+	childManager.newSession({ parentSession: parentSessionFile, rlmDepth: 1 });
 	childManager.appendSessionInfo("spawn-worker");
 	childManager.appendSessionInfo("renamed-worker");
 	childManager.appendMessage({ role: "user", content: "complete this task", timestamp: 1 });
@@ -9708,7 +9905,7 @@ function makePersistedRlmDaemonFixture(
 	mkdirSync(childArtifactDir, { recursive: true });
 	const grandchildSessionDir = join(childSessionDir, "sub-deadbeef");
 	const grandchildManager = SessionManager.create(tempDir, grandchildSessionDir);
-	grandchildManager.newSession({ parentSession: childSessionFile });
+	grandchildManager.newSession({ parentSession: childSessionFile, rlmDepth: 2 });
 	grandchildManager.appendSessionInfo("nested-worker");
 	grandchildManager.appendMessage({ role: "user", content: "complete the nested task", timestamp: 2 });
 	grandchildManager.flushNow();
@@ -9824,9 +10021,12 @@ function makePersistedRlmDaemonFixture(
 		parentArtifactDir,
 		parentSessionId: parentManager.getSessionId(),
 		childId,
+		childSessionId: childManager.getSessionId(),
 		childSessionFile,
 		childSessionDir,
+		childArtifactDir,
 		grandchildId,
+		grandchildSessionId: grandchildManager.getSessionId(),
 		grandchildSessionFile,
 	};
 }

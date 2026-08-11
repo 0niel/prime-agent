@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { HostRequestHandler } from "./kernel/index.js";
+import { createHostRequestHandler, type HostRequestContext, type HostRequestHandler } from "./kernel/index.js";
 import type { CustomMessage } from "./messages.js";
 import { canonicalSessionPath } from "./session-lease.js";
 
@@ -257,7 +257,20 @@ function sameAgentSessionNameParent(
 	if (left.depth === 0 && right.depth === 0) {
 		return true;
 	}
-	return sameAgentFamilyParent(left, right, catalog);
+	if (sameAgentFamilyParent(left, right, catalog)) return true;
+
+	// A passive child can outlive the active parent row that would normally
+	// resolve its family edge. Name reservation must still protect that parent's
+	// sibling namespace, but this weaker direct-claim fallback is deliberately
+	// not used for family reach: reach continues to require an unambiguous,
+	// catalog-resolved parent.
+	if (left.depth !== right.depth || left.depth === 0) return false;
+	return (
+		(left.parentSessionId !== undefined && left.parentSessionId === right.parentSessionId) ||
+		(left.parentSessionPath !== undefined &&
+			right.parentSessionPath !== undefined &&
+			canonicalSessionPath(left.parentSessionPath) === canonicalSessionPath(right.parentSessionPath))
+	);
 }
 
 function sameAgentFamilyParent(
@@ -265,44 +278,38 @@ function sameAgentFamilyParent(
 	right: AgentSessionNameScope,
 	catalog: readonly AgentFamilyCatalogEntry[],
 ): boolean {
-	if (left.parentSessionPath !== undefined && left.parentSessionPath === right.parentSessionPath) {
-		return true;
-	}
-	if (left.parentSessionId !== undefined && left.parentSessionId === right.parentSessionId) {
-		return true;
-	}
-	const hasCatalogParentPair = (parentSessionId: string | undefined, parentSessionPath: string | undefined) =>
-		parentSessionId !== undefined &&
-		parentSessionPath !== undefined &&
-		catalog.some(
-			(entry) =>
-				(entry.id === parentSessionId && entry.sessionPath === parentSessionPath) ||
-				(entry.parentSessionId === parentSessionId && entry.parentSessionPath === parentSessionPath),
+	if (left.depth === 0 && right.depth === 0) {
+		return (
+			left.parentSessionId === undefined &&
+			left.parentSessionPath === undefined &&
+			right.parentSessionId === undefined &&
+			right.parentSessionPath === undefined
 		);
-	if (
-		hasCatalogParentPair(left.parentSessionId, right.parentSessionPath) ||
-		hasCatalogParentPair(right.parentSessionId, left.parentSessionPath)
-	) {
-		return true;
 	}
-	if (
-		left.depth === 0 &&
-		right.depth === 0 &&
-		left.parentSessionPath === undefined &&
-		right.parentSessionPath === undefined &&
-		left.parentSessionId === undefined &&
-		right.parentSessionId === undefined
-	) {
-		return true;
-	}
-	// Unresolved mixed identifiers stay unrelated to avoid false name conflicts across families.
-	return false;
+	if (left.depth !== right.depth || left.depth === 0) return false;
+	const parentFor = (child: AgentSessionNameScope) => {
+		const parents = catalog.filter((entry) => isAgentFamilyParent(entry, child));
+		return parents.length === 1 ? parents[0] : undefined;
+	};
+	const leftParent = parentFor(left);
+	const rightParent = parentFor(right);
+	return leftParent !== undefined && leftParent.id === rightParent?.id;
 }
 
-function isAgentFamilyParent(parent: AgentFamilyCatalogEntry, child: AgentFamilyCatalogEntry): boolean {
+/**
+ * Validates one persisted parent edge. A child may supply either durable
+ * identifier, but when it supplies both they must identify this same direct
+ * parent. This keeps contradictory records from becoming relatives through
+ * whichever identifier happens to match.
+ */
+function isAgentFamilyParent(parent: AgentFamilyCatalogEntry, child: AgentSessionNameScope): boolean {
+	if (child.depth <= 0 || parent.depth !== child.depth - 1) return false;
+	const claimsId = child.parentSessionId !== undefined;
+	const claimsPath = child.parentSessionPath !== undefined;
 	return (
-		(child.parentSessionPath !== undefined && child.parentSessionPath === parent.sessionPath) ||
-		(child.parentSessionId !== undefined && child.parentSessionId === parent.id)
+		(claimsId || claimsPath) &&
+		(!claimsId || child.parentSessionId === parent.id) &&
+		(!claimsPath || child.parentSessionPath === parent.sessionPath)
 	);
 }
 
@@ -310,19 +317,21 @@ function isAgentFamilyParent(parent: AgentFamilyCatalogEntry, child: AgentFamily
 export function agentFamilyRelationship(
 	current: AgentFamilyCatalogEntry,
 	target: AgentFamilyCatalogEntry,
+	catalog: readonly AgentFamilyCatalogEntry[] = [current, target],
 ): AgentFamilyRelationship | undefined {
 	if (current.id === target.id) return undefined;
 	if (isAgentFamilyParent(target, current)) return "parent";
 	if (isAgentFamilyParent(current, target)) return "child";
-	if (current.depth === target.depth && sameAgentFamilyParent(current, target, [current, target])) return "sibling";
+	if (sameAgentFamilyParent(current, target, catalog)) return "sibling";
 	return undefined;
 }
 
 export function assertAgentFamilyReach(
 	current: AgentFamilyCatalogEntry,
 	target: AgentFamilyCatalogEntry,
+	catalog?: readonly AgentFamilyCatalogEntry[],
 ): AgentFamilyRelationship {
-	const relationship = agentFamilyRelationship(current, target);
+	const relationship = agentFamilyRelationship(current, target, catalog);
 	if (!relationship) throw new Error(AGENT_FAMILY_REACH_ERROR);
 	return relationship;
 }
@@ -526,83 +535,90 @@ export function createAgentMessageHostHandlers(
 	controller: Pick<AgentSessionMessageController, "roster" | "sendAgentMessage" | "awaitPendingChildPublication">,
 ): Record<string, HostRequestHandler> {
 	return {
-		"agent_message.list_agents": async () => {
-			if (!controller.roster) throw new Error("agent family roster is not available in this session");
-			return (await controller.roster()) as unknown as Record<string, unknown>;
-		},
-		"agent_message.send": async (payload) => {
-			if (typeof payload.message !== "string") {
-				throw new Error("agent_message.send message must be a string");
-			}
-			let target: string;
-			if (typeof payload.target === "string") {
-				if (payload.target !== "all") {
-					throw new Error(
-						"positional agent_message.send targets are not supported; use receiver_role and receiver_name",
-					);
-				}
-				if (payload.receiver_role !== undefined || payload.receiver_name !== undefined) {
-					throw new Error("agent_message.send broadcast cannot be combined with receiver_role/receiver_name");
-				}
+		"agent_message.list_agents": createHostRequestHandler(
+			async (_payload: Record<string, unknown>, _context: HostRequestContext) => {
 				if (!controller.roster) throw new Error("agent family roster is not available in this session");
-				const roster = await controller.roster();
-				const results = await Promise.allSettled(
-					roster.entries.map((entry) =>
-						controller.sendAgentMessage({
-							target: entry.id,
-							message: payload.message as string,
-							receiverRole: entry.relationship,
-						}),
-					),
-				);
-				const receipts = results.map((result, index) =>
-					result.status === "fulfilled"
-						? result.value
-						: {
-								target: roster.entries[index]!.id,
-								error: result.reason instanceof Error ? result.reason.message : String(result.reason),
-							},
-				);
-				return { receipts } as unknown as Record<string, unknown>;
-			} else {
-				const role = payload.receiver_role;
-				if (role !== "parent" && role !== "sibling" && role !== "child") {
-					throw new Error('agent_message.send receiver_role must be "parent", "sibling", or "child"');
+				return (await controller.roster()) as unknown as Record<string, unknown>;
+			},
+		),
+		"agent_message.send": createHostRequestHandler(
+			async (payload: Record<string, unknown>, _context: HostRequestContext) => {
+				if (typeof payload.message !== "string") {
+					throw new Error("agent_message.send message must be a string");
 				}
-				const receiverName = payload.receiver_name;
-				if (role === "parent" && receiverName !== undefined && receiverName !== null) {
-					throw new Error("agent_message.send receiver_name must be omitted for parent messages");
-				}
-				if (role !== "parent" && (typeof receiverName !== "string" || !receiverName.trim())) {
-					throw new Error("agent_message.send receiver_name is required for sibling and child messages");
-				}
-				if (!controller.roster) throw new Error("agent family roster is not available in this session");
-				const selector = typeof receiverName === "string" ? receiverName.trim() : undefined;
-				const publishedId =
-					role === "child" && selector && controller.awaitPendingChildPublication
-						? await controller.awaitPendingChildPublication(selector)
-						: undefined;
-				const roster = await controller.roster();
-				const matches = roster.entries.filter(
-					(entry) =>
-						entry.relationship === role &&
-						(role === "parent" || entry.name === selector || entry.id === selector || entry.id === publishedId),
-				);
-				if (matches.length !== 1) {
-					throw new Error(
-						matches.length === 0
-							? `No ${role} matches ${role === "parent" ? "the current agent" : JSON.stringify(receiverName)}`
-							: `${role} selector ${JSON.stringify(receiverName)} is ambiguous`,
+				let target: string;
+				if (typeof payload.target === "string") {
+					if (payload.target !== "all") {
+						throw new Error(
+							"positional agent_message.send targets are not supported; use receiver_role and receiver_name",
+						);
+					}
+					if (payload.receiver_role !== undefined || payload.receiver_name !== undefined) {
+						throw new Error("agent_message.send broadcast cannot be combined with receiver_role/receiver_name");
+					}
+					if (!controller.roster) throw new Error("agent family roster is not available in this session");
+					const roster = await controller.roster();
+					const results = await Promise.allSettled(
+						roster.entries.map((entry) =>
+							controller.sendAgentMessage({
+								target: entry.id,
+								message: payload.message as string,
+								receiverRole: entry.relationship,
+							}),
+						),
 					);
+					const receipts = results.map((result, index) =>
+						result.status === "fulfilled"
+							? result.value
+							: {
+									target: roster.entries[index]!.id,
+									error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+								},
+					);
+					return { receipts } as unknown as Record<string, unknown>;
+				} else {
+					const role = payload.receiver_role;
+					if (role !== "parent" && role !== "sibling" && role !== "child") {
+						throw new Error('agent_message.send receiver_role must be "parent", "sibling", or "child"');
+					}
+					const receiverName = payload.receiver_name;
+					if (role === "parent" && receiverName !== undefined && receiverName !== null) {
+						throw new Error("agent_message.send receiver_name must be omitted for parent messages");
+					}
+					if (role !== "parent" && (typeof receiverName !== "string" || !receiverName.trim())) {
+						throw new Error("agent_message.send receiver_name is required for sibling and child messages");
+					}
+					if (!controller.roster) throw new Error("agent family roster is not available in this session");
+					const selector = typeof receiverName === "string" ? receiverName.trim() : undefined;
+					const publishedId =
+						role === "child" && selector && controller.awaitPendingChildPublication
+							? await controller.awaitPendingChildPublication(selector)
+							: undefined;
+					const roster = await controller.roster();
+					const matches = roster.entries.filter(
+						(entry) =>
+							entry.relationship === role &&
+							(role === "parent" ||
+								entry.name === selector ||
+								entry.id === selector ||
+								entry.id === publishedId),
+					);
+					if (matches.length !== 1) {
+						throw new Error(
+							matches.length === 0
+								? `No ${role} matches ${role === "parent" ? "the current agent" : JSON.stringify(receiverName)}`
+								: `${role} selector ${JSON.stringify(receiverName)} is ambiguous`,
+						);
+					}
+					target = matches[0]!.id;
 				}
-				target = matches[0]!.id;
-			}
-			return (await controller.sendAgentMessage({
-				target,
-				message: payload.message,
-				receiverRole: payload.receiver_role as AgentFamilyRelationship,
-			})) as unknown as Record<string, unknown>;
-		},
+				return (await controller.sendAgentMessage({
+					target,
+					message: payload.message,
+					receiverRole: payload.receiver_role as AgentFamilyRelationship,
+				})) as unknown as Record<string, unknown>;
+			},
+		),
 	};
 }
 
