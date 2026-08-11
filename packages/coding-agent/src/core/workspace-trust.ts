@@ -18,13 +18,11 @@
 import type { Dirent } from "node:fs";
 import {
 	existsSync,
-	linkSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
-	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
@@ -202,26 +200,13 @@ export class WorkspaceTrustStore {
 		if (existsSync(this.filePath)) {
 			return;
 		}
-		const tmpPath = `${this.filePath}.${process.pid}.tmp`;
+		// O_EXCL create: atomic create-or-fail on every filesystem, so a
+		// concurrent creator never clobbers already-committed trust data.
 		const empty: WorkspaceTrustFile = { version: 1, trusted: [] };
-		writeFileSync(tmpPath, `${JSON.stringify(empty, null, 2)}\n`, "utf-8");
 		try {
-			linkSync(tmpPath, this.filePath);
+			writeFileSync(this.filePath, `${JSON.stringify(empty, null, 2)}\n`, { flag: "wx" });
 		} catch {
-			// Lost the create race, or hard links are unsupported here.
-		}
-		if (!existsSync(this.filePath)) {
-			// Hard links unsupported: move the staging file instead.
-			try {
-				renameSync(tmpPath, this.filePath);
-			} catch {
-				// Another writer won in the meantime.
-			}
-		}
-		try {
-			rmSync(tmpPath, { force: true });
-		} catch {
-			// Best effort.
+			// Another process created it first; its content stands.
 		}
 		if (!existsSync(this.filePath)) {
 			throw new Error(`Failed to create workspace trust store at ${this.filePath}`);
