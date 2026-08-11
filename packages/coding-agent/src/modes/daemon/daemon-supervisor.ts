@@ -2402,7 +2402,9 @@ export class DaemonSupervisor {
 		} catch (error) {
 			// The launched child never passed its startup gate; do not retain a
 			// transient recovery environment for a later automatic retry.
-			existing?.recoveryLaunchEnv = undefined;
+			if (existing) {
+				existing.recoveryLaunchEnv = undefined;
+			}
 			if (startupGate instanceof Writable) {
 				startupGate.destroy();
 			}
