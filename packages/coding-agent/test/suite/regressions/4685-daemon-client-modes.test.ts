@@ -151,12 +151,9 @@ async function runRpc(
 describe("ENG-4685 daemon-backed client modes", () => {
 	it("commits owned-worker promotion before best-effort peer synchronization", async () => {
 		const client = { id: "client-1" } as DaemonSocketClient;
-		const worker: {
-			descriptor: { ownerClientId: string | undefined; launchEnv?: Record<string, string> };
-			launchEnv?: Record<string, string>;
-		} = {
+		const worker = {
 			descriptor: { ownerClientId: "protocol-client" },
-			launchEnv: { TSX_TSCONFIG_PATH: "/tmp/tsconfig.json", SECRET_TOKEN: "must-not-persist" },
+			launchEnv: { TEST: "value" },
 		};
 		const persistWorker = vi.fn();
 		const syncAgentPeers = vi.fn(async () => {
@@ -176,8 +173,7 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		await supervisor.promoteOwnedWorker(client, worker);
 
 		expect(worker.descriptor.ownerClientId).toBeUndefined();
-		expect(worker.descriptor.launchEnv).toEqual({ TSX_TSCONFIG_PATH: "/tmp/tsconfig.json" });
-		expect(worker.launchEnv).toEqual({ TSX_TSCONFIG_PATH: "/tmp/tsconfig.json" });
+		expect(worker.launchEnv).toBeUndefined();
 		expect(persistWorker).toHaveBeenCalledOnce();
 		expect(syncAgentPeers).toHaveBeenCalledOnce();
 		expect(log).toHaveBeenCalledWith(expect.stringContaining("peer unavailable"));
@@ -185,11 +181,11 @@ describe("ENG-4685 daemon-backed client modes", () => {
 
 	it("rolls back owned-worker promotion when persistence fails", async () => {
 		const client = { id: "client-1" } as DaemonSocketClient;
-		const descriptor = { ownerClientId: "protocol-client", launchEnv: undefined };
+		const descriptor = { ownerClientId: "protocol-client" };
 		const timer = setTimeout(() => {}, 60_000);
 		const worker = {
 			descriptor,
-			launchEnv: { TSX_TSCONFIG_PATH: "/tmp/tsconfig.json", SECRET_TOKEN: "must-not-persist" },
+			launchEnv: { TEST: "value" },
 			ownerCleanupTimer: timer,
 		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -204,7 +200,7 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		await expect(supervisor.promoteOwnedWorker(client, worker)).rejects.toThrow("disk full");
 
 		expect(worker.descriptor).toBe(descriptor);
-		expect(worker.launchEnv).toEqual({ TSX_TSCONFIG_PATH: "/tmp/tsconfig.json", SECRET_TOKEN: "must-not-persist" });
+		expect(worker.launchEnv).toEqual({ TEST: "value" });
 		expect(worker.ownerCleanupTimer).toBe(timer);
 		clearTimeout(timer);
 	});

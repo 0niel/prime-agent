@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
-import { createTestHostHandlers } from "./host-request-context.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
@@ -36,8 +35,8 @@ describe("goal skill over the kernel host bridge", { tags: ["kernel-heavy"] }, (
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledGoalSkill()],
-			hostHandlers: createTestHostHandlers({
-				"goal.create": async (payload, _context) => {
+			hostHandlers: {
+				"goal.create": async (payload) => {
 					requests.push({ type: "goal.create", payload });
 					return {
 						goal: { objective: payload.objective, status: "active", tokens_used: 0 },
@@ -45,7 +44,7 @@ describe("goal skill over the kernel host bridge", { tags: ["kernel-heavy"] }, (
 						completion_budget_report: null,
 					};
 				},
-				"goal.complete": async (payload, _context) => {
+				"goal.complete": async (payload) => {
 					requests.push({ type: "goal.complete", payload });
 					return {
 						goal: { objective: "ship it", status: "complete", tokens_used: 7 },
@@ -54,7 +53,7 @@ describe("goal skill over the kernel host bridge", { tags: ["kernel-heavy"] }, (
 							"Goal achieved. Report final budget usage to the user: tokens used: 7 of 10.",
 					};
 				},
-			}),
+			},
 		});
 
 		const manager = await provisioner.ensure();
@@ -86,11 +85,11 @@ print(_completed["goal"]["status"], _completed["completion_budget_report"])
 	it("surfaces host errors and missing handlers as Python exceptions", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledGoalSkill()],
-			hostHandlers: createTestHostHandlers({
-				"goal.complete": async (_payload, _context) => {
+			hostHandlers: {
+				"goal.complete": async () => {
 					throw new Error("cannot complete goal because this thread has no goal");
 				},
-			}),
+			},
 		});
 
 		const manager = await provisioner.ensure();
@@ -129,9 +128,9 @@ except RuntimeError as error:
 	it("rejects replies with an unexpected status instead of hanging", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledGoalSkill()],
-			hostHandlers: createTestHostHandlers({
-				"goal.get": async (_payload, _context) => ({ status: "partial" }),
-			}),
+			hostHandlers: {
+				"goal.get": async () => ({ status: "partial" }),
+			},
 		});
 
 		const manager = await provisioner.ensure();

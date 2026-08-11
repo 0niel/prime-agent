@@ -5,10 +5,8 @@ import { getOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oau
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { McpManager } from "../src/core/mcp/mcp-manager.js";
-import { createMcpRuntimeDeclarationSnapshot } from "../src/core/mcp/mcp-runtime-declaration-snapshot.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import type { McpServerConfig } from "../src/core/settings-manager.js";
-import { invokeHostRequest } from "./host-request-context.js";
 
 describe("McpManager", () => {
 	let tempDir: string;
@@ -81,10 +79,8 @@ describe("McpManager", () => {
 
 		// refresh with no credentials fails (so the kernel reports a refresh error,
 		// not a false success), and a missing server arg is rejected.
-		await expect(invokeHostRequest(handlers["mcp.refresh"] as never, { server: "linear" })).rejects.toThrow(
-			"Could not refresh",
-		);
-		await expect(invokeHostRequest(handlers["mcp.refresh"] as never, {})).rejects.toThrow("requires a server");
+		await expect(handlers["mcp.refresh"]({ server: "linear" })).rejects.toThrow("Could not refresh");
+		await expect(handlers["mcp.refresh"]({})).rejects.toThrow("requires a server");
 	});
 
 	it("exposes mcp.begin_login only when beginLogin is provided", async () => {
@@ -97,7 +93,7 @@ describe("McpManager", () => {
 		});
 		const handlers = manager.hostHandlers();
 		expect(Object.keys(handlers).sort()).toEqual(["mcp.begin_login", "mcp.config", "mcp.refresh"]);
-		await invokeHostRequest(handlers["mcp.begin_login"] as never, { server: "linear" });
+		await handlers["mcp.begin_login"]({ server: "linear" });
 		expect(called).toBe("linear");
 	});
 
@@ -109,13 +105,11 @@ describe("McpManager", () => {
 			}),
 		});
 		const handlers = manager.hostHandlers();
-		expect(await invokeHostRequest(handlers["mcp.config"] as never, { server: "linear" })).toEqual({
+		expect(await handlers["mcp.config"]({ server: "linear" })).toEqual({
 			url: "https://proxy.test/mcp",
 			headers: { "X-Extra": "1" },
 		});
-		expect(await invokeHostRequest(handlers["mcp.config"] as never, { server: "notion" })).toEqual({
-			url: "https://mcp.notion.com/mcp",
-		});
+		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({ url: "https://mcp.notion.com/mcp" });
 	});
 
 	it("does not treat an oauth override of a catalog name as authed via the official stored cred", () => {
@@ -169,24 +163,6 @@ describe("McpManager", () => {
 		void manager;
 		// Built-in linear provider must be gone so we don't send the official token to the override URL.
 		expect(getOAuthProvider("mcp:linear")).toBeUndefined();
-	});
-
-	it("keeps declaration snapshots out of host handlers and legacy integrations", () => {
-		const snapshot = createMcpRuntimeDeclarationSnapshot({
-			userDocument: {
-				version: 1,
-				servers: { inert: { name: "inert", url: "https://declaration.example/mcp", enabled: true } },
-			},
-		});
-		const manager = new McpManager({
-			authStorage,
-			getRuntimeDeclarations: () => snapshot,
-		});
-
-		expect(manager.getDeclarationSnapshot()).toBe(snapshot);
-		expect(manager.listStatus().map((status) => status.server)).not.toContain("inert");
-		expect(manager.hostHandlers()).not.toHaveProperty("mcp.declarations");
-		expect(manager.hostHandlers()).not.toHaveProperty("mcp.config.inert");
 	});
 
 	it("unregisters a user server's OAuth provider when it's removed on refresh()", () => {

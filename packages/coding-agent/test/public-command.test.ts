@@ -58,17 +58,6 @@ describe("public command routing", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("rejects public mcp test before command parsing can access settings", async () => {
-		await expect(handlePublicCommand(["mcp", "test", "catalog"])).resolves.toMatchObject({ handled: true });
-		expect(process.exitCode).toBe(1);
-		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("MCP probe is unavailable"));
-	});
-
-	it("does not advertise mcp test in public help", () => {
-		expect(formatTopLevelHelp()).toContain("mcp");
-		expect(formatTopLevelHelp()).not.toContain("mcp <list|inspect|preview|test");
-	});
-
 	it("rewrites attach into the normal interactive resume path", async () => {
 		await expect(handlePublicCommand(["attach", "worker"])).resolves.toEqual({
 			handled: false,

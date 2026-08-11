@@ -2,7 +2,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSession } from "./agent-session.js";
 import type { ToolDefinition } from "./extensions/index.js";
-import { createHostRequestHandler, type HostRequestContext, type HostRequestHandler } from "./kernel/index.js";
+import type { HostRequestHandler } from "./kernel/index.js";
 
 export interface RlmRunRequest {
 	prompt: string;
@@ -150,7 +150,7 @@ export function findRlmModelMatches(query: string, models: Model<Api>[], limit: 
 
 /** Adapt an RlmRunHandler into the typed "rlm.run" handler for the kernel host bridge. */
 export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHandler {
-	return createHostRequestHandler(async (payload: Record<string, unknown>, _context: HostRequestContext) => {
+	return async (payload) => {
 		if (typeof payload.prompt !== "string") {
 			throw new Error("rlm.run prompt must be a string");
 		}
@@ -162,12 +162,12 @@ export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHand
 			cellSourceCode,
 		});
 		return result as unknown as Record<string, unknown>;
-	});
+	};
 }
 
 /** Search a bounded authenticated model catalog without adding it to the system prompt. */
 export function createRlmFindModelsHostHandler(handler: RlmFindModelsHandler): HostRequestHandler {
-	return createHostRequestHandler(async (payload: Record<string, unknown>, _context: HostRequestContext) => {
+	return async (payload) => {
 		if (typeof payload.query !== "string") {
 			throw new Error("rlm.find_models query must be a string");
 		}
@@ -176,26 +176,26 @@ export function createRlmFindModelsHostHandler(handler: RlmFindModelsHandler): H
 			throw new Error(`rlm.find_models limit must be an integer from 1 to ${MAX_RLM_MODEL_SEARCH_LIMIT}`);
 		}
 		return { models: (await handler(payload.query, limit as number)).models };
-	});
+	};
 }
 
 /** Expose the current parent session's RLM child registry to its kernel. */
 export function createRlmListSubagentsHostHandler(handler: RlmListSubagentsHandler): HostRequestHandler {
-	return createHostRequestHandler(async (_payload: Record<string, unknown>, _context: HostRequestContext) => {
+	return async () => {
 		const { subagents } = await handler();
 		return { subagents };
-	});
+	};
 }
 
 /** Delete one direct child selected from the current parent session's registry. */
 export function createRlmDeleteSubagentHostHandler(handler: RlmDeleteSubagentHandler): HostRequestHandler {
-	return createHostRequestHandler(async (payload: Record<string, unknown>, _context: HostRequestContext) => {
+	return async (payload) => {
 		if (typeof payload.target !== "string" || !payload.target.trim()) {
 			throw new Error("rlm.delete_subagent target must be a non-empty string");
 		}
 		const { subagent, outcome } = await handler(payload.target.trim());
 		return outcome === undefined ? { subagent } : { subagent, outcome };
-	});
+	};
 }
 
 export interface RlmSubagentRuntime {
