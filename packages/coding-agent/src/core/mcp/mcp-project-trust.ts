@@ -3,33 +3,61 @@ import type {
 	McpProjectTrustAuthorization,
 	McpProjectTrustBinding,
 	McpProjectTrustBindingValidation,
-} from "../index.js";
+} from "./project-trust-authority.js";
+import { isMcpProjectTrustAuthority } from "./project-trust-authority.js";
 import { emptyMcpDeclarationDocument, type McpDeclarationDocument } from "./mcp-declarations.js";
 
 /**
- * The composition boundary makes one authorization decision for a raw project
- * path. All later privileged uses retain only the opaque Core binding.
+ * A branded, empty capability. Its authority/binding pair never appears on the
+ * object: membership is checked before that pair is ever dereferenced.
  */
-export interface ProjectMcpDeclarationAdmission {
+export interface ProjectMcpDeclarationAdmission {}
+
+interface AdmissionPair {
 	readonly authority: McpProjectTrustAuthority;
 	readonly binding: McpProjectTrustBinding;
 }
+
+const admissions = new WeakSet<object>();
+const admissionPairs = new WeakMap<object, AdmissionPair>();
+const DENIED: McpProjectTrustBindingValidation = Object.freeze({ kind: "denied" });
+const GRANTED: McpProjectTrustBindingValidation = Object.freeze({ kind: "granted" });
 
 export function admitProjectMcpDeclarations(
 	rawProjectDirectory: string,
 	authority: McpProjectTrustAuthority | undefined,
 ): ProjectMcpDeclarationAdmission | undefined {
-	if (!authority) return undefined;
-	const authorization: McpProjectTrustAuthorization = authority.authorizeProjectDirectory(rawProjectDirectory);
+	if (!isMcpProjectTrustAuthority(authority)) return undefined;
+	let authorization: McpProjectTrustAuthorization;
+	try {
+		authorization = authority.authorizeProjectDirectory(rawProjectDirectory);
+	} catch {
+		return undefined;
+	}
 	if (authorization.kind !== "granted") return undefined;
-	return Object.freeze({ authority, binding: authorization.binding });
+
+	const admission = Object.freeze(Object.create(null));
+	admissions.add(admission);
+	admissionPairs.set(admission, Object.freeze({ authority, binding: authorization.binding }));
+	return admission as ProjectMcpDeclarationAdmission;
 }
 
-/** Validate the retained Core binding without consulting a raw path or policy. */
+/**
+ * This membership test intentionally precedes the WeakMap read. A forged
+ * envelope cannot cause a supplied authority, binding, or accessor to be
+ * consulted.
+ */
 export function validateProjectMcpDeclarationAdmission(
 	admission: ProjectMcpDeclarationAdmission | undefined,
 ): McpProjectTrustBindingValidation {
-	return admission?.authority.validateBinding(admission.binding) ?? { kind: "denied" };
+	if (typeof admission !== "object" || admission === null || !admissions.has(admission)) return DENIED;
+	const pair = admissionPairs.get(admission);
+	if (!pair) return DENIED;
+	try {
+		return pair.authority.validateBinding(pair.binding).kind === "granted" ? GRANTED : DENIED;
+	} catch {
+		return DENIED;
+	}
 }
 
 export function requireProjectMcpDeclarationAdmission(
@@ -47,7 +75,7 @@ export interface ProjectMcpDeclarations {
 }
 
 /**
- * A denied, missing, stale, foreign, or forged binding makes declarations
+ * A denied, missing, stale, foreign, or forged capability makes declarations
  * inert. The caller must validate before any project settings read or write.
  */
 export function resolveProjectMcpDeclarations(

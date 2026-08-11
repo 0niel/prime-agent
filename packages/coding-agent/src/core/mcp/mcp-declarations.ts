@@ -24,8 +24,45 @@ function fail(message: string): never {
 	throw new Error(message);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+/**
+ * Configuration crosses a hostile-data boundary. Only ordinary (or null
+ * prototype) records with enumerable own data properties are accepted. This
+ * intentionally rejects accessors, inherited fields, symbols, and exotic
+ * prototype chains before any configured value is read.
+ */
+function ownDataRecord(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return false;
+		if (Object.getOwnPropertySymbols(value).length !== 0) return false;
+		for (const key of Object.getOwnPropertyNames(value)) {
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function ownDataKeys(record: Record<string, unknown>, message: string): string[] {
+	if (!ownDataRecord(record)) fail(message);
+	try {
+		return Object.getOwnPropertyNames(record);
+	} catch {
+		return fail(message);
+	}
+}
+
+function ownDataValue(record: Record<string, unknown>, key: string, message: string): unknown {
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(record, key);
+		if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) fail(message);
+		return descriptor.value;
+	} catch {
+		return fail(message);
+	}
 }
 
 export function normalizeMcpDeclarationName(value: unknown): string {
@@ -55,21 +92,21 @@ export function normalizeMcpDeclarationUrl(value: unknown): string {
 	return url.toString();
 }
 
-function requireExactKeys(record: Record<string, unknown>, keys: readonly string[]): void {
-	for (const key of Object.keys(record)) {
-		if (!keys.includes(key)) fail("MCP declarations only permit name, url, and enabled fields.");
-	}
+function requireExactKeys(record: Record<string, unknown>, keys: readonly string[], message: string): void {
+	const actual = ownDataKeys(record, message);
+	if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) fail(message);
 }
 
 export function parseMcpDeclaration(value: unknown, expectedName?: string): McpDeclaration {
-	if (!isRecord(value)) fail("MCP declaration must be an object.");
-	requireExactKeys(value, ["name", "url", "enabled"]);
-	const name = normalizeMcpDeclarationName(value.name);
+	if (!ownDataRecord(value)) fail("MCP declaration must be a plain object with own data fields.");
+	requireExactKeys(value, ["name", "url", "enabled"], "MCP declarations only permit name, url, and enabled fields.");
+	const name = normalizeMcpDeclarationName(ownDataValue(value, "name", "MCP declaration name must be an own data field."));
 	if (expectedName !== undefined && name !== expectedName) {
 		fail("MCP declaration name must match its settings key.");
 	}
-	if (typeof value.enabled !== "boolean") fail("MCP declaration enabled must be a boolean.");
-	return { name, url: normalizeMcpDeclarationUrl(value.url), enabled: value.enabled };
+	const enabled = ownDataValue(value, "enabled", "MCP declaration enabled must be an own data field.");
+	if (typeof enabled !== "boolean") fail("MCP declaration enabled must be a boolean.");
+	return { name, url: normalizeMcpDeclarationUrl(ownDataValue(value, "url", "MCP declaration URL must be an own data field.")), enabled };
 }
 
 export function emptyMcpDeclarationDocument(): McpDeclarationDocument {
@@ -78,19 +115,22 @@ export function emptyMcpDeclarationDocument(): McpDeclarationDocument {
 
 export function parseMcpDeclarationDocument(value: unknown): McpDeclarationDocument {
 	if (value === undefined) return emptyMcpDeclarationDocument();
-	if (!isRecord(value)) fail("MCP declaration settings must be an object.");
-	requireExactKeys(value, ["version", "servers"]);
-	if (value.version !== MCP_DECLARATION_VERSION || !isRecord(value.servers)) {
+	if (!ownDataRecord(value)) fail("MCP declaration settings must be a plain object with own data fields.");
+	requireExactKeys(value, ["version", "servers"], "MCP declarations only permit version and servers fields.");
+	if (ownDataValue(value, "version", "MCP declaration version must be an own data field.") !== MCP_DECLARATION_VERSION) {
 		fail("MCP declaration settings use an unsupported format.");
 	}
+	const rawServers = ownDataValue(value, "servers", "MCP declaration servers must be an own data field.");
+	if (!ownDataRecord(rawServers)) fail("MCP declaration settings use an unsupported format.");
+
 	const servers: Record<string, McpDeclaration> = {};
 	const urls = new Set<string>();
-	for (const [key, declaration] of Object.entries(value.servers)) {
+	for (const key of ownDataKeys(rawServers, "MCP declaration servers must be plain own data.")) {
 		const name = normalizeMcpDeclarationName(key);
-		const parsed = parseMcpDeclaration(declaration, name);
+		const parsed = parseMcpDeclaration(ownDataValue(rawServers, key, "MCP declaration server must be an own data field."), name);
 		if (urls.has(parsed.url)) fail("MCP declarations must not repeat an endpoint URL.");
 		urls.add(parsed.url);
-		servers[name] = parsed;
+		Object.defineProperty(servers, name, { value: parsed, enumerable: true, configurable: true, writable: true });
 	}
 	return { version: MCP_DECLARATION_VERSION, servers };
 }
@@ -102,7 +142,7 @@ export function addMcpDeclaration(
 ): McpDeclarationDocument {
 	const parsedName = normalizeMcpDeclarationName(name);
 	const parsedUrl = normalizeMcpDeclarationUrl(url);
-	if (document.servers[parsedName]) fail("An MCP declaration with that name already exists.");
+	if (Object.hasOwn(document.servers, parsedName)) fail("An MCP declaration with that name already exists.");
 	if (Object.values(document.servers).some((server) => server.url === parsedUrl)) {
 		fail("An MCP declaration with that endpoint URL already exists.");
 	}
@@ -114,7 +154,7 @@ export function addMcpDeclaration(
 
 export function removeMcpDeclaration(document: McpDeclarationDocument, name: unknown): McpDeclarationDocument {
 	const parsedName = normalizeMcpDeclarationName(name);
-	if (!document.servers[parsedName]) fail("No MCP declaration has that name.");
+	if (!Object.hasOwn(document.servers, parsedName)) fail("No MCP declaration has that name.");
 	const { [parsedName]: _removed, ...servers } = document.servers;
 	return { version: MCP_DECLARATION_VERSION, servers };
 }

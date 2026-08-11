@@ -13,7 +13,10 @@ import {
 	resolveProjectMcpDeclarations,
 } from "../src/core/mcp/mcp-project-trust.js";
 import { redactMcpValue } from "../src/core/mcp/mcp-redaction.js";
-import { createMcpProjectTrustAuthority } from "../src/core/index.js";
+import {
+	createMcpProjectTrustAuthority,
+	type McpProjectTrustAuthority,
+} from "../src/core/index.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
 const projectDocument = {
@@ -40,6 +43,17 @@ describe("M01 declarative MCP contract", () => {
 		expect(() => parseMcpDeclarationDocument({ version: 1, servers: { x: { name: "x", url: "https://x.test", enabled: true, headers: {} } } })).toThrow();
 	});
 
+	it("rejects inherited, accessor, and symbol-bearing declaration data without reading it", () => {
+		const inherited = Object.create({ version: 1, servers: {} });
+		const accessor = { version: 1, servers: {} as Record<string, unknown> };
+		Object.defineProperty(accessor, "servers", { enumerable: true, get() { throw new Error("must not read accessor"); } });
+		const symbolBearing = { version: 1, servers: {} };
+		Object.defineProperty(symbolBearing, Symbol("hidden"), { value: true, enumerable: false });
+		expect(() => parseMcpDeclarationDocument(inherited)).toThrow();
+		expect(() => parseMcpDeclarationDocument(accessor)).toThrow();
+		expect(() => parseMcpDeclarationDocument(symbolBearing)).toThrow();
+	});
+
 	it("parses non-starting command routing without touching settings or a runtime", () => {
 		expect(parseMcpDeclarationCommand(["add", "catalog", "https://catalog.test/mcp"])).toEqual({ kind: "add", scope: "user", name: "catalog", url: "https://catalog.test/mcp" });
 		expect(parseMcpDeclarationCommand(["preview", "catalog", "--project"])).toEqual({ kind: "preview", scope: "project", name: "catalog" });
@@ -52,6 +66,14 @@ describe("M01 declarative MCP contract", () => {
 		const methods: string[] = [];
 		await expect(executeMcpDeclarationCommand(command, settings, undefined, { probeTransport: { async open() { return { request: async ({ method }) => void methods.push(method), close: () => undefined }; } } })).resolves.toEqual({ initialized: true, toolsListed: true });
 		expect(methods).toEqual(["initialize", "tools/list"]);
+	});
+
+	it("rejects a structurally forged authority before authorization or project reads", () => {
+		let calls = 0;
+		const fake = { authorizeProjectDirectory() { calls++; return { kind: "granted", binding: {} }; }, validateBinding() { calls++; return { kind: "granted" }; } };
+		const admission = admitProjectMcpDeclarations("/not-a-project", fake as never);
+		expect(admission).toBeUndefined();
+		expect(calls).toBe(0);
 	});
 
 	it("makes exactly one raw-path authorization at admission and validates an opaque Core binding for project reads", () => {
@@ -75,18 +97,22 @@ describe("M01 declarative MCP contract", () => {
 			const add = parseMcpDeclarationCommand(["add", "new", "https://new.test/mcp", "--project"]);
 			const test = parseMcpDeclarationCommand(["test", "new", "--project"]);
 			const granted = admitProjectMcpDeclarations(f.directory, f.authority)!;
-			const foreignBinding = admitProjectMcpDeclarations(other.directory, other.authority)!.binding;
-			const forged = { ...granted, binding: {} as never };
-			// Keep the original authority and substitute another authority's grant:
-			// Core rejects this foreign opaque binding.
-			const foreign = { ...granted, binding: foreignBinding };
-			for (const admission of [undefined, forged, foreign]) {
+			const foreign = { ...admitProjectMcpDeclarations(other.directory, other.authority)! };
+			let forgedAuthorityCalls = 0;
+			const forged = {
+				get authority() { forgedAuthorityCalls++; return { validateBinding: () => ({ kind: "granted" }) }; },
+				get binding() { forgedAuthorityCalls++; return {}; },
+			};
+			// Admissions are identity capabilities, so copied, forged, and foreign
+			// envelopes all fail before any caller-supplied member is read.
+			for (const admission of [undefined, { ...granted }, forged, foreign]) {
 				await expect(executeMcpDeclarationCommand(list, settings, admission)).rejects.toThrow("Project MCP declarations are unavailable.");
 				await expect(executeMcpDeclarationCommand(add, settings, admission)).rejects.toThrow("Project MCP declarations are unavailable.");
 				let opens = 0;
 				await expect(executeMcpDeclarationCommand(test, settings, admission, { probeTransport: { async open() { opens++; throw new Error("must not open"); } } })).rejects.toThrow("Project MCP declarations are unavailable.");
 				expect(opens).toBe(0);
 			}
+			expect(forgedAuthorityCalls).toBe(0);
 			// A binding becomes stale once its bound directory no longer exists.
 			rmSync(f.directory, { recursive: true, force: true });
 			await expect(executeMcpDeclarationCommand(list, settings, granted)).rejects.toThrow("Project MCP declarations are unavailable.");

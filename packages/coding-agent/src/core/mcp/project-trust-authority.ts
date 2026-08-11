@@ -52,6 +52,14 @@ const DENIED: McpProjectTrustAuthorization = Object.freeze({ kind: "denied" });
 const BINDING_DENIED: McpProjectTrustBindingValidation = Object.freeze({ kind: "denied" });
 const BINDING_GRANTED: McpProjectTrustBindingValidation = Object.freeze({ kind: "granted" });
 
+// Only authorities minted by this Core factory may cross privileged MCP seams.
+// The registry remains module-private; callers receive only this narrow check.
+const genuineAuthorities = new WeakSet<object>();
+
+export function isMcpProjectTrustAuthority(value: unknown): value is McpProjectTrustAuthority {
+	return typeof value === "object" && value !== null && genuineAuthorities.has(value);
+}
+
 /**
  * Reads a directory only when the supplied spelling is already its exact
  * physical spelling. Relative paths, lexical aliases, symlinks (including
@@ -121,7 +129,7 @@ export function createMcpProjectTrustAuthority(input: McpProjectTrustAuthorityIn
 	const snapshotDigest = digestSnapshot(revision, snapshot);
 	const bindings = new WeakSet<object>();
 	const records = new WeakMap<object, BindingRecord>();
-	return Object.freeze({
+	const authority: McpProjectTrustAuthority = Object.freeze({
 		authorizeProjectDirectory(projectDirectory: string): McpProjectTrustAuthorization {
 			const requested = typeof projectDirectory === "string" ? exactDirectoryIdentity(projectDirectory) : undefined;
 			if (!requested || !snapshot.some((approved) => sameIdentity(approved, requested))) {
@@ -158,4 +166,6 @@ export function createMcpProjectTrustAuthority(input: McpProjectTrustAuthorityIn
 			return BINDING_GRANTED;
 		},
 	});
+	genuineAuthorities.add(authority);
+	return authority;
 }
