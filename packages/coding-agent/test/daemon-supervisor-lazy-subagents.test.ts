@@ -313,6 +313,45 @@ describe("daemon supervisor passive subagent topology", () => {
 		);
 	});
 
+	it("rejects taken saved sibling names for modern and legacy same-parent rows", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-saved-sibling-parent-anchor-"));
+		tempDirs.push(directory);
+		const parentSessionPath = join(directory, "parent.jsonl");
+		const base = {
+			cwd: directory,
+			created: new Date(0),
+			modified: new Date(0),
+			messageCount: 0,
+			firstMessage: "",
+			allMessagesText: "",
+			parentSessionPath,
+		};
+		const target = { ...base, id: "target", path: join(directory, "target.jsonl"), rlmDepth: 1 };
+		const modernTaken = {
+			...base,
+			id: "modern-taken",
+			path: join(directory, "modern-taken.jsonl"),
+			name: "taken",
+			rlmDepth: 1,
+		};
+		const legacyTaken = {
+			...base,
+			id: "legacy-taken",
+			path: join(directory, "legacy-taken.jsonl"),
+			name: "taken",
+		};
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+
+		for (const taken of [modernTaken, legacyTaken]) {
+			expect(() => supervisor.assertSavedSiblingNameAvailable([target, taken], target, "taken")).toThrow(
+				"an agent of that name already exists at depth 1 under this parent",
+			);
+		}
+	});
+
 	it("publishes an opening reservation before named create validation awaits", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-named-create-race-"));
 		tempDirs.push(directory);

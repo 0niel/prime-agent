@@ -3160,19 +3160,37 @@ export class DaemonSupervisor {
 
 	private assertSavedSiblingNameAvailable(siblings: SessionInfo[], target: SessionInfo, name: string): void {
 		const setDepth = target.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0;
+		const parentSessionPath = target.parentSessionPath ? canonicalSessionPath(target.parentSessionPath) : undefined;
+		// The bounded sibling catalog intentionally omits its parent. Add one local
+		// structural anchor so C05's exact-one-parent check can compare legacy rows
+		// whose depth is inferred from this modern sibling set.
+		const parent =
+			setDepth > 0 && parentSessionPath
+				? [
+						{
+							id: `saved-sibling-parent:${parentSessionPath}`,
+							depth: setDepth - 1,
+							status: "inactive" as const,
+							sessionPath: parentSessionPath,
+						},
+					]
+				: [];
 		assertAgentSessionNameAvailable(
-			siblings.map((info) => {
-				const summary = summaryForInactiveSession(info);
-				return {
-					id: summary.sessionId,
-					...(summary.sessionName ? { name: summary.sessionName } : {}),
-					depth: setDepth,
-					status: classifySessionRosterStatus(summary),
-					...(summary.parentSessionPath
-						? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
-						: {}),
-				};
-			}),
+			[
+				...parent,
+				...siblings.map((info) => {
+					const summary = summaryForInactiveSession(info);
+					return {
+						id: summary.sessionId,
+						...(summary.sessionName ? { name: summary.sessionName } : {}),
+						depth: setDepth,
+						status: classifySessionRosterStatus(summary),
+						...(summary.parentSessionPath
+							? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
+							: {}),
+					};
+				}),
+			],
 			{
 				name,
 				depth: setDepth,
