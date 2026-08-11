@@ -314,3 +314,72 @@ describe("KernelManager abort handling", () => {
 		manager.disposeSync();
 	});
 });
+
+
+describe("KernelManager typed host-request authority", () => {
+	function managerWithComm(handler: (payload: Record<string, unknown>, context: import("../src/core/kernel/index.js").HostRequestContext) => Promise<Record<string, unknown>>) {
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const sent = vi.fn(async () => {});
+		Object.assign(manager as unknown as { state: "running"; control: { send: (frames: Buffer[]) => Promise<void> }; connection: { key: string } }, {
+			state: "running",
+			control: { send: sent },
+			connection: { key: "test-key" },
+		});
+		return { manager, sent };
+	}
+
+	it("aborts only the request tied to an aborted caller", async () => {
+		let firstContext: import("../src/core/kernel/index.js").HostRequestContext | undefined;
+		let secondContext: import("../src/core/kernel/index.js").HostRequestContext | undefined;
+		let resolveFirst!: () => void;
+		let resolveSecond!: () => void;
+		const firstDone = new Promise<void>((resolve) => { resolveFirst = resolve; });
+		const secondDone = new Promise<void>((resolve) => { resolveSecond = resolve; });
+		const { manager } = managerWithComm(async (_payload, context) => {
+			if (!firstContext) {
+				firstContext = context;
+				await firstDone;
+			} else {
+				secondContext = context;
+				await secondDone;
+			}
+			return {};
+		});
+		const firstController = new AbortController();
+		Object.assign(manager as unknown as { activeExecution: { opts: { signal: AbortSignal } } }, { activeExecution: { opts: { signal: firstController.signal } } });
+		(manager as unknown as { handleCommMessage: (message: unknown) => void }).handleCommMessage({ header: { msg_type: "comm_open" }, content: { comm_id: "one", target_name: "host.request", data: { type: "test" } } });
+		await Promise.resolve();
+		const secondController = new AbortController();
+		Object.assign(manager as unknown as { activeExecution: { opts: { signal: AbortSignal } } }, { activeExecution: { opts: { signal: secondController.signal } } });
+		(manager as unknown as { handleCommMessage: (message: unknown) => void }).handleCommMessage({ header: { msg_type: "comm_open" }, content: { comm_id: "two", target_name: "host.request", data: { type: "test" } } });
+		await Promise.resolve();
+		firstController.abort();
+		expect(firstContext?.signal.aborted).toBe(true);
+		expect(secondContext?.signal.aborted).toBe(false);
+		resolveFirst();
+		resolveSecond();
+	});
+
+	it("fences a stale reply after its comm disconnects", async () => {
+		let resolveHandler!: () => void;
+		const handlerDone = new Promise<void>((resolve) => { resolveHandler = resolve; });
+		const { manager, sent } = managerWithComm(async () => { await handlerDone; return { value: "late" }; });
+		(manager as unknown as { handleCommMessage: (message: unknown) => void }).handleCommMessage({ header: { msg_type: "comm_open" }, content: { comm_id: "one", target_name: "host.request", data: { type: "test" } } });
+		await Promise.resolve();
+		(manager as unknown as { handleCommMessage: (message: unknown) => void }).handleCommMessage({ header: { msg_type: "comm_close" }, content: { comm_id: "one" } });
+		resolveHandler();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(sent).not.toHaveBeenCalled();
+	});
+
+	it("rejects over-bounded payloads before invoking a handler", async () => {
+		const handler = vi.fn(async () => ({}));
+		const { manager, sent } = managerWithComm(handler);
+		(manager as unknown as { handleCommMessage: (message: unknown) => void }).handleCommMessage({ header: { msg_type: "comm_open" }, content: { comm_id: "one", target_name: "host.request", data: { type: "test", value: "x".repeat(64 * 1024 + 1) } } });
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(handler).not.toHaveBeenCalled();
+		expect(sent).toHaveBeenCalledTimes(1);
+	});
+});

@@ -118,4 +118,33 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const leaseRoot = join(runtimeHost.services.agentDir, "session-leases");
 		expect(readdirSync(leaseRoot).filter((entry) => entry.endsWith(".lock"))).toHaveLength(1);
 	});
+
+	it("waits for current session disposal before building a replacement", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => undefined);
+		const oldSession = runtimeHost.session;
+		const originalDispose = oldSession.disposeAsync.bind(oldSession);
+		const order: string[] = [];
+		let releaseDispose!: () => void;
+		const disposePending = new Promise<void>((resolve) => {
+			releaseDispose = resolve;
+		});
+		oldSession.disposeAsync = async () => {
+			order.push("dispose-start");
+			await disposePending;
+			await originalDispose();
+			order.push("dispose-end");
+		};
+
+		const replacing = runtimeHost.newSession();
+		try {
+			for (let i = 0; i < 50 && order.length === 0; i++) {
+				await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			}
+			expect(order).toEqual(["dispose-start"]);
+		} finally {
+			releaseDispose();
+		}
+		await replacing;
+		expect(order).toEqual(["dispose-start", "dispose-end"]);
+	});
 });

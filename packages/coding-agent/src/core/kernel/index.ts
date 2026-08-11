@@ -29,7 +29,6 @@ const READY_TIMEOUT_MS = 5000;
 // Loopback PUB/SUB subscription propagation is usually sub-ms, but keep a small guard before first execute.
 const IOPUB_SUBSCRIBE_DELAY_MS = 50;
 const DEFAULT_MAX_OUTPUT_CHARS = 65536;
-const HOST_REQUEST_DISPOSE_TIMEOUT_MS = 5000;
 const DEFAULT_SNAPSHOT_DEBOUNCE_MS = 1500;
 // How often to poll a forked kernel's pid for unexpected death.
 const FORKED_LIVENESS_POLL_MS = 1000;
@@ -56,10 +55,26 @@ export class KernelBusyAfterInterruptError extends Error {
 export const HOST_COMM_TARGET = "host.request";
 
 /**
- * Handles one typed request from Python code running in the kernel.
- * The returned record is sent back verbatim as the comm reply payload.
+ * Per-call authority supplied only by the kernel host-request dispatcher.
+ * `requestId` is an opaque host-minted correlation token, never accepted from
+ * the kernel payload. `isCurrent()` fences completions after a comm disconnect,
+ * kernel replacement, or disposal.
  */
-export type HostRequestHandler = (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
+export interface HostRequestContext {
+	readonly requestId: string;
+	readonly generation: number;
+	readonly signal: AbortSignal;
+	isCurrent(): boolean;
+}
+
+/**
+ * Handles one authenticated typed request from Python code running in the
+ * kernel. The returned record is sent back verbatim as the comm reply payload.
+ */
+export type HostRequestHandler = (
+	payload: Record<string, unknown>,
+	context: HostRequestContext,
+) => Promise<Record<string, unknown>>;
 
 /** Host request handlers keyed by request type (e.g. "rlm.run", "goal.complete"). */
 export type HostRequestHandlers = Record<string, HostRequestHandler>;
@@ -328,12 +343,59 @@ interface Deferred<T> {
 	reject: (error: Error) => void;
 }
 
+interface ActiveHostRequest {
+	requestId: string;
+	commId: string;
+	generation: number;
+	controller: AbortController;
+	callerSignal?: AbortSignal;
+	onCallerAbort?: () => void;
+	settled: boolean;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+const MAX_HOST_REQUEST_PAYLOAD_BYTES = 64 * 1024;
+const MAX_HOST_REQUEST_PAYLOAD_DEPTH = 8;
+const MAX_HOST_REQUEST_PAYLOAD_NODES = 1024;
+const MAX_HOST_REQUEST_PAYLOAD_KEYS = 128;
+
+/** Reject pathological comm data before a typed handler can observe it. */
+function assertBoundedHostRequestPayload(value: unknown): void {
+	let estimatedBytes = 0;
+	let nodes = 0;
+	const visit = (item: unknown, depth: number): void => {
+		if (depth > MAX_HOST_REQUEST_PAYLOAD_DEPTH) throw new Error("host request payload is too deeply nested");
+		nodes += 1;
+		if (nodes > MAX_HOST_REQUEST_PAYLOAD_NODES) throw new Error("host request payload has too many values");
+		if (typeof item === "string") {
+			estimatedBytes += Buffer.byteLength(item);
+		} else if (typeof item === "number") {
+			if (!Number.isFinite(item)) throw new Error("host request payload numbers must be finite");
+			estimatedBytes += 16;
+		} else if (typeof item === "boolean" || item === null) {
+			estimatedBytes += 8;
+		} else if (Array.isArray(item)) {
+			for (const entry of item) visit(entry, depth + 1);
+		} else if (isRecord(item)) {
+			const entries = Object.entries(item);
+			if (entries.length > MAX_HOST_REQUEST_PAYLOAD_KEYS) throw new Error("host request payload has too many object keys");
+			for (const [key, entry] of entries) {
+				estimatedBytes += Buffer.byteLength(key);
+				visit(entry, depth + 1);
+			}
+		} else {
+			throw new Error("host request payload must contain JSON-compatible values");
+		}
+		if (estimatedBytes > MAX_HOST_REQUEST_PAYLOAD_BYTES) throw new Error("host request payload is too large");
+	};
+	visit(value, 0);
 }
 
 function createDeferred<T>(): Deferred<T> {
@@ -517,6 +579,10 @@ export class KernelManager {
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
 	private readonly handledHostRequestCommIds = new Set<string>();
+	/** Monotonically revokes all host-request authority across kernel lifecycles. */
+	private hostRequestGeneration = 0;
+	private readonly activeHostRequests = new Map<string, ActiveHostRequest>();
+	private readonly hostRequestIdsByComm = new Map<string, string>();
 	private kernel?: ChildProcess;
 	// Set instead of `kernel` when the kernel was forked from the forkserver: it is
 	// not a direct child, so it has no ChildProcess handle and is killed by pid.
@@ -1197,6 +1263,7 @@ export class KernelManager {
 		if (msgType === "comm_close") {
 			this.commTargets.delete(commId);
 			this.handledHostRequestCommIds.delete(commId);
+			this.revokeHostRequestForComm(commId);
 			return;
 		}
 
@@ -1224,34 +1291,93 @@ export class KernelManager {
 		}
 		this.handledHostRequestCommIds.add(commId);
 
+		const callerSignal = this.activeExecution?.opts.signal;
+		const request: ActiveHostRequest = {
+			requestId: uuid(),
+			commId,
+			generation: this.hostRequestGeneration,
+			controller: new AbortController(),
+			callerSignal,
+			settled: false,
+		};
+		request.onCallerAbort = () => request.controller.abort();
+		callerSignal?.addEventListener("abort", request.onCallerAbort, { once: true });
+		if (callerSignal?.aborted) request.controller.abort();
+		this.activeHostRequests.set(request.requestId, request);
+		this.hostRequestIdsByComm.set(commId, request.requestId);
+
 		const task = (async () => {
 			try {
-				const result = await this.handleHostRequest(data);
-				try {
-					await this.sendCommMessage(commId, { status: "ok", ...result });
-				} catch (replyError) {
-					this.appendKernelDiagnostic(
-						`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,
-					);
-				}
+				const result = await this.handleHostRequest(data, this.hostRequestContext(request));
+				await this.replyToHostRequest(request, { status: "ok", ...result });
 			} catch (error) {
-				this.appendKernelDiagnostic(`host request failed for comm ${commId}: ${errorMessage(error)}`);
-				try {
-					await this.sendCommMessage(commId, { status: "error", error: errorMessage(error) });
-				} catch (replyError) {
-					this.appendKernelDiagnostic(
-						`failed to send host request error reply for comm ${commId}: ${errorMessage(replyError)}`,
-					);
+				if (this.isHostRequestCurrent(request)) {
+					this.appendKernelDiagnostic(`host request failed for comm ${commId}: ${errorMessage(error)}`);
 				}
+				await this.replyToHostRequest(request, { status: "error", error: errorMessage(error) });
 			}
 		})();
 		this.inFlightHostRequests.add(task);
 		void task.finally(() => {
 			this.inFlightHostRequests.delete(task);
+			request.callerSignal?.removeEventListener("abort", request.onCallerAbort!);
+			this.activeHostRequests.delete(request.requestId);
+			if (this.hostRequestIdsByComm.get(commId) === request.requestId) {
+				this.hostRequestIdsByComm.delete(commId);
+			}
 		});
 	}
 
-	private async handleHostRequest(data: unknown): Promise<Record<string, unknown>> {
+	private hostRequestContext(request: ActiveHostRequest): HostRequestContext {
+		return {
+			requestId: request.requestId,
+			generation: request.generation,
+			signal: request.controller.signal,
+			isCurrent: () => this.isHostRequestCurrent(request),
+		};
+	}
+
+	private isHostRequestCurrent(request: ActiveHostRequest): boolean {
+		return (
+			this.state !== "shutdown" &&
+			this.hostRequestGeneration === request.generation &&
+			this.commTargets.get(request.commId) === HOST_COMM_TARGET &&
+			this.hostRequestIdsByComm.get(request.commId) === request.requestId &&
+			!request.controller.signal.aborted
+		);
+	}
+
+	private revokeHostRequestForComm(commId: string): void {
+		const requestId = this.hostRequestIdsByComm.get(commId);
+		if (!requestId) return;
+		this.hostRequestIdsByComm.delete(commId);
+		this.activeHostRequests.get(requestId)?.controller.abort();
+	}
+
+	/** Abort every active request before a kernel connection is replaced or closed. */
+	private revokeHostRequests(): void {
+		this.hostRequestGeneration += 1;
+		for (const request of this.activeHostRequests.values()) {
+			request.controller.abort();
+		}
+		this.hostRequestIdsByComm.clear();
+	}
+
+	private async replyToHostRequest(request: ActiveHostRequest, data: Record<string, unknown>): Promise<void> {
+		// Claim the one reply before awaiting I/O so a late handler cannot double-send.
+		if (request.settled || !this.isHostRequestCurrent(request)) return;
+		request.settled = true;
+		try {
+			await this.sendCommMessage(request.commId, data);
+		} catch (replyError) {
+			this.appendKernelDiagnostic(
+				`failed to send host request reply for comm ${request.commId}: ${errorMessage(replyError)}`,
+			);
+		}
+	}
+
+	private async handleHostRequest(data: unknown, context: HostRequestContext): Promise<Record<string, unknown>> {
+		assertBoundedHostRequestPayload(data);
 		if (!isRecord(data)) {
 			throw new Error("host request payload must be an object");
 		}
@@ -1267,7 +1393,7 @@ export class KernelManager {
 		// the in-flight execution; detached spawns (asyncio.create_task) fire after
 		// the scheduling cell goes idle, so fall back to that last cell's source.
 		const cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;
-		return handler({ ...data, cellSourceCode });
+		return handler({ ...data, cellSourceCode }, context);
 	}
 
 	private async sendCommMessage(commId: string, data: Record<string, unknown>): Promise<void> {
@@ -1286,6 +1412,9 @@ export class KernelManager {
 	}
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
+		this.revokeHostRequests();
+		this.commTargets.clear();
+		this.handledHostRequestCommIds.clear();
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		if (this.forkedLivenessTimer) {
@@ -1325,29 +1454,17 @@ export class KernelManager {
 		this.startPromise = undefined;
 	}
 
-	private async waitForHostRequestsToSettle(tasks: Promise<void>[], timeoutMs: number): Promise<void> {
-		let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
-		const timeoutPromise = new Promise<"timeout">((resolve) => {
-			timeout = globalThis.setTimeout(() => resolve("timeout"), timeoutMs);
-			if (timeout && typeof timeout === "object" && "unref" in timeout) {
-				timeout.unref();
-			}
-		});
-
-		const result = await Promise.race([Promise.allSettled(tasks).then(() => "settled" as const), timeoutPromise]);
-		if (timeout) {
-			globalThis.clearTimeout(timeout);
-		}
-		if (result === "timeout") {
-			this.appendKernelDiagnostic(
-				`timed out waiting ${timeoutMs}ms for ${tasks.length} host request task(s) during dispose`,
-			);
-		}
+	/** All active typed handlers must observe revocation and settle before teardown continues. */
+	private async waitForHostRequestsToSettle(tasks: Promise<void>[]): Promise<void> {
+		await Promise.allSettled(tasks);
 	}
 
 	async shutdown(opts: { snapshot?: boolean } = {}): Promise<void> {
+		this.revokeHostRequests();
+		const inFlightHostRequests = [...this.inFlightHostRequests];
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
+			await this.waitForHostRequestsToSettle(inFlightHostRequests);
 			this.cleanupResources();
 			return;
 		}
@@ -1371,6 +1488,7 @@ export class KernelManager {
 			);
 		}
 
+		await this.waitForHostRequestsToSettle(inFlightHostRequests);
 		this.cleanupResources();
 	}
 
@@ -1393,8 +1511,11 @@ export class KernelManager {
 	}
 
 	async kill(): Promise<void> {
+		this.revokeHostRequests();
+		const inFlightHostRequests = [...this.inFlightHostRequests];
 		this.state = "shutdown";
 		liveKernels.delete(this);
+		await this.waitForHostRequestsToSettle(inFlightHostRequests);
 		this.cleanupResources("SIGKILL");
 	}
 
@@ -1496,19 +1617,17 @@ export class KernelManager {
 		}
 	}
 
-	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
+	/** Graceful cleanup. Revokes and awaits every in-flight typed host handler before closing sockets. */
 	dispose(): Promise<void> {
 		return (async () => {
+			this.revokeHostRequests();
+			const inFlightHostRequests = [...this.inFlightHostRequests];
 			// Final namespace flush while the kernel is still live (session end / reload).
 			await this.flushSnapshotForDispose();
 			this.state = "shutdown";
 			liveKernels.delete(this);
-			const inFlightHostRequests = [...this.inFlightHostRequests];
-			// TODO: plumb AbortSignal through AgentSession.prompt so disposal can cancel long-running child loops.
 			try {
-				if (inFlightHostRequests.length > 0) {
-					await this.waitForHostRequestsToSettle(inFlightHostRequests, HOST_REQUEST_DISPOSE_TIMEOUT_MS);
-				}
+				await this.waitForHostRequestsToSettle(inFlightHostRequests);
 			} finally {
 				this.cleanupResources();
 			}
@@ -1517,6 +1636,7 @@ export class KernelManager {
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	disposeSync(): void {
+		this.revokeHostRequests();
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.
