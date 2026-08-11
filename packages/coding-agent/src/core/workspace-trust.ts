@@ -94,7 +94,9 @@ export function isDefaultUserGlobalAgentDir(agentDir: string): boolean {
 export function isAgentDirWithinWorkspace(agentDir: string, cwd: string): boolean {
 	const canonicalCwd = canonicalizeWorkspacePath(cwd);
 	const canonicalAgentDir = canonicalizeWorkspacePath(agentDir);
-	return canonicalAgentDir === canonicalCwd || canonicalAgentDir.startsWith(canonicalCwd + sep);
+	// Avoid "//" when the workspace is a filesystem root.
+	const prefix = canonicalCwd.endsWith(sep) ? canonicalCwd : canonicalCwd + sep;
+	return canonicalAgentDir === canonicalCwd || canonicalAgentDir.startsWith(prefix);
 }
 
 /**
@@ -296,7 +298,8 @@ function hasExtensionEntry(dir: string): boolean {
 	const packageJsonPath = join(dir, "package.json");
 	if (existsSync(packageJsonPath)) {
 		const manifest = readPiManifest(packageJsonPath);
-		if (manifest?.extensions?.some((entry) => existsSync(resolve(dir, entry)))) {
+		// Malformed manifests (non-string entries) must not crash detection.
+		if (manifest?.extensions?.some((entry) => typeof entry === "string" && existsSync(resolve(dir, entry)))) {
 			return true;
 		}
 	}

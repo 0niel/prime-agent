@@ -542,6 +542,9 @@ function resolveExtensionEntries(dir: string): string[] | null {
 		if (manifest?.extensions?.length) {
 			const entries: string[] = [];
 			for (const extPath of manifest.extensions) {
+				if (typeof extPath !== "string") {
+					continue;
+				}
 				const resolvedExtPath = resolve(dir, extPath);
 				if (existsSync(resolvedExtPath)) {
 					entries.push(resolvedExtPath);

@@ -10,6 +10,7 @@ import {
 	canonicalizeWorkspacePath,
 	canPersistWorkspaceTrust,
 	detectProjectScopedConfig,
+	isAgentDirWithinWorkspace,
 	isWorkspaceTrusted,
 	WorkspaceTrustStore,
 } from "../src/core/workspace-trust.js";
@@ -333,6 +334,21 @@ export default function () {}
 			const findings = detectProjectScopedConfig(projectDir);
 
 			expect(findings.some((finding) => finding.summary.includes("project extensions (1 entry)"))).toBe(true);
+		});
+
+		it("does not crash on malformed pi.extensions manifest entries", () => {
+			const extensionsDir = join(configDir, "extensions");
+			mkdirSync(extensionsDir, { recursive: true });
+			writeFileSync(join(extensionsDir, "package.json"), JSON.stringify({ pi: { extensions: [null, 42, {}] } }));
+
+			expect(() => detectProjectScopedConfig(projectDir)).not.toThrow();
+		});
+
+		it("treats an agent dir as inside a root-level workspace", () => {
+			// The root workspace prefix must not become "//" and miss containment.
+			expect(isAgentDirWithinWorkspace("/.prime/agent", "/")).toBe(true);
+			expect(isAgentDirWithinWorkspace("/somewhere", "/")).toBe(true);
+			expect(isAgentDirWithinWorkspace("/", "/")).toBe(true);
 		});
 
 		it("reports .agents/skills from ancestor directories up to the git root", () => {
