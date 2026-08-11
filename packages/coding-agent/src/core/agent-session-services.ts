@@ -19,7 +19,7 @@ import { type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
 import type { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { installAgentTelemetry, isTelemetryEnabled } from "./telemetry.js";
-import { detectProjectScopedConfig, isWorkspaceTrusted } from "./workspace-trust.js";
+import { canPersistWorkspaceTrust, detectProjectScopedConfig, isWorkspaceTrusted } from "./workspace-trust.js";
 
 /**
  * Non-fatal issues collected while creating services or sessions.
@@ -227,11 +227,16 @@ export async function createAgentSessionServices(
 	if (!projectTrusted) {
 		const findings = detectProjectScopedConfig(cwd);
 		if (findings.length > 0) {
+			// When the trust store would live inside the workspace, trusting is
+			// impossible; do not point users at a command that refuses.
+			const remediation = canPersistWorkspaceTrust(cwd, agentDir)
+				? 'Run "prime-agent trust" to enable it.'
+				: "It cannot be enabled here: the trust store would live inside the workspace itself.";
 			diagnostics.push({
 				type: "warning",
 				message: `Workspace is not trusted; disabled project-scoped configuration: ${findings
 					.map((finding) => finding.summary)
-					.join("; ")}. Run "prime-agent trust" to enable it.`,
+					.join("; ")}. ${remediation}`,
 			});
 		}
 	}

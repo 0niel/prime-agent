@@ -197,12 +197,23 @@ export class WorkspaceTrustStore {
 		try {
 			linkSync(tmpPath, this.filePath);
 		} catch {
-			// Lost the create race; the other process's file stands.
+			// Lost the create race, or hard links are unsupported here.
+		}
+		if (!existsSync(this.filePath)) {
+			// Hard links unsupported: move the staging file instead.
+			try {
+				renameSync(tmpPath, this.filePath);
+			} catch {
+				// Another writer won in the meantime.
+			}
 		}
 		try {
 			rmSync(tmpPath, { force: true });
 		} catch {
 			// Best effort.
+		}
+		if (!existsSync(this.filePath)) {
+			throw new Error(`Failed to create workspace trust store at ${this.filePath}`);
 		}
 	}
 
@@ -317,9 +328,21 @@ function countExtensionEntries(extensionsDir: string): number {
 	for (const entry of entries) {
 		if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "package.json") continue;
 		const fullPath = join(extensionsDir, entry.name);
-		if (entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
+		// Symlinks are followed like the loader does.
+		let isFile = entry.isFile();
+		let isDir = entry.isDirectory();
+		if (entry.isSymbolicLink()) {
+			try {
+				const stats = statSync(fullPath);
+				isFile = stats.isFile();
+				isDir = stats.isDirectory();
+			} catch {
+				continue;
+			}
+		}
+		if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
 			count++;
-		} else if (entry.isDirectory() && hasExtensionEntry(fullPath)) {
+		} else if (isDir && hasExtensionEntry(fullPath)) {
 			count++;
 		}
 	}
