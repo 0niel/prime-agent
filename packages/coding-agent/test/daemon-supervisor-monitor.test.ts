@@ -2094,6 +2094,70 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it("hands finalization from a stale timed-out stop to its newer tombstone", async () => {
+		vi.useFakeTimers();
+		const originalPid = 111_130;
+		const replacementPid = 111_131;
+		const worker = {
+			descriptor: {
+				workerId: "worker-finalization-handoff",
+				pid: originalPid,
+				rootActiveSessionId: "active-1",
+				stopRequestedAt: "stop-A" as string | undefined,
+			},
+			intentionalStop: true,
+			stopRevision: 0,
+			stopFinalization: undefined as Promise<void> | undefined,
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const deleteWorkerDescriptor = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			shuttingDown: false,
+			persistWorkerStopTombstone: vi.fn(),
+			deleteWorkerDescriptor,
+			syncAgentPeers: vi.fn(async () => undefined),
+			broadcastHeartbeatsChanged: vi.fn(),
+			persistWorker: vi.fn(),
+			log: vi.fn(),
+			reportCleanupFailure: vi.fn(),
+		}) as {
+			scheduleWorkerStopFinalization(target: object): void;
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const existsSpy = vi
+			.spyOn(childProcessModule, "processIdExists")
+			.mockImplementation((pid) => pid === originalPid);
+		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		try {
+			supervisor.scheduleWorkerStopFinalization(worker);
+			const staleFinalization = worker.stopFinalization;
+			expect(staleFinalization).toBeDefined();
+
+			// A newer stop times out while A still owns the finalization slot. Its
+			// scheduling call must not start a concurrent loop, but A must hand off
+			// once its exact tuple is fenced out.
+			worker.descriptor.pid = replacementPid;
+			worker.descriptor.stopRequestedAt = "stop-B";
+			worker.stopRevision = 1;
+			supervisor.scheduleWorkerStopFinalization(worker);
+			expect(worker.stopFinalization).toBe(staleFinalization);
+
+			await vi.advanceTimersByTimeAsync(500);
+
+			// B observes its pid as gone and completes recovery cleanup, removing
+			// the registration. A never gets authority to signal B's pid.
+			expect(workers.has(worker.descriptor.workerId)).toBe(false);
+			expect(deleteWorkerDescriptor).toHaveBeenCalledWith(worker);
+			expect(killSpy).not.toHaveBeenCalledWith(replacementPid, "SIGKILL");
+		} finally {
+			existsSpy.mockRestore();
+			killSpy.mockRestore();
+		}
+	});
+
 	it("treats a recycled pid as gone instead of killing its new owner", async () => {
 		vi.useFakeTimers();
 		const worker = {

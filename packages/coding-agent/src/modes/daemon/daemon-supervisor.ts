@@ -4829,9 +4829,38 @@ export class DaemonSupervisor {
 		if (worker.stopFinalization) {
 			return;
 		}
-		worker.stopFinalization = this.finalizeTimedOutWorkerStop(worker).finally(() => {
+		// Keep the slot owned by the exact promise that installed it. A stop retry
+		// can replace this worker's tombstone while the old generation is awaiting;
+		// its finalizer must hand the slot to the current tombstone after it drops
+		// out, rather than leaving that newer timed-out stop without escalation.
+		const descriptor = worker.descriptor;
+		const { pid, processStartId, stopRequestedAt } = descriptor;
+		const stopRevision = worker.stopRevision;
+		const isFinalizationGenerationCurrent = () =>
+			this.workers.get(descriptor.workerId) === worker &&
+			worker.descriptor === descriptor &&
+			worker.stopRevision === stopRevision &&
+			worker.descriptor.stopRequestedAt === stopRequestedAt &&
+			stopRequestedAt !== undefined &&
+			worker.descriptor.pid === pid &&
+			worker.descriptor.processStartId === processStartId;
+		let finalization: Promise<void>;
+		finalization = this.finalizeTimedOutWorkerStop(worker).finally(() => {
+			if (worker.stopFinalization !== finalization) {
+				return;
+			}
+			const needsGenerationHandoff = !isFinalizationGenerationCurrent();
 			worker.stopFinalization = undefined;
+			if (
+				needsGenerationHandoff &&
+				!this.shuttingDown &&
+				this.workers.get(worker.descriptor.workerId) === worker &&
+				worker.descriptor.stopRequestedAt !== undefined
+			) {
+				this.scheduleWorkerStopFinalization(worker);
+			}
 		});
+		worker.stopFinalization = finalization;
 	}
 
 	private async finalizeTimedOutWorkerStop(worker: ResidentWorker): Promise<void> {
