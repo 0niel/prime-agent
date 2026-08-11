@@ -13,7 +13,7 @@ import type { AuthStorage } from "../auth-storage.js";
 import type { McpServerConfig } from "../settings-manager.js";
 import { MCP_OAUTH_SECRET_NAMESPACE, type McpOAuthSecretStore, type SecretReference } from "./mcp-secret-store.js";
 import type { McpOAuthBinding, McpOAuthSecretPort } from "@earendil-works/pi-ai/mcp";
-import type { HostRequestHandler } from "../kernel/index.js";
+import type { HostRequestContext, HostRequestHandler } from "../kernel/index.js";
 import { McpHostBridge, type McpHostBinding } from "./mcp-host-bridge.js";
 import type { McpRuntimeDeclarationSnapshot } from "./mcp-runtime-declaration-snapshot.js";
 
@@ -303,8 +303,22 @@ export class McpManager {
 
 	/** Host-request handlers exposed to the kernel. */
 	hostHandlers(): Record<string, HostRequestHandler> {
+		const requireCurrent = (context: HostRequestContext): void => {
+			if (context.signal.aborted || !context.isCurrent()) throw new Error("MCP request was cancelled.");
+		};
 		const handlers: Record<string, HostRequestHandler> = {
+			"mcp.refresh": async (payload, context) => {
+				requireCurrent(context);
+				const server = typeof payload.server === "string" ? payload.server : "";
+				if (!server) throw new Error("mcp.refresh requires a server");
+				// Forced access retrieval closes/fences the old binding before rotation;
+				// it returns no endpoint or credential material to Python.
+				await this.withOAuthAccessToken(server, async () => undefined, true);
+				requireCurrent(context);
+				return {};
+			},
 			"mcp.request": async (payload, context) => {
+				requireCurrent(context);
 				const server = typeof payload.server === "string" ? payload.server : "";
 				const method = typeof payload.method === "string" ? payload.method : "";
 				if (!server || !method) throw new Error("mcp.request requires server and method");
@@ -316,6 +330,16 @@ export class McpManager {
 				return { result: await this.hostBridge.request(this.bindingFor(server, integration, endpoint), method, payload.params, context) };
 			},
 		};
+		if (this.beginLogin) {
+			handlers["mcp.begin_login"] = async (payload, context) => {
+				requireCurrent(context);
+				const server = typeof payload.server === "string" ? payload.server : "";
+				if (!server) throw new Error("mcp.begin_login requires a server");
+				await this.beginLogin!(server);
+				requireCurrent(context);
+				return {};
+			};
+		}
 		return handlers;
 	}
 

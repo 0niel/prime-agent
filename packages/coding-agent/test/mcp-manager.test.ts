@@ -95,11 +95,23 @@ describe("McpManager", () => {
 		expect(getOAuthProvider("mcp:acme")).toBeDefined();
 	});
 
-	it("exposes only typed mcp.request and rejects unary invocation", async () => {
+	it("exposes typed refresh/request and rejects absent or stale contexts", async () => {
 		const manager = new McpManager({ authStorage });
 		const handlers = manager.hostHandlers();
-		expect(Object.keys(handlers)).toEqual(["mcp.request"]);
+		expect(Object.keys(handlers).sort()).toEqual(["mcp.refresh", "mcp.request"]);
 		await expect((handlers["mcp.request"] as unknown as (payload: Record<string, unknown>) => Promise<Record<string, unknown>>)({ server: "linear", method: "tools/list" })).rejects.toThrow();
+		const stale = { requestId: "r", generation: 1, signal: new AbortController().signal, isCurrent: () => false };
+		await expect(handlers["mcp.refresh"]!({ server: "linear" }, stale)).rejects.toThrow("cancelled");
+	});
+
+	it("conditionally exposes begin_login with context fencing and no credential output", async () => {
+		let called = "";
+		const manager = new McpManager({ authStorage, beginLogin: async (server) => { called = server; } });
+		const handlers = manager.hostHandlers();
+		expect(Object.keys(handlers).sort()).toEqual(["mcp.begin_login", "mcp.refresh", "mcp.request"]);
+		const live = { requestId: "r", generation: 1, signal: new AbortController().signal, isCurrent: () => true };
+		await expect(handlers["mcp.begin_login"]!({ server: "linear" }, live)).resolves.toEqual({});
+		expect(called).toBe("linear");
 	});
 
 	it("has no public configuration or header handler", () => {
