@@ -303,6 +303,17 @@ export default function () {}
 			expect(text).toContain("project themes are auto-discovered");
 		});
 
+		it("reports an extensions directory that is itself a manifest package", () => {
+			const extensionsDir = join(configDir, "extensions");
+			mkdirSync(join(extensionsDir, "src"), { recursive: true });
+			writeFileSync(join(extensionsDir, "src", "main.ts"), "export default function () {}\n");
+			writeFileSync(join(extensionsDir, "package.json"), JSON.stringify({ pi: { extensions: ["./src/main.ts"] } }));
+
+			const findings = detectProjectScopedConfig(projectDir);
+
+			expect(findings.some((finding) => finding.summary.includes("project extensions (1 entry)"))).toBe(true);
+		});
+
 		it("reports manifest-based extensions", () => {
 			const pkgDir = join(configDir, "extensions", "pkg-ext");
 			mkdirSync(pkgDir, { recursive: true });

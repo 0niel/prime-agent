@@ -227,6 +227,11 @@ function hasExtensionEntry(dir: string): boolean {
 }
 
 function countExtensionEntries(extensionsDir: string): number {
+	// The extensions directory itself may be a package (pi.extensions manifest
+	// or index file), in which case its contents are not scanned individually.
+	if (hasExtensionEntry(extensionsDir)) {
+		return 1;
+	}
 	let entries: Dirent[];
 	try {
 		entries = readdirSync(extensionsDir, { withFileTypes: true });

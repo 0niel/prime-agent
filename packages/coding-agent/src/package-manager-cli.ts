@@ -48,6 +48,7 @@ import type { AgentSessionRuntimeMetadata } from "./core/agent-session-runtime.j
 import { type CustomMessage, isSessionSlashCommand } from "./core/messages.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { isWorkspaceTrusted } from "./core/workspace-trust.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
 	DAEMON_PROTOCOL_VERSION,
@@ -1392,7 +1393,9 @@ export async function handleConfigCommand(args: string[]): Promise<boolean> {
 
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
-	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const settingsManager = SettingsManager.create(cwd, agentDir, {
+		projectTrusted: isWorkspaceTrusted(cwd, agentDir),
+	});
 	reportSettingsErrors(settingsManager, "config command");
 	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
 	const resolvedPaths = await packageManager.resolve();
@@ -1489,7 +1492,9 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
-	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const settingsManager = SettingsManager.create(cwd, agentDir, {
+		projectTrusted: isWorkspaceTrusted(cwd, agentDir),
+	});
 	reportSettingsErrors(settingsManager, "package command");
 	const selfUpdateNpmCommand = settingsManager.getGlobalSettings().npmCommand;
 
