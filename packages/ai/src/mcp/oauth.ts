@@ -4,7 +4,8 @@
 import type { Server } from "node:http";
 import { oauthErrorHtml, oauthSuccessHtml } from "../utils/oauth/oauth-page.js";
 import { generatePKCE } from "../utils/oauth/pkce.js";
-import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "../utils/oauth/types.js";
+import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderCredentials, OAuthProviderInterface } from "../utils/oauth/types.js";
+
 
 const CALLBACK_HOST = process.env.PI_OAUTH_CALLBACK_HOST || "127.0.0.1";
 // A range (not one port) so a leaked/concurrent login can't wedge all logins with EADDRINUSE.
@@ -37,13 +38,41 @@ export interface McpOAuthConfig {
 	clientId?: string;
 	/** Explicit scopes; falls back to the server's advertised scopes. */
 	scopes?: string;
+	/** Injected Core S01 secret authority; absent means OAuth is unavailable. */
+	secretStore?: McpOAuthSecretPort;
 }
 
 /** Extra fields we persist alongside the standard credential triple. */
-interface McpCredentials extends OAuthCredentials {
-	tokenEndpoint?: string;
-	clientId?: string;
+/** AI never interprets secret handles; the coding-agent adapter owns S01 validation. */
+export interface McpOAuthBinding {
+	mcpEndpoint: string;
+	authServer: string;
+	tokenEndpoint: string;
+	clientId: string;
+	scopes: string;
 }
+
+export interface McpOAuthSecretPort {
+	put(value: Uint8Array): Promise<unknown>;
+	/** The adapter validates an opaque S01 handle before returning encrypted secret bytes. */
+	get(reference: unknown, expected: McpOAuthBinding): Promise<Uint8Array | undefined>;
+	replace(reference: unknown, value: Uint8Array): Promise<unknown>;
+	delete(reference: unknown): Promise<void>;
+}
+
+export interface McpOAuthKeychainRecord {
+	kind: "opaque";
+	secretReference: unknown;
+	mcpEndpoint: string;
+	authServer: string;
+	clientId: string;
+	scopes: string;
+	tokenEndpoint: string;
+	expires: number;
+}
+
+/** The generic provider surface accepts a legacy OAuth payload or opaque MCP metadata. */
+export type McpProviderCredentials = OAuthCredentials | McpOAuthKeychainRecord;
 
 async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
 	const res = await fetch(url, init);
@@ -228,29 +257,95 @@ async function exchangeToken(
 	return JSON.parse(text);
 }
 
-function toCredentials(
-	token: { access_token: string; refresh_token?: string; expires_in?: number },
-	tokenEndpoint: string,
-	clientId: string,
-	previousRefresh?: string,
-): McpCredentials {
-	return {
-		access: token.access_token,
-		// Some servers omit refresh_token on refresh; keep the prior one.
-		refresh: token.refresh_token ?? previousRefresh ?? "",
-		expires: token.expires_in
-			? Date.now() + token.expires_in * 1000 - TOKEN_EXPIRY_BUFFER_MS
-			: Date.now() + 3600 * 1000 - TOKEN_EXPIRY_BUFFER_MS,
-		tokenEndpoint,
-		clientId,
-	};
+function zero(bytes: Uint8Array): void { bytes.fill(0); }
+
+function requireStore(store: McpOAuthSecretPort | undefined): McpOAuthSecretPort {
+	if (!store) throw new Error("MCP OAuth secret storage is unavailable.");
+	return store;
+}
+
+function canonicalHttpsUrl(value: string): string {
+	const url = new URL(value);
+	if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+		throw new Error("MCP OAuth binding requires a canonical HTTPS URL.");
+	}
+	return url.href;
+}
+
+async function toCredentials(token: { access_token: string; refresh_token?: string; expires_in?: number }, binding: { endpoint: string; authServer: string; tokenEndpoint: string; clientId: string; scopes: string }, store: McpOAuthSecretPort, previous?: McpOAuthKeychainRecord): Promise<McpOAuthKeychainRecord> {
+	if (!token.access_token) throw new Error("OAuth token response omitted access_token.");
+	const sealedBinding: OAuthBinding = { mcpEndpoint: binding.endpoint, authServer: binding.authServer, tokenEndpoint: binding.tokenEndpoint, clientId: binding.clientId, scopes: binding.scopes };
+	const bytes = new TextEncoder().encode(JSON.stringify({ access: token.access_token, refresh: token.refresh_token ?? "", binding: sealedBinding } satisfies StoredTokens));
+	try {
+		const secretReference = previous
+			? await store.replace(previous.secretReference, bytes)
+			: await store.put(bytes);
+		return { kind: "opaque", expires: token.expires_in ? Date.now() + token.expires_in * 1000 - TOKEN_EXPIRY_BUFFER_MS : Date.now() + 3300_000, secretReference, mcpEndpoint: binding.endpoint, authServer: binding.authServer, tokenEndpoint: binding.tokenEndpoint, clientId: binding.clientId, scopes: binding.scopes };
+	} finally { zero(bytes); }
+}
+
+function isCanonicalHttpsUrl(value: unknown): value is string {
+	if (typeof value !== "string") return false;
+	try { return canonicalHttpsUrl(value) === value; } catch { return false; }
+}
+
+function isBinding(value: unknown): value is OAuthBinding {
+	if (!value || typeof value !== "object") return false;
+	const binding = value as Partial<OAuthBinding>;
+	return isCanonicalHttpsUrl(binding.mcpEndpoint) && isCanonicalHttpsUrl(binding.authServer) &&
+		isCanonicalHttpsUrl(binding.tokenEndpoint) && typeof binding.clientId === "string" &&
+		binding.clientId.length > 0 && typeof binding.scopes === "string";
+}
+
+function sameBinding(left: OAuthBinding | undefined, right: OAuthBinding | undefined): boolean {
+	return !!left && !!right && left.mcpEndpoint === right.mcpEndpoint && left.authServer === right.authServer && left.tokenEndpoint === right.tokenEndpoint && left.clientId === right.clientId && left.scopes === right.scopes;
+}
+
+function isOpaqueRecord(value: unknown): value is McpOAuthKeychainRecord {
+	if (!value || typeof value !== "object") return false;
+	const record = value as Partial<McpOAuthKeychainRecord>;
+	return record.kind === "opaque" && record.secretReference !== undefined &&
+		isBinding({ mcpEndpoint: record.mcpEndpoint, authServer: record.authServer, tokenEndpoint: record.tokenEndpoint, clientId: record.clientId, scopes: record.scopes }) &&
+		typeof record.expires === "number" && Number.isFinite(record.expires);
+}
+
+function decodeTokens(bytes: Uint8Array): StoredTokens {
+	try {
+		const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+		if (!parsed || typeof parsed !== "object") throw new Error();
+		const stored = parsed as Partial<StoredTokens>;
+		if (typeof stored.access !== "string" || typeof stored.refresh !== "string" || !isBinding(stored.binding)) throw new Error();
+		return stored as StoredTokens;
+	} catch { throw new Error("MCP OAuth secret is unavailable or invalid."); }
+}
+
+/**
+ * Host-only access retrieval. It validates both public and sealed bindings
+ * before exposing a transient bearer string to the host transport.
+ */
+export async function getMcpOAuthAccessToken(
+	record: McpOAuthKeychainRecord,
+	expected: McpOAuthBinding,
+	store: McpOAuthSecretPort,
+): Promise<string> {
+	if (!isOpaqueRecord(record) || !sameBinding({ mcpEndpoint: record.mcpEndpoint, authServer: record.authServer, tokenEndpoint: record.tokenEndpoint, clientId: record.clientId, scopes: record.scopes }, expected)) {
+		throw new Error("MCP OAuth credential binding is invalid.");
+	}
+	const bytes = await store.get(record.secretReference, expected);
+	if (!bytes) throw new Error("MCP OAuth secret is unavailable.");
+	try {
+		const stored = decodeTokens(bytes);
+		if (!sameBinding(stored.binding, expected) || !stored.access) throw new Error("MCP OAuth credential binding is invalid.");
+		return stored.access;
+	} finally { zero(bytes); }
 }
 
 /** Build a provider for one MCP server. Register it with registerOAuthProvider(). */
 export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInterface {
 	const label = config.label ?? config.server;
+	const mcpEndpoint = canonicalHttpsUrl(config.url);
 
-	async function login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+	async function login(callbacks: OAuthLoginCallbacks): Promise<McpProviderCredentials> {
 		const meta = await discover(config.url);
 		callbacks.onProgress?.(`Discovered ${meta.issuer ?? new URL(config.url).origin}`);
 
@@ -348,25 +443,30 @@ export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInt
 				client_id: clientId,
 				code_verifier: verifier,
 			});
-			return toCredentials(token, meta.token_endpoint, clientId);
+			return await toCredentials(token, { endpoint: mcpEndpoint, authServer: canonicalHttpsUrl(meta.issuer ?? new URL(config.url).origin), tokenEndpoint: canonicalHttpsUrl(meta.token_endpoint), clientId, scopes: scope ?? "" }, requireStore(config.secretStore));
 		} finally {
 			cb.server.close();
 		}
 	}
 
-	async function refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-		const creds = credentials as McpCredentials;
-		const tokenEndpoint = creds.tokenEndpoint ?? (await discover(config.url)).token_endpoint;
-		const clientId = creds.clientId ?? config.clientId;
-		if (!creds.refresh) {
-			throw new Error(`No refresh token stored for ${label}; re-run /mcp login ${config.server}`);
+	async function refreshToken(credentials: McpProviderCredentials): Promise<McpProviderCredentials> {
+		if (!isOpaqueRecord(credentials)) throw new Error("MCP OAuth credential binding is invalid.");
+		const creds = credentials;
+		const store = requireStore(config.secretStore);
+		if (creds.mcpEndpoint !== mcpEndpoint) {
+			throw new Error("MCP OAuth credential binding is invalid.");
 		}
-		const token = await exchangeToken(tokenEndpoint, {
-			grant_type: "refresh_token",
-			refresh_token: creds.refresh,
-			...(clientId ? { client_id: clientId } : {}),
-		});
-		return toCredentials(token, tokenEndpoint, clientId ?? "", creds.refresh);
+		const publicBinding: OAuthBinding = { mcpEndpoint: creds.mcpEndpoint, authServer: creds.authServer, tokenEndpoint: creds.tokenEndpoint, clientId: creds.clientId, scopes: creds.scopes };
+		const bytes = await store.get(creds.secretReference, publicBinding);
+		if (!bytes) throw new Error("MCP OAuth secret is unavailable.");
+		try {
+			const stored = decodeTokens(bytes);
+			if (!sameBinding(stored.binding, publicBinding)) throw new Error("MCP OAuth credential binding is invalid.");
+			if (!stored.refresh) throw new Error(`No refresh token stored for ${label}; re-run /mcp login ${config.server}`);
+			const token = await exchangeToken(stored.binding.tokenEndpoint, { grant_type: "refresh_token", refresh_token: stored.refresh, client_id: stored.binding.clientId });
+			if (!token.refresh_token) token.refresh_token = stored.refresh;
+			return await toCredentials(token, { endpoint: stored.binding.mcpEndpoint, authServer: stored.binding.authServer, tokenEndpoint: stored.binding.tokenEndpoint, clientId: stored.binding.clientId, scopes: stored.binding.scopes }, store, creds);
+		} finally { zero(bytes); }
 	}
 
 	return {
@@ -375,6 +475,7 @@ export function createMcpOAuthProvider(config: McpOAuthConfig): OAuthProviderInt
 		usesCallbackServer: true,
 		login,
 		refreshToken,
-		getApiKey: (credentials) => credentials.access,
+		// MCP bearer material is available only through host-owned transient retrieval.
+		getApiKey: () => { throw new Error("MCP OAuth tokens require the host secret adapter."); },
 	};
 }

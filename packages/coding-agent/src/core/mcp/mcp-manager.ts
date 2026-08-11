@@ -4,12 +4,81 @@
 import {
 	BUILTIN_MCP_CATALOG,
 	createMcpOAuthProvider,
+	getMcpOAuthAccessToken,
 	getCatalogEntry,
 	registerBuiltinMcpOAuthProviders,
 } from "@earendil-works/pi-ai/mcp";
-import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { getOAuthProvider, registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { AuthStorage } from "../auth-storage.js";
 import type { McpServerConfig } from "../settings-manager.js";
+import { MCP_OAUTH_SECRET_NAMESPACE, type McpOAuthSecretStore, type SecretReference } from "./mcp-secret-store.js";
+import type { McpOAuthBinding, McpOAuthSecretPort } from "@earendil-works/pi-ai/mcp";
+
+interface McpOAuthPublicRecord {
+	type: "mcp_oauth";
+	kind: "opaque";
+	secretReference: SecretReference;
+	mcpEndpoint: string;
+	authServer: string;
+	clientId: string;
+	scopes: string;
+	tokenEndpoint: string;
+	expires: number;
+}
+
+function canonicalEndpoint(value: string): string | undefined {
+	try { const url = new URL(value); return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash ? url.href : undefined; } catch { return undefined; }
+}
+
+function isS01Reference(value: unknown): value is SecretReference {
+	if (!value || typeof value !== "object") return false;
+	const reference = value as Partial<SecretReference>;
+	return reference.version === 1 && reference.namespace === MCP_OAUTH_SECRET_NAMESPACE &&
+		typeof reference.id === "string" && /^[A-Za-z0-9_-]{43}$/.test(reference.id) &&
+		typeof reference.revision === "string" && /^[A-Za-z0-9_-]{43}$/.test(reference.revision);
+}
+
+function isBoundMcpOAuth(value: unknown, endpoint: string): value is McpOAuthPublicRecord {
+	if (!value || typeof value !== "object") return false;
+	const record = value as Partial<McpOAuthPublicRecord>;
+	const ref = record.secretReference;
+	return record.type === "mcp_oauth" && record.kind === "opaque" && record.mcpEndpoint === endpoint && typeof record.authServer === "string" && typeof record.tokenEndpoint === "string" && typeof record.clientId === "string" && typeof record.scopes === "string" && typeof record.expires === "number" && !!ref && ref.version === 1 && ref.namespace === "mcp-oauth" && typeof ref.id === "string" && typeof ref.revision === "string";
+}
+
+function isCanonicalBinding(value: McpOAuthBinding): boolean {
+	return canonicalEndpoint(value.mcpEndpoint) === value.mcpEndpoint &&
+		canonicalEndpoint(value.authServer) === value.authServer &&
+		canonicalEndpoint(value.tokenEndpoint) === value.tokenEndpoint &&
+		typeof value.clientId === "string" && value.clientId.length > 0 && typeof value.scopes === "string";
+}
+
+function toOpaqueCredential(value: unknown, expectedEndpoint: string): McpOAuthPublicRecord | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const candidate = value as Partial<McpOAuthPublicRecord>;
+	if (candidate.kind !== "opaque" || candidate.mcpEndpoint !== expectedEndpoint || !isS01Reference(candidate.secretReference)) return undefined;
+	if (typeof candidate.authServer !== "string" || typeof candidate.tokenEndpoint !== "string" || typeof candidate.clientId !== "string" || typeof candidate.scopes !== "string" || typeof candidate.expires !== "number") return undefined;
+	const record: McpOAuthPublicRecord = { type: "mcp_oauth", kind: "opaque", secretReference: candidate.secretReference, mcpEndpoint: candidate.mcpEndpoint, authServer: candidate.authServer, tokenEndpoint: candidate.tokenEndpoint, clientId: candidate.clientId, scopes: candidate.scopes, expires: candidate.expires };
+	return isBoundMcpOAuth(record, expectedEndpoint) && isCanonicalBinding({ mcpEndpoint: record.mcpEndpoint, authServer: record.authServer, tokenEndpoint: record.tokenEndpoint, clientId: record.clientId, scopes: record.scopes }) ? record : undefined;
+}
+
+/** The only bridge from AI OAuth to Core S01. AI receives opaque unknown handles. */
+function createS01SecretPort(store: McpOAuthSecretStore): McpOAuthSecretPort {
+	return {
+		put: (value) => store.put(MCP_OAUTH_SECRET_NAMESPACE, value),
+		get: (reference, expected) => {
+			if (!isS01Reference(reference) || !isCanonicalBinding(expected)) return Promise.resolve(undefined);
+			return store.get(reference);
+		},
+		replace: (reference, value) => {
+			if (!isS01Reference(reference)) return Promise.reject(new Error("MCP OAuth secret reference is invalid."));
+			return store.replace(reference, reference.revision, value);
+		},
+		delete: (reference) => {
+			if (!isS01Reference(reference)) return Promise.reject(new Error("MCP OAuth secret reference is invalid."));
+			return store.delete(reference, reference.revision);
+		},
+	};
+}
 
 export interface McpManagerOptions {
 	authStorage: AuthStorage;
@@ -17,6 +86,8 @@ export interface McpManagerOptions {
 	getUserServers?: () => Record<string, McpServerConfig> | undefined;
 	/** Start an interactive host-side login for a server. Provided by the UI mode. */
 	beginLogin?: (server: string) => Promise<void>;
+	/** Core S01 store; absent is an explicit unavailable OAuth state. */
+	secretStore?: McpOAuthSecretStore;
 }
 
 /** A resolved integration: a catalog/user entry plus its provider id. */
@@ -37,6 +108,7 @@ export class McpManager {
 	private readonly authStorage: AuthStorage;
 	private readonly getUserServers: () => Record<string, McpServerConfig> | undefined;
 	private readonly beginLogin?: (server: string) => Promise<void>;
+	private readonly secretStore?: McpOAuthSecretStore;
 	private integrations = new Map<string, ResolvedIntegration>();
 	/** Provider ids we registered for user servers, so refresh can drop removed ones. */
 	private registeredUserProviderIds = new Set<string>();
@@ -45,6 +117,7 @@ export class McpManager {
 		this.authStorage = options.authStorage;
 		this.getUserServers = options.getUserServers ?? (() => undefined);
 		this.beginLogin = options.beginLogin;
+		this.secretStore = options.secretStore;
 		this.resolveIntegrations();
 		this.registerProviders();
 	}
@@ -86,7 +159,7 @@ export class McpManager {
 	}
 
 	private registerProviders(): void {
-		registerBuiltinMcpOAuthProviders();
+		registerBuiltinMcpOAuthProviders(this.secretStore ? createS01SecretPort(this.secretStore) : undefined);
 		this.registerUserProviders();
 	}
 
@@ -108,6 +181,7 @@ export class McpManager {
 						server: integration.server,
 						label: integration.label,
 						url: integration.url,
+					secretStore: this.secretStore ? createS01SecretPort(this.secretStore) : undefined,
 					}),
 				);
 			} else if (getCatalogEntry(integration.server)) {
@@ -126,18 +200,9 @@ export class McpManager {
 	/** True when valid credentials exist for the integration (drives enablement). */
 	private isAuthed(integration: ResolvedIntegration): boolean {
 		if (integration.enabled === false) return false;
-		if (integration.bearerTokenEnvVar && process.env[integration.bearerTokenEnvVar]?.trim()) {
-			return true;
-		}
-		// A user server that overrides a catalog name must NOT inherit the built-in's
-		// stored mcp: creds — those were issued for the official endpoint and could be
-		// sent to the override URL. Such an override authenticates only via a bearer
-		// env var (handled above); we don't trust auth.json OAuth creds for it.
-		if (integration.userDeclared && getCatalogEntry(integration.server)) {
-			return false;
-		}
-		const cred = this.authStorage.get(this.providerId(integration.server));
-		return cred !== undefined;
+		if (!integration.usesOAuth || !this.secretStore) return false;
+		const endpoint = canonicalEndpoint(integration.url);
+		return endpoint !== undefined && isBoundMcpOAuth(this.authStorage.get(this.providerId(integration.server)), endpoint);
 	}
 
 	/** `-<server>/SKILL.md` overrides for every built-in integration the user isn't logged into. */
@@ -152,17 +217,49 @@ export class McpManager {
 		return overrides;
 	}
 
+	private async refreshOpaqueRecord(server: string, integration: ResolvedIntegration, current: McpOAuthPublicRecord): Promise<McpOAuthPublicRecord> {
+		const endpoint = canonicalEndpoint(integration.url);
+		const provider = getOAuthProvider(this.providerId(server));
+		if (!endpoint || !provider || !this.secretStore) throw new Error("MCP OAuth credentials are unavailable.");
+		const refreshed = await provider.refreshToken({ kind: "opaque", secretReference: current.secretReference, mcpEndpoint: current.mcpEndpoint, authServer: current.authServer, tokenEndpoint: current.tokenEndpoint, clientId: current.clientId, scopes: current.scopes, expires: current.expires });
+		const rotated = toOpaqueCredential(refreshed, endpoint);
+		if (!rotated || !this.authStorage.replaceMcpOAuthCredential(this.providerId(server), current.secretReference, rotated)) throw new Error("MCP OAuth credentials changed during refresh.");
+		return rotated;
+	}
+
+	/** Host-only transient token retrieval. Never expose this through a kernel/RPC handler. */
+	async withOAuthAccessToken<T>(server: string, operation: (accessToken: string) => Promise<T>, forceRefresh = false): Promise<T> {
+		const integration = this.integrations.get(server);
+		const endpoint = integration && canonicalEndpoint(integration.url);
+		const stored = this.authStorage.get(this.providerId(server));
+		if (!integration || !endpoint || !this.secretStore || !isBoundMcpOAuth(stored, endpoint)) throw new Error("MCP OAuth credentials are unavailable.");
+		const record = forceRefresh || Date.now() >= stored.expires ? await this.refreshOpaqueRecord(server, integration, stored) : stored;
+		const expected: McpOAuthBinding = { mcpEndpoint: endpoint, authServer: record.authServer, tokenEndpoint: record.tokenEndpoint, clientId: record.clientId, scopes: record.scopes };
+		const accessToken = await getMcpOAuthAccessToken(record, expected, createS01SecretPort(this.secretStore));
+		return operation(accessToken);
+	}
+
+	/** Delete the endpoint-bound Core secret before deleting its public metadata. */
+	async logout(server: string): Promise<boolean> {
+		const integration = this.integrations.get(server);
+		const endpoint = integration && canonicalEndpoint(integration.url);
+		const credential = this.authStorage.get(this.providerId(server));
+		if (!integration || !endpoint || !isBoundMcpOAuth(credential, endpoint)) return false;
+		if (!this.secretStore) throw new Error("MCP OAuth secret storage is unavailable.");
+		await this.secretStore.delete(credential.secretReference, credential.secretReference.revision);
+		this.authStorage.remove(this.providerId(server));
+		return true;
+	}
+
 	/** Host-request handlers exposed to the kernel. */
 	hostHandlers(): Record<string, (payload: Record<string, unknown>) => Promise<Record<string, unknown>>> {
 		const handlers: Record<string, (payload: Record<string, unknown>) => Promise<Record<string, unknown>>> = {
 			"mcp.refresh": async (payload) => {
 				const server = String(payload.server ?? "");
 				if (!server) throw new Error("mcp.refresh requires a server");
-				// getApiKey refreshes + rewrites auth.json under lock; Python re-reads.
-				// Surface failure (throw) instead of a false success so the kernel can
-				// report a refresh error rather than a misleading "not enabled".
-				const key = await this.authStorage.getApiKey(this.providerId(server));
-				if (!key) throw new Error(`Could not refresh credentials for ${server}`);
+				// This only verifies host-owned credentials. It deliberately never returns
+				// a token; transports use withOAuthAccessToken() directly.
+				await this.withOAuthAccessToken(server, async () => undefined, true);
 				return {};
 			},
 			// Resolved config so the kernel skill connects to the same URL the host

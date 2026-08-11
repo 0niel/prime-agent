@@ -1,5 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createMcpOAuthProvider } from "../src/mcp/oauth.js";
+import { createMcpOAuthProvider, getMcpOAuthAccessToken, type McpOAuthKeychainRecord } from "../src/mcp/oauth.js";
+import type { McpOAuthSecretPort } from "../src/mcp/oauth.js";
+
+class FakeSecretPort implements McpOAuthSecretPort {
+	readonly values = new Map<string, Uint8Array>();
+	private next = 0;
+	async put(value: Uint8Array): Promise<unknown> { const key = String(++this.next); this.values.set(key, Uint8Array.from(value)); return { key }; }
+	async get(reference: unknown, _expected: { mcpEndpoint: string; authServer: string; tokenEndpoint: string; clientId: string; scopes: string }): Promise<Uint8Array | undefined> { const key = (reference as { key?: string }).key; const value = key && this.values.get(key); return value && Uint8Array.from(value); }
+	async replace(reference: unknown, value: Uint8Array): Promise<unknown> { const key = (reference as { key?: string }).key; if (!key || !this.values.has(key)) throw new Error("missing"); this.values.set(key, Uint8Array.from(value)); return { key }; }
+	async delete(reference: unknown): Promise<void> { const key = (reference as { key?: string }).key; if (key) this.values.delete(key); }
+}
+function fakeStore() { const store = new FakeSecretPort(); return { store, keychain: store }; }
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -26,7 +37,7 @@ describe.sequential("MCP OAuth provider", () => {
 	});
 
 	it("has a namespaced id and label", () => {
-		const provider = createMcpOAuthProvider({ server: "linear", label: "Linear", url: "https://srv.test/mcp" });
+		const provider = createMcpOAuthProvider({ server: "linear", label: "Linear", url: "https://srv.test/mcp", secretStore: fakeStore().store });
 		expect(provider.id).toBe("mcp:linear");
 		expect(provider.name).toBe("Linear");
 		expect(provider.usesCallbackServer).toBe(true);
@@ -50,8 +61,9 @@ describe.sequential("MCP OAuth provider", () => {
 		});
 		vi.stubGlobal("fetch", fetchMock);
 
-		const provider = createMcpOAuthProvider({ server: "demo", url: "https://srv.test/mcp" });
-		const creds = await provider.login({
+		const { store, keychain } = fakeStore();
+		const provider = createMcpOAuthProvider({ server: "demo", url: "https://srv.test/mcp", secretStore: store });
+		const creds = (await provider.login({
 			onAuth: (info) => {
 				authUrl = info.url;
 			},
@@ -62,10 +74,14 @@ describe.sequential("MCP OAuth provider", () => {
 				const state = new URL(authUrl).searchParams.get("state") ?? "";
 				return `${REDIRECT}?code=the-code&state=${state}`;
 			},
-		});
+		})) as unknown as McpOAuthKeychainRecord;
 
-		expect(creds.access).toBe("access-1");
-		expect(creds.refresh).toBe("refresh-1");
+		expect("access" in creds).toBe(false);
+		expect("refresh" in creds).toBe(false);
+		expect(creds.secretReference).toBeDefined();
+		expect(JSON.stringify(creds)).not.toContain("access-1");
+		expect(JSON.stringify(creds)).not.toContain("refresh-1");
+		expect([...keychain.values.values()].map((value) => new TextDecoder().decode(value)).join("\n")).toContain("access-1");
 		expect(creds.expires).toBeGreaterThan(Date.now());
 		// auth URL carries PKCE challenge + registered client id
 		const authParams = new URL(authUrl).searchParams;
@@ -95,7 +111,7 @@ describe.sequential("MCP OAuth provider", () => {
 					throw new Error(`unexpected fetch: ${url}`);
 				}),
 			);
-			const provider = createMcpOAuthProvider({ server: "demo", url: "https://srv.test/mcp" });
+			const provider = createMcpOAuthProvider({ server: "demo", url: "https://srv.test/mcp", secretStore: fakeStore().store });
 			const creds = await provider.login({
 				onAuth: (info) => {
 					authUrl = info.url;
@@ -106,7 +122,7 @@ describe.sequential("MCP OAuth provider", () => {
 					return `${p.get("redirect_uri")}?code=x&state=${p.get("state")}`;
 				},
 			});
-			expect(creds.access).toBe("a");
+			expect("access" in creds).toBe(false);
 			// Did NOT use the blocked base port.
 			const redirect = new URL(authUrl).searchParams.get("redirect_uri") ?? "";
 			expect(redirect).not.toContain(":53700/");
@@ -116,30 +132,31 @@ describe.sequential("MCP OAuth provider", () => {
 		}
 	});
 
-	it("refreshes tokens, keeping the prior refresh token when omitted", async () => {
-		const fetchMock = vi.fn(async (input: unknown, init?: RequestInit): Promise<Response> => {
-			const url = urlOf(input);
-			if (url === META.token_endpoint) {
-				const params = new URLSearchParams(String(init?.body));
-				expect(params.get("grant_type")).toBe("refresh_token");
-				expect(params.get("refresh_token")).toBe("old-refresh");
-				return jsonResponse({ access_token: "access-2", expires_in: 1800 });
-			}
-			throw new Error(`unexpected fetch: ${url}`);
-		});
-		vi.stubGlobal("fetch", fetchMock);
+	it("rejects a sealed binding edited beneath valid opaque metadata", async () => {
+		const { store } = fakeStore();
+		const reference = await store.put(new TextEncoder().encode(JSON.stringify({
+			access: "sealed-access", refresh: "sealed-refresh",
+			binding: { mcpEndpoint: "https://other.test/mcp", authServer: "https://srv.test/", tokenEndpoint: "https://srv.test/token", clientId: "client", scopes: "read" },
+		})));
+		const record: McpOAuthKeychainRecord = { kind: "opaque", secretReference: reference, mcpEndpoint: "https://srv.test/mcp", authServer: "https://srv.test/", tokenEndpoint: "https://srv.test/token", clientId: "client", scopes: "read", expires: Date.now() + 1_000 };
+		await expect(getMcpOAuthAccessToken(record, { mcpEndpoint: "https://srv.test/mcp", authServer: "https://srv.test/", tokenEndpoint: "https://srv.test/token", clientId: "client", scopes: "read" }, store)).rejects.toThrow("binding is invalid");
+	});
 
+	it("rejects an invalid opaque reference and token endpoint before an operation", async () => {
+		const { store } = fakeStore();
+		const record: McpOAuthKeychainRecord = { kind: "opaque", secretReference: undefined, mcpEndpoint: "https://srv.test/mcp", authServer: "https://srv.test/", tokenEndpoint: "https://srv.test/token", clientId: "client", scopes: "read", expires: Date.now() + 1_000 };
+		await expect(getMcpOAuthAccessToken(record, { mcpEndpoint: "https://srv.test/mcp", authServer: "https://srv.test/", tokenEndpoint: "https://edited.test/token", clientId: "client", scopes: "read" }, store)).rejects.toThrow("binding is invalid");
+	});
+
+	it("rejects an edited public endpoint binding before refresh network I/O", async () => {
+		const { store } = fakeStore();
+		const provider = createMcpOAuthProvider({ server: "demo", url: "https://srv.test/mcp", secretStore: store });
+		await expect(provider.refreshToken({ kind: "opaque", secretReference: { version: 1, namespace: "mcp-oauth", id: "a".repeat(43), revision: "b".repeat(43) }, mcpEndpoint: "https://edited.test/mcp", authServer: "https://srv.test/", tokenEndpoint: "https://srv.test/token", clientId: "c", scopes: "", expires: 0 } as never)).rejects.toThrow("binding is invalid");
+	});
+
+	it("fails closed when the Core secret store is unavailable", async () => {
 		const provider = createMcpOAuthProvider({ server: "demo", url: "https://srv.test/mcp" });
-		const refreshed = await provider.refreshToken({
-			access: "access-1",
-			refresh: "old-refresh",
-			expires: Date.now() - 1000,
-			tokenEndpoint: META.token_endpoint,
-			clientId: "client-xyz",
-		} as never);
-
-		expect(refreshed.access).toBe("access-2");
-		expect(refreshed.refresh).toBe("old-refresh");
+		await expect(provider.refreshToken({ kind: "opaque", secretReference: { opaque: true }, mcpEndpoint: "https://srv.test/mcp", authServer: "https://srv.test/", tokenEndpoint: "https://srv.test/token", clientId: "client", scopes: "", expires: 0 })).rejects.toThrow("secret storage is unavailable");
 	});
 
 	it("fails clearly when DCR is unavailable and no clientId is set", async () => {
@@ -152,7 +169,7 @@ describe.sequential("MCP OAuth provider", () => {
 				throw new Error(`unexpected fetch: ${url}`);
 			}),
 		);
-		const provider = createMcpOAuthProvider({ server: "slackish", url: "https://srv.test/mcp" });
+		const provider = createMcpOAuthProvider({ server: "slackish", url: "https://srv.test/mcp", secretStore: fakeStore().store });
 		await expect(provider.login({ onAuth: () => {}, onPrompt: async () => "" })).rejects.toThrow(
 			"dynamic client registration",
 		);

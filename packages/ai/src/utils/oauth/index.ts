@@ -29,7 +29,7 @@ export * from "./types.js";
 import { anthropicOAuthProvider } from "./anthropic.js";
 import { githubCopilotOAuthProvider } from "./github-copilot.js";
 import { openaiCodexOAuthProvider } from "./openai-codex.js";
-import type { OAuthCredentials, OAuthProviderId, OAuthProviderInfo, OAuthProviderInterface } from "./types.js";
+import { isPlainOAuthCredentials, type OAuthCredentials, type OAuthProviderId, type OAuthProviderInfo, type OAuthProviderInterface } from "./types.js";
 
 const BUILT_IN_OAUTH_PROVIDERS: OAuthProviderInterface[] = [
 	anthropicOAuthProvider,
@@ -114,7 +114,9 @@ export async function refreshOAuthToken(
 	if (!provider) {
 		throw new Error(`Unknown OAuth provider: ${providerId}`);
 	}
-	return provider.refreshToken(credentials);
+	const refreshed = await provider.refreshToken(credentials);
+	if (!isPlainOAuthCredentials(refreshed)) throw new Error("Opaque OAuth credentials require a host secret adapter");
+	return refreshed;
 }
 
 /**
@@ -141,7 +143,9 @@ export async function getOAuthApiKey(
 	// Refresh if expired
 	if (Date.now() >= creds.expires) {
 		try {
-			creds = await provider.refreshToken(creds);
+			const refreshed = await provider.refreshToken(creds);
+			if (!isPlainOAuthCredentials(refreshed)) throw new Error("Opaque OAuth credentials require a host secret adapter");
+			creds = refreshed;
 		} catch (_error) {
 			throw new Error(`Failed to refresh OAuth token for ${providerId}`);
 		}

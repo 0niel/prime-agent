@@ -13,6 +13,7 @@ import {
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 	type OAuthProviderId,
+	isPlainOAuthCredentials,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
@@ -30,6 +31,7 @@ import {
 	savePrimeCliTeamSelection,
 } from "./prime-inference-auth.js";
 import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
+import type { SecretReference } from "./mcp/mcp-secret-store.js";
 
 export type PrimeTeamCredential = {
 	teamId: string;
@@ -49,7 +51,20 @@ export type OAuthCredential = {
 	type: "oauth";
 } & OAuthCredentials;
 
-export type AuthCredential = ApiKeyCredential | OAuthCredential;
+/** Public-only MCP OAuth binding. Secret bytes never enter auth.json. */
+export type McpOAuthCredential = {
+	type: "mcp_oauth";
+	kind: "opaque";
+	secretReference: SecretReference;
+	mcpEndpoint: string;
+	authServer: string;
+	clientId: string;
+	scopes: string;
+	tokenEndpoint: string;
+	expires: number;
+};
+
+export type AuthCredential = ApiKeyCredential | OAuthCredential | McpOAuthCredential;
 
 export type AuthStorageData = Record<string, AuthCredential>;
 
@@ -244,6 +259,17 @@ export class InMemoryAuthStorageBackend implements AuthStorageBackend {
 /**
  * Credential storage backed by a JSON file.
  */
+function isMcpOAuthCredentialPayload(value: import("@earendil-works/pi-ai").OAuthProviderCredentials): value is Omit<McpOAuthCredential, "type"> & { kind: "opaque" } {
+	const candidate = value as Record<string, unknown>;
+	const ref = candidate.secretReference as Record<string, unknown> | undefined;
+	return Boolean(
+		candidate.kind === "opaque" && ref && ref.version === 1 && ref.namespace === "mcp-oauth" &&
+		typeof ref.id === "string" && typeof ref.revision === "string" &&
+		typeof candidate.mcpEndpoint === "string" && typeof candidate.authServer === "string" &&
+		typeof candidate.clientId === "string" && typeof candidate.scopes === "string" && typeof candidate.tokenEndpoint === "string" && typeof candidate.expires === "number",
+	);
+}
+
 export class AuthStorage {
 	private data: AuthStorageData = {};
 	private runtimeOverrides: Map<string, string> = new Map();
@@ -354,6 +380,7 @@ export class AuthStorage {
 			}
 			return `api_key:${credential.key}\0${resolveConfigValue(credential.key) ?? ""}`;
 		}
+		if (credential.type === "mcp_oauth") return undefined;
 		const provider = getOAuthProvider(providerId);
 		const apiKey = provider?.getApiKey(credential) ?? credential.access;
 		return `oauth:${apiKey}\0${credential.refresh}\0${credential.expires}`;
@@ -677,6 +704,21 @@ export class AuthStorage {
 		this.persistProviderChange(provider, credential);
 	}
 
+	/** Persist rotated opaque MCP metadata only if the public reference has not changed. */
+	replaceMcpOAuthCredential(provider: string, expected: SecretReference, credential: McpOAuthCredential): boolean {
+		if (this.loadError) return false;
+		try {
+			return this.storage.withLock((current) => {
+				const data = this.parseStorageData(current);
+				const existing = data[provider];
+				if (existing?.type !== "mcp_oauth" || existing.kind !== "opaque" || existing.secretReference.id !== expected.id || existing.secretReference.revision !== expected.revision) return { result: false };
+				const merged = { ...data, [provider]: credential };
+				this.data = merged;
+				return { result: true, next: JSON.stringify(merged, null, 2) };
+			});
+		} catch (error) { this.recordError(error); return false; }
+	}
+
 	/**
 	 * Remove credential for a provider.
 	 */
@@ -738,7 +780,20 @@ export class AuthStorage {
 		}
 
 		const credentials = await provider.login(callbacks);
-		this.set(providerId, { type: "oauth", ...credentials });
+		// MCP providers return only an opaque SecretReference plus public endpoint
+		// binding metadata. Never coerce them into the legacy plaintext OAuth shape.
+		if (isMcpOAuthCredentialPayload(credentials)) {
+			// Select fields, rather than spread: a provider payload can never put
+			// access/refresh or unknown OAuth material into auth.json.
+			this.set(providerId, {
+				type: "mcp_oauth", kind: "opaque", secretReference: credentials.secretReference,
+				mcpEndpoint: credentials.mcpEndpoint, authServer: credentials.authServer,
+				clientId: credentials.clientId, scopes: credentials.scopes, tokenEndpoint: credentials.tokenEndpoint, expires: credentials.expires,
+			});
+		} else {
+			if (!isPlainOAuthCredentials(credentials)) throw new Error("Unsupported opaque OAuth credential.");
+			this.set(providerId, { type: "oauth", ...credentials });
+		}
 	}
 
 	/**

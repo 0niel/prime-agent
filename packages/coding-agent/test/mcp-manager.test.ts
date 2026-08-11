@@ -1,12 +1,21 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
+import { getOAuthProvider, registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { McpManager } from "../src/core/mcp/mcp-manager.js";
+import { MCP_OAUTH_SECRET_NAMESPACE, McpOAuthSecretStore, type McpKeychainAdapter } from "../src/core/mcp/mcp-secret-store.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import type { McpServerConfig } from "../src/core/settings-manager.js";
+
+class MemoryKeychain implements McpKeychainAdapter {
+	readonly values = new Map<string, Uint8Array>();
+	async create(id: string, value: Uint8Array) { this.values.set(id, Uint8Array.from(value)); }
+	async read(id: string) { const value = this.values.get(id); return value && Uint8Array.from(value); }
+	async replace(id: string, expected: Uint8Array, value: Uint8Array) { const current = this.values.get(id); if (!current || current.length !== expected.length || current.some((byte, index) => byte !== expected[index])) return false; this.values.set(id, Uint8Array.from(value)); return true; }
+	async delete(id: string, expected: Uint8Array) { const current = this.values.get(id); if (!current || current.length !== expected.length || current.some((byte, index) => byte !== expected[index])) return false; this.values.delete(id); return true; }
+}
 
 describe("McpManager", () => {
 	let tempDir: string;
@@ -23,6 +32,19 @@ describe("McpManager", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
+	it("persists MCP OAuth public metadata without credential bytes", () => {
+		authStorage.set("mcp:demo", {
+			type: "mcp_oauth",
+			kind: "opaque",
+			secretReference: { version: 1, namespace: "mcp-oauth", id: "a".repeat(43), revision: "b".repeat(43) },
+			mcpEndpoint: "https://demo.test/mcp", authServer: "https://auth.demo.test/", clientId: "client", scopes: "tools", tokenEndpoint: "https://auth.demo.test/token", expires: Date.now() + 3600_000,
+		});
+		const serialized = readFileSync(join(tempDir, "auth.json"), "utf8");
+		expect(serialized).toContain('"mcp_oauth"');
+		expect(serialized).not.toMatch(/"access"\s*:/);
+		expect(serialized).not.toMatch(/"refresh"\s*:/);
+	});
+
 	it("disables every built-in integration when no credentials exist", () => {
 		const manager = new McpManager({ authStorage });
 		const overrides = manager.getDisabledBuiltinSkillOverrides();
@@ -32,12 +54,13 @@ describe("McpManager", () => {
 
 	it("enables an integration once credentials are stored", () => {
 		authStorage.set("mcp:linear", {
-			type: "oauth",
-			access: "tok",
-			refresh: "r",
+			type: "mcp_oauth",
+			kind: "opaque",
+			secretReference: { version: 1, namespace: "mcp-oauth", id: "a".repeat(43), revision: "b".repeat(43) },
+			mcpEndpoint: "https://mcp.linear.app/mcp", authServer: "https://auth.linear.test/", clientId: "client", scopes: "read", tokenEndpoint: "https://auth.linear.test/token",
 			expires: Date.now() + 3600_000,
 		});
-		const manager = new McpManager({ authStorage });
+		const manager = new McpManager({ authStorage, secretStore: {} as McpOAuthSecretStore });
 		const overrides = manager.getDisabledBuiltinSkillOverrides();
 		expect(overrides).not.toContain("-linear/SKILL.md");
 		expect(overrides).toContain("-notion/SKILL.md");
@@ -79,7 +102,7 @@ describe("McpManager", () => {
 
 		// refresh with no credentials fails (so the kernel reports a refresh error,
 		// not a false success), and a missing server arg is rejected.
-		await expect(handlers["mcp.refresh"]({ server: "linear" })).rejects.toThrow("Could not refresh");
+		await expect(handlers["mcp.refresh"]({ server: "linear" })).rejects.toThrow("MCP OAuth credentials are unavailable");
 		await expect(handlers["mcp.refresh"]({})).rejects.toThrow("requires a server");
 	});
 
@@ -128,20 +151,12 @@ describe("McpManager", () => {
 		expect(manager.listStatus().find((s) => s.server === "linear")?.enabled).toBe(false);
 	});
 
-	it("honors a bearer-token env var for user-declared servers", () => {
+	it("does not accept bearer-token environment variables as MCP credentials", () => {
 		process.env.MY_MCP_TOKEN = "secret";
 		try {
-			const manager = new McpManager({
-				authStorage,
-				getUserServers: () => ({
-					custom: { type: "http", url: "https://example.test/mcp", bearerTokenEnvVar: "MY_MCP_TOKEN" },
-				}),
-			});
-			const status = manager.listStatus().find((s) => s.server === "custom");
-			expect(status?.enabled).toBe(true);
-		} finally {
-			delete process.env.MY_MCP_TOKEN;
-		}
+			const manager = new McpManager({ authStorage, getUserServers: () => ({ custom: { type: "http", url: "https://example.test/mcp", bearerTokenEnvVar: "MY_MCP_TOKEN" } }) });
+			expect(manager.listStatus().find((item) => item.server === "custom")?.enabled).toBe(false);
+		} finally { delete process.env.MY_MCP_TOKEN; }
 	});
 
 	it("picks up mcpServers added after construction on refresh()", () => {
@@ -176,4 +191,26 @@ describe("McpManager", () => {
 		manager.refresh();
 		expect(getOAuthProvider("mcp:acme")).toBeUndefined();
 	});
+	it("force-refreshes expired opaque credentials, persists the rotated reference, and returns only a host token", async () => {
+		const store = new McpOAuthSecretStore(new MemoryKeychain());
+		const binding = { mcpEndpoint: "https://mcp.linear.app/mcp", authServer: "https://auth.linear.test/", tokenEndpoint: "https://auth.linear.test/token", clientId: "client", scopes: "read" };
+		const oldReference = await store.put(MCP_OAUTH_SECRET_NAMESPACE, new TextEncoder().encode(JSON.stringify({ access: "old", refresh: "old-refresh", binding })));
+		authStorage.set("mcp:linear", { type: "mcp_oauth", kind: "opaque", secretReference: oldReference, ...binding, expires: Date.now() - 1 });
+		let refreshCalls = 0;
+		const manager = new McpManager({ authStorage, secretStore: store });
+		registerOAuthProvider({
+			id: "mcp:linear", name: "Linear", login: async () => { throw new Error("unused"); }, getApiKey: () => { throw new Error("must not use generic api key"); },
+			refreshToken: async () => {
+				refreshCalls += 1;
+				const reference = await store.put(MCP_OAUTH_SECRET_NAMESPACE, new TextEncoder().encode(JSON.stringify({ access: "rotated-access", refresh: "old-refresh", binding })));
+				return { kind: "opaque", secretReference: reference, ...binding, expires: Date.now() + 60_000 };
+			},
+		});
+		await expect(manager.withOAuthAccessToken("linear", async (token) => token)).resolves.toBe("rotated-access");
+		expect(refreshCalls).toBe(1);
+		const rotated = authStorage.get("mcp:linear");
+		expect(rotated).toMatchObject({ type: "mcp_oauth", kind: "opaque" });
+		expect((rotated as { secretReference: { revision: string } }).secretReference.revision).not.toBe(oldReference.revision);
+	});
+
 });

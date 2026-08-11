@@ -1,7 +1,7 @@
 // Built-in MCP integrations we ship a skill package for. User servers go in the `mcpServers` setting instead.
 
 import { getOAuthProvider, registerOAuthProvider } from "../utils/oauth/index.js";
-import { createMcpOAuthProvider, type McpOAuthConfig } from "./oauth.js";
+import { createMcpOAuthProvider, type McpOAuthConfig, type McpOAuthSecretPort } from "./oauth.js";
 
 export interface McpCatalogEntry {
 	/** Matches the skill package import name and the auth.json key `mcp:<server>`. */
@@ -35,7 +35,7 @@ export function getCatalogEntry(server: string): McpCatalogEntry | undefined {
  * after any resetOAuthProviders() (e.g. ModelRegistry.refresh) since reset drops
  * everything but the model-provider built-ins.
  */
-export function registerBuiltinMcpOAuthProviders(): void {
+export function registerBuiltinMcpOAuthProviders(secretStore?: McpOAuthSecretPort): void {
 	for (const entry of BUILTIN_MCP_CATALOG) {
 		if (entry.oauth?.kind !== "oauth") continue;
 		const id = `mcp:${entry.server}`;
@@ -47,6 +47,7 @@ export function registerBuiltinMcpOAuthProviders(): void {
 				url: entry.url,
 				scopes: entry.oauth.scopes,
 				clientId: entry.oauth.clientId,
+				secretStore,
 			}),
 		);
 	}

@@ -7,6 +7,14 @@ export type OAuthCredentials = {
 	[key: string]: unknown;
 };
 
+/** Opaque service credentials intentionally carry no bearer fields. */
+export type OpaqueOAuthCredentials = { kind: "opaque"; [key: string]: unknown };
+export type OAuthProviderCredentials = OAuthCredentials | OpaqueOAuthCredentials;
+
+export function isPlainOAuthCredentials(value: OAuthProviderCredentials): value is OAuthCredentials {
+	return !("kind" in value && value.kind === "opaque");
+}
+
 export type OAuthProviderId = string;
 
 /** @deprecated Use OAuthProviderId instead */
@@ -48,16 +56,16 @@ export interface OAuthProviderInterface {
 	readonly name: string;
 
 	/** Run the login flow, return credentials to persist */
-	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+	login(callbacks: OAuthLoginCallbacks): Promise<OAuthProviderCredentials>;
 
 	/** Whether login uses a local callback server and supports manual code input. */
 	usesCallbackServer?: boolean;
 
 	/** Refresh expired credentials, return updated credentials to persist */
-	refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+	refreshToken(credentials: OAuthProviderCredentials): Promise<OAuthProviderCredentials>;
 
 	/** Convert credentials to API key string for the provider */
-	getApiKey(credentials: OAuthCredentials): string;
+	getApiKey(credentials: OAuthProviderCredentials): string;
 
 	/** Optional: modify models for this provider (e.g., update baseUrl) */
 	modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
