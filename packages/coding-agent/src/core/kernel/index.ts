@@ -638,6 +638,10 @@ export class KernelManager {
 	private readonly activeHostRequestControllers = new Map<string, AbortController>();
 	/** Monotonic terminal admission gate: shutdown never grants new host-request authority. */
 	private hostRequestsClosed = false;
+	/** Incremented synchronously by every public terminal lifecycle entry point. */
+	private terminalRevision = 0;
+	/** Once terminal, this manager can never reopen host-request admission. */
+	private terminal = false;
 	private hostRequestGeneration = 0;
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Memoized so concurrent callers all await the same in-flight startup. */
@@ -667,6 +671,9 @@ export class KernelManager {
 	}
 
 	async start(options: KernelStartOptions = {}): Promise<void> {
+		if (this.terminal) {
+			throw new Error("Kernel was disposed");
+		}
 		if (options.signal?.aborted) {
 			throw createKernelStartupAbortError();
 		}
@@ -807,6 +814,10 @@ export class KernelManager {
 			throw e;
 		}
 
+		if (this.terminal || this.state === "shutdown") {
+			this.cleanupResources();
+			throw new Error("Kernel was disposed during startup");
+		}
 		this.state = "running";
 		this.startForkedLivenessMonitor();
 	}
@@ -1453,7 +1464,16 @@ export class KernelManager {
 		}
 	}
 
-	async shutdown(opts: { snapshot?: boolean } = {}): Promise<void> {
+	/** Enter the one-way terminal state before any asynchronous teardown work begins. */
+	private enterTerminal(reason: string): void {
+		if (this.terminal) return;
+		this.terminal = true;
+		this.terminalRevision++;
+		this.beginHostRequestShutdown(reason);
+	}
+
+	/** Shutdown implementation shared with restart; unlike public shutdown, it is not terminal. */
+	private async shutdownInternal(opts: { snapshot?: boolean } = {}): Promise<void> {
 		this.beginHostRequestShutdown("kernel is shutting down");
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
@@ -1483,7 +1503,13 @@ export class KernelManager {
 		this.cleanupResources();
 	}
 
+	async shutdown(opts: { snapshot?: boolean } = {}): Promise<void> {
+		this.enterTerminal("kernel is shutting down");
+		await this.shutdownInternal(opts);
+	}
+
 	async restart(): Promise<void> {
+		const terminalRevision = this.terminalRevision;
 		const prev = this.executionQueue;
 		let resolveNext: () => void = () => {};
 		this.executionQueue = new Promise<void>((r) => {
@@ -1492,7 +1518,10 @@ export class KernelManager {
 		await prev;
 
 		try {
-			await this.shutdown();
+			await this.shutdownInternal();
+			if (this.terminal || terminalRevision !== this.terminalRevision) {
+				throw new Error("Kernel terminated during restart");
+			}
 			this.hostRequestsClosed = false;
 			this.state = "idle";
 			this.kernelStderr = "";
@@ -1503,7 +1532,7 @@ export class KernelManager {
 	}
 
 	async kill(): Promise<void> {
-		this.beginHostRequestShutdown("kernel is being killed");
+		this.enterTerminal("kernel is being killed");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
@@ -1609,8 +1638,8 @@ export class KernelManager {
 
 	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
 	dispose(): Promise<void> {
+		this.enterTerminal("kernel is being disposed");
 		return (async () => {
-			this.beginHostRequestShutdown("kernel is being disposed");
 			// Final namespace flush while the kernel is still live (session end / reload).
 			await this.flushSnapshotForDispose();
 			this.state = "shutdown";
@@ -1629,7 +1658,7 @@ export class KernelManager {
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	disposeSync(): void {
-		this.beginHostRequestShutdown("kernel is being disposed");
+		this.enterTerminal("kernel is being disposed");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.

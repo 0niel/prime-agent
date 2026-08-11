@@ -512,7 +512,7 @@ describe("KernelManager abort handling", () => {
 			state: "idle" | "running" | "shutdown";
 			connection: { key: string };
 			shell: { send: () => Promise<void>; close: () => void };
-			shutdown: () => Promise<void>;
+			shutdownInternal: () => Promise<void>;
 			start: () => Promise<void>;
 			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
 			sendCommMessage: (_commId: string, data: Record<string, unknown>) => Promise<void>;
@@ -520,7 +520,7 @@ describe("KernelManager abort handling", () => {
 			inFlightHostRequests: Set<Promise<void>>;
 		};
 		internals.hostRequestsClosed = true;
-		internals.shutdown = async () => {
+		internals.shutdownInternal = async () => {
 			expect(internals.hostRequestsClosed).toBe(true);
 			internals.state = "shutdown";
 			await shutdownSettled;
@@ -611,5 +611,39 @@ describe("KernelManager abort handling", () => {
 		expect(shellSend).toHaveBeenCalledTimes(1);
 		expect(controlSend).toHaveBeenCalled();
 		manager.disposeSync();
+	});
+
+	it("does not restart or reopen host-request admission when disposal races shutdown", async () => {
+		let releaseShutdown: (() => void) | undefined;
+		let markShutdownEntered: (() => void) | undefined;
+		const shutdownEntered = new Promise<void>((resolve) => {
+			markShutdownEntered = resolve;
+		});
+		const shutdownBlocked = new Promise<void>((resolve) => {
+			releaseShutdown = resolve;
+		});
+		const manager = new KernelManager({ cwd: process.cwd() });
+		const start = vi.fn(async () => {});
+		const internals = manager as unknown as {
+			hostRequestsClosed: boolean;
+			state: "idle" | "running" | "shutdown";
+			shutdownInternal: () => Promise<void>;
+			start: () => Promise<void>;
+		};
+		internals.shutdownInternal = async () => {
+			markShutdownEntered?.();
+			await shutdownBlocked;
+		};
+		internals.start = start;
+
+		const restartPromise = manager.restart();
+		await shutdownEntered;
+		manager.disposeSync();
+		expect(internals.hostRequestsClosed).toBe(true);
+		releaseShutdown?.();
+
+		await expect(restartPromise).rejects.toThrow("Kernel terminated during restart");
+		expect(start).not.toHaveBeenCalled();
+		expect(internals.hostRequestsClosed).toBe(true);
 	});
 });
