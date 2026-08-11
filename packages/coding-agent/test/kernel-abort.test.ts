@@ -374,6 +374,127 @@ describe("KernelManager abort handling", () => {
 		manager.disposeSync();
 	});
 
+	it("closes host-request admission before snapshot shutdown flushes", async () => {
+		let capturedContext: HostRequestContext | undefined;
+		let releaseHandler: (() => void) | undefined;
+		let releaseFlush: (() => void) | undefined;
+		let markFlushEntered: (() => void) | undefined;
+		const flushEntered = new Promise<void>((resolve) => {
+			markFlushEntered = resolve;
+		});
+		const implementation = vi.fn(async (_payload: Record<string, unknown>, context: HostRequestContext) => {
+			capturedContext = context;
+			await new Promise<void>((resolve) => {
+				releaseHandler = resolve;
+			});
+			return { ok: true };
+		});
+		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const internals = manager as unknown as {
+			state: "running";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			flushSnapshotForDispose: () => Promise<void>;
+			activeHostRequestControllers: Map<string, AbortController>;
+			handledHostRequestCommIds: Set<string>;
+			inFlightHostRequests: Set<Promise<void>>;
+		};
+		Object.assign(internals, {
+			state: "running",
+			connection: { key: "test" },
+			shell: { send: async () => {}, close: () => {} },
+			flushSnapshotForDispose: async () => {
+				markFlushEntered?.();
+				await new Promise<void>((resolve) => {
+					releaseFlush = resolve;
+				});
+			},
+		});
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "existing", target_name: "host.request", data: { type: "test" } },
+		});
+		await vi.waitFor(() => expect(capturedContext).toBeDefined());
+
+		const shutdownPromise = manager.shutdown({ snapshot: true });
+		await flushEntered;
+		expect(capturedContext?.signal.aborted).toBe(true);
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "late", target_name: "host.request", data: { type: "test" } },
+		});
+		expect(implementation).toHaveBeenCalledTimes(1);
+		expect(internals.activeHostRequestControllers.has("late")).toBe(false);
+		expect(internals.handledHostRequestCommIds.has("late")).toBe(false);
+
+		releaseFlush?.();
+		await shutdownPromise;
+		releaseHandler?.();
+		await Promise.allSettled([...internals.inFlightHostRequests]);
+	});
+
+	it("closes host-request admission before dispose flushes", async () => {
+		let capturedContext: HostRequestContext | undefined;
+		let releaseHandler: (() => void) | undefined;
+		let releaseFlush: (() => void) | undefined;
+		let markFlushEntered: (() => void) | undefined;
+		const flushEntered = new Promise<void>((resolve) => {
+			markFlushEntered = resolve;
+		});
+		const implementation = vi.fn(async (_payload: Record<string, unknown>, context: HostRequestContext) => {
+			capturedContext = context;
+			await new Promise<void>((resolve) => {
+				releaseHandler = resolve;
+			});
+			return { ok: true };
+		});
+		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const internals = manager as unknown as {
+			state: "running";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			flushSnapshotForDispose: () => Promise<void>;
+			activeHostRequestControllers: Map<string, AbortController>;
+			handledHostRequestCommIds: Set<string>;
+			inFlightHostRequests: Set<Promise<void>>;
+		};
+		Object.assign(internals, {
+			state: "running",
+			connection: { key: "test" },
+			shell: { send: async () => {}, close: () => {} },
+			flushSnapshotForDispose: async () => {
+				markFlushEntered?.();
+				await new Promise<void>((resolve) => {
+					releaseFlush = resolve;
+				});
+			},
+		});
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "existing", target_name: "host.request", data: { type: "test" } },
+		});
+		await vi.waitFor(() => expect(capturedContext).toBeDefined());
+
+		const disposePromise = manager.dispose();
+		await flushEntered;
+		expect(capturedContext?.signal.aborted).toBe(true);
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "late", target_name: "host.request", data: { type: "test" } },
+		});
+		expect(implementation).toHaveBeenCalledTimes(1);
+		expect(internals.activeHostRequestControllers.has("late")).toBe(false);
+		expect(internals.handledHostRequestCommIds.has("late")).toBe(false);
+
+		releaseFlush?.();
+		releaseHandler?.();
+		await disposePromise;
+	});
+
 	it("fails a later execution fast when the interrupted cell never idles", async () => {
 		vi.useFakeTimers();
 		const manager = new KernelManager({ cwd: process.cwd() });
