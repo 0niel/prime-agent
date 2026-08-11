@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerFauxProvider } from "@earendil-works/pi-ai";
@@ -9,7 +9,8 @@ import { createAgentSessionFromServices, createAgentSessionServices } from "../s
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { McpOAuthSecretStore, type McpKeychainAdapter } from "../src/core/mcp/mcp-secret-store.js";
 import { SessionManager } from "../src/core/session-manager.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { SettingsManager, type SettingsScope, type SettingsStorage } from "../src/core/settings-manager.js";
+import { composeMcpRuntimeProjectAdmission } from "../src/core/mcp/mcp-runtime-composition.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 
 class TestMcpKeychain implements McpKeychainAdapter {
@@ -18,6 +19,16 @@ class TestMcpKeychain implements McpKeychainAdapter {
 	async read(id: string) { const value = this.values.get(id); return value && Uint8Array.from(value); }
 	async replace(id: string, expected: Uint8Array, value: Uint8Array) { const current = this.values.get(id); if (!current || current.length !== expected.length || current.some((entry, index) => entry !== expected[index])) return false; this.values.set(id, Uint8Array.from(value)); return true; }
 	async delete(id: string, expected: Uint8Array) { const current = this.values.get(id); if (!current || current.length !== expected.length || current.some((entry, index) => entry !== expected[index])) return false; this.values.delete(id); return true; }
+}
+
+class McpTrackingStorage implements SettingsStorage {
+	readonly reads: Record<SettingsScope, number> = { global: 0, project: 0 };
+	constructor(private readonly values: Record<SettingsScope, string | undefined>) {}
+	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
+		this.reads[scope]++;
+		const next = fn(this.values[scope]);
+		if (next !== undefined) this.values[scope] = next;
+	}
 }
 
 describe("createAgentSessionFromServices", () => {
@@ -35,6 +46,33 @@ describe("createAgentSessionFromServices", () => {
 				rmSync(path, { recursive: true, force: true });
 			}
 		}
+	});
+
+	it("denied MCP trust preserves ordinary project settings while never reading the project MCP getter", async () => {
+		const tempDir = join(tmpdir(), `pi-session-mcp-admission-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true }); cleanupPaths.push(tempDir);
+		const canonicalTempDir = realpathSync.native(tempDir);
+		const declaration = { version: 1, servers: { catalog: { name: "catalog", url: "https://catalog.test/mcp", enabled: true } } };
+		const deniedStorage = new McpTrackingStorage({ global: JSON.stringify({ mcpProjectTrustPolicy: { revision: "wrong", allowedProjectDirectories: [] } }), project: JSON.stringify({ mcpDeclarations: declaration, shellPath: "/bin/project-shell" }) });
+		const deniedAdmission = composeMcpRuntimeProjectAdmission(SettingsManager.loadGlobalSettingsFromStorage(deniedStorage), canonicalTempDir);
+		const deniedSettings = SettingsManager.fromStorage(deniedStorage);
+		let deniedMcpGetterReads = 0;
+		const originalDeniedGetter = deniedSettings.getMcpDeclarationDocument.bind(deniedSettings);
+		deniedSettings.getMcpDeclarationDocument = ((scope) => { if (scope === "project") deniedMcpGetterReads++; return originalDeniedGetter(scope); }) as typeof deniedSettings.getMcpDeclarationDocument;
+		const denied = await createAgentSessionServices({ cwd: tempDir, agentDir: tempDir, settingsManager: deniedSettings, mcpProjectAdmission: deniedAdmission, noBuiltinHerdrReporter: true, resourceLoaderOptions: { noPromptTemplates: true, noThemes: true } });
+		expect(deniedStorage.reads.project).toBeGreaterThan(0);
+		expect(deniedSettings.getProjectSettings().shellPath).toBe("/bin/project-shell");
+		expect(deniedMcpGetterReads).toBe(0);
+		expect(denied.mcpManager.listStatus().find((entry) => entry.server === "catalog")).toBeUndefined();
+		const allowedStorage = new McpTrackingStorage({ global: JSON.stringify({ mcpProjectTrustPolicy: { revision: "r1", allowedProjectDirectories: [canonicalTempDir] } }), project: JSON.stringify({ mcpDeclarations: declaration }) });
+		const allowedAdmission = composeMcpRuntimeProjectAdmission(SettingsManager.loadGlobalSettingsFromStorage(allowedStorage), canonicalTempDir);
+		const allowedSettings = SettingsManager.fromStorage(allowedStorage);
+		let allowedMcpGetterReads = 0;
+		const originalAllowedGetter = allowedSettings.getMcpDeclarationDocument.bind(allowedSettings);
+		allowedSettings.getMcpDeclarationDocument = ((scope) => { if (scope === "project") allowedMcpGetterReads++; return originalAllowedGetter(scope); }) as typeof allowedSettings.getMcpDeclarationDocument;
+		const allowed = await createAgentSessionServices({ cwd: tempDir, agentDir: tempDir, settingsManager: allowedSettings, mcpProjectAdmission: allowedAdmission, noBuiltinHerdrReporter: true, resourceLoaderOptions: { noPromptTemplates: true, noThemes: true } });
+		expect(allowedMcpGetterReads).toBe(1);
+		expect(allowed.mcpManager.listStatus().find((entry) => entry.server === "catalog")).toBeDefined();
 	});
 
 	it("accepts an explicitly injected Core S01 store for normal service composition", async () => {

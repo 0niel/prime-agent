@@ -337,7 +337,7 @@ export class SettingsManager {
 		initialProject: Settings,
 		globalLoadError: Error | null = null,
 		projectLoadError: Error | null = null,
-		initialErrors: SettingsError[] = [],
+		initialErrors: SettingsError[] = []
 	) {
 		this.storage = storage;
 		this.globalSettings = initialGlobal;

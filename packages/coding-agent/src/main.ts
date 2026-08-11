@@ -741,6 +741,9 @@ async function prepareRuntimeServices(options: {
 	const mcpProjectAdmission = composeMcpRuntimeProjectAdmission(
 		SettingsManager.loadGlobalSettings(options.cwd, effectiveAgentDir), options.cwd,
 	);
+	// This preflight only guards project MCP declarations. Normal project settings
+	// still load for extensions/themes/tools regardless of MCP admission.
+	const settingsManager = SettingsManager.create(options.cwd, effectiveAgentDir);
 	const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
 		usePrimeCliConfig: effectiveAgentDir === options.agentDir,
 	});
@@ -748,6 +751,7 @@ async function prepareRuntimeServices(options: {
 		cwd: options.cwd,
 		agentDir: effectiveAgentDir,
 		authStorage,
+		settingsManager,
 		mcpProjectAdmission,
 		extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
 		// Subagents share the parent's Herdr pane; their own reporter would race
