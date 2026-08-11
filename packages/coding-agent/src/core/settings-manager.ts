@@ -208,6 +208,15 @@ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
 
 export type SettingsScope = "global" | "project";
 
+export interface SettingsManagerOptions {
+	/**
+	 * Whether project-scoped settings may contribute executable configuration.
+	 * Defaults to true for direct library use; the app layer passes the
+	 * workspace-trust decision explicitly.
+	 */
+	projectTrusted?: boolean;
+}
+
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
 }
@@ -306,6 +315,7 @@ export class SettingsManager {
 	private globalSettings: Settings;
 	private projectSettings: Settings;
 	private settings: Settings;
+	private projectTrusted: boolean;
 	private runtimeOverrides: Settings = {};
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -323,10 +333,12 @@ export class SettingsManager {
 		globalLoadError: Error | null = null,
 		projectLoadError: Error | null = null,
 		initialErrors: SettingsError[] = [],
+		projectTrusted = true,
 	) {
 		this.storage = storage;
 		this.globalSettings = initialGlobal;
 		this.projectSettings = initialProject;
+		this.projectTrusted = projectTrusted;
 		this.globalSettingsLoadError = globalLoadError;
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
@@ -334,13 +346,13 @@ export class SettingsManager {
 	}
 
 	/** Create a SettingsManager that loads from files */
-	static create(cwd: string, agentDir: string = getAgentDir()): SettingsManager {
+	static create(cwd: string, agentDir: string = getAgentDir(), options?: SettingsManagerOptions): SettingsManager {
 		const storage = new FileSettingsStorage(cwd, agentDir);
-		return SettingsManager.fromStorage(storage);
+		return SettingsManager.fromStorage(storage, options);
 	}
 
 	/** Create a SettingsManager from an arbitrary storage backend */
-	static fromStorage(storage: SettingsStorage): SettingsManager {
+	static fromStorage(storage: SettingsStorage, options?: SettingsManagerOptions): SettingsManager {
 		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global");
 		const projectLoad = SettingsManager.tryLoadFromStorage(storage, "project");
 		const initialErrors: SettingsError[] = [];
@@ -358,7 +370,22 @@ export class SettingsManager {
 			globalLoad.error,
 			projectLoad.error,
 			initialErrors,
+			options?.projectTrusted ?? true,
 		);
+	}
+
+	/**
+	 * Whether the project directory is trusted to contribute executable
+	 * configuration (extensions, shell command prefix, MCP servers, ...).
+	 * Untrusted projects still contribute cosmetic settings, but anything that
+	 * turns committed files into executed commands is ignored.
+	 */
+	isProjectTrusted(): boolean {
+		return this.projectTrusted;
+	}
+
+	setProjectTrusted(trusted: boolean): void {
+		this.projectTrusted = trusted;
 	}
 
 	/** Create an in-memory SettingsManager (no file I/O) */
@@ -665,7 +692,9 @@ export class SettingsManager {
 	}
 
 	getSessionDir(): string | undefined {
-		const sessionDir = this.settings.sessionDir;
+		// Project sessionDir redirects where session files are written; untrusted
+		// projects keep the global/default location.
+		const sessionDir = (this.projectTrusted ? this.settings : this.globalSettings).sessionDir;
 		if (!sessionDir) {
 			return sessionDir;
 		}
@@ -948,7 +977,7 @@ export class SettingsManager {
 	}
 
 	getShellPath(): string | undefined {
-		return this.settings.shellPath;
+		return this.projectTrusted ? this.settings.shellPath : this.globalSettings.shellPath;
 	}
 
 	setShellPath(path: string | undefined): void {
@@ -968,7 +997,7 @@ export class SettingsManager {
 	}
 
 	getShellCommandPrefix(): string | undefined {
-		return this.settings.shellCommandPrefix;
+		return this.projectTrusted ? this.settings.shellCommandPrefix : this.globalSettings.shellCommandPrefix;
 	}
 
 	setShellCommandPrefix(prefix: string | undefined): void {
@@ -978,7 +1007,8 @@ export class SettingsManager {
 	}
 
 	getNpmCommand(): string[] | undefined {
-		return this.settings.npmCommand ? [...this.settings.npmCommand] : undefined;
+		const command = this.projectTrusted ? this.settings.npmCommand : this.globalSettings.npmCommand;
+		return command ? [...command] : undefined;
 	}
 
 	setNpmCommand(command: string[] | undefined): void {
@@ -1210,7 +1240,7 @@ export class SettingsManager {
 	}
 
 	getMcpServers(): Record<string, McpServerConfig> | undefined {
-		return this.settings.mcpServers;
+		return this.projectTrusted ? this.settings.mcpServers : this.globalSettings.mcpServers;
 	}
 
 	setEnabledModels(patterns: string[] | undefined): void {

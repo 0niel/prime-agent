@@ -867,11 +867,17 @@ export class DefaultPackageManager implements PackageManager {
 		const accumulator = this.createAccumulator();
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
+		// Workspace trust: an untrusted project contributes no packages, resource
+		// entries, or auto-discovered directories. Committed configuration must
+		// never turn into executed code without explicit consent.
+		const projectTrusted = this.settingsManager.isProjectTrusted();
 
 		// Collect all packages with scope (project first so cwd resources win collisions)
 		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
-		for (const pkg of projectSettings.packages ?? []) {
-			allPackages.push({ pkg, scope: "project" });
+		if (projectTrusted) {
+			for (const pkg of projectSettings.packages ?? []) {
+				allPackages.push({ pkg, scope: "project" });
+			}
 		}
 		for (const pkg of globalSettings.packages ?? []) {
 			allPackages.push({ pkg, scope: "user" });
@@ -887,7 +893,7 @@ export class DefaultPackageManager implements PackageManager {
 		for (const resourceType of RESOURCE_TYPES) {
 			const target = this.getTargetMap(accumulator, resourceType);
 			const globalEntries = (globalSettings[resourceType] ?? []) as string[];
-			const projectEntries = (projectSettings[resourceType] ?? []) as string[];
+			const projectEntries = projectTrusted ? ((projectSettings[resourceType] ?? []) as string[]) : [];
 			this.resolveLocalEntries(
 				projectEntries,
 				resourceType,
@@ -2197,37 +2203,39 @@ export class DefaultPackageManager implements PackageManager {
 			}
 		};
 
-		addResources(
-			"extensions",
-			collectAutoExtensionEntries(projectDirs.extensions),
-			projectMetadata,
-			projectOverrides.extensions,
-			projectBaseDir,
-		);
-		addResources(
-			"skills",
-			[
-				...collectAutoSkillEntries(projectDirs.skills, "pi"),
-				...projectAgentsSkillDirs.flatMap((dir) => collectAutoSkillEntries(dir, "agents")),
-			],
-			projectMetadata,
-			projectOverrides.skills,
-			projectBaseDir,
-		);
-		addResources(
-			"prompts",
-			collectAutoPromptEntries(projectDirs.prompts),
-			projectMetadata,
-			projectOverrides.prompts,
-			projectBaseDir,
-		);
-		addResources(
-			"themes",
-			collectAutoThemeEntries(projectDirs.themes),
-			projectMetadata,
-			projectOverrides.themes,
-			projectBaseDir,
-		);
+		if (this.settingsManager.isProjectTrusted()) {
+			addResources(
+				"extensions",
+				collectAutoExtensionEntries(projectDirs.extensions),
+				projectMetadata,
+				projectOverrides.extensions,
+				projectBaseDir,
+			);
+			addResources(
+				"skills",
+				[
+					...collectAutoSkillEntries(projectDirs.skills, "pi"),
+					...projectAgentsSkillDirs.flatMap((dir) => collectAutoSkillEntries(dir, "agents")),
+				],
+				projectMetadata,
+				projectOverrides.skills,
+				projectBaseDir,
+			);
+			addResources(
+				"prompts",
+				collectAutoPromptEntries(projectDirs.prompts),
+				projectMetadata,
+				projectOverrides.prompts,
+				projectBaseDir,
+			);
+			addResources(
+				"themes",
+				collectAutoThemeEntries(projectDirs.themes),
+				projectMetadata,
+				projectOverrides.themes,
+				projectBaseDir,
+			);
+		}
 
 		addResources(
 			"extensions",

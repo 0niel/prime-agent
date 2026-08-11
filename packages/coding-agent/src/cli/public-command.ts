@@ -1,5 +1,7 @@
+import { resolve } from "node:path";
 import chalk from "chalk";
-import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
+import { APP_NAME, expandTildePath, getAgentDir, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
+import { canonicalizeWorkspacePath, WorkspaceTrustStore } from "../core/workspace-trust.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
 import {
@@ -140,6 +142,10 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		case "config":
 			if (!requireArgumentCount(args.slice(1), 0, "config")) return HANDLED;
 			return continueWith(args);
+		case "trust":
+			return runTrust(args.slice(1));
+		case "untrust":
+			return runUntrust(args.slice(1));
 		default:
 			return continueWith(args);
 	}
@@ -423,6 +429,48 @@ function validateScheduleArgs(args: string[]): boolean {
 		return false;
 	}
 	return true;
+}
+
+function runTrust(args: string[]): PublicCommandResult {
+	if (args.includes("--list")) {
+		const trusted = WorkspaceTrustStore.create(getAgentDir()).list();
+		if (trusted.length === 0) {
+			console.log("No trusted workspaces.");
+		} else {
+			for (const path of trusted) {
+				console.log(path);
+			}
+		}
+		return HANDLED;
+	}
+	const unknownOption = args.find((arg) => arg.startsWith("-"));
+	if (unknownOption) {
+		return fail(`Unknown option: ${unknownOption}`, `Usage: ${APP_NAME} ${getCommandSpec(["trust"])!.usage}`);
+	}
+	const target = args[0] ? resolve(expandTildePath(args[0])) : process.cwd();
+	const store = WorkspaceTrustStore.create(getAgentDir());
+	const canonical = canonicalizeWorkspacePath(target);
+	store.trust(target);
+	console.log(`Trusted workspace: ${canonical}`);
+	console.log(
+		chalk.dim("New sessions in this directory will auto-load its project-scoped extensions, skills, and settings."),
+	);
+	return HANDLED;
+}
+
+function runUntrust(args: string[]): PublicCommandResult {
+	const unknownOption = args.find((arg) => arg.startsWith("-"));
+	if (unknownOption) {
+		return fail(`Unknown option: ${unknownOption}`, `Usage: ${APP_NAME} ${getCommandSpec(["untrust"])!.usage}`);
+	}
+	const target = args[0] ? resolve(expandTildePath(args[0])) : process.cwd();
+	const store = WorkspaceTrustStore.create(getAgentDir());
+	if (!store.untrust(target)) {
+		console.log(`Workspace is not trusted: ${canonicalizeWorkspacePath(target)}`);
+		return HANDLED;
+	}
+	console.log(`Revoked trust for workspace: ${canonicalizeWorkspacePath(target)}`);
+	return HANDLED;
 }
 
 function fail(message: string, hint?: string): PublicCommandResult {

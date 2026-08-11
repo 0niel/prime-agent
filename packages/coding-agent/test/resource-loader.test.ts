@@ -10,6 +10,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+import { WorkspaceTrustStore } from "../src/core/workspace-trust.js";
 
 describe("DefaultResourceLoader", () => {
 	let tempDir: string;
@@ -25,6 +26,9 @@ describe("DefaultResourceLoader", () => {
 		delete process.env.SERPER_API_KEY;
 		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(cwd, { recursive: true });
+		// Project-resource discovery is gated behind workspace trust; these tests
+		// exercise discovery mechanics, so trust the fixture workspace.
+		WorkspaceTrustStore.create(agentDir).trust(cwd);
 	});
 
 	afterEach(() => {

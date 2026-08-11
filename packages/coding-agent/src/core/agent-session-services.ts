@@ -19,6 +19,7 @@ import { type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
 import type { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { installAgentTelemetry, isTelemetryEnabled } from "./telemetry.js";
+import { detectProjectScopedConfig, isWorkspaceTrusted } from "./workspace-trust.js";
 
 /**
  * Non-fatal issues collected while creating services or sessions.
@@ -180,7 +181,15 @@ export async function createAgentSessionServices(
 	const cwd = options.cwd;
 	const agentDir = options.agentDir ?? getAgentDir();
 	const authStorage = options.authStorage ?? AuthStorage.create(join(agentDir, "auth.json"));
-	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	// Workspace trust is the security boundary for project-committed executable
+	// configuration. It is enforced here, at service creation, so every mode
+	// (interactive, headless, daemon worker, SDK) gets the same behavior.
+	// Narrowing only: an explicitly untrusted manager is never re-trusted.
+	const projectTrusted = isWorkspaceTrusted(cwd, agentDir);
+	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir, { projectTrusted });
+	if (!projectTrusted) {
+		settingsManager.setProjectTrusted(false);
+	}
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, join(agentDir, "models.json"));
 
 	// MCP integrations: registers OAuth providers and gates the built-in
@@ -215,6 +224,17 @@ export async function createAgentSessionServices(
 	await resourceLoader.reload();
 
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
+	if (!projectTrusted) {
+		const findings = detectProjectScopedConfig(cwd);
+		if (findings.length > 0) {
+			diagnostics.push({
+				type: "warning",
+				message: `Workspace is not trusted; disabled project-scoped configuration: ${findings
+					.map((finding) => finding.summary)
+					.join("; ")}. Run "prime-agent trust" to enable it.`,
+			});
+		}
+	}
 	if (
 		!options.telemetryDisabled &&
 		isTelemetryEnabled(settingsManager) &&

@@ -150,6 +150,20 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		usage: "config",
 		summary: "Configure package resources",
 	},
+	{
+		path: ["trust"],
+		usage: "trust [path] [--list]",
+		summary: "Trust a workspace's project-scoped configuration",
+		description:
+			"Trusted workspaces auto-load committed extensions, skills, prompts, themes, and executable settings keys. Without a path, trusts the current directory.",
+		options: ["--list  List trusted workspaces"],
+	},
+	{
+		path: ["untrust"],
+		usage: "untrust [path]",
+		summary: "Revoke workspace trust",
+		description: "Without a path, revokes trust for the current directory.",
+	},
 ];
 
 export const PUBLIC_COMMAND_NAMES = new Set(

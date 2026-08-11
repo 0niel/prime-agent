@@ -19,6 +19,7 @@ import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { time } from "./timings.js";
 import { createBashTool, createEditTool, createIpythonTool, withFileMutationQueue } from "./tools/index.js";
+import { isWorkspaceTrusted } from "./workspace-trust.js";
 
 export interface CreateAgentSessionOptions extends AgentSessionCreationOptions {
 	/** Working directory for project-local discovery. Default: process.cwd() */
@@ -163,7 +164,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const authStorage = options.authStorage ?? AuthStorage.create(authPath);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, modelsPath);
 
-	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const projectTrusted = isWorkspaceTrusted(cwd, agentDir);
+	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir, { projectTrusted });
+	if (!projectTrusted) {
+		settingsManager.setProjectTrusted(false);
+	}
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	// Ensure MCP providers are registered and built-in MCP skills are gated by

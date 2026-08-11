@@ -33,6 +33,7 @@ import {
 	SessionSelectorError,
 	SessionSelectorNotFoundError,
 } from "./cli/session-resolver.js";
+import { gateWorkspaceTrustOnStartup } from "./cli/workspace-trust-prompt.js";
 import { APP_NAME, expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
 import {
 	type AgentExecutionMode,
@@ -72,6 +73,7 @@ import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { isTelemetryEnabled } from "./core/telemetry.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
+import { isWorkspaceTrusted } from "./core/workspace-trust.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
 import { deserializeDaemonError } from "./modes/daemon/daemon-errors.js";
@@ -1135,7 +1137,9 @@ export async function main(args: string[], options?: MainOptions) {
 	time("runMigrations");
 
 	const agentDir = getAgentDir();
-	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
+	const startupSettingsManager = SettingsManager.create(cwd, agentDir, {
+		projectTrusted: isWorkspaceTrusted(cwd, agentDir),
+	});
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
 	const startupBenchmark = isTruthyEnvFlag(process.env.PI_STARTUP_BENCHMARK);
 	if (startupBenchmark && appMode !== "interactive") {
@@ -1242,10 +1246,21 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createSessionManager");
 
+	// Workspace-trust consent gate: must run before any runtime services are
+	// created for the effective session cwd (daemon workers read the shared
+	// trust store at session creation).
+	await gateWorkspaceTrustOnStartup({
+		cwd: sessionManager.getCwd(),
+		agentDir,
+		interactive: appMode === "interactive",
+	});
+
 	const telemetrySettingsManager =
-		sessionManager.getCwd() === cwd
+		sessionManager.getCwd() === cwd && startupSettingsManager.isProjectTrusted()
 			? startupSettingsManager
-			: SettingsManager.create(sessionManager.getCwd(), agentDir);
+			: SettingsManager.create(sessionManager.getCwd(), agentDir, {
+					projectTrusted: isWorkspaceTrusted(sessionManager.getCwd(), agentDir),
+				});
 	const telemetryDisabled = isTelemetryEnabled(telemetrySettingsManager) ? undefined : true;
 	const defaultSessionConfig = runtimeConfigFromArgs(
 		parsed,
@@ -1506,7 +1521,9 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 	if (useDaemonClient) {
-		const settingsManager = SettingsManager.create(sessionManager.getCwd(), agentDir);
+		const settingsManager = SettingsManager.create(sessionManager.getCwd(), agentDir, {
+			projectTrusted: isWorkspaceTrusted(sessionManager.getCwd(), agentDir),
+		});
 		let stdinContent: string | undefined;
 		if (appMode !== "rpc" && appMode !== "acp") {
 			stdinContent = await readPipedStdin();

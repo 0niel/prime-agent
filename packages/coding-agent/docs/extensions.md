@@ -115,8 +115,33 @@ Extensions are auto-discovered from:
 |----------|-------|
 | `~/.prime/agent/extensions/*.ts` | Global (all projects) |
 | `~/.prime/agent/extensions/*/index.ts` | Global (subdirectory) |
-| `.prime/agent/extensions/*.ts` | Project-local |
-| `.prime/agent/extensions/*/index.ts` | Project-local (subdirectory) |
+| `.prime/agent/extensions/*.ts` | Project-local (trusted workspaces only) |
+| `.prime/agent/extensions/*/index.ts` | Project-local (subdirectory; trusted workspaces only) |
+
+Project-local extensions execute automatically when a session starts in that
+directory, before any agent turn. Because a cloned repository can commit
+extensions, project-local discovery only runs for **trusted workspaces**. See
+[Workspace Trust](#workspace-trust).
+
+## Workspace Trust
+
+A repository can commit executable configuration: `.prime/agent/extensions/`,
+`.prime/agent/settings.json` keys such as `extensions`, `packages`, `mcpServers`,
+`shellCommandPrefix`, `shellPath`, `npmCommand`, and `sessionDir`, Python skills
+(installed into the kernel environment), and `SYSTEM.md` / `APPEND_SYSTEM.md`.
+Opening an uninspected repository must never execute its committed code, so
+project-scoped configuration only applies to workspaces you explicitly trust.
+
+- Interactive startup in an untrusted workspace with such configuration asks
+  for consent once; trusting persists to
+  `~/.prime/agent/trusted-workspaces.json`.
+- Headless modes never prompt: untrusted workspaces run without the
+  project-scoped configuration, with a notice on stderr.
+- `prime-agent trust [path]` trusts a directory (default: current), ahead of
+  time or for headless use. `prime-agent untrust [path]` revokes it,
+  `prime-agent trust --list` shows all trusted workspaces.
+
+Global configuration in `~/.prime/agent/` is your own and always applies.
 
 Additional paths via `settings.json`:
 

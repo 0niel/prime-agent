@@ -182,7 +182,13 @@ prime-agent package list
 prime-agent package update [source]
 prime-agent update [--force]
 prime-agent config
+
+prime-agent trust [path] [--list]
+prime-agent untrust [path]
 ```
+
+See [Workspace Trust](extensions.md#workspace-trust) for what project-scoped
+configuration is gated behind trust.
 
 See [Prime Agent Packages](packages.md) for package sources and security notes.
 
