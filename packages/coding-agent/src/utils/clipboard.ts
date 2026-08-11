@@ -33,8 +33,7 @@ function copyToWaylandClipboard(text: string, timeoutMs = 5000): Promise<boolean
 			resolve(success);
 		};
 		timer = setTimeout(() => {
-			proc.kill();
-			finish(false);
+			proc.kill("SIGKILL");
 		}, timeoutMs);
 		timer.unref();
 		proc.on("error", () => finish(false));

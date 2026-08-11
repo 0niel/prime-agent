@@ -191,9 +191,10 @@ describe("copyToClipboard", () => {
 			const copying = copyToClipboard("hello");
 			child.emit("spawn");
 			await vi.advanceTimersByTimeAsync(5000);
-			await copying;
 
-			expect(child.kill).toHaveBeenCalledWith();
+			expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+			child.emit("close", null, "SIGKILL");
+			await copying;
 			expect(osc52Writes()).toHaveLength(1);
 		} finally {
 			vi.useRealTimers();
