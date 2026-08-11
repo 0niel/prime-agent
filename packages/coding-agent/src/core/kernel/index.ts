@@ -1493,6 +1493,7 @@ export class KernelManager {
 
 		try {
 			await this.shutdown();
+			this.hostRequestsClosed = false;
 			this.state = "idle";
 			this.kernelStderr = "";
 			await this.start();
