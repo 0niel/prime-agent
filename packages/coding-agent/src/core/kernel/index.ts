@@ -117,6 +117,7 @@ function mintHostRequestContext(
 		"abort",
 		() => {
 			current = false;
+			dispatcherCreatedHostRequestContexts.delete(context);
 		},
 		{ once: true },
 	);
