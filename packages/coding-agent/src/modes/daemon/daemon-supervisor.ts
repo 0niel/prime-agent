@@ -4203,9 +4203,14 @@ export class DaemonSupervisor {
 			!this.shuttingDown
 		) {
 			worker.intentionalStop = true;
-			this.workers.delete(worker.descriptor.workerId);
-			this.deleteWorkerDescriptor(worker);
-			void this.syncAgentPeers().catch(() => undefined);
+			// An exact stop owns its registration and descriptor cleanup until its
+			// tuple assertions complete. A synchronous root shutdown event can arrive
+			// before its request resolves, so leave both intact while it is active.
+			if ((this.workerStopCounts?.get(worker) ?? 0) === 0) {
+				this.workers.delete(worker.descriptor.workerId);
+				this.deleteWorkerDescriptor(worker);
+				void this.syncAgentPeers().catch(() => undefined);
+			}
 		}
 	}
 

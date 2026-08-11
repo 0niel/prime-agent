@@ -1390,6 +1390,146 @@ describe("daemon worker supervisor monitoring", () => {
 		await stopping;
 	});
 
+	it.each([
+		{ name: "removal", removeDescriptor: true },
+		{ name: "update restart", removeDescriptor: false },
+	])(
+		"leaves root shutdown cleanup to the active exact stop for $name",
+		async ({ removeDescriptor }) => {
+			type StopWorker = {
+				descriptor: {
+					workerId: string;
+					pid: number;
+					processStartId: string;
+					rootActiveSessionId: string;
+					lifecycle: "ready" | "recovering";
+					stopRequestedAt?: string;
+				};
+				client?: { request(command: unknown, timeout: number): Promise<unknown>; close(): void };
+				summaries: Map<string, SessionSummary>;
+				snapshotCache: Map<string, DaemonAttachResult>;
+				transcriptCaches: Map<string, never>;
+				snapshotGenerations: Map<string, never>;
+				snapshotLoads: Map<string, Promise<DaemonAttachResult>>;
+				intentionalStop: boolean;
+				stopRevision: number;
+			};
+			type StopHarness = {
+				workers: Map<string, StopWorker>;
+				workerStopCounts: Map<StopWorker, number>;
+				stopWorker(worker: StopWorker, removeDescriptor: boolean): Promise<void>;
+				handleWorkerFrame(worker: StopWorker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+			};
+			const worker: StopWorker = {
+				descriptor: {
+					workerId: `worker-root-shutdown-${removeDescriptor ? "remove" : "update"}`,
+					pid: 123_456,
+					processStartId: "proc:entry",
+					rootActiveSessionId: "root-active",
+					lifecycle: "ready",
+				},
+				summaries: new Map(),
+				snapshotCache: new Map(),
+				transcriptCaches: new Map(),
+				snapshotGenerations: new Map(),
+				snapshotLoads: new Map(),
+				intentionalStop: false,
+				stopRevision: 0,
+			};
+			const workers = new Map([[worker.descriptor.workerId, worker]]);
+			const shutdownEmitted = createDeferred<void>();
+			const releaseRequest = createDeferred<void>();
+			const deleteWorkerDescriptor = vi.fn();
+			const persistWorker = vi.fn();
+			const entryClient = {
+				request: vi.fn(async () => {
+					supervisor.handleWorkerFrame(worker, {
+						header: { kind: "outbound", outboundType: "session_closed", activeSessionId: "root-active" },
+						payload: Buffer.from(JSON.stringify({ type: "session_closed", reason: "shutdown" })),
+					});
+					shutdownEmitted.resolve();
+					await releaseRequest.promise;
+				}),
+				close: vi.fn(),
+			};
+			worker.client = entryClient;
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers,
+				workerStopCounts: new Map(),
+				clients: new Set(),
+				shuttingDown: false,
+				streamReconstructor: { observe: vi.fn() },
+				invalidateWorkerSnapshot: vi.fn(),
+				refreshWorkerSummaries: vi.fn(async () => undefined),
+				syncAgentPeers: vi.fn(async () => undefined),
+				persistWorkerStopTombstone: vi.fn(),
+				persistWorker,
+				deleteWorkerDescriptor,
+				broadcastHeartbeatsChanged: vi.fn(),
+				log: vi.fn(),
+				reportCleanupFailure: vi.fn(),
+			}) as StopHarness;
+			const childProcessModule = await import("../src/utils/child-process.js");
+			const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
+			try {
+				const stopping = supervisor.stopWorker(worker, removeDescriptor);
+				await shutdownEmitted.promise;
+
+				// session_closed is delivered synchronously from request(), before the
+				// exact stop has reached its tuple assertions and final cleanup.
+				expect(workers.get(worker.descriptor.workerId)).toBe(worker);
+				expect(deleteWorkerDescriptor).not.toHaveBeenCalled();
+
+				releaseRequest.resolve();
+				await stopping;
+
+				expect(entryClient.request).toHaveBeenCalledWith({ type: "shutdown" }, 5000);
+				expect(entryClient.close).toHaveBeenCalledOnce();
+				expect(worker.client).toBeUndefined();
+				expect(workers.has(worker.descriptor.workerId)).toBe(false);
+				expect(deleteWorkerDescriptor).toHaveBeenCalledTimes(removeDescriptor ? 1 : 0);
+				if (removeDescriptor) {
+					expect(persistWorker).not.toHaveBeenCalled();
+				} else {
+					expect(worker.descriptor.lifecycle).toBe("recovering");
+					expect(persistWorker).toHaveBeenCalledWith(worker);
+				}
+			} finally {
+				existsSpy.mockRestore();
+			}
+		},
+	);
+
+	it("deletes a spontaneously shutdown root when no exact stop is active", () => {
+		const worker = {
+			descriptor: { workerId: "worker-spontaneous-shutdown", rootActiveSessionId: "root-active" },
+			intentionalStop: false,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const deleteWorkerDescriptor = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			clients: new Set(),
+			shuttingDown: false,
+			streamReconstructor: { observe: vi.fn() },
+			invalidateWorkerSnapshot: vi.fn(),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+			syncAgentPeers: vi.fn(async () => undefined),
+			deleteWorkerDescriptor,
+		}) as {
+			handleWorkerFrame(target: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+
+		supervisor.handleWorkerFrame(worker, {
+			header: { kind: "outbound", outboundType: "session_closed", activeSessionId: "root-active" },
+			payload: Buffer.from(JSON.stringify({ type: "session_closed", reason: "shutdown" })),
+		});
+
+		expect(worker.intentionalStop).toBe(true);
+		expect(workers.has(worker.descriptor.workerId)).toBe(false);
+		expect(deleteWorkerDescriptor).toHaveBeenCalledWith(worker);
+	});
+
 	it("cancels an in-flight recovery after an intentional stop tombstone", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
