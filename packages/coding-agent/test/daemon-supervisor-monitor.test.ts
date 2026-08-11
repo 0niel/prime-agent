@@ -2866,7 +2866,7 @@ describe("daemon worker supervisor monitoring", () => {
 			stopRevision: 0,
 			stopFinalization: undefined as Promise<void> | undefined,
 		};
-		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const workers = new Map<string, object>([[worker.descriptor.workerId, worker]]);
 		let finishFinalization!: () => void;
 		worker.stopFinalization = new Promise<void>((resolveFinalization) => {
 			finishFinalization = resolveFinalization;
