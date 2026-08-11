@@ -224,4 +224,52 @@ describe("MCP host bridge", () => {
 		expect(deletes).toBe(1);
 	});
 
+	it("rejects malformed matching envelopes immediately on a persistent SSE stream", async () => {
+		for (const envelope of [{ jsonrpc: "2.0" }, { jsonrpc: "2.0", result: {}, error: { code: -1, message: "both" } }]) {
+			let cancelled = false;
+			const bridge = new McpHostBridge({
+				fetch: async (_url, init) => {
+					const message = JSON.parse(String(init?.body));
+					if (message.method === "notifications/initialized") return new Response("", { status: 202 });
+					if (message.method === "initialize") return json({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26" } });
+					const bytes = new TextEncoder().encode(`data: ${JSON.stringify({ ...envelope, id: message.id })}\n\n`);
+					return new Response(new ReadableStream({ start(controller) { controller.enqueue(bytes); }, cancel() { cancelled = true; } }), { headers: { "content-type": "text/event-stream" } });
+				},
+				withOAuthAccessToken: async (_server, run) => run("secret"),
+			});
+			await expect(bridge.request(binding, "tools/list", {}, context())).rejects.toThrow("exactly one");
+			expect(cancelled).toBe(true);
+		}
+	});
+
+	it("keeps the canonical r3 state when a blocked r1 peer retires after r1-to-r2-to-r3", async () => {
+		let toolCalls = 0; let releaseLate!: () => void;
+		const r2 = { ...binding, authRevision: "secret-r2" };
+		const bridge = new McpHostBridge({
+			fetch: async (_url, init) => {
+				const message = JSON.parse(String(init?.body));
+				if (message.method === "notifications/initialized") return new Response("", { status: 202 });
+				if (message.method === "initialize") return json({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26" } });
+				switch (++toolCalls) {
+					case 1: return new Response("expired", { status: 401 }); // r1 -> r2
+					case 2: await new Promise<void>((resolve) => { releaseLate = resolve; }); throw new DOMException("retired", "AbortError");
+					case 4: return new Response("expired", { status: 401 }); // r2 -> r3
+					default: return json({ jsonrpc: "2.0", id: message.id, result: { tools: [] } });
+				}
+			},
+			resolveBinding: (value) => value.authRevision === "secret-r1" ? r2 : { ...value, authRevision: "secret-r3" },
+			beforeForceRefresh: async () => true,
+			withOAuthAccessToken: async (_server, run) => run("secret"),
+		});
+		const first = bridge.request(binding, "tools/list", {}, context());
+		const late = bridge.request(binding, "tools/list", {}, context());
+		await expect(first).resolves.toEqual({ tools: [] });
+		await expect(bridge.request(r2, "tools/list", {}, context())).resolves.toEqual({ tools: [] });
+		releaseLate(); await expect(late).resolves.toEqual({ tools: [] });
+		const states = (bridge as unknown as { states: Map<string, { binding: { authRevision?: string } }> }).states;
+		expect([...states.values()]).toHaveLength(1);
+		expect([...states.values()][0]?.binding.authRevision).toBe("secret-r3");
+		expect([...states.keys()].some((key) => key.includes("secret-r1") || key.includes("secret-r2"))).toBe(false);
+	});
+
 });

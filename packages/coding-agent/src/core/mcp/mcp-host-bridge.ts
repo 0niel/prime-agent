@@ -50,8 +50,13 @@ async function drain(response: Response, maximum: number): Promise<string> {
 async function readRpc(response: Response, id: string, maximum: number): Promise<Rpc> {
 	if (!response.body) throw new Error("MCP response has no body.");
 	const reader = response.body.getReader(); const decoder = new TextDecoder(); let bytes = 0; let events = 0; let buffer = ""; let data: string[] = [];
-	const match = (value: unknown): Rpc | undefined => { const candidate = rpc(value); return candidate.id === id ? candidate : undefined; };
-	const parseJson = (text: string): Rpc | undefined => { try { return match(JSON.parse(text)); } catch { return undefined; } };
+	// Syntax failures and unrelated ids may be skipped on a persistent stream.
+	// Once an envelope claims our id, strict JSON-RPC validation is authoritative.
+	const parseJson = (text: string): Rpc | undefined => {
+		let raw: unknown; try { raw = JSON.parse(text); } catch { return undefined; }
+		if (!raw || typeof raw !== "object" || Array.isArray(raw) || (raw as { id?: unknown }).id !== id) return undefined;
+		return rpc(raw);
+	};
 	try {
 		for (;;) {
 			const part = await reader.read(); if (part.done) break; bytes += part.value.byteLength;
@@ -68,6 +73,11 @@ async function readRpc(response: Response, id: string, maximum: number): Promise
 		if (data.length) { const value = parseJson(data.join("\n")); if (value) return value; }
 		const final = buffer ? parseJson(buffer) : undefined; if (final) return final;
 		throw new Error("MCP response did not contain the matching JSON-RPC id.");
+	} catch (error) {
+		// A correlated malformed envelope is terminal even on an endless SSE body.
+		// Cancel before surfacing it so no persistent response remains owned here.
+		try { await reader.cancel("MCP response is invalid"); } catch { /* preserve protocol error */ }
+		throw error;
 	} finally { reader.releaseLock(); }
 }
 
@@ -99,12 +109,12 @@ export class McpHostBridge {
 	}
 	private id(state: State): string { return `prime-agent-${randomUUID()}-${++state.nextId}`; }
 	private current(state: State, context?: HostRequestContext, epoch?: number): boolean { return !this.disposed && state.generation === this.generation && (epoch === undefined || state.epoch === epoch) && (!context || (!context.signal.aborted && context.isCurrent())); }
-	private rekey(state: State, binding: McpHostBinding, preserveInitialize = false): void {
+	private rekey(state: State, binding: McpHostBinding, preserveInitialize = false, replaceCanonical = true): void {
 		if (this.disposed) throw new Error("MCP host bridge is disposed.");
 		const oldKey = bindingKey(state.binding); if (this.states.get(oldKey) === state) this.states.delete(oldKey);
 		state.binding = binding; state.sessionId = undefined; if (!preserveInitialize) state.initialize = undefined; state.generation = this.generation; state.epoch += 1;
 		for (const controller of state.controllers) controller.abort();
-		this.states.set(bindingKey(binding), state);
+		if (replaceCanonical) this.states.set(bindingKey(binding), state);
 	}
 	private async tracked<T>(state: State, action: () => Promise<T>): Promise<T> {
 		const operation = action(); const settled = operation.then(() => undefined, () => undefined); state.inFlight.add(settled);
@@ -140,25 +150,31 @@ export class McpHostBridge {
 		} finally { clearTimeout(timer); this.controllers.delete(controller); state.controllers.delete(controller); if (!allowCancelled) context?.signal.removeEventListener("abort", abort); }
 	}); }
 	private async authenticated<T>(state: State, run: (token: string | undefined) => Promise<T>, refresh = false): Promise<T> { return state.binding.oauth ? this.options.withOAuthAccessToken(state.binding.server, run, refresh) : run(undefined); }
+	private adoptResolvedBinding(state: State, prior: McpHostBinding, resolved: McpHostBinding, message: Rpc): McpHostBinding {
+		const oldKey = bindingKey(prior); const resolvedKey = bindingKey(resolved); const currentKey = bindingKey(state.binding);
+		if (resolvedKey === oldKey || currentKey === resolvedKey) return state.binding;
+		// Only the exact old epoch may advance. If a peer already owns the newer
+		// canonical key, advance this caller without replacing that canonical state.
+		if (currentKey === oldKey) this.rekey(state, resolved, message.method === "initialize", !this.states.has(resolvedKey));
+		return state.binding;
+	}
 	private async refreshBinding(state: State, prior: McpHostBinding, message: Rpc): Promise<{ binding: McpHostBinding; retired: boolean }> {
 		const key = bindingKey(prior);
 		let flight = this.bindingRefreshFlights.get(key);
 		if (!flight) {
 			flight = (async () => {
-				// A newer sealed reference wins before we issue a refresh. This is also
-				// intentionally inside the old-key flight, preventing backward rekeys.
-				const already = this.options.resolveBinding?.(prior) ?? prior;
-				if (bindingKey(already) !== key) {
-					this.rekey(state, already, message.method === "initialize");
-					return { binding: already, retired: true };
-				}
+				const initial = this.options.resolveBinding?.(prior) ?? prior;
+				if (bindingKey(initial) !== key) return { binding: this.adoptResolvedBinding(state, prior, initial, message), retired: true };
 				let retired = false;
 				try { retired = (await this.options.beforeForceRefresh?.(prior)) === true; } catch { /* cleanup is best effort */ }
+				// Retirement itself can rotate the sealed binding. Never issue another
+				// refresh against the old reference when that has already happened.
+				const afterRetirement = this.options.resolveBinding?.(prior) ?? prior;
+				if (bindingKey(afterRetirement) !== key) return { binding: this.adoptResolvedBinding(state, prior, afterRetirement, message), retired };
 				await this.authenticated(state, async () => undefined, true);
 				const renewed = this.options.resolveBinding?.(prior) ?? prior;
 				if (bindingKey(renewed) === key) throw new Error("MCP OAuth refresh did not rotate its binding revision.");
-				this.rekey(state, renewed, message.method === "initialize");
-				return { binding: renewed, retired };
+				return { binding: this.adoptResolvedBinding(state, prior, renewed, message), retired };
 			})();
 			this.bindingRefreshFlights.set(key, flight);
 			void flight.finally(() => { if (this.bindingRefreshFlights.get(key) === flight) this.bindingRefreshFlights.delete(key); }).catch(() => {});
