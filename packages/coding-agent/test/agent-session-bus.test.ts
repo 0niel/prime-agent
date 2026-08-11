@@ -14,6 +14,7 @@ import {
 	parseAgentSessionMessagePromptId,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
+import { invokeHostRequestHandlerForTest } from "../src/core/kernel/index.js";
 
 describe("agent session bus", () => {
 	it("formats routed messages with sender and target context", () => {
@@ -181,7 +182,7 @@ describe("agent session bus", () => {
 			sendAgentMessage,
 		});
 
-		await handlers["agent_message.send"]!({
+		await invokeHostRequestHandlerForTest(handlers["agent_message.send"]!, {
 			message: "hello",
 			receiver_role: "sibling",
 			receiver_name: "reviewer",
@@ -193,7 +194,9 @@ describe("agent session bus", () => {
 		});
 
 		sendAgentMessage.mockClear();
-		await expect(handlers["agent_message.send"]!({ target: "all", message: "status" })).resolves.toMatchObject({
+		await expect(
+			invokeHostRequestHandlerForTest(handlers["agent_message.send"]!, { target: "all", message: "status" }),
+		).resolves.toMatchObject({
 			receipts: [
 				{ id: "root", deliveryStatus: "delivered" },
 				{ id: "sibling", deliveryStatus: "delivered" },
@@ -204,7 +207,7 @@ describe("agent session bus", () => {
 
 		sendAgentMessage.mockClear();
 		await expect(
-			handlers["agent_message.send"]!({
+			invokeHostRequestHandlerForTest(handlers["agent_message.send"]!, {
 				target: "all",
 				message: "private",
 				receiver_role: "sibling",
@@ -224,9 +227,9 @@ describe("agent session bus", () => {
 			sendAgentMessage,
 		});
 
-		await expect(handlers["agent_message.send"]!({ target: "reviewer", message: "status" })).rejects.toThrow(
-			"use receiver_role and receiver_name",
-		);
+		await expect(
+			invokeHostRequestHandlerForTest(handlers["agent_message.send"]!, { target: "reviewer", message: "status" }),
+		).rejects.toThrow("use receiver_role and receiver_name");
 		expect(sendAgentMessage).not.toHaveBeenCalled();
 	});
 
@@ -253,7 +256,9 @@ describe("agent session bus", () => {
 			sendAgentMessage,
 		});
 
-		await expect(handlers["agent_message.send"]!({ target: "all", message: "status" })).resolves.toMatchObject({
+		await expect(
+			invokeHostRequestHandlerForTest(handlers["agent_message.send"]!, { target: "all", message: "status" }),
+		).resolves.toMatchObject({
 			receipts: [
 				{ id: "root", deliveryStatus: "delivered" },
 				{ target: "sibling", error: "rate limited" },

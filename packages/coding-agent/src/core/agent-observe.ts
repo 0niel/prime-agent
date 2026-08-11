@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { contextAwareHostRequestHandler, createHostRequestHandler, type HostRequestHandlers } from "./kernel/index.js";
 
 export const AGENT_OBSERVE_SKILL_NAME = "agent-observe";
 export const AGENT_OBSERVE_IMPORT_NAME = "agent_observe";
@@ -67,25 +68,24 @@ export interface AgentObserveController {
 	): AgentObserveRecentMessagesResult | Promise<AgentObserveRecentMessagesResult>;
 }
 
-export function createAgentObserveHostHandlers(controller: AgentObserveController) {
+export function createAgentObserveHostHandlers(controller: AgentObserveController): HostRequestHandlers {
 	return {
-		"agent_observe.list": async () => controller.listAgents() as unknown as Record<string, unknown>,
-		"agent_observe.get": async (payload: Record<string, unknown> = {}) => {
-			if (typeof payload.target !== "string") {
-				throw new Error("agent_observe.get target must be a string");
-			}
+		"agent_observe.list": createHostRequestHandler(
+			async (_payload, _context) => controller.listAgents() as unknown as Record<string, unknown>,
+			contextAwareHostRequestHandler,
+		),
+		"agent_observe.get": createHostRequestHandler(async (payload, _context) => {
+			if (typeof payload.target !== "string") throw new Error("agent_observe.get target must be a string");
 			return (await controller.getAgent(payload.target)) as unknown as Record<string, unknown>;
-		},
-		"agent_observe.recent": async (payload: Record<string, unknown> = {}) => {
-			if (typeof payload.target !== "string") {
-				throw new Error("agent_observe.recent target must be a string");
-			}
+		}, contextAwareHostRequestHandler),
+		"agent_observe.recent": createHostRequestHandler(async (payload, _context) => {
+			if (typeof payload.target !== "string") throw new Error("agent_observe.recent target must be a string");
 			return (await controller.recentMessages({
 				target: payload.target,
 				limit: normalizeOptionalInteger(payload.limit, "agent_observe.recent limit"),
 				maxChars: normalizeOptionalInteger(payload.max_chars ?? payload.maxChars, "agent_observe.recent max_chars"),
 			})) as unknown as Record<string, unknown>;
-		},
+		}, contextAwareHostRequestHandler),
 	};
 }
 

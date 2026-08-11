@@ -169,7 +169,12 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
+import {
+	contextAwareHostRequestHandler,
+	createHostRequestHandler,
+	type HostRequestHandlers,
+	type KernelSentAgentMessage,
+} from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -8766,25 +8771,37 @@ export class AgentSession {
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
-			"model.info": async () => ({
-				id: this.model?.id ?? null,
-				provider: this.model?.provider ?? null,
-				input: this.model?.input ?? [],
-			}),
+			"model.info": createHostRequestHandler(
+				async (_payload, _context) => ({
+					id: this.model?.id ?? null,
+					provider: this.model?.provider ?? null,
+					input: this.model?.input ?? [],
+				}),
+				contextAwareHostRequestHandler,
+			),
 		};
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
-				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
+				handlers[type] = createHostRequestHandler(
+					async (payload, _context) => this.handleGoalHostRequest(type, payload),
+					contextAwareHostRequestHandler,
+				);
 			}
 		}
 		if (this._includeCompactSkill) {
 			for (const type of ["compact.run", "compact.status"]) {
-				handlers[type] = async (payload) => this.handleCompactHostRequest(type, payload);
+				handlers[type] = createHostRequestHandler(
+					async (payload, _context) => this.handleCompactHostRequest(type, payload),
+					contextAwareHostRequestHandler,
+				);
 			}
 		}
 		if (this._autoRefineAllowedForSession()) {
 			for (const type of ["refine.run", "refine.status"]) {
-				handlers[type] = async (payload) => this.handleRefineHostRequest(type, payload);
+				handlers[type] = createHostRequestHandler(
+					async (payload, _context) => this.handleRefineHostRequest(type, payload),
+					contextAwareHostRequestHandler,
+				);
 			}
 		}
 		if (this._rlmHeartbeatController) {
@@ -8794,7 +8811,10 @@ export class AgentSession {
 				"rlm_heartbeat.update",
 				"rlm_heartbeat.delete",
 			]) {
-				handlers[type] = async (payload) => this.handleRlmHeartbeatHostRequest(type, payload);
+				handlers[type] = createHostRequestHandler(
+					async (payload, _context) => this.handleRlmHeartbeatHostRequest(type, payload),
+					contextAwareHostRequestHandler,
+				);
 			}
 		}
 		const visibleKernelSkillNames = new Set(

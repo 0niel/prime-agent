@@ -6,6 +6,8 @@ import { getBundledSkillsDir } from "../src/config.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
+import { createTestHostHandlers } from "./host-request-context.js";
+
 function bundledAgentObserveSkill(): PythonSkillRuntimeInfo {
 	const packagePath = join(getBundledSkillsDir(), "agent-observe");
 	return {
@@ -35,7 +37,7 @@ describe("agent-observe skill over the kernel host bridge", () => {
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentObserveSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"agent_observe.list": async (payload) => {
 					requests.push({ type: "agent_observe.list", payload });
 					return {
@@ -60,7 +62,7 @@ describe("agent-observe skill over the kernel host bridge", () => {
 						truncated: false,
 					};
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -93,11 +95,11 @@ print(json.dumps({"agents": agents, "agent": agent, "recent": recent}, sort_keys
 	it("validates argument types before sending to the host", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentObserveSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"agent_observe.get": async () => {
 					throw new Error("should not reach host");
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();

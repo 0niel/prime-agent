@@ -6,6 +6,8 @@ import { getBundledSkillsDir } from "../src/config.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
+import { createTestHostHandlers } from "./host-request-context.js";
+
 function bundledRlmHeartbeatSkill(): PythonSkillRuntimeInfo {
 	const packagePath = join(getBundledSkillsDir(), "rlm-heartbeat");
 	return {
@@ -35,7 +37,7 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledRlmHeartbeatSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"rlm_heartbeat.create": async (payload) => {
 					requests.push({ type: "rlm_heartbeat.create", payload });
 					return {
@@ -85,7 +87,7 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 						},
 					};
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -131,7 +133,7 @@ print(json.dumps({
 	it("surfaces missing host handlers as Python exceptions", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledRlmHeartbeatSkill()],
-			hostHandlers: {},
+			hostHandlers: createTestHostHandlers({}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -151,12 +153,12 @@ except RuntimeError as error:
 		let hostRequestCount = 0;
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledRlmHeartbeatSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"rlm_heartbeat.create": async () => {
 					hostRequestCount++;
 					return {};
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();

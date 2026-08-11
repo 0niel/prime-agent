@@ -10,6 +10,8 @@ import { acpUpdatesForSessionEvent } from "../src/modes/acp/acp-events.js";
 import { PRIME_AGENT_META_NAMESPACE } from "../src/modes/acp/acp-meta.js";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/types.js";
 
+import { createTestHostHandlers } from "./host-request-context.js";
+
 /**
  * Real-kernel verification for ACP mode.
  *
@@ -166,7 +168,7 @@ print(json.dumps({
 			provisioner = new IpythonKernelProvisioner(tempDir, {
 				pythonSkills: [AGENT_MESSAGE_SKILL],
 				env: { RLM_DEPTH: "0", RLM_MAX_DEPTH: "1" },
-				hostHandlers: {
+				hostHandlers: createTestHostHandlers({
 					"rlm.list_subagents": async () => ({
 						subagents: [
 							{
@@ -189,7 +191,7 @@ print(json.dumps({
 							status: "completed",
 						},
 					}),
-				},
+				}),
 			});
 			const manager = await provisioner.ensure();
 
@@ -219,7 +221,7 @@ print(json.dumps({
 		async () => {
 			provisioner = new IpythonKernelProvisioner(tempDir, {
 				pythonSkills: [AGENT_MESSAGE_SKILL],
-				hostHandlers: {
+				hostHandlers: createTestHostHandlers({
 					// The family roster: parent, siblings, and children of this agent.
 					"agent_message.list_agents": async () => ({
 						current: { name: "root", id: "session-alpha", depth: 0 },
@@ -234,7 +236,7 @@ print(json.dumps({
 						queuedAt: "2026-08-04T00:00:00.000Z",
 						deliveryMode: payload.mode ?? "auto",
 					}),
-				},
+				}),
 			});
 			const manager = await provisioner.ensure();
 
