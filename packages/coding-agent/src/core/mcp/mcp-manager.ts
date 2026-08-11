@@ -146,7 +146,7 @@ export class McpManager {
 				// The pre-refresh DELETE must use the old sealed token even if its
 				// expiry clock has elapsed; otherwise cleanup recurses into refresh.
 				this.beginClosingCredential(binding.server);
-				try { await this.hostBridge.closeBinding(binding); }
+				try { await this.hostBridge.closeBinding(binding); return true; }
 				finally { this.endClosingCredential(binding.server); }
 			},
 		});

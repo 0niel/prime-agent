@@ -743,7 +743,7 @@ async function prepareRuntimeServices(options: {
 	);
 	// This preflight only guards project MCP declarations. Normal project settings
 	// still load for extensions/themes/tools regardless of MCP admission.
-	const settingsManager = SettingsManager.create(options.cwd, effectiveAgentDir);
+	const runtimeSettingsManager = SettingsManager.create(options.cwd, effectiveAgentDir);
 	const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
 		usePrimeCliConfig: effectiveAgentDir === options.agentDir,
 	});
@@ -751,7 +751,7 @@ async function prepareRuntimeServices(options: {
 		cwd: options.cwd,
 		agentDir: effectiveAgentDir,
 		authStorage,
-		settingsManager,
+		settingsManager: runtimeSettingsManager,
 		mcpProjectAdmission,
 		extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
 		// Subagents share the parent's Herdr pane; their own reporter would race
@@ -1059,6 +1059,11 @@ export interface MainOptions {
 	extensionFactories?: ExtensionFactory[];
 }
 
+/** Read only global policy and mint admission before a caller opens cwd settings. */
+export function preflightMcpProjectAdmission(cwd: string, agentDir: string): void {
+	void composeMcpRuntimeProjectAdmission(SettingsManager.loadGlobalSettings(cwd, agentDir), cwd);
+}
+
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
 	if (isDaemonWorkerProcess()) {
@@ -1164,6 +1169,9 @@ export async function main(args: string[], options?: MainOptions) {
 	time("runMigrations");
 
 	const agentDir = getAgentDir();
+	// Project MCP policy is admitted before *any* full SettingsManager opens the
+	// project scope. Ordinary startup/session behavior may then load settings.
+	preflightMcpProjectAdmission(cwd, agentDir);
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
 	const startupBenchmark = isTruthyEnvFlag(process.env.PI_STARTUP_BENCHMARK);
@@ -1271,6 +1279,9 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createSessionManager");
 
+	// A resumed session may select a different cwd. Admit its project MCP policy
+	// before telemetry or daemon-client settings can open that project scope.
+	preflightMcpProjectAdmission(sessionManager.getCwd(), agentDir);
 	const telemetrySettingsManager =
 		sessionManager.getCwd() === cwd
 			? startupSettingsManager

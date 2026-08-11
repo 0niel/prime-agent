@@ -578,4 +578,14 @@ describe("SettingsManager", () => {
 			expect(manager.getTelemetryEnabled()).toBe(false);
 		});
 	});
+	it("keeps legacy MCP servers merged while host composition reads only global servers", () => {
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ mcpServers: { global: { type: "http", url: "https://global.test/mcp" } } }));
+		writeFileSync(join(projectDir, ".prime", "agent", "settings.json"), JSON.stringify({ mcpServers: { project: { type: "stdio", command: "project" } } }));
+		const manager = SettingsManager.create(projectDir, agentDir);
+		expect(manager.getMcpServers()).toMatchObject({ global: expect.any(Object), project: expect.any(Object) });
+		expect(manager.getGlobalMcpServers()).toEqual({ global: { type: "http", url: "https://global.test/mcp" } });
+		const clone = manager.getGlobalMcpServers()!; delete clone.global;
+		expect(manager.getGlobalMcpServers()).toHaveProperty("global");
+	});
+
 });

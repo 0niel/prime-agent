@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -12,6 +12,7 @@ import {
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
 	parseAgentsViewCommand,
+	preflightMcpProjectAdmission,
 	resolveRuntimeSessionOptions,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldEnsureInteractiveDaemonForStartup,
@@ -26,6 +27,17 @@ import {
 import type { SessionSummary } from "../src/modes/index.js";
 
 describe("interactive startup routing", () => {
+	test("preflights a resumed cwd using global policy without reading project settings", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-resume-mcp-admission-"));
+		const agentDir = join(root, "agent"); const resumed = join(root, "resumed");
+		mkdirSync(join(resumed, ".prime", "agent"), { recursive: true }); mkdirSync(agentDir, { recursive: true });
+		try {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ mcpProjectTrustPolicy: { revision: "r1", allowedProjectDirectories: [] } }));
+			// Deliberately malformed project JSON must not be parsed by admission.
+			writeFileSync(join(resumed, ".prime", "agent", "settings.json"), "{ broken project settings");
+			expect(() => preflightMcpProjectAdmission(resumed, agentDir)).not.toThrow();
+		} finally { rmSync(root, { recursive: true, force: true }); }
+	});
 	test.each(["interactive", "print", "json", "rpc"] as const)(
 		"uses the daemon runtime for the %s client",
 		(appMode) => {

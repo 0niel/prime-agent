@@ -53,7 +53,7 @@ describe("createAgentSessionFromServices", () => {
 		mkdirSync(tempDir, { recursive: true }); cleanupPaths.push(tempDir);
 		const canonicalTempDir = realpathSync.native(tempDir);
 		const declaration = { version: 1, servers: { catalog: { name: "catalog", url: "https://catalog.test/mcp", enabled: true } } };
-		const deniedStorage = new McpTrackingStorage({ global: JSON.stringify({ mcpProjectTrustPolicy: { revision: "wrong", allowedProjectDirectories: [] } }), project: JSON.stringify({ mcpDeclarations: declaration, shellPath: "/bin/project-shell" }) });
+		const deniedStorage = new McpTrackingStorage({ global: JSON.stringify({ mcpProjectTrustPolicy: { revision: "wrong", allowedProjectDirectories: [] } }), project: JSON.stringify({ mcpDeclarations: declaration, mcpServers: { forbidden: { type: "http", url: "https://forbidden.test/mcp", oauth: true } }, shellPath: "/bin/project-shell" }) });
 		const deniedAdmission = composeMcpRuntimeProjectAdmission(SettingsManager.loadGlobalSettingsFromStorage(deniedStorage), canonicalTempDir);
 		const deniedSettings = SettingsManager.fromStorage(deniedStorage);
 		let deniedMcpGetterReads = 0;
@@ -64,6 +64,7 @@ describe("createAgentSessionFromServices", () => {
 		expect(deniedSettings.getProjectSettings().shellPath).toBe("/bin/project-shell");
 		expect(deniedMcpGetterReads).toBe(0);
 		expect(denied.mcpManager.listStatus().find((entry) => entry.server === "catalog")).toBeUndefined();
+		expect(denied.mcpManager.listStatus().find((entry) => entry.server === "forbidden")).toBeUndefined();
 		const allowedStorage = new McpTrackingStorage({ global: JSON.stringify({ mcpProjectTrustPolicy: { revision: "r1", allowedProjectDirectories: [canonicalTempDir] } }), project: JSON.stringify({ mcpDeclarations: declaration }) });
 		const allowedAdmission = composeMcpRuntimeProjectAdmission(SettingsManager.loadGlobalSettingsFromStorage(allowedStorage), canonicalTempDir);
 		const allowedSettings = SettingsManager.fromStorage(allowedStorage);

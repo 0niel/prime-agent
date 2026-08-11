@@ -1195,6 +1195,8 @@ export class AgentSession {
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
 	private _disposeAsyncPromise?: Promise<void>;
+	/** Started synchronously to fence MCP I/O before any async teardown awaits. */
+	private _mcpDisposePromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
@@ -3768,9 +3770,14 @@ export class AgentSession {
 	 * (which flushes a final namespace snapshot) before the synchronous dispose, so
 	 * the latest state reaches disk instead of racing process exit.
 	 */
+	private _startMcpDispose(): Promise<void> {
+		return this._mcpDisposePromise ??= this._mcpManager?.dispose().catch(() => undefined) ?? Promise.resolve();
+	}
+
 	async disposeAsync(): Promise<void> {
+		const mcpDispose = this._startMcpDispose();
 		if (this._disposed) {
-			return this._disposeCallbacksPromise;
+			return mcpDispose.then(() => this._disposeCallbacksPromise);
 		}
 		// Concurrent callers await the same in-flight teardown so none resolves before
 		// the kernel snapshot flush finishes.
@@ -3783,7 +3790,7 @@ export class AgentSession {
 			// aborts each request and awaits its handler before its connection closes.
 			// This prevents an old session's host handler from surviving replacement.
 			await this._ipythonKernelProvisioner?.dispose();
-			await this._mcpManager?.dispose();
+			await mcpDispose;
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
 			await this._drainPendingRefinementForDisposal();
@@ -3980,6 +3987,9 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		// Start immediately; callers of synchronous dispose cannot await, but the
+		// shared bridge promise fences controllers before DELETE completion.
+		this._startMcpDispose();
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
 			// Invalidate scheduled timers and abort any in-flight review so a late

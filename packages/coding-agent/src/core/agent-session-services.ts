@@ -205,7 +205,7 @@ export async function createAgentSessionServices(
 	});
 	const mcpManager = new McpManager({
 		authStorage,
-		getUserServers: () => settingsManager.getMcpServers(),
+		getUserServers: () => settingsManager.getGlobalMcpServers(),
 		secretStore: options.mcpOAuthSecretStore,
 		runtimeDeclarationSnapshot: mcpRuntimeDeclarationSnapshot,
 	});

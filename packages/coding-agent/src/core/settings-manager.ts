@@ -1237,9 +1237,13 @@ export class SettingsManager {
 		return this.settings.enabledModels;
 	}
 
-	getMcpServers(): Record<string, McpServerConfig> | undefined {
-		return this.settings.mcpServers;
+	/** Legacy MCP runtime config is global-only; project scope cannot supply auth or endpoints. */
+	getGlobalMcpServers(): Record<string, McpServerConfig> | undefined {
+		return this.globalSettings.mcpServers ? structuredClone(this.globalSettings.mcpServers) : undefined;
 	}
+
+	/** Legacy interactive configuration retains the merged global/project view. */
+	getMcpServers(): Record<string, McpServerConfig> | undefined { return this.settings.mcpServers; }
 
 	/** Read one M01 declaration document without merging user and project scope. */
 	getMcpDeclarationDocument(scope: McpDeclarationScope): McpDeclarationDocument {
