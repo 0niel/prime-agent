@@ -788,7 +788,7 @@ export class KernelManager {
 			this.connection = conn;
 		} catch (e) {
 			const canRetryStartup = (this.state as string) !== "shutdown";
-			await this.shutdown();
+			await this.shutdownInternal();
 			if (canRetryStartup) this.state = "idle";
 			throw e;
 		}
@@ -809,7 +809,7 @@ export class KernelManager {
 			await this.probeReady();
 		} catch (e) {
 			const canRetryStartup = (this.state as string) !== "shutdown";
-			await this.shutdown();
+			await this.shutdownInternal();
 			if (canRetryStartup) this.state = "idle";
 			throw e;
 		}
