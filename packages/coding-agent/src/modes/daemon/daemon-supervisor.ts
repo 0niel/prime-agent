@@ -3863,7 +3863,7 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private handleWorkerFrame(worker: ResidentWorker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void {
+	private async handleWorkerFrame(worker: ResidentWorker, frame: PrivateFrame<DaemonWorkerFrameHeader>): Promise<void> {
 		if (frame.header.kind !== "outbound") {
 			return;
 		}
