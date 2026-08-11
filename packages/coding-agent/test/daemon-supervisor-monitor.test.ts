@@ -1771,6 +1771,7 @@ describe("daemon worker supervisor monitoring", () => {
 		} as unknown as DaemonAttachResult;
 		const worker = {
 			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
+			client: {},
 			summaries: new Map([[activeSessionId, summary]]),
 			snapshotCache: new Map([[activeSessionId, result]]),
 			snapshotTransferFrames: new Map(),
