@@ -727,4 +727,60 @@ describe("daemon supervisor passive subagent topology", () => {
 			}),
 		]);
 	});
+	it("denies live endpoint topology that contradicts a captured supervisor catalog", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-captured-family-message-"));
+		tempDirs.push(directory);
+		const targetManager = SessionManager.create(directory, join(directory, "sessions"));
+		// The saved target is a root, but the captured authorization snapshot below
+		// deliberately records it as an unrelated child.
+		targetManager.newSession({ rlmDepth: 0 });
+		targetManager.flushNow();
+		const targetPath = targetManager.getSessionFile();
+		if (!targetPath) throw new Error("Missing target session path");
+
+		const source = summary({
+			id: "source-active", activeSessionId: "source-active", sessionId: "source-session", rlmDepth: 0,
+		});
+		const liveTarget = summary({
+			id: "target-active", activeSessionId: "target-active", sessionId: targetManager.getSessionId(),
+			sessionFile: targetPath, rlmDepth: 0,
+		});
+		const sourceWorker = worker("source", [source]);
+		const targetWorker = worker("target", [liveTarget]);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory }, descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		supervisor.workers.set("source", sourceWorker);
+		const createOrReuseWorker = vi.fn(async () => targetWorker);
+		Object.assign(supervisor, {
+			catalog: { resolve: vi.fn(async () => targetPath) },
+			familyCatalogEntries: vi.fn(async () => Object.freeze([
+				{ id: "left-parent", depth: 0, status: "inactive", sessionPath: join(directory, "left-parent.jsonl") },
+				{ id: "right-parent", depth: 0, status: "inactive", sessionPath: join(directory, "right-parent.jsonl") },
+				{ id: source.sessionId, depth: 1, status: "running", parentSessionId: "left-parent" },
+				{ id: targetManager.getSessionId(), depth: 1, status: "inactive", parentSessionId: "right-parent", sessionPath: targetPath },
+			])),
+			createOrReuseWorker,
+		});
+		const command = {
+			type: "send_message", id: "captured-topology", agentOrigin: true,
+			fromActiveSessionId: source.activeSessionId, targetActiveSessionId: targetManager.getSessionId(), message: "hello",
+		};
+
+		// Pre-wake authorization must reject the snapshot's unrelated children even
+		// though the live source and saved target both claim root topology.
+		await expect(supervisor.handleCommand({}, command)).rejects.toThrow(
+			"Agent reach is limited to parent, siblings, and children",
+		);
+		expect(createOrReuseWorker).not.toHaveBeenCalled();
+
+		// The post-resolution path uses the exact same snapshot, rather than the
+		// contradictory live target summary, and therefore also fails closed.
+		supervisor.workers.set("target", targetWorker);
+		await expect(supervisor.handleCommand({}, command)).rejects.toThrow(
+			"Agent reach is limited to parent, siblings, and children",
+		);
+		expect(targetWorker.client.requestWorker).not.toHaveBeenCalled();
+	});
+
 });

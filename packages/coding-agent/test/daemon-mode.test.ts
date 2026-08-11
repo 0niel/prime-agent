@@ -2761,6 +2761,44 @@ describe("daemon mode helpers", () => {
 		);
 	});
 
+	it("observes residents from the captured family catalog rather than live endpoint fields", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-observe-captured-family.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" }, createRuntime: vi.fn(),
+		});
+		const source = makeState("source");
+		const target = makeState("target");
+		for (const state of [source, target]) {
+			state.runtime = {
+				...state.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					...state.runtime.session, sessionId: `session-${state.activeSessionId}`,
+					sessionFile: `/tmp/${state.activeSessionId}.jsonl`, rlmDepth: 0,
+				},
+			} as never;
+		}
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries(): Promise<readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]>;
+			createAgentObserveController(getCurrentState: () => ActiveSessionState): AgentObserveController;
+		};
+		internals.sessions.set(source.activeSessionId, source);
+		internals.sessions.set(target.activeSessionId, target);
+		Object.assign(internals, {
+			agentFamilyCatalogEntries: vi.fn(async () => Object.freeze([
+				{ id: "left-parent", depth: 0, status: "inactive", sessionPath: "/tmp/left.jsonl" },
+				{ id: "right-parent", depth: 0, status: "inactive", sessionPath: "/tmp/right.jsonl" },
+				{ id: "session-source", depth: 1, status: "running", parentSessionId: "left-parent" },
+				{ id: "session-target", depth: 1, status: "running", parentSessionId: "right-parent" },
+			])),
+		});
+
+		// The live root summaries would otherwise be sibling roots. Their conflicting
+		// topology cannot override the captured snapshot's unrelated parent edges.
+		const observed = await internals.createAgentObserveController(() => source).listAgents();
+		expect(observed.agents.map((agent) => agent.activeSessionId)).toEqual(["source"]);
+	});
+
 	it("resolves a duplicate session name to the only family-reachable agent", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-family-name-resolution.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },

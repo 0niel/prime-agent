@@ -1800,9 +1800,14 @@ export class DaemonSupervisor {
 				: undefined;
 			// Hold this persisted topology through pre-wake and post-wake checks.
 			const familyCatalog = source && command.agentOrigin === true ? await this.familyCatalogEntries() : undefined;
+			// Session IDs are the stable identities for this authorization snapshot. Do not
+			// rebuild either endpoint from worker summaries after the snapshot is captured.
+			const sourceSessionId = source?.summary.sessionId;
+			let targetSessionId: string;
 			let target: WorkerMatch;
 			try {
 				target = await this.findWorkerForClient(client, command.targetActiveSessionId);
+				targetSessionId = target.summary.sessionId;
 			} catch (error) {
 				if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
 				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
@@ -1821,12 +1826,13 @@ export class DaemonSupervisor {
 					}
 					throw error;
 				}
+				const targetInfo = await readSessionInfo(sessionPath);
+				if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
+				targetSessionId = targetInfo.id;
 				if (source && command.agentOrigin === true) {
-					const targetInfo = await readSessionInfo(sessionPath);
-					if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
 					assertAgentFamilyReach(
-						this.familyCatalogEntry(source.summary),
-						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
+						this.authoritativeFamilyCatalogEntry(familyCatalog!, sourceSessionId!),
+						this.authoritativeFamilyCatalogEntry(familyCatalog!, targetSessionId),
 						familyCatalog!,
 					);
 				}
@@ -1843,9 +1849,14 @@ export class DaemonSupervisor {
 			}
 			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
 			if (source && command.agentOrigin === true) {
+				// Waking must not substitute a different live session for the target that
+				// was authorized by the captured topology.
+				if (target.summary.sessionId !== targetSessionId) {
+					throw new Error("Agent reach is limited to parent, siblings, and children");
+				}
 				assertAgentFamilyReach(
-					this.familyCatalogEntry(source.summary),
-					this.familyCatalogEntry(target.summary),
+					this.authoritativeFamilyCatalogEntry(familyCatalog!, sourceSessionId!),
+					this.authoritativeFamilyCatalogEntry(familyCatalog!, targetSessionId),
 					familyCatalog!,
 				);
 			}
@@ -3203,6 +3214,16 @@ export class DaemonSupervisor {
 			return "recovering";
 		}
 		return worker.descriptor.lifecycle;
+	}
+
+	/** Resolve both authorization endpoints exclusively from one captured topology snapshot. */
+	private authoritativeFamilyCatalogEntry(
+		catalog: readonly AgentFamilyCatalogEntry[],
+		sessionId: string,
+	): AgentFamilyCatalogEntry {
+		const matches = catalog.filter((entry) => entry.id === sessionId);
+		if (matches.length !== 1) throw new Error("Agent reach is limited to parent, siblings, and children");
+		return matches[0]!;
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {

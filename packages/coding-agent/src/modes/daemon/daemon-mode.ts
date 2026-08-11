@@ -2877,7 +2877,11 @@ export class AgentDaemon {
 			.filter((state) => {
 				if (state.activeSessionId === currentState.activeSessionId) return true;
 				try {
-					assertAgentFamilyReach(this.agentFamilyEntry(currentState), this.agentFamilyEntry(state), catalog);
+					assertAgentFamilyReach(
+						this.authoritativeAgentFamilyEntry(currentState, catalog),
+						this.authoritativeAgentFamilyEntry(state, catalog),
+						catalog,
+					);
 					return true;
 				} catch (error) {
 					if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) return false;
