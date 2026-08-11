@@ -1498,6 +1498,84 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(recoverWorker).toHaveBeenCalledOnce();
 	});
 
+	it("clears an unpersisted fresh recovery environment before later automatic recovery", async () => {
+		type RecoveryWorker = {
+			descriptor: {
+				workerId: string;
+				rootActiveSessionId: string;
+				lifecycle: "failed" | "recovering" | "ready";
+				consecutiveFailures: number;
+				stopRequestedAt?: string;
+				archiveOnStop?: boolean;
+				lastError?: string;
+			};
+			client?: object;
+			recovery?: Promise<void>;
+			recoveryLaunchEnv?: Record<string, string>;
+			intentionalStop: boolean;
+		};
+		type RecoveryHarness = {
+			persistWorker: ReturnType<typeof vi.fn>;
+			recoverWorker: ReturnType<typeof vi.fn>;
+			reuseWorkerForCreate(
+				worker: RecoveryWorker,
+				ownerClientId: undefined,
+				sessionPath: string,
+				command: { type: "create"; lifecycle?: "client_owned"; launchEnv: Record<string, string> },
+			): Promise<RecoveryWorker>;
+		};
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-unpersisted-fresh-resume",
+				rootActiveSessionId: "active-unpersisted-fresh-resume",
+				lifecycle: "failed",
+				consecutiveFailures: 3,
+				lastError: "previous recovery failure",
+			},
+			intentionalStop: false,
+		};
+		const originalDescriptor = worker.descriptor;
+		let automaticRecoveryEnv: Record<string, string> | undefined;
+		const recoverWorker = vi.fn(async (target: RecoveryWorker) => {
+			automaticRecoveryEnv = target.recoveryLaunchEnv;
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			persistWorker: vi.fn((target: RecoveryWorker) => {
+				// Match persistWorker's ability to update the staged descriptor before
+				// its synchronous filesystem operations fail.
+				target.descriptor.lastError = "partially persisted recovery state";
+				throw new Error("simulated worker persistence failure");
+			}),
+			recoverWorker,
+		}) as RecoveryHarness;
+
+		await expect(
+			supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/unpersisted-fresh-resume", {
+				type: "create",
+				launchEnv: { ACP_FIXTURE_API_KEY: "must-not-survive-persist-failure" },
+			}),
+		).rejects.toThrow("simulated worker persistence failure");
+		expect(supervisor.persistWorker).toHaveBeenCalledOnce();
+		expect(recoverWorker).not.toHaveBeenCalled();
+		expect(worker.recoveryLaunchEnv).toBeUndefined();
+		expect(worker.descriptor).toBe(originalDescriptor);
+		expect(worker.descriptor).toMatchObject({
+			lifecycle: "failed",
+				consecutiveFailures: 3,
+				lastError: "previous recovery failure",
+				stopRequestedAt: undefined,
+				archiveOnStop: undefined,
+			});
+		expect(worker.intentionalStop).toBe(false);
+		expect(worker.recovery).toBeUndefined();
+
+		// A later automatic recovery must not inherit a credential whose hand-off
+		// failed before recovery began.
+		await supervisor.recoverWorker(worker);
+		expect(recoverWorker).toHaveBeenCalledOnce();
+		expect(automaticRecoveryEnv).toBeUndefined();
+	});
+
 	it("lets the first fresh resume adopt recovery after an automatic env-less recovery settles", async () => {
 		type RecoveryWorker = {
 			descriptor: {
