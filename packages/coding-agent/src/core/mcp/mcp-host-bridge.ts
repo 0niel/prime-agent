@@ -87,7 +87,7 @@ export class McpHostBridge {
 	private readonly states = new Map<string, State>();
 	private readonly controllers = new Set<AbortController>();
 	/** Each old binding has one transition, installed before any current-binding lookup. */
-	private readonly bindingRefreshFlights = new Map<string, Promise<{ binding: McpHostBinding; retired: boolean }>>();
+	private readonly bindingRefreshFlights = new Map<string, Promise<{ state: State; retired: boolean }>>();
 	/** Whole public lifecycles, including close/refresh/retry, for disposal fencing. */
 	private readonly operations = new Set<Promise<void>>();
 	private readonly fetchImpl: typeof fetch;
@@ -200,6 +200,9 @@ export class McpHostBridge {
 			if (this.disposed || !state.binding.oauth || !retryable || !context.isCurrent() || context.signal.aborted) throw error;
 			const refreshed = await this.refreshBinding(state, prior, message); const target = refreshed.state;
 			if (aborted && !refreshed.retired) throw error;
+			// A late initialize belongs to the canonical epoch. Join its initialize
+			// promise rather than posting a duplicate initialize/notification.
+			if (message.method === "initialize" && target !== state) { await this.initialize(target, context); return undefined; }
 			if (message.method !== "initialize") await this.initialize(target, context);
 			return this.authenticated(target, (token) => this.post(target, message, context, token, response, allowCancelled));
 		}
@@ -207,7 +210,15 @@ export class McpHostBridge {
 	private async initialize(state: State, context: HostRequestContext): Promise<void> {
 		state = this.canonical(state);
 		if (state.initialize) return state.initialize;
-		const initialization = (async () => { const id = this.id(state); const result = await this.send(state, { jsonrpc: "2.0", id, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "Prime Agent", version: "0" } } }, context); if (!result || result.error || !Object.prototype.hasOwnProperty.call(result, "result") || !result.result || typeof result.result !== "object" || Array.isArray(result.result) || (result.result as { protocolVersion?: unknown }).protocolVersion !== "2025-03-26") throw new Error("MCP initialize returned an invalid protocol version."); await this.send(state, { jsonrpc: "2.0", method: "notifications/initialized" }, context, false); })();
+		const initialization = (async () => {
+			const id = this.id(state); const result = await this.send(state, { jsonrpc: "2.0", id, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "Prime Agent", version: "0" } } }, context);
+			const canonical = this.canonical(state);
+			// The old closure was forwarded while its response/refresh was pending.
+			// Its canonical initializer owns validation and initialized notification.
+			if (canonical !== state) { await this.initialize(canonical, context); return; }
+			if (!result || result.error || !Object.prototype.hasOwnProperty.call(result, "result") || !result.result || typeof result.result !== "object" || Array.isArray(result.result) || (result.result as { protocolVersion?: unknown }).protocolVersion !== "2025-03-26") throw new Error("MCP initialize returned an invalid protocol version.");
+			await this.send(state, { jsonrpc: "2.0", method: "notifications/initialized" }, context, false);
+		})();
 		state.initialize = initialization;
 		try { await initialization; } catch (error) { if (state.initialize === initialization) state.initialize = undefined; throw error; }
 	}

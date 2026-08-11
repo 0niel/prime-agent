@@ -273,12 +273,12 @@ describe("MCP host bridge", () => {
 	});
 
 	it("routes late initialize adoption to the canonical session and disposes only that session", async () => {
-		let revision = "secret-r1"; let initCalls = 0; let toolCalls = 0; let deletes: string[] = []; let releaseLate!: () => void;
+		let revision = "secret-r1"; let initCalls = 0; let initialized = 0; let toolCalls = 0; let deletes: string[] = []; let releaseLate!: () => void;
 		const bridge = new McpHostBridge({
 			fetch: async (_url, init) => {
 				if (init?.method === "DELETE") { deletes.push(new Headers(init.headers).get("mcp-session-id")!); return new Response(null, { status: 204 }); }
 				const message = JSON.parse(String(init?.body));
-				if (message.method === "notifications/initialized") return new Response("", { status: 202 });
+				if (message.method === "notifications/initialized") { initialized++; return new Response("", { status: 202 }); }
 				if (message.method === "initialize") {
 					if (++initCalls === 1) return new Response("expired", { status: 401 }); // r1 -> r2 during initialize
 					if (initCalls === 3) { await new Promise<void>((resolve) => { releaseLate = resolve; }); return new Response("expired", { status: 401 }); }
@@ -296,6 +296,7 @@ describe("MCP host bridge", () => {
 		for (let i = 0; i < 20 && !releaseLate; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 		await bridge.request({ ...binding, authRevision: "secret-r2" }, "tools/list", {}, context()); // r2 -> r3 canonical
 		releaseLate(); await expect(late).resolves.toEqual({ tools: [] });
+		expect(initCalls).toBe(4); expect(initialized).toBe(2);
 		const states = (bridge as unknown as { states: Map<string, { binding: { authRevision?: string }; sessionId?: string }> }).states;
 		expect([...states.values()]).toHaveLength(1); expect([...states.values()][0]?.binding.authRevision).toBe("secret-r3");
 		await bridge.dispose(); expect(deletes).toEqual(["session-secret-r3"]);
