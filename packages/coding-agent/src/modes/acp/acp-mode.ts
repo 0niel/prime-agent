@@ -191,11 +191,11 @@ class AcpUpdateProducer {
 		if (event.type === "rlm_child_update") {
 			const known = this.childOriginTurnIds.get(event.child.id);
 			if (known !== undefined) return this.terminalTurns.has(known) ? 0 : known;
-			// A child is first observed while its parent prompt is producing it.
-			// Remember that origin so a later child update cannot be relabelled by
-			// a subsequent prompt.
-			if (this.activePromptTurnId !== 0) this.childOriginTurnIds.set(event.child.id, this.activePromptTurnId);
-			return this.activePromptTurnId;
+			// Remember its initial origin, including connection scope, so a later
+			// child update cannot be relabelled by a subsequent prompt.
+			const originTurnId = this.activePromptTurnId !== 0 ? this.activePromptTurnId : 0;
+			this.childOriginTurnIds.set(event.child.id, originTurnId);
+			return originTurnId;
 		}
 		return this.activePromptTurnId;
 	}

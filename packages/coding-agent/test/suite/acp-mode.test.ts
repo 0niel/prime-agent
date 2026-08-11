@@ -460,6 +460,30 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("preserves a child first observed between prompts as connection-scoped", async () => {
+		const child = { id: "between-prompts", label: "child", status: "running", sessionDir: "/tmp/child" };
+		let connection: any;
+		connection = fakeAcpConnection({
+			onPromptAndWait: () => connection.emitChild({ ...child, status: "done" }),
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		connection.emitChild(child);
+		await vi.waitFor(() =>
+			expect(updates.some((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.subagents)).toBe(true),
+		);
+		await client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "complete" }],
+		});
+		const childUpdates = updates
+			.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE])
+			.filter((meta) => meta?.subagents?.[0]?.id === child.id);
+		expect(childUpdates.map((meta) => meta.promptTurnId)).toEqual([0, 0]);
+		close();
+	});
+
 	it("makes a child first observed after terminal connection-scoped", async () => {
 		const connection = fakeAcpConnection();
 		const { client, updates, close } = connectAcpClient(connection);
