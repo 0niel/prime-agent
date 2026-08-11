@@ -253,6 +253,12 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+type FamilyCatalogSource = "persisted" | "live";
+
+type FamilyCatalogCandidate = AgentFamilyCatalogEntry & {
+	source: FamilyCatalogSource;
+};
+
 interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
@@ -1790,9 +1796,16 @@ export class DaemonSupervisor {
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
 				: undefined;
+			// Hold this persisted topology through pre-wake and post-wake checks.
+			const familyCatalog = source && command.agentOrigin === true ? await this.familyCatalogEntries() : undefined;
+			// Session IDs are the stable identities for this authorization snapshot. Do not
+			// rebuild either endpoint from worker summaries after the snapshot is captured.
+			const sourceSessionId = source?.summary.sessionId;
+			let targetSessionId: string;
 			let target: WorkerMatch;
 			try {
 				target = await this.findWorkerForClient(client, command.targetActiveSessionId);
+				targetSessionId = target.summary.sessionId;
 			} catch (error) {
 				if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
 				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
@@ -1811,12 +1824,14 @@ export class DaemonSupervisor {
 					}
 					throw error;
 				}
+				const targetInfo = await readSessionInfo(sessionPath);
+				if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
+				targetSessionId = targetInfo.id;
 				if (source && command.agentOrigin === true) {
-					const targetInfo = await readSessionInfo(sessionPath);
-					if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
 					assertAgentFamilyReach(
-						this.familyCatalogEntry(source.summary),
-						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
+						this.authoritativeFamilyCatalogEntry(familyCatalog!, sourceSessionId!),
+						this.authoritativeFamilyCatalogEntry(familyCatalog!, targetSessionId),
+						familyCatalog!,
 					);
 				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
@@ -1832,7 +1847,16 @@ export class DaemonSupervisor {
 			}
 			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
 			if (source && command.agentOrigin === true) {
-				assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
+				// Waking must not substitute a different live session for the target that
+				// was authorized by the captured topology.
+				if (target.summary.sessionId !== targetSessionId) {
+					throw new Error("Agent reach is limited to parent, siblings, and children");
+				}
+				assertAgentFamilyReach(
+					this.authoritativeFamilyCatalogEntry(familyCatalog!, sourceSessionId!),
+					this.authoritativeFamilyCatalogEntry(familyCatalog!, targetSessionId),
+					familyCatalog!,
+				);
 			}
 			if (source) {
 				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
@@ -3008,19 +3032,74 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async familyCatalogEntries(): Promise<AgentFamilyCatalogEntry[]> {
-		const active = [...this.workers.values()].flatMap((worker) => [...worker.summaries.values()]);
-		const activePaths = new Set(
-			active.flatMap((summary) => (summary.sessionFile ? [canonicalSessionPath(summary.sessionFile)] : [])),
+	private async familyCatalogEntries(): Promise<readonly AgentFamilyCatalogEntry[]> {
+		const live = [...this.workers.values()]
+			.flatMap((worker) => [...worker.summaries.values()])
+			.map((summary): FamilyCatalogCandidate => ({ ...this.familyCatalogEntry(summary), source: "live" }));
+		// Keep the persisted row even when its path is currently active. A live
+		// overlay may fill in missing claims, but it may not silently replace a
+		// conflicting durable topology claim.
+		const persisted = (await this.catalog.list()).map(
+			(info): FamilyCatalogCandidate => ({
+				...this.familyCatalogEntry(summaryForInactiveSession(info)),
+				source: "persisted",
+			}),
 		);
-		const savedRoots = (await this.catalog.list()).filter(
-			(info) =>
-				(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
-				!activePaths.has(canonicalSessionPath(info.path)),
-		);
-		return [...active, ...savedRoots.map((info) => summaryForInactiveSession(info))].map((summary) =>
-			this.familyCatalogEntry(summary),
-		);
+		return Object.freeze(this.mergeEquivalentFamilyCatalogEntries([...persisted, ...live]));
+	}
+
+	/**
+	 * Collapse durable/live duplicates only when their stable identity and every
+	 * jointly-present topology claim agree. Incompatible candidates intentionally
+	 * remain duplicated: authoritative endpoint lookup then fails closed.
+	 */
+	private mergeEquivalentFamilyCatalogEntries(entries: readonly FamilyCatalogCandidate[]): AgentFamilyCatalogEntry[] {
+		const compatible = (left: FamilyCatalogCandidate, right: FamilyCatalogCandidate) =>
+			left.id === right.id &&
+			(left.sessionPath === undefined ||
+				right.sessionPath === undefined ||
+				left.sessionPath === right.sessionPath) &&
+			left.depth === right.depth &&
+			(left.parentSessionId === undefined ||
+				right.parentSessionId === undefined ||
+				left.parentSessionId === right.parentSessionId) &&
+			(left.parentSessionPath === undefined ||
+				right.parentSessionPath === undefined ||
+				left.parentSessionPath === right.parentSessionPath);
+		const groups: FamilyCatalogCandidate[][] = [];
+		for (const entry of entries) {
+			const group = groups.find((candidate) => candidate.every((member) => compatible(member, entry)));
+			if (group) group.push(entry);
+			else groups.push([entry]);
+		}
+		const statusRank: Record<AgentFamilyCatalogEntry["status"], number> = { inactive: 0, idle: 1, running: 2 };
+		const preferred = <T>(
+			rows: readonly FamilyCatalogCandidate[],
+			get: (row: FamilyCatalogCandidate) => T | undefined,
+		): T | undefined =>
+			[...rows]
+				.sort((left, right) => (right.source === "live" ? 1 : 0) - (left.source === "live" ? 1 : 0))
+				.map(get)
+				.find((value): value is T => value !== undefined);
+		return groups.map((rows) => {
+			const exemplar = rows[0]!;
+			const name = preferred(rows, (row) => row.name);
+			const parentSessionId = preferred(rows, (row) => row.parentSessionId);
+			const parentSessionPath = preferred(rows, (row) => row.parentSessionPath);
+			const sessionPath = preferred(rows, (row) => row.sessionPath);
+			return {
+				id: exemplar.id,
+				depth: exemplar.depth,
+				status: rows.reduce<AgentFamilyCatalogEntry["status"]>(
+					(best, row) => (statusRank[row.status] > statusRank[best] ? row.status : best),
+					"inactive",
+				),
+				...(name ? { name } : {}),
+				...(parentSessionId ? { parentSessionId } : {}),
+				...(parentSessionPath ? { parentSessionPath } : {}),
+				...(sessionPath ? { sessionPath } : {}),
+			};
+		});
 	}
 
 	private async withSessionNameReservation<T>(
@@ -3190,6 +3269,16 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker is ${this.effectiveWorkerState(worker)}`);
 		}
 		return worker.client;
+	}
+
+	/** Resolve both authorization endpoints exclusively from one captured topology snapshot. */
+	private authoritativeFamilyCatalogEntry(
+		catalog: readonly AgentFamilyCatalogEntry[],
+		sessionId: string,
+	): AgentFamilyCatalogEntry {
+		const matches = catalog.filter((entry) => entry.id === sessionId);
+		if (matches.length !== 1) throw new Error("Agent reach is limited to parent, siblings, and children");
+		return matches[0]!;
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+	AGENT_FAMILY_REACH_ERROR,
 	AGENT_MESSAGE_SOURCE,
 	AgentSessionMessageRateLimiter,
 	assertAgentFamilyReach,
@@ -308,10 +309,11 @@ describe("agent session bus", () => {
 				{ id: "orphan-b", depth: 3, status: "inactive" },
 			),
 		).toThrow("Agent reach is limited to parent, siblings, and children");
-		expect(assertAgentFamilyReach(root, child)).toBe("child");
-		expect(assertAgentFamilyReach(child, root)).toBe("parent");
-		expect(assertAgentFamilyReach(child, sibling)).toBe("sibling");
-		expect(assertAgentFamilyReach(sibling, idOnlySibling)).toBe("sibling");
+		const catalog = [root, child, sibling, idOnlySibling, grandchild];
+		expect(assertAgentFamilyReach(root, child, catalog)).toBe("child");
+		expect(assertAgentFamilyReach(child, root, catalog)).toBe("parent");
+		expect(assertAgentFamilyReach(child, sibling, catalog)).toBe("sibling");
+		expect(assertAgentFamilyReach(sibling, idOnlySibling, catalog)).toBe("sibling");
 		expect(() => assertAgentFamilyReach(root, grandchild)).toThrow(
 			"Agent reach is limited to parent, siblings, and children",
 		);
@@ -398,6 +400,67 @@ describe("agent session bus", () => {
 			{ relationship: "parent", name: "orchestrator", id: "root", depth: 0, status: "running" },
 			{ relationship: "sibling", name: "builder", id: "path-child", depth: 1, status: "inactive" },
 		]);
+	});
+
+	it("reserves passive sibling names from direct canonical parent claims without broadening family reach", () => {
+		const catalog = [
+			{ id: "passive-id", name: "worker", depth: 1, status: "inactive" as const, parentSessionId: "parent" },
+			{
+				id: "passive-path",
+				name: "path-worker",
+				depth: 1,
+				status: "inactive" as const,
+				parentSessionPath: "/tmp/prime-agent-parent/../parent.jsonl",
+			},
+		];
+
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, { name: "worker", depth: 1, parentSessionId: "parent" }),
+		).toThrow("an agent of that name already exists at depth 1 under this parent");
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, {
+				name: "path-worker",
+				depth: 1,
+				parentSessionPath: "/tmp/parent.jsonl",
+			}),
+		).toThrow("an agent of that name already exists at depth 1 under this parent");
+		// Direct claims reserve names only. They cannot synthesize a relationship
+		// while the parent record is unavailable from the catalog.
+		expect(() => assertAgentFamilyReach(catalog[0]!, catalog[1]!, catalog)).toThrow(AGENT_FAMILY_REACH_ERROR);
+	});
+	it("resolves id-only and path-only catalog claims but rejects contradictory claims", () => {
+		const parent = { id: "parent", depth: 0, status: "running" as const, sessionPath: "/parent" };
+		const idOnly = {
+			id: "id-only",
+			name: "id-worker",
+			depth: 1,
+			status: "inactive" as const,
+			parentSessionId: "parent",
+		};
+		const pathOnly = {
+			id: "path-only",
+			name: "path-worker",
+			depth: 1,
+			status: "inactive" as const,
+			parentSessionPath: "/parent",
+		};
+		const contradictory = {
+			id: "contradictory",
+			depth: 1,
+			status: "inactive" as const,
+			parentSessionId: "parent",
+			parentSessionPath: "/other",
+		};
+		const catalog = [parent, idOnly, pathOnly, contradictory];
+		expect(assertAgentFamilyReach(parent, idOnly, catalog)).toBe("child");
+		expect(assertAgentFamilyReach(parent, pathOnly, catalog)).toBe("child");
+		expect(() => assertAgentFamilyReach(parent, contradictory, catalog)).toThrow(AGENT_FAMILY_REACH_ERROR);
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, { name: "id-worker", depth: 1, parentSessionId: "parent" }),
+		).toThrow("an agent of that name already exists at depth 1 under this parent");
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, { name: "path-worker", depth: 1, parentSessionPath: "/parent" }),
+		).toThrow("an agent of that name already exists at depth 1 under this parent");
 	});
 
 	it("builds a sorted nuclear-family roster with inactive members", () => {
