@@ -45,7 +45,8 @@ function fakeAcpConnection(
 ): any {
 	let listener: ((event: any) => void) | undefined;
 	let subscribed = false;
-	const snapshot = { state: { cwd: process.cwd() }, messages: [] };
+	const messages: any[] = [];
+	const snapshot = { state: { cwd: process.cwd() }, messages };
 	return {
 		subscribe(callback: (event: any) => void) {
 			subscribed = true;
@@ -56,7 +57,7 @@ function fakeAcpConnection(
 			};
 		},
 		getState: async () => snapshot.state,
-		getMessages: async () => [],
+		getMessages: async () => messages,
 		getInitialSnapshot: async () => {
 			if (options.onInitialSnapshot) options.onInitialSnapshot(subscribed);
 			if (options.initialSnapshot) {
@@ -92,6 +93,7 @@ function fakeAcpConnection(
 		emitHeartbeat() {
 			listener?.({ type: "heartbeats_changed" });
 		},
+		messages,
 	};
 }
 
@@ -349,6 +351,37 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("captures an autonomous continuation error after headless completion", async () => {
+		let connection: any;
+		connection = fakeAcpConnection({
+			onWaitForHeadlessCompletion: () => {
+				connection.messages.push({
+					role: "assistant",
+					timestamp: Date.now(),
+					stopReason: "error",
+					errorMessage: "autonomous continuation failed",
+				});
+			},
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await expect(
+			client.request("session/prompt", {
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "finish" }],
+			}),
+		).rejects.toThrow("autonomous continuation failed");
+		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(metadata.filter((meta) => meta.phase === "responseBoundary")).toEqual([
+			expect.objectContaining({ outcome: "error" }),
+		]);
+		expect(metadata.filter((meta) => meta.phase === "terminalQuiescence")).toEqual([
+			expect.objectContaining({ outcome: "error" }),
+		]);
+		close();
+	});
+
 	it("propagates a failed roster read at quiescence emission", async () => {
 		// A snapshot failure while emitting must not degrade to outstandingSubagents: 0.
 		// Reporting a fabricated zero is the false-quiescent answer this metadata
@@ -501,6 +534,83 @@ describe("ACP mode end to end", () => {
 			.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE])
 			.find((meta) => meta?.subagents?.[0]?.id === "late");
 		expect(late).toMatchObject({ promptTurnId: 0, phase: "event" });
+		close();
+	});
+
+	it("drains an earlier backpressured update before cancellation after the initial transcript read", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const enteredPublish = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const releasePublish = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection, {
+			beforeAcpUpdatePublish: async () => {
+				entered();
+				await releasePublish;
+			},
+		});
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		connection.emitHeartbeat();
+		await enteredPublish;
+		connection.getMessages = async () => {
+			await client.notify("session/cancel", { sessionId: session.sessionId });
+			return [];
+		};
+		const pending = client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "cancel" }],
+		});
+		await Promise.resolve();
+		let settled = false;
+		void pending.then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		release();
+		await expect(pending).resolves.toMatchObject({ stopReason: "cancelled" });
+		expect(updates.map((update) => update.update?.sessionUpdate)).toEqual(["session_info_update"]);
+		close();
+	});
+
+	it("settles queued updates before close resolves without a post-close notification", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const enteredPublish = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const releasePublish = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection, {
+			beforeAcpUpdatePublish: async () => {
+				entered();
+				await releasePublish;
+			},
+		});
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		connection.emitHeartbeat();
+		await enteredPublish;
+		const closing = client.request("session/close", { sessionId: session.sessionId });
+		await Promise.resolve();
+		let closed = false;
+		void closing.then(() => {
+			closed = true;
+		});
+		await Promise.resolve();
+		expect(closed).toBe(false);
+		release();
+		await closing;
+		expect(updates).toHaveLength(1);
+		await Promise.resolve();
+		expect(updates).toHaveLength(1);
 		close();
 	});
 

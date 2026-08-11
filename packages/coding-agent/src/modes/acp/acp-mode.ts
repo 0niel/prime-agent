@@ -591,13 +591,11 @@ export async function runAcpModeWithConnection(
 			try {
 				const { text, images } = promptContent(params.prompt);
 				const priorMessages = turnBoundary(await connection.getMessages());
-				if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
-				await connection.promptAndWait(text, images.length > 0 ? { images } : undefined);
 				if (abort.signal.aborted) {
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
 				}
-				const failure = await turnFailure(connection, priorMessages);
+				await connection.promptAndWait(text, images.length > 0 ? { images } : undefined);
 				if (abort.signal.aborted) {
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
@@ -605,6 +603,11 @@ export async function runAcpModeWithConnection(
 				// Both successful and failed model turns must establish quiescence from
 				// the same authoritative sources before making a terminal claim.
 				const status = await connection.waitForHeadlessCompletion();
+				if (abort.signal.aborted) {
+					await entry.producer.drain();
+					return { stopReason: "cancelled" satisfies AcpStopReason };
+				}
+				const failure = await turnFailure(connection, priorMessages);
 				if (abort.signal.aborted) {
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
@@ -691,6 +694,9 @@ export async function runAcpModeWithConnection(
 				closing.abort.abort();
 				await connection.abort().catch(() => undefined);
 			}
+			// Settle queued notifications before returning the close response, so no
+			// update can arrive after the client observes this session as closed.
+			await closing.producer.drain();
 			return {};
 		})
 		.onNotification("session/cancel", async (ctx: any) => {
