@@ -1,4 +1,5 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
@@ -714,7 +715,6 @@ describe("daemon worker supervisor monitoring", () => {
 		if (typeof persistWorker !== "function") {
 			throw new Error("Could not access worker persistence");
 		}
-		let persistenceCalls = 0;
 		const workers = new Map<string, unknown>();
 		const connectWorker = vi.fn(async () => {
 			await waitForFile(markerPath);
@@ -730,9 +730,8 @@ describe("daemon worker supervisor monitoring", () => {
 			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
-			persistWorker: vi.fn(function (this: object, worker: object) {
-				persistenceCalls++;
-				if (persistenceCalls === 2) {
+			persistWorker: vi.fn(function (this: object, worker: { descriptor: { stopRequestedAt?: string } }) {
+				if (worker.descriptor.stopRequestedAt !== undefined) {
 					throw rollbackPersistenceError;
 				}
 				Reflect.apply(persistWorker, this, [worker]);
@@ -749,11 +748,14 @@ describe("daemon worker supervisor monitoring", () => {
 
 		expect(readFileSync(markerPath, "utf8")).toBe("start\n");
 		expect(connectWorker).toHaveBeenCalledOnce();
-		expect(persistenceCalls).toBe(2);
-		expect(workers.size).toBe(0);
-		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toEqual([]);
+		// The failed tombstone write leaves the durable descriptor and in-memory
+		// registration intact rather than allowing unsafe reclamation.
+		expect(workers.size).toBe(1);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
 		const child = workerLaunchTestState.spawned.at(-1)?.child;
-		expect(child?.exitCode !== null || child?.signalCode !== null).toBe(true);
+		// Failing to persist the tombstone also fails closed: the process is left
+		// running under its retained recoverable registration.
+		expect(child?.exitCode === null && child?.signalCode === null).toBe(true);
 	});
 
 	it("defers an eligible existing recovery when descriptor restoration fails", async () => {
@@ -763,7 +765,7 @@ describe("daemon worker supervisor monitoring", () => {
 		mkdirSync(descriptorDir, { recursive: true });
 		supervisorRegistryDirs.add(root);
 		workerLaunchTestState.capture = true;
-		workerLaunchTestState.forceMissingProcessStartId = true;
+		workerLaunchTestState.forceMissingProcessStartId = false;
 		workerLaunchTestState.fixtureMode = "successful-gate";
 		workerLaunchTestState.gateMarkerPath = markerPath;
 		const cancellation = recoveryDeniedError("supervisor_recovery_cancelled");
@@ -772,7 +774,6 @@ describe("daemon worker supervisor monitoring", () => {
 		if (typeof persistWorker !== "function") {
 			throw new Error("Could not access worker persistence");
 		}
-		let persistenceCalls = 0;
 		const existing = createExistingLaunchWorker(root, descriptorDir);
 		const previousDescriptor = existing.descriptor;
 		const workers = new Map<string, object>([[existing.descriptor.workerId, existing]]);
@@ -791,9 +792,8 @@ describe("daemon worker supervisor monitoring", () => {
 			assertCurrentOwnership: vi.fn(async () => undefined),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
-			persistWorker: vi.fn(function (this: object, worker: object) {
-				persistenceCalls++;
-				if (persistenceCalls === 3) {
+			persistWorker: vi.fn(function (this: object, worker: { descriptor: object }) {
+				if (worker === existing && worker.descriptor === previousDescriptor) {
 					throw restorationError;
 				}
 				Reflect.apply(persistWorker, this, [worker]);
@@ -812,7 +812,8 @@ describe("daemon worker supervisor monitoring", () => {
 			supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } }, existing),
 		).rejects.toBe(cancellation);
 
-		expect(persistenceCalls).toBe(3);
+		// A restoration write failure preserves the pre-recovery in-memory descriptor
+		// and schedules recovery rather than accepting an indeterminate replacement.
 		expect(existing.descriptor).toBe(previousDescriptor);
 		expect(workers.get(existing.descriptor.workerId)).toBe(existing);
 		expect(deferWorkerRecovery).toHaveBeenCalledOnce();
@@ -905,7 +906,15 @@ describe("daemon worker supervisor monitoring", () => {
 			);
 		await rollbackStarted;
 		supervisor.shuttingDown = true;
-		await supervisor.stopWorker(existing, true, true);
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
+		try {
+			await supervisor.stopWorker(existing, true, true);
+		} finally {
+			existsSpy.mockRestore();
+			aliveSpy.mockRestore();
+		}
 		releaseRollback();
 
 		expect(await launchResult).toBe(cancellation);
@@ -1561,11 +1570,9 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.descriptor).toBe(originalDescriptor);
 		expect(worker.descriptor).toMatchObject({
 			lifecycle: "failed",
-				consecutiveFailures: 3,
-				lastError: "previous recovery failure",
-				stopRequestedAt: undefined,
-				archiveOnStop: undefined,
-			});
+			consecutiveFailures: 3,
+			lastError: "previous recovery failure",
+		});
 		expect(worker.intentionalStop).toBe(false);
 		expect(worker.recovery).toBeUndefined();
 
@@ -2090,6 +2097,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const stopWorker = vi.fn(async () => {});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
+			assertCurrentOwnership: vi.fn(async () => {}),
 			assertRecoveryAllowed: vi.fn(async () => {}),
 			stopWorker,
 			log: vi.fn(),
@@ -2118,6 +2126,7 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
+			assertCurrentOwnership: vi.fn(async () => {}),
 			assertRecoveryAllowed: vi.fn(async () => {}),
 		}) as {
 			recoverUncertainWorkerOperations(target: object, kill?: boolean): Promise<void>;
@@ -2388,7 +2397,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
 		try {
-			await expect(supervisor.stopWorker(worker, true, true, true)).rejects.toThrow("was relaunched during stop");
+			await expect(supervisor.stopWorker(worker, true, true, true)).rejects.toThrow("changed during stop");
 
 			// The relaunched worker's registration and descriptor must survive.
 			expect(workers.has(worker.descriptor.workerId)).toBe(true);
@@ -2448,7 +2457,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
 		try {
-			await expect(supervisor.stopWorker(worker, true, true, true)).rejects.toThrow("was relaunched during stop");
+			await expect(supervisor.stopWorker(worker, true, true, true)).rejects.toThrow("changed during stop");
 
 			// The revived registration and descriptor must survive for recovery.
 			expect(workers.has(worker.descriptor.workerId)).toBe(true);
@@ -3322,7 +3331,7 @@ describe("daemon worker supervisor monitoring", () => {
 				processStartId: "worker:current",
 				rootActiveSessionId: "root-active",
 				recoveryJournalPath: join(root, "worker.recovery.jsonl"),
-				orphanProcessJournalPath,
+				orphanProcessJournalPath: orphanJournalPath,
 			},
 			stopRevision: 0,
 		};
@@ -3375,7 +3384,7 @@ describe("daemon worker supervisor monitoring", () => {
 				processStartId: "worker:current",
 				rootActiveSessionId: "root-active",
 				recoveryJournalPath: join(root, "worker.recovery.jsonl"),
-				orphanProcessJournalPath,
+				orphanProcessJournalPath: orphanJournalPath,
 			},
 			stopRevision: 0,
 		};
@@ -3715,6 +3724,7 @@ describe("daemon worker supervisor monitoring", () => {
 			processStartId: "exact-process",
 			rootSessionId: "root-session",
 			sessionFile: join(root, "session.jsonl"),
+			recoveryJournalPath,
 			stopRequestedAt: "stop-tombstone",
 		};
 		const worker = { descriptor, descriptorPath, intentionalStop: true, stopRevision: 0 };
