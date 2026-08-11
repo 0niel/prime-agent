@@ -549,10 +549,12 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		const { worker } = workerHarness();
 		const persistWorker = vi.fn();
 		const internals = supervisor as unknown as {
+			workers: Map<string, WorkerHarness>;
 			persistWorker: typeof persistWorker;
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 			stopWorker(worker: WorkerHarness, removeDescriptor: boolean): Promise<void>;
 		};
+		internals.workers.set(worker.descriptor.workerId, worker);
 		internals.persistWorker = persistWorker;
 		const frames = snapshotFrames([{ role: "user", content: "stable", timestamp: 1 }]);
 		for (const message of [frames.begin, frames.chunk, frames.end]) {

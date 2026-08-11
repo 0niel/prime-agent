@@ -4885,13 +4885,13 @@ export class DaemonSupervisor {
 			await unrefDelay(STOP_FINALIZATION_RECHECK_MS);
 		}
 		// Retry transient cleanup failures (for example catalog archival) so a
-		// dead worker's registration is never stranded permanently. Each attempt
-		// bumps the worker's stopRevision, so rescission is detected through the
-		// registration and tombstone instead of the waiting-phase snapshot.
+		// dead worker's registration is never stranded permanently. Retain the
+		// original stop revision so the same tombstone remains authoritative;
+		// genuine concurrent stops still increment and fence this finalizer.
 		const isCleanupStillWanted = isStopGenerationCurrent;
 		while (!this.shuttingDown && isCleanupStillWanted()) {
 			try {
-				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
+				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true, true);
 				this.log(`Finalized timed-out stop for worker ${worker.descriptor.workerId}`);
 				return;
 			} catch (error) {
