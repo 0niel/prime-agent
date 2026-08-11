@@ -22,7 +22,7 @@ import {
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
-import { type HostRequestHandlers, KernelManager } from "../src/core/kernel/index.js";
+import { type HostRequestHandlers, invokeHostRequestHandlerForTest, KernelManager } from "../src/core/kernel/index.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import {
@@ -37,6 +37,8 @@ import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
+import { createTestHostHandlers } from "./host-request-context.js";
+
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -328,7 +330,7 @@ describe("AgentSession rlm recursion", () => {
 			outcome: "skipped_running",
 		}));
 
-		await expect(deleteHandler({ target: subagent.rlm_child_id })).resolves.toEqual({
+		await expect(invokeHostRequestHandlerForTest(deleteHandler, { target: subagent.rlm_child_id })).resolves.toEqual({
 			subagent,
 			outcome: "skipped_running",
 		});
@@ -743,7 +745,9 @@ describe("AgentSession rlm recursion", () => {
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
 		expect(child.repliedToParentSinceTask).toBe(false);
-		await expect(send({ message: "done", receiver_role: "parent" })).resolves.toMatchObject({
+		await expect(
+			invokeHostRequestHandlerForTest(send, { message: "done", receiver_role: "parent" }),
+		).resolves.toMatchObject({
 			message: "done",
 		});
 		expect(sendAgentMessage).toHaveBeenCalledWith(
@@ -802,7 +806,7 @@ describe("AgentSession rlm recursion", () => {
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
-		const pendingSend = send({
+		const pendingSend = invokeHostRequestHandlerForTest(send, {
 			message: "hello",
 			receiver_role: "child",
 			receiver_name: spawned.rlm_child_id,
@@ -865,7 +869,11 @@ describe("AgentSession rlm recursion", () => {
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
 		await expect(
-			send({ message: "follow-up", receiver_role: "child", receiver_name: spawned.rlm_child_id }),
+			invokeHostRequestHandlerForTest(send, {
+				message: "follow-up",
+				receiver_role: "child",
+				receiver_name: spawned.rlm_child_id,
+			}),
 		).resolves.toMatchObject({ message: "follow-up" });
 		expect(sendAgentMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ target: child.sessionId, message: "follow-up" }),
@@ -901,7 +909,11 @@ describe("AgentSession rlm recursion", () => {
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
-		const pendingSend = send({ message: "hello", receiver_role: "child", receiver_name: spawned.name });
+		const pendingSend = invokeHostRequestHandlerForTest(send, {
+			message: "hello",
+			receiver_role: "child",
+			receiver_name: spawned.name,
+		});
 		rejectStartup?.(new Error("child startup failed"));
 
 		await expect(pendingSend).rejects.toThrow("child startup failed");
@@ -957,7 +969,11 @@ describe("AgentSession rlm recursion", () => {
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
 		await expect(
-			send({ message: "hello", receiver_role: "child", receiver_name: "shared-child" }),
+			invokeHostRequestHandlerForTest(send, {
+				message: "hello",
+				receiver_role: "child",
+				receiver_name: "shared-child",
+			}),
 		).resolves.toMatchObject({ message: "hello" });
 		expect(sendAgentMessage).toHaveBeenCalledWith(
 			expect.objectContaining({ target: "healthy-child-session", message: "hello" }),
@@ -999,9 +1015,13 @@ describe("AgentSession rlm recursion", () => {
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
-		await expect(send({ message: "hello", receiver_role: "child", receiver_name: "deleted-child" })).rejects.toThrow(
-			'No child matches "deleted-child"',
-		);
+		await expect(
+			invokeHostRequestHandlerForTest(send, {
+				message: "hello",
+				receiver_role: "child",
+				receiver_name: "deleted-child",
+			}),
+		).rejects.toThrow('No child matches "deleted-child"');
 		releaseRuntimeCreation();
 		await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
 	});
@@ -1038,7 +1058,7 @@ describe("AgentSession rlm recursion", () => {
 		const send = handlers["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
-		await expect(send({ target: "all", message: "status" })).resolves.toMatchObject({
+		await expect(invokeHostRequestHandlerForTest(send, { target: "all", message: "status" })).resolves.toMatchObject({
 			receipts: [{ message: "status" }],
 		});
 		expect(roster).toHaveBeenCalledTimes(1);
@@ -1263,7 +1283,7 @@ describe("AgentSession rlm recursion", () => {
 		vi.spyOn(child, "promptAndWait").mockImplementation(async () => {
 			const send = (child as unknown as InspectableRlmSession)._createKernelHostHandlers()["agent_message.send"];
 			if (!send) throw new Error("Missing agent_message.send host handler");
-			await send({ message: "done", receiver_role: "parent" });
+			await invokeHostRequestHandlerForTest(send, { message: "done", receiver_role: "parent" });
 			const followUp = createAgentSessionMessage({
 				id: "agentmsg-parent-follow-up-after-reply",
 				source: "agent_message",
@@ -1509,13 +1529,15 @@ describe("AgentSession rlm recursion", () => {
 		if (!listHandler || !deleteHandler) {
 			throw new Error("Missing RLM subagent registry host handlers");
 		}
-		await expect(listHandler({})).resolves.toEqual(expectedRegistry);
-		await expect(deleteHandler({ target: expectedSessionName })).resolves.toEqual({
+		await expect(invokeHostRequestHandlerForTest(listHandler, {})).resolves.toEqual(expectedRegistry);
+		await expect(invokeHostRequestHandlerForTest(deleteHandler, { target: expectedSessionName })).resolves.toEqual({
 			subagent: expectedRegistry.subagents[0],
 		});
 		expect(root.getRlmChildSession(daemonChildId)).toBeUndefined();
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-		await expect(deleteHandler({ target: expectedSessionName })).rejects.toThrow("No direct RLM subagent matches");
+		await expect(invokeHostRequestHandlerForTest(deleteHandler, { target: expectedSessionName })).rejects.toThrow(
+			"No direct RLM subagent matches",
+		);
 
 		root.dispose();
 
@@ -2904,7 +2926,7 @@ describe("AgentSession rlm recursion", () => {
 		const replies: CapturedCommReply[] = [];
 		const manager = new KernelManager({
 			python: process.execPath,
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"rlm.run": createRlmRunHostHandler(async ({ prompt }) => {
 					active++;
 					started++;
@@ -2919,7 +2941,7 @@ describe("AgentSession rlm recursion", () => {
 						model: "test/model",
 					};
 				}),
-			},
+			}),
 		});
 
 		try {
@@ -2964,7 +2986,7 @@ describe("AgentSession rlm recursion", () => {
 		let promptSeen = "";
 		const manager = new KernelManager({
 			python: process.execPath,
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"rlm.run": createRlmRunHostHandler(async ({ prompt }) => {
 					promptSeen = prompt;
 					return {
@@ -2975,7 +2997,7 @@ describe("AgentSession rlm recursion", () => {
 						model: "test/model",
 					};
 				}),
-			},
+			}),
 		});
 
 		try {
@@ -3010,7 +3032,7 @@ describe("AgentSession rlm recursion", () => {
 		const prompts: string[] = [];
 		const manager = new KernelManager({
 			cwd: tempDir,
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"rlm.run": createRlmRunHostHandler(async ({ prompt }) => {
 					prompts.push(prompt);
 					return {
@@ -3020,7 +3042,7 @@ describe("AgentSession rlm recursion", () => {
 						model: "test/model",
 					};
 				}),
-			},
+			}),
 		});
 
 		try {
@@ -3089,7 +3111,7 @@ print(_result.name)
 		const replies: CapturedCommReply[] = [];
 		const manager = new KernelManager({
 			python: process.execPath,
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"rlm.run": createRlmRunHostHandler(async () => ({
 					answer: "unused",
 					usage: { prompt_tokens: 1, completion_tokens: 1 },
@@ -3097,7 +3119,7 @@ print(_result.name)
 					session_dir: null,
 					model: "test/model",
 				})),
-			},
+			}),
 		});
 
 		try {
@@ -3136,7 +3158,7 @@ print(_result.name)
 		});
 		const manager = new KernelManager({
 			python: process.execPath,
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"rlm.run": createRlmRunHostHandler(async () => {
 					started = true;
 					try {
@@ -3146,7 +3168,7 @@ print(_result.name)
 						handlerSettled = true;
 					}
 				}),
-			},
+			}),
 		});
 		const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 

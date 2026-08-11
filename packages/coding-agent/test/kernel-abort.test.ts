@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AGENT_MESSAGE_DISPLAY_MIME, KernelManager, type KernelSentAgentMessage } from "../src/core/kernel/index.js";
+import {
+	AGENT_MESSAGE_DISPLAY_MIME,
+	contextAwareHostRequestHandler,
+	createHostRequestHandler,
+	KernelManager,
+	type KernelSentAgentMessage,
+} from "../src/core/kernel/index.js";
 
 async function waitForCalls(mock: { mock: { calls: unknown[][] } }, count: number): Promise<void> {
 	for (let i = 0; i < 20; i++) {
@@ -248,6 +254,51 @@ describe("KernelManager abort handling", () => {
 
 		await expect(executePromise).resolves.toMatchObject({ status: "aborted" });
 		expect(controlSend).toHaveBeenCalled();
+	});
+
+	it("revokes host-request authority on comm close and never reads context from payload", async () => {
+		let contextSignal: AbortSignal | undefined;
+		let resolveHandler: (() => void) | undefined;
+		const handler = createHostRequestHandler(async (_payload, context) => {
+			contextSignal = context.signal;
+			await new Promise<void>((resolve) => {
+				resolveHandler = resolve;
+			});
+			return { current: context.isCurrent() };
+		}, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const sent: Record<string, unknown>[] = [];
+		const internals = manager as unknown as {
+			state: "running";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			sendCommMessage: (_commId: string, data: Record<string, unknown>) => Promise<void>;
+			inFlightHostRequests: Set<Promise<void>>;
+		};
+		internals.state = "running";
+		internals.connection = { key: "test" };
+		internals.shell = { send: async () => {}, close: () => {} };
+		internals.sendCommMessage = async (_commId, data) => {
+			sent.push(data);
+		};
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: {
+				comm_id: "request",
+				target_name: "host.request",
+				data: { type: "test", context: { forged: true } },
+			},
+		});
+		await vi.waitFor(() => expect(contextSignal).toBeDefined());
+		expect(contextSignal).toBeDefined();
+		expect(contextSignal?.aborted).toBe(false);
+		internals.handleCommMessage({ header: { msg_type: "comm_close" }, content: { comm_id: "request" } });
+		expect(contextSignal?.aborted).toBe(true);
+		resolveHandler?.();
+		await Promise.allSettled([...internals.inFlightHostRequests]);
+		expect(sent).toContainEqual(expect.objectContaining({ status: "error" }));
+		manager.disposeSync();
 	});
 
 	it("fails a later execution fast when the interrupted cell never idles", async () => {

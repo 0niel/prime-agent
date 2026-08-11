@@ -6,6 +6,8 @@ import { getBundledSkillsDir } from "../src/config.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
+import { createTestHostHandlers } from "./host-request-context.js";
+
 function bundledGoalSkill(): PythonSkillRuntimeInfo {
 	const packagePath = join(getBundledSkillsDir(), "goal");
 	return {
@@ -35,7 +37,7 @@ describe("goal skill over the kernel host bridge", { tags: ["kernel-heavy"] }, (
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledGoalSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"goal.create": async (payload) => {
 					requests.push({ type: "goal.create", payload });
 					return {
@@ -53,7 +55,7 @@ describe("goal skill over the kernel host bridge", { tags: ["kernel-heavy"] }, (
 							"Goal achieved. Report final budget usage to the user: tokens used: 7 of 10.",
 					};
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -85,11 +87,11 @@ print(_completed["goal"]["status"], _completed["completion_budget_report"])
 	it("surfaces host errors and missing handlers as Python exceptions", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledGoalSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"goal.complete": async () => {
 					throw new Error("cannot complete goal because this thread has no goal");
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -128,9 +130,9 @@ except RuntimeError as error:
 	it("rejects replies with an unexpected status instead of hanging", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledGoalSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"goal.get": async () => ({ status: "partial" }),
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();

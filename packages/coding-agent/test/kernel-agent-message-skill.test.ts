@@ -7,6 +7,8 @@ import { KernelManager, type KernelSentAgentMessage } from "../src/core/kernel/i
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
+import { createTestHostHandlers } from "./host-request-context.js";
+
 function bundledAgentMessageSkill(): PythonSkillRuntimeInfo {
 	const packagePath = join(getBundledSkillsDir(), "agent-message");
 	return {
@@ -44,7 +46,7 @@ describe("agent-message skill over the kernel host bridge", () => {
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"agent_message.list_agents": async (payload) => {
 					requests.push({ type: "agent_message.list_agents", payload });
 					return {
@@ -64,7 +66,7 @@ describe("agent-message skill over the kernel host bridge", () => {
 						queuedAt: "2026-06-16T00:00:00.000Z",
 					};
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -117,7 +119,7 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 	it("emits successful broadcast receipts and leaves short errors in the result", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"agent_message.send": async (payload) => ({
 					receipts: [
 						{
@@ -132,7 +134,7 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 						{ target: "sibling", error: "rate limited" },
 					],
 				}),
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -162,11 +164,11 @@ print(json.dumps(receipt, sort_keys=True))
 	it("rejects broadcast combined with role selectors before reaching the host", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"agent_message.send": async () => {
 					throw new Error("should not reach host");
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -183,11 +185,11 @@ except TypeError as error:
 	it("rejects a positional name target before reaching the host", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"agent_message.send": async () => {
 					throw new Error("should not reach host");
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -206,11 +208,11 @@ except TypeError as error:
 	it("does not expose a queueable delivery mode", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"agent_message.send": async () => {
 					throw new Error("should not reach host");
 				},
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();
@@ -227,7 +229,7 @@ except TypeError as error:
 	it("captures sent messages from detached tasks after the cell is idle", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledAgentMessageSkill()],
-			hostHandlers: {
+			hostHandlers: createTestHostHandlers({
 				"agent_message.send": async (payload) => ({
 					id: "agentmsg-background",
 					source: "agent_message",
@@ -237,7 +239,7 @@ except TypeError as error:
 					deliveredAt: "2026-07-10T00:00:00.000Z",
 					deliveryMode: payload.mode,
 				}),
-			},
+			}),
 		});
 
 		const manager = await provisioner.ensure();

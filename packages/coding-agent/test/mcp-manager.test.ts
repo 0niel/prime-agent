@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { getOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { invokeHostRequestHandlerForTest } from "../src/core/kernel/index.js";
 import { McpManager } from "../src/core/mcp/mcp-manager.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import type { McpServerConfig } from "../src/core/settings-manager.js";
@@ -79,8 +80,10 @@ describe("McpManager", () => {
 
 		// refresh with no credentials fails (so the kernel reports a refresh error,
 		// not a false success), and a missing server arg is rejected.
-		await expect(handlers["mcp.refresh"]({ server: "linear" })).rejects.toThrow("Could not refresh");
-		await expect(handlers["mcp.refresh"]({})).rejects.toThrow("requires a server");
+		await expect(invokeHostRequestHandlerForTest(handlers["mcp.refresh"]!, { server: "linear" })).rejects.toThrow(
+			"Could not refresh",
+		);
+		await expect(invokeHostRequestHandlerForTest(handlers["mcp.refresh"]!, {})).rejects.toThrow("requires a server");
 	});
 
 	it("exposes mcp.begin_login only when beginLogin is provided", async () => {
@@ -93,7 +96,7 @@ describe("McpManager", () => {
 		});
 		const handlers = manager.hostHandlers();
 		expect(Object.keys(handlers).sort()).toEqual(["mcp.begin_login", "mcp.config", "mcp.refresh"]);
-		await handlers["mcp.begin_login"]({ server: "linear" });
+		await invokeHostRequestHandlerForTest(handlers["mcp.begin_login"]!, { server: "linear" });
 		expect(called).toBe("linear");
 	});
 
@@ -105,11 +108,13 @@ describe("McpManager", () => {
 			}),
 		});
 		const handlers = manager.hostHandlers();
-		expect(await handlers["mcp.config"]({ server: "linear" })).toEqual({
+		expect(await invokeHostRequestHandlerForTest(handlers["mcp.config"]!, { server: "linear" })).toEqual({
 			url: "https://proxy.test/mcp",
 			headers: { "X-Extra": "1" },
 		});
-		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({ url: "https://mcp.notion.com/mcp" });
+		expect(await invokeHostRequestHandlerForTest(handlers["mcp.config"]!, { server: "notion" })).toEqual({
+			url: "https://mcp.notion.com/mcp",
+		});
 	});
 
 	it("does not treat an oauth override of a catalog name as authed via the official stored cred", () => {

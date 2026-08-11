@@ -1,32 +1,20 @@
 import {
+	contextAwareHostRequestHandler,
 	createHostRequestHandler,
 	type HostRequestContext,
 	type HostRequestHandlerImplementation,
+	invokeHostRequestHandlerForTest,
 } from "../src/core/kernel/index.js";
 
-let nextSyntheticHostRequestId = 0;
-
-/** Create a distinct, current dispatcher context for direct host-handler tests. */
-export function createSyntheticHostRequestContext(): HostRequestContext {
-	const requestNumber = ++nextSyntheticHostRequestId;
-	const controller = new AbortController();
-	return {
-		requestId: `test-host-request-${requestNumber}`,
-		generation: requestNumber,
-		signal: controller.signal,
-		isCurrent: () => !controller.signal.aborted,
-	};
-}
-
-/** Invoke a production-shaped handler with a synthetic dispatcher context. */
+/** Invoke only through a dispatcher-minted context; fixtures cannot fabricate one. */
 export function invokeHostRequest(
 	handler: HostRequestHandlerImplementation,
 	payload: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-	return handler(payload, createSyntheticHostRequestContext());
+	return invokeHostRequestHandlerForTest(handler, payload);
 }
 
-/** Build staged context-aware fixture handlers through the production factory. */
+/** Build factory-minted handlers for integration tests. Context identity is host-private. */
 export function createTestHostHandlers<
 	T extends Record<
 		string,
@@ -34,6 +22,9 @@ export function createTestHostHandlers<
 	>,
 >(handlers: T): Record<keyof T, HostRequestHandlerImplementation> {
 	return Object.fromEntries(
-		Object.entries(handlers).map(([type, handler]) => [type, createHostRequestHandler(handler)]),
+		Object.entries(handlers).map(([type, handler]) => [
+			type,
+			createHostRequestHandler(handler, contextAwareHostRequestHandler),
+		]),
 	) as unknown as Record<keyof T, HostRequestHandlerImplementation>;
 }
