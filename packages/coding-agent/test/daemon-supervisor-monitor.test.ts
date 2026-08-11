@@ -1964,6 +1964,61 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 	});
 
+	it("does not retain an attachment when snapshot loading fails", async () => {
+		type AttachClient = {
+			id: string;
+			capabilities: Set<string>;
+			supportsExtensionUi: boolean;
+			attachedActiveSessionIds: Set<string>;
+		};
+		const activeSessionId = "active-failed-attach";
+		const summary = {
+			id: activeSessionId,
+			activeSessionId,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			sessionId: "session-failed-attach",
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+		} satisfies SessionSummary;
+		const worker = {
+			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
+			client: {
+				request: vi.fn(async () => {
+					throw new Error("snapshot failed");
+				}),
+			},
+			summaries: new Map([[activeSessionId, summary]]),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			incomingTranscriptActiveSessionIds: new Set(),
+			snapshotTransferFrames: new Map(),
+			snapshotLoads: new Map(),
+		};
+		const client: AttachClient = {
+			id: "client-1",
+			capabilities: new Set<string>(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set<string>(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+		}) as {
+			attachClient(client: AttachClient, command: { type: "attach"; activeSessionId: string }): Promise<unknown>;
+		};
+
+		await expect(supervisor.attachClient(client, { type: "attach", activeSessionId })).rejects.toThrow(
+			"snapshot failed",
+		);
+		expect(client.attachedActiveSessionIds).toEqual(new Set());
+	});
+
 	it("rejects an unavailable worker when attach needs an uncached snapshot", async () => {
 		const activeSessionId = "active-unavailable-attach";
 		const summary = {
