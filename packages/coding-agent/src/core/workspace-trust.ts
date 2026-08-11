@@ -78,15 +78,12 @@ export function canonicalizeWorkspacePath(path: string): string {
 }
 
 /**
- * Whether `target` lies inside the project's committed config directory.
- * Guards against portable setups that point the global agent dir into the
- * workspace: such "global" files are project-controlled and must not be
- * treated as trusted user configuration.
+ * Whether the agent dir is the user's own home-based global config directory.
+ * Its contents are the user's own configuration — never checkout-controlled —
+ * regardless of the current working directory.
  */
-export function isWithinProjectConfigDir(target: string, cwd: string): boolean {
-	const root = canonicalizeWorkspacePath(join(cwd, CONFIG_DIR_NAME));
-	const resolved = canonicalizeWorkspacePath(target);
-	return resolved === root || resolved.startsWith(root + sep);
+export function isDefaultUserGlobalAgentDir(agentDir: string): boolean {
+	return canonicalizeWorkspacePath(agentDir) === canonicalizeWorkspacePath(join(homedir(), CONFIG_DIR_NAME));
 }
 
 /**

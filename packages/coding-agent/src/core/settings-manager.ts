@@ -4,7 +4,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
-import { isAgentDirWithinWorkspace, isProjectConfigDirTheUserGlobalDir } from "./workspace-trust.js";
+import { isAgentDirWithinWorkspace, isDefaultUserGlobalAgentDir } from "./workspace-trust.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -363,7 +363,7 @@ export class SettingsManager {
 		// just the conventional config path), except the user's own home-based
 		// global directory.
 		const globalConfigAliasedToProject =
-			isAgentDirWithinWorkspace(agentDir, cwd) && !isProjectConfigDirTheUserGlobalDir(cwd);
+			isAgentDirWithinWorkspace(agentDir, cwd) && !isDefaultUserGlobalAgentDir(agentDir);
 		return SettingsManager.fromStorage(storage, { globalConfigAliasedToProject, ...options });
 	}
 

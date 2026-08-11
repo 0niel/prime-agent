@@ -19,11 +19,7 @@ import { SettingsManager } from "./settings-manager.js";
 import type { Skill } from "./skills.js";
 import { loadSkills } from "./skills.js";
 import { createSourceInfo, type SourceInfo } from "./source-info.js";
-import {
-	isAgentDirWithinWorkspace,
-	isProjectConfigDirTheUserGlobalDir,
-	isWorkspaceTrusted,
-} from "./workspace-trust.js";
+import { isAgentDirWithinWorkspace, isDefaultUserGlobalAgentDir, isWorkspaceTrusted } from "./workspace-trust.js";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -500,7 +496,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 						includeGlobal:
 							this.settingsManager.isProjectTrusted() ||
 							!isAgentDirWithinWorkspace(this.agentDir, this.cwd) ||
-							isProjectConfigDirTheUserGlobalDir(this.cwd),
+							isDefaultUserGlobalAgentDir(this.agentDir),
 					}),
 		};
 		const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(agentsFiles) : agentsFiles;
@@ -903,7 +899,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			existsSync(globalPath) &&
 			(this.settingsManager.isProjectTrusted() ||
 				!isAgentDirWithinWorkspace(this.agentDir, this.cwd) ||
-				isProjectConfigDirTheUserGlobalDir(this.cwd))
+				isDefaultUserGlobalAgentDir(this.agentDir))
 		) {
 			return globalPath;
 		}
@@ -924,7 +920,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			existsSync(globalPath) &&
 			(this.settingsManager.isProjectTrusted() ||
 				!isAgentDirWithinWorkspace(this.agentDir, this.cwd) ||
-				isProjectConfigDirTheUserGlobalDir(this.cwd))
+				isDefaultUserGlobalAgentDir(this.agentDir))
 		) {
 			return globalPath;
 		}

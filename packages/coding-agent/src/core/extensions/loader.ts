@@ -14,11 +14,7 @@ import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
 import { createSyntheticSourceInfo } from "../source-info.js";
-import {
-	isAgentDirWithinWorkspace,
-	isProjectConfigDirTheUserGlobalDir,
-	isWorkspaceTrusted,
-} from "../workspace-trust.js";
+import { isAgentDirWithinWorkspace, isDefaultUserGlobalAgentDir, isWorkspaceTrusted } from "../workspace-trust.js";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -594,7 +590,7 @@ export async function discoverAndLoadExtensions(
 	if (
 		isWorkspaceTrusted(cwd, agentDir) ||
 		!isAgentDirWithinWorkspace(agentDir, cwd) ||
-		isProjectConfigDirTheUserGlobalDir(cwd)
+		isDefaultUserGlobalAgentDir(agentDir)
 	) {
 		addPaths(discoverExtensionsInDir(globalExtDir));
 	}
