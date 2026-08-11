@@ -14,7 +14,7 @@ import {
 	parseAgentSessionMessagePromptId,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
-import { invokeHostRequestHandlerForTest } from "../src/core/kernel/index.js";
+import { invokeHostRequestThroughKernelForTest as invokeHostRequestHandlerForTest } from "./host-request-context.js";
 
 describe("agent session bus", () => {
 	it("formats routed messages with sender and target context", () => {
