@@ -8,7 +8,7 @@ This matters most for unattended and autonomous runs. Repository files, issue te
 
 Prime Agent provides controls that reduce exposure, but none confines IPython to the working directory:
 
-- `--no-tools` disables all model tools. `--no-builtin-tools` disables built-in tools, and `--tools <list>` allowlists tools by name.
+- `--no-tools` disables model tools by default; an explicit `--tools <list>` allowlist overrides it and enables only the listed tools. `--no-builtin-tools` disables built-in tools by default, and `--tools <list>` likewise overrides it.
 - `--no-extensions`, `--no-skills`, `--no-prompt-templates`, and `--no-context-files` disable resource discovery. Use them when the repository or installed resources are not trusted.
 - Autonomous continuation, turn, token, and elapsed-time budgets bound host-managed continuations. The elapsed-time limit is checked between operations; it is not a hard kill deadline for arbitrary code already running.
 - `--autonomous-gate-timeout-ms` bounds each quality-gate process and Prime Agent stops its process tree on timeout. Gates decide whether work satisfies a check; they do not isolate the agent.
