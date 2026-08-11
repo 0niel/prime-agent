@@ -2760,7 +2760,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
 		try {
 			await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
-			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
+			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false, true);
 		} finally {
 			aliveSpy.mockRestore();
 		}
@@ -2799,7 +2799,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("proc:recycled");
 		try {
 			await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
-			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
+			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false, true);
 		} finally {
 			aliveSpy.mockRestore();
 			startIdSpy.mockRestore();
@@ -2847,6 +2847,52 @@ describe("daemon worker supervisor monitoring", () => {
 			// The reclaim defers to the finalizer's cleanup instead of duplicating it.
 			await expect(reclaim).resolves.toBe(true);
 			expect(stopWorker).not.toHaveBeenCalled();
+		} finally {
+			aliveSpy.mockRestore();
+		}
+	});
+
+	it("fails closed when a replacement registration arrives during stale reclaim", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-replaced-during-reclaim",
+				pid: process.pid,
+				rootActiveSessionId: "active-1",
+				stopRequestedAt: new Date().toISOString(),
+			},
+			client: undefined,
+			recovery: undefined,
+			intentionalStop: true,
+			stopRevision: 0,
+			stopFinalization: undefined as Promise<void> | undefined,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		let finishFinalization!: () => void;
+		worker.stopFinalization = new Promise<void>((resolveFinalization) => {
+			finishFinalization = resolveFinalization;
+		});
+		const successor = { descriptor: { workerId: worker.descriptor.workerId } };
+		const stopWorker = vi.fn(async () => {});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			stopWorker,
+			log: vi.fn(),
+			reportCleanupFailure: vi.fn(),
+		}) as {
+			reclaimStaleWorkerRegistration(target: object): Promise<boolean>;
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
+		try {
+			const reclaim = supervisor.reclaimStaleWorkerRegistration(worker);
+			workers.set(worker.descriptor.workerId, successor);
+			finishFinalization();
+
+			await expect(reclaim).rejects.toThrow("was replaced during cleanup; retry shortly");
+			// The stale reclaim neither cleans up nor authorizes a second launch for
+			// a registration installed by the concurrent path.
+			expect(stopWorker).not.toHaveBeenCalled();
+			expect(workers.get(worker.descriptor.workerId)).toBe(successor);
 		} finally {
 			aliveSpy.mockRestore();
 		}

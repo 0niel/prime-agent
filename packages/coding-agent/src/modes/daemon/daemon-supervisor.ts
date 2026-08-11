@@ -2096,11 +2096,20 @@ export class DaemonSupervisor {
 		if (finalization) {
 			await Promise.race([finalization.catch(() => undefined), unrefDelay(STALE_RECLAIM_WAIT_MS)]);
 		}
-		if (this.workers.get(worker.descriptor.workerId) === worker) {
+		const currentRegistration = this.workers.get(worker.descriptor.workerId);
+		if (currentRegistration === worker) {
 			// The process is confirmed dead, so the registration must never be
 			// reused; slow cleanup fails the resume honestly instead.
 			throw new Error(
 				`Stopped session worker ${worker.descriptor.workerId} is still being cleaned up; retry shortly`,
+			);
+		}
+		if (currentRegistration !== undefined) {
+			// A concurrent resume/recovery installed a successor while this reclaim
+			// awaited the old finalizer. Never turn that successor into permission to
+			// launch another worker from the stale caller's captured registration.
+			throw new Error(
+				`Stopped session worker ${worker.descriptor.workerId} was replaced during cleanup; retry shortly`,
 			);
 		}
 		this.log(`Reclaimed stale registration for stopped worker ${worker.descriptor.workerId}`);
