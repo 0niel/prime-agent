@@ -1359,6 +1359,8 @@ export class KernelManager {
 				if (context.signal.aborted) throw new Error("host request authority was revoked");
 				await this.sendCommMessage(commId, { status: "ok", ...result });
 			} catch (error) {
+				// A closed or replaced comm must not receive a stale error from its former request.
+				if (context.signal.aborted || this.activeHostRequestControllers.get(commId) !== controller) return;
 				this.appendKernelDiagnostic(`host request failed for comm ${commId}: ${errorMessage(error)}`);
 				try {
 					await this.sendCommMessage(commId, { status: "error", error: errorMessage(error) });
