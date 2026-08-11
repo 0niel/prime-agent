@@ -91,9 +91,12 @@ def main():
  try:
   try: prime=directory(3,".prime",action=="write"); agent=directory(prime,"agent",action=="write")
   except FileNotFoundError:
-   if action=="read": print('{"mcpDeclarations":null}'); return
+   if action=="read": print('{"hasMcpDeclarations":false,"mcpDeclarations":null}'); return
    raise
-  if action=="read": print(json.dumps({"mcpDeclarations":read(agent).get("mcpDeclarations")},ensure_ascii=False,allow_nan=False,separators=(",", ":")))
+  if action=="read":
+   doc=read(agent)
+   has="mcpDeclarations" in doc
+   print(json.dumps({"hasMcpDeclarations":has,"mcpDeclarations":doc.get("mcpDeclarations") if has else None},ensure_ascii=False,allow_nan=False,separators=(",", ":")))
   elif action=="write" and "document" in request: write(agent,request["document"]); print("{}")
   else: reject()
  finally:
@@ -178,11 +181,17 @@ export class ProjectSettingsOpenat {
 			typeof response !== "object" ||
 			response === null ||
 			Array.isArray(response) ||
+			!Object.hasOwn(response, "hasMcpDeclarations") ||
 			!Object.hasOwn(response, "mcpDeclarations")
 		)
 			unavailable();
+		const { hasMcpDeclarations, mcpDeclarations } = response as {
+			hasMcpDeclarations: unknown;
+			mcpDeclarations: unknown;
+		};
+		if (typeof hasMcpDeclarations !== "boolean" || (!hasMcpDeclarations && mcpDeclarations !== null)) unavailable();
 		try {
-			return parseMcpDeclarationDocument((response as { mcpDeclarations: unknown }).mcpDeclarations);
+			return parseMcpDeclarationDocument(hasMcpDeclarations ? mcpDeclarations : undefined);
 		} catch {
 			unavailable();
 		}

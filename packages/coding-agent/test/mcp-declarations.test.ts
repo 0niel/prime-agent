@@ -11,6 +11,7 @@ import {
 } from "../src/core/mcp/mcp-declarations.js";
 import { admitProjectMcpDeclarations, resolveProjectMcpDeclarations } from "../src/core/mcp/mcp-project-trust.js";
 import { redactMcpValue } from "../src/core/mcp/mcp-redaction.js";
+import { ProjectSettingsOpenat } from "../src/core/mcp/project-settings-openat.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
 const projectDocument = {
@@ -89,12 +90,16 @@ describe("M01 declarative MCP contract", () => {
 			executeMcpDeclarationCommand(command, settings, undefined, {
 				probeTransport: {
 					async open() {
-						return { request: async ({ method }) => void methods.push(method), close: () => undefined };
+						return {
+							request: async ({ method }) => void methods.push(method),
+							notification: async ({ method }) => void methods.push(method),
+							close: () => undefined,
+						};
 					},
 				},
 			}),
 		).resolves.toEqual({ initialized: true, toolsListed: true });
-		expect(methods).toEqual(["initialize", "tools/list"]);
+		expect(methods).toEqual(["initialize", "notifications/initialized", "tools/list"]);
 	});
 
 	it("rejects a structurally forged authority before authorization or project reads", () => {
@@ -213,6 +218,9 @@ describe("M01 declarative MCP contract", () => {
 									async request({ method }) {
 										calls.push(method);
 									},
+									async notification({ method }) {
+										calls.push(method);
+									},
 									close() {},
 								};
 							},
@@ -220,7 +228,7 @@ describe("M01 declarative MCP contract", () => {
 					},
 				),
 			).resolves.toEqual({ initialized: true, toolsListed: true });
-			expect(calls).toEqual(["open", "initialize", "tools/list"]);
+			expect(calls).toEqual(["open", "initialize", "notifications/initialized", "tools/list"]);
 		} finally {
 			f.dispose();
 		}
@@ -241,6 +249,38 @@ describe("M01 declarative MCP contract", () => {
 		});
 		expect(JSON.stringify(redacted)).not.toContain("secret");
 	});
+	it("treats missing project declaration directories and unrelated settings as an empty declaration document", async () => {
+		const f = fixture();
+		try {
+			const admission = admitProjectMcpDeclarations(f.directory, f.authority)!;
+			const settings = await ProjectSettingsOpenat.create(admission);
+			expect(settings.getDocument()).toEqual(emptyMcpDeclarationDocument());
+			mkdirSync(join(f.directory, ".prime", "agent"), { recursive: true });
+			const { writeFileSync } = await import("node:fs");
+			writeFileSync(join(f.directory, ".prime", "agent", "settings.json"), JSON.stringify({ ordinary: true }));
+			expect(settings.getDocument()).toEqual(emptyMcpDeclarationDocument());
+		} finally {
+			f.dispose();
+		}
+	});
+
+	it("rejects an explicit null declaration value", async () => {
+		const f = fixture();
+		try {
+			const admission = admitProjectMcpDeclarations(f.directory, f.authority)!;
+			mkdirSync(join(f.directory, ".prime", "agent"), { recursive: true });
+			const { writeFileSync } = await import("node:fs");
+			writeFileSync(
+				join(f.directory, ".prime", "agent", "settings.json"),
+				JSON.stringify({ mcpDeclarations: null }),
+			);
+			const settings = await ProjectSettingsOpenat.create(admission);
+			expect(() => settings.getDocument()).toThrow("Project MCP declarations are unavailable.");
+		} finally {
+			f.dispose();
+		}
+	});
+
 	it("fails closed when a queued project write loses its approved root", async () => {
 		const f = fixture();
 		const replacement = `${f.directory}-replacement`;

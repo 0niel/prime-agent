@@ -1,3 +1,4 @@
+import { VERSION } from "../../config.js";
 import type { McpDeclaration } from "./mcp-declarations.js";
 
 /** The probe never constructs a network client. Callers must inject a local test transport. */
@@ -12,6 +13,7 @@ export interface McpProbeOpenRequest {
 
 export interface McpProbeSession {
 	request(request: McpProbeRequest): Promise<unknown>;
+	notification(notification: McpProbeNotification): Promise<void> | void;
 	close(): Promise<void> | void;
 }
 
@@ -21,12 +23,17 @@ export interface McpProbeRequest {
 	signal: AbortSignal;
 }
 
+export interface McpProbeNotification {
+	method: "notifications/initialized";
+	signal: AbortSignal;
+}
+
 export interface McpDeclarationProbeOptions {
 	/** Explicit offline mode blocks before the injected transport is opened. */
 	offline?: boolean;
 	/** A project declaration must have passed the C05 trust boundary first. */
 	trusted?: boolean;
-	/** Total wall-clock budget for opening, both protocol requests, and close. */
+	/** Total wall-clock budget for opening and protocol requests. */
 	timeoutMs?: number;
 }
 
@@ -81,14 +88,14 @@ export async function runMcpDeclarationProbe(
 	if (options.trusted !== true) throw publicProbeError("untrusted");
 
 	const timeoutMs = boundedTimeout(options.timeoutMs);
-	const controller = new AbortController();
-	const deadlineTimer = setTimeout(() => controller.abort(), timeoutMs);
+	const operationController = new AbortController();
+	const operationDeadline = setTimeout(() => operationController.abort(), timeoutMs);
 	let session: McpProbeSession | undefined;
 	let failure: Error | undefined;
 	try {
 		session = await withDeadline(
-			transport.open({ url: declaration.url, signal: controller.signal }),
-			controller.signal,
+			transport.open({ url: declaration.url, signal: operationController.signal }),
+			operationController.signal,
 		);
 		await withDeadline(
 			session.request({
@@ -96,31 +103,41 @@ export async function runMcpDeclarationProbe(
 				params: {
 					protocolVersion: "2025-03-26",
 					capabilities: {},
-					clientInfo: { name: "Prime Agent" },
+					clientInfo: { name: "Prime Agent", version: VERSION },
 				},
-				signal: controller.signal,
+				signal: operationController.signal,
 			}),
-			controller.signal,
+			operationController.signal,
 		);
-		await withDeadline(session.request({ method: "tools/list", signal: controller.signal }), controller.signal);
+		await withDeadline(
+			session.notification({ method: "notifications/initialized", signal: operationController.signal }),
+			operationController.signal,
+		);
+		await withDeadline(
+			session.request({ method: "tools/list", signal: operationController.signal }),
+			operationController.signal,
+		);
 	} catch (error) {
-		controller.abort();
+		operationController.abort();
 		failure = error instanceof Error && error.message === "MCP probe timed out." ? error : publicProbeError("failed");
 	} finally {
+		clearTimeout(operationDeadline);
 		if (session) {
+			// Cleanup deliberately gets a fresh controller. An operation timeout aborts
+			// its signal, but must not prevent a bounded attempt to release the session.
+			const cleanupController = new AbortController();
+			const cleanupDeadline = setTimeout(() => cleanupController.abort(), timeoutMs);
 			try {
-				// Invoke close even after cancellation. The injected session owns its
-				// local cleanup and cannot be left open by a failed handshake.
-				await withDeadline(session.close(), controller.signal);
+				await withDeadline(session.close(), cleanupController.signal);
 			} catch {
-				// A close failure must never disclose transport data. Preserve an
-				// earlier request failure, but do not report a false success when
-				// cleanup itself failed or exceeded the total deadline.
+				// The primary operation error always wins. Both paths intentionally
+				// redact adapter details, including errors emitted during close.
 				if (!failure)
-					failure = controller.signal.aborted ? publicProbeError("timeout") : publicProbeError("failed");
+					failure = cleanupController.signal.aborted ? publicProbeError("timeout") : publicProbeError("failed");
+			} finally {
+				clearTimeout(cleanupDeadline);
 			}
 		}
-		clearTimeout(deadlineTimer);
 	}
 	if (failure) throw failure;
 	return { initialized: true, toolsListed: true };
