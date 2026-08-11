@@ -62,7 +62,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
 export const DAEMON_SCHEMA_REVISION = 16;
 // Keep this digest synchronized with the wire shapes below (daemon-protocol.test.ts verifies it).
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-1bcb9e7f1a49";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-cb14c6f40d53";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

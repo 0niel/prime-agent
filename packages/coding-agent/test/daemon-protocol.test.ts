@@ -37,8 +37,16 @@ describe("daemon protocol helpers", () => {
 			source.indexOf("export type DaemonOutbound ="),
 			source.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
 		);
+		// DaemonOutbound carries SessionSummary by reference, so include the
+		// exported wire shape rather than leaving summary-field changes invisible
+		// to the advertised schema identity.
+		const sessionListSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-session-list.ts"), "utf8");
+		const sessionSummarySource = sessionListSource.slice(
+			sessionListSource.indexOf("export interface SessionSummary"),
+			sessionListSource.indexOf("/**\n * Pick the model fallback message"),
+		);
 		const digest = createHash("sha256")
-			.update(`${commandSource}\n${savedSessionSource}\n${outboundSource}`)
+			.update(`${commandSource}\n${savedSessionSource}\n${outboundSource}\n${sessionSummarySource}`)
 			.digest("hex")
 			.slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);

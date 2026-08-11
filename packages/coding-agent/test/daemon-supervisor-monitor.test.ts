@@ -1771,6 +1771,9 @@ describe("daemon worker supervisor monitoring", () => {
 		} as unknown as DaemonAttachResult;
 		const worker = {
 			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
+			// A ready lifecycle now requires an available worker client; this fixture
+			// represents the connected worker whose snapshot is being attached.
+			client: {},
 			summaries: new Map([[activeSessionId, summary]]),
 			snapshotCache: new Map([[activeSessionId, result]]),
 			snapshotTransferFrames: new Map(),
