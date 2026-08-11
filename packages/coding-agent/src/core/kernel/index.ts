@@ -59,7 +59,10 @@ export const HOST_COMM_TARGET = "host.request";
  * Handles one typed request from Python code running in the kernel.
  * The returned record is sent back verbatim as the comm reply payload.
  */
-export type HostRequestHandler = (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
+export type HostRequestHandler = (
+	payload: Record<string, unknown>,
+	signal?: AbortSignal,
+) => Promise<Record<string, unknown>>;
 
 /** Host request handlers keyed by request type (e.g. "rlm.run", "goal.complete"). */
 export type HostRequestHandlers = Record<string, HostRequestHandler>;
@@ -540,6 +543,7 @@ export class KernelManager {
 	// attribute their spawning program.
 	private lastCellCode?: string;
 	private readonly inFlightHostRequests = new Set<Promise<void>>();
+	private hostRequestController = new AbortController();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Memoized so concurrent callers all await the same in-flight startup. */
 	private startPromise?: Promise<void>;
@@ -582,6 +586,9 @@ export class KernelManager {
 
 	private async doStart(startOptions: KernelStartOptions): Promise<void> {
 		if (this.state !== "idle") return;
+		if (this.hostRequestController.signal.aborted) {
+			this.hostRequestController = new AbortController();
+		}
 		this.state = "starting";
 		installSignalHandlersOnce();
 		// Tracked from the moment startup begins so session cleanup and signal
@@ -1224,9 +1231,10 @@ export class KernelManager {
 		}
 		this.handledHostRequestCommIds.add(commId);
 
+		const signal = this.hostRequestController.signal;
 		const task = (async () => {
 			try {
-				const result = await this.handleHostRequest(data);
+				const result = await this.handleHostRequest(data, signal);
 				try {
 					await this.sendCommMessage(commId, { status: "ok", ...result });
 				} catch (replyError) {
@@ -1251,7 +1259,7 @@ export class KernelManager {
 		});
 	}
 
-	private async handleHostRequest(data: unknown): Promise<Record<string, unknown>> {
+	private async handleHostRequest(data: unknown, signal: AbortSignal): Promise<Record<string, unknown>> {
 		if (!isRecord(data)) {
 			throw new Error("host request payload must be an object");
 		}
@@ -1267,7 +1275,7 @@ export class KernelManager {
 		// the in-flight execution; detached spawns (asyncio.create_task) fire after
 		// the scheduling cell goes idle, so fall back to that last cell's source.
 		const cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;
-		return handler({ ...data, cellSourceCode });
+		return handler({ ...data, cellSourceCode }, signal);
 	}
 
 	private async sendCommMessage(commId: string, data: Record<string, unknown>): Promise<void> {
@@ -1286,6 +1294,7 @@ export class KernelManager {
 	}
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
+		this.abortHostRequests("IPython kernel stopped");
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		if (this.forkedLivenessTimer) {
@@ -1325,6 +1334,12 @@ export class KernelManager {
 		this.startPromise = undefined;
 	}
 
+	private abortHostRequests(message: string): void {
+		if (!this.hostRequestController.signal.aborted) {
+			this.hostRequestController.abort(new Error(message));
+		}
+	}
+
 	private async waitForHostRequestsToSettle(tasks: Promise<void>[], timeoutMs: number): Promise<void> {
 		let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
 		const timeoutPromise = new Promise<"timeout">((resolve) => {
@@ -1356,6 +1371,7 @@ export class KernelManager {
 		if (opts.snapshot) {
 			await this.flushSnapshotForDispose();
 		}
+		this.abortHostRequests("IPython kernel shut down");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 
@@ -1393,6 +1409,7 @@ export class KernelManager {
 	}
 
 	async kill(): Promise<void> {
+		this.abortHostRequests("IPython kernel killed");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		this.cleanupResources("SIGKILL");
@@ -1501,10 +1518,10 @@ export class KernelManager {
 		return (async () => {
 			// Final namespace flush while the kernel is still live (session end / reload).
 			await this.flushSnapshotForDispose();
+			this.abortHostRequests("IPython kernel disposed");
 			this.state = "shutdown";
 			liveKernels.delete(this);
 			const inFlightHostRequests = [...this.inFlightHostRequests];
-			// TODO: plumb AbortSignal through AgentSession.prompt so disposal can cancel long-running child loops.
 			try {
 				if (inFlightHostRequests.length > 0) {
 					await this.waitForHostRequestsToSettle(inFlightHostRequests, HOST_REQUEST_DISPOSE_TIMEOUT_MS);
@@ -1517,6 +1534,7 @@ export class KernelManager {
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	disposeSync(): void {
+		this.abortHostRequests("IPython kernel disposed");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.
