@@ -55,6 +55,20 @@ describe("M01 injected MCP probe", () => {
 		expect(calls).toEqual(["open:https://catalog.test/mcp", "initialize", "close"]);
 	});
 
+	it("reports a redacted cleanup failure after a successful handshake", async () => {
+		const calls: string[] = [];
+		const transport = fakeTransport(calls, {
+			async close() {
+				calls.push("close");
+				throw new Error("https://alice:secret@catalog.test/mcp?token=secret");
+			},
+		});
+		await expect(runMcpDeclarationProbe(declaration, transport, { trusted: true })).rejects.toThrow(
+			"MCP probe failed.",
+		);
+		expect(calls).toEqual(["open:https://catalog.test/mcp", "initialize", "tools/list", "close"]);
+	});
+
 	it("aborts a hanging injected transport within its bounded timeout", async () => {
 		let aborted = false;
 		const transport: McpProbeTransport = {
