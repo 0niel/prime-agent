@@ -8,6 +8,7 @@ import { DefaultResourceLoader } from "../src/core/resource-loader.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import {
 	canonicalizeWorkspacePath,
+	canPersistWorkspaceTrust,
 	detectProjectScopedConfig,
 	isWorkspaceTrusted,
 	WorkspaceTrustStore,
@@ -241,10 +242,12 @@ export default function () {}
 			await loader.reload();
 			expect(loader.getSystemPrompt()).toBeUndefined();
 
+			// A trust store inside the workspace cannot vouch for it: even a
+			// written trust entry keeps the workspace untrusted.
 			WorkspaceTrustStore.create(aliasedAgentDir).trust(projectDir);
-			const trustedLoader = new DefaultResourceLoader({ cwd: projectDir, agentDir: aliasedAgentDir });
-			await trustedLoader.reload();
-			expect(trustedLoader.getSystemPrompt()).toContain("project system prompt");
+			const stillUntrustedLoader = new DefaultResourceLoader({ cwd: projectDir, agentDir: aliasedAgentDir });
+			await stillUntrustedLoader.reload();
+			expect(stillUntrustedLoader.getSystemPrompt()).toBeUndefined();
 		});
 
 		it("narrows a caller-provided trusted manager when the store is untrusted", async () => {
@@ -425,7 +428,7 @@ export default function () {}
 			await expect(manager.update("npm:some-pkg")).rejects.toThrow();
 		});
 
-		it("loads aliased global-scope extensions when the workspace is trusted", async () => {
+		it("stays untrusted when the trust store lives inside the workspace", async () => {
 			const aliasedAgentDir = configDir;
 			const canaryPath = join(tempDir, "aliased-canary.txt");
 			mkdirSync(join(configDir, "extensions"), { recursive: true });
@@ -435,7 +438,29 @@ export default function () {}
 
 			await loader.reload();
 
-			expect(existsSync(canaryPath)).toBe(true);
+			expect(isWorkspaceTrusted(projectDir, aliasedAgentDir)).toBe(false);
+			expect(existsSync(canaryPath)).toBe(false);
+			expect(loader.getExtensions().extensions).toEqual([]);
+		});
+
+		it("ignores a committed trust store that trusts its own workspace", async () => {
+			// Simulate a checkout that ships its own trusted-workspaces.json
+			// outside .prime/agent but still inside the workspace tree.
+			const committedAgentDir = join(projectDir, ".agent-data");
+			mkdirSync(committedAgentDir, { recursive: true });
+			writeFileSync(
+				join(committedAgentDir, "trusted-workspaces.json"),
+				JSON.stringify({ version: 1, trusted: [canonicalizeWorkspacePath(projectDir)] }, null, 2),
+			);
+			const canaryPath = join(tempDir, "committed-store-canary.txt");
+			mkdirSync(join(configDir, "extensions"), { recursive: true });
+			writeFileSync(join(configDir, "extensions", "evil.ts"), evilSource(canaryPath));
+
+			expect(canPersistWorkspaceTrust(projectDir, committedAgentDir)).toBe(false);
+			expect(isWorkspaceTrusted(projectDir, committedAgentDir)).toBe(false);
+			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir: committedAgentDir });
+			await loader.reload();
+			expect(existsSync(canaryPath)).toBe(false);
 		});
 	});
 

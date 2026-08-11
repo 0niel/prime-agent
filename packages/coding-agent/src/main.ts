@@ -1132,16 +1132,17 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 	}
 
-	// Run migrations (pass cwd for project-local migrations)
-	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
-	time("runMigrations");
-
 	const agentDir = getAgentDir();
 	// Early workspace-trust consent gate: accepting here makes trust effective
 	// for this launch (project sessionDir, settings, and service creation all
 	// read the store afterwards). A second gate runs after session resolution
 	// in case --resume selected a session from a different project.
 	await gateWorkspaceTrustOnStartup({ cwd, agentDir, interactive: appMode === "interactive" });
+
+	// Run migrations (pass cwd for project-local migrations; the project side
+	// only mutates trusted workspaces, so this runs after the consent gate).
+	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
+	time("runMigrations");
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir, {
 		projectTrusted: isWorkspaceTrusted(cwd, agentDir),
 	});

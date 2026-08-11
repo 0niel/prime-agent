@@ -12,7 +12,13 @@
  */
 
 import chalk from "chalk";
-import { canonicalizeWorkspacePath, detectProjectScopedConfig, WorkspaceTrustStore } from "../core/workspace-trust.js";
+import {
+	canonicalizeWorkspacePath,
+	canPersistWorkspaceTrust,
+	detectProjectScopedConfig,
+	isWorkspaceTrusted,
+	WorkspaceTrustStore,
+} from "../core/workspace-trust.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 
 export interface WorkspaceTrustGateOptions {
@@ -31,8 +37,12 @@ export async function gateWorkspaceTrustOnStartup(options: WorkspaceTrustGateOpt
 	if (promptedThisProcess.has(canonical)) {
 		return;
 	}
-	const store = WorkspaceTrustStore.create(agentDir);
-	if (store.isTrusted(cwd)) {
+	// When the trust store would live inside the workspace it cannot vouch for
+	// it (a checkout could commit one), so trust is impossible: never prompt.
+	if (!canPersistWorkspaceTrust(cwd, agentDir)) {
+		return;
+	}
+	if (isWorkspaceTrusted(cwd, agentDir)) {
 		return;
 	}
 	if (!options.interactive || !process.stdin.isTTY || !process.stdout.isTTY) {
@@ -52,7 +62,7 @@ export async function gateWorkspaceTrustOnStartup(options: WorkspaceTrustGateOpt
 	console.error(chalk.dim("Only trust repositories you have inspected. Untrusted workspaces run without the above."));
 	const trusted = await promptYesNo("Trust this workspace and enable its project-scoped configuration?");
 	if (trusted) {
-		store.trust(cwd);
+		WorkspaceTrustStore.create(agentDir).trust(cwd);
 		console.error(chalk.dim(`Trusted ${cwd} (stored in trusted-workspaces.json).`));
 	}
 }

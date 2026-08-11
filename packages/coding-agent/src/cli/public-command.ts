@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import chalk from "chalk";
 import { APP_NAME, expandTildePath, getAgentDir, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
-import { canonicalizeWorkspacePath, WorkspaceTrustStore } from "../core/workspace-trust.js";
+import { canonicalizeWorkspacePath, canPersistWorkspaceTrust, WorkspaceTrustStore } from "../core/workspace-trust.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
 import {
@@ -448,7 +448,14 @@ function runTrust(args: string[]): PublicCommandResult {
 		return fail(`Unknown option: ${unknownOption}`, `Usage: ${APP_NAME} ${getCommandSpec(["trust"])!.usage}`);
 	}
 	const target = args[0] ? resolve(expandTildePath(args[0])) : process.cwd();
-	const store = WorkspaceTrustStore.create(getAgentDir());
+	const agentDir = getAgentDir();
+	if (!canPersistWorkspaceTrust(target, agentDir)) {
+		return fail(
+			`Cannot trust ${canonicalizeWorkspacePath(target)}: the trust store would live inside the workspace itself.`,
+			"Trust state must persist outside the workspace; point the agent dir elsewhere to use project trust here.",
+		);
+	}
+	const store = WorkspaceTrustStore.create(agentDir);
 	const canonical = canonicalizeWorkspacePath(target);
 	store.trust(target);
 	console.log(`Trusted workspace: ${canonical}`);

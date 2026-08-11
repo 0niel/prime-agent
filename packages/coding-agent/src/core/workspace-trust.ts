@@ -18,11 +18,13 @@
 import type { Dirent } from "node:fs";
 import {
 	existsSync,
+	linkSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
+	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
@@ -168,9 +170,7 @@ export class WorkspaceTrustStore {
 	 */
 	private mutate(apply: (trusted: Set<string>) => void): void {
 		mkdirSync(dirname(this.filePath), { recursive: true });
-		if (!existsSync(this.filePath)) {
-			this.writeFile(this.trusted);
-		}
+		this.ensureFileExists();
 		const release = this.acquireLock();
 		try {
 			const trusted = readTrustFile(this.filePath);
@@ -179,6 +179,30 @@ export class WorkspaceTrustStore {
 			this.trusted = trusted;
 		} finally {
 			release();
+		}
+	}
+
+	/**
+	 * Create the store file for lock acquisition without ever clobbering
+	 * committed content: linkSync fails atomically when another process won
+	 * the create race, and the winner's file stands.
+	 */
+	private ensureFileExists(): void {
+		if (existsSync(this.filePath)) {
+			return;
+		}
+		const tmpPath = `${this.filePath}.${process.pid}.tmp`;
+		const empty: WorkspaceTrustFile = { version: 1, trusted: [] };
+		writeFileSync(tmpPath, `${JSON.stringify(empty, null, 2)}\n`, "utf-8");
+		try {
+			linkSync(tmpPath, this.filePath);
+		} catch {
+			// Lost the create race; the other process's file stands.
+		}
+		try {
+			rmSync(tmpPath, { force: true });
+		} catch {
+			// Best effort.
 		}
 	}
 
@@ -217,8 +241,25 @@ export class WorkspaceTrustStore {
 	}
 }
 
-/** Convenience for one-off checks at call sites that do not keep a store around. */
+/**
+ * Whether trust for this workspace can persist outside the workspace itself.
+ * A trust store inside the workspace tree is checkout-controlled content: a
+ * repository could commit `trusted-workspaces.json` and trust itself.
+ */
+export function canPersistWorkspaceTrust(cwd: string, agentDir: string): boolean {
+	const canonicalCwd = canonicalizeWorkspacePath(cwd);
+	const storePath = join(canonicalizeWorkspacePath(agentDir), TRUST_FILE_NAME);
+	return storePath !== canonicalCwd && !storePath.startsWith(canonicalCwd + sep);
+}
+
+/**
+ * Convenience for one-off checks at call sites that do not keep a store
+ * around. Fail-closed when the store would live inside the workspace.
+ */
 export function isWorkspaceTrusted(cwd: string, agentDir: string): boolean {
+	if (!canPersistWorkspaceTrust(cwd, agentDir)) {
+		return false;
+	}
 	return WorkspaceTrustStore.create(agentDir).isTrusted(cwd);
 }
 

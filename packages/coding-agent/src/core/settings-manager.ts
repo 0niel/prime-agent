@@ -420,6 +420,15 @@ export class SettingsManager {
 		return this.globalConfigAliasedToProject ? {} : this.globalSettings;
 	}
 
+	/**
+	 * Executable settings for untrusted workspaces: global values (when not
+	 * project-controlled) plus runtime overrides, which are process-driven
+	 * and never come from the workspace.
+	 */
+	private untrustedExecutableSettings(): Settings {
+		return deepMergeSettings(this.untrustedGlobalSettings(), this.runtimeOverrides);
+	}
+
 	/** Create an in-memory SettingsManager (no file I/O) */
 	static inMemory(settings: Partial<Settings> = {}): SettingsManager {
 		const storage = new InMemorySettingsStorage();
@@ -726,7 +735,7 @@ export class SettingsManager {
 	getSessionDir(): string | undefined {
 		// Project sessionDir redirects where session files are written; untrusted
 		// projects keep the global/default location.
-		const sessionDir = (this.projectTrusted ? this.settings : this.untrustedGlobalSettings()).sessionDir;
+		const sessionDir = (this.projectTrusted ? this.settings : this.untrustedExecutableSettings()).sessionDir;
 		if (!sessionDir) {
 			return sessionDir;
 		}
@@ -1009,7 +1018,7 @@ export class SettingsManager {
 	}
 
 	getShellPath(): string | undefined {
-		return this.projectTrusted ? this.settings.shellPath : this.untrustedGlobalSettings().shellPath;
+		return this.projectTrusted ? this.settings.shellPath : this.untrustedExecutableSettings().shellPath;
 	}
 
 	setShellPath(path: string | undefined): void {
@@ -1029,7 +1038,9 @@ export class SettingsManager {
 	}
 
 	getShellCommandPrefix(): string | undefined {
-		return this.projectTrusted ? this.settings.shellCommandPrefix : this.untrustedGlobalSettings().shellCommandPrefix;
+		return this.projectTrusted
+			? this.settings.shellCommandPrefix
+			: this.untrustedExecutableSettings().shellCommandPrefix;
 	}
 
 	setShellCommandPrefix(prefix: string | undefined): void {
@@ -1039,7 +1050,7 @@ export class SettingsManager {
 	}
 
 	getNpmCommand(): string[] | undefined {
-		const command = this.projectTrusted ? this.settings.npmCommand : this.untrustedGlobalSettings().npmCommand;
+		const command = this.projectTrusted ? this.settings.npmCommand : this.untrustedExecutableSettings().npmCommand;
 		return command ? [...command] : undefined;
 	}
 
@@ -1272,7 +1283,7 @@ export class SettingsManager {
 	}
 
 	getMcpServers(): Record<string, McpServerConfig> | undefined {
-		return this.projectTrusted ? this.settings.mcpServers : this.untrustedGlobalSettings().mcpServers;
+		return this.projectTrusted ? this.settings.mcpServers : this.untrustedExecutableSettings().mcpServers;
 	}
 
 	setEnabledModels(patterns: string[] | undefined): void {
