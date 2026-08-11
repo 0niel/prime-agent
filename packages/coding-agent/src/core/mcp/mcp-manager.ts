@@ -175,6 +175,9 @@ export class McpManager {
 				if (!integration) return {};
 				const config: Record<string, unknown> = {
 					url: integration.url,
+					// Always make the host's effective enablement explicit. The kernel must
+					// gate this before considering its fallback URL, credentials, or transport.
+					enabled: integration.enabled !== false,
 					requiresAuth: integration.usesOAuth || Boolean(integration.bearerTokenEnvVar),
 				};
 				if (integration.headers && Object.keys(integration.headers).length > 0) {

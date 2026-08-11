@@ -107,11 +107,13 @@ describe("McpManager", () => {
 		const handlers = manager.hostHandlers();
 		expect(await handlers["mcp.config"]({ server: "linear" })).toEqual({
 			url: "https://proxy.test/mcp",
+			enabled: true,
 			requiresAuth: true,
 			headers: { "X-Extra": "1" },
 		});
 		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({
 			url: "https://mcp.notion.com/mcp",
+			enabled: true,
 			requiresAuth: true,
 		});
 	});
@@ -142,6 +144,7 @@ describe("McpManager", () => {
 		expect(manager.listStatus().find((s) => s.server === "public")?.enabled).toBe(true);
 		expect(await manager.hostHandlers()["mcp.config"]({ server: "public" })).toEqual({
 			url: "https://public.test/mcp",
+			enabled: true,
 			requiresAuth: false,
 		});
 	});
@@ -212,5 +215,20 @@ describe("McpManager", () => {
 		servers = {};
 		manager.refresh();
 		expect(getOAuthProvider("mcp:acme")).toBeUndefined();
+	});
+	it("reports a disabled anonymous user integration as disabled in status and config", async () => {
+		const manager = new McpManager({
+			authStorage,
+			getUserServers: () => ({
+				public: { type: "http", url: "https://public.test/mcp", enabled: false },
+			}),
+		});
+
+		expect(manager.listStatus().find((s) => s.server === "public")?.enabled).toBe(false);
+		expect(await manager.hostHandlers()["mcp.config"]({ server: "public" })).toEqual({
+			url: "https://public.test/mcp",
+			enabled: false,
+			requiresAuth: false,
+		});
 	});
 });

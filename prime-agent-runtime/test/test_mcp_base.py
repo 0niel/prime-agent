@@ -241,6 +241,45 @@ class McpIntegrationTest(unittest.TestCase):
         self._run_open_session_with_transport(transport)
         self.assertEqual(captured["headers"], {"Authorization": "Bearer tok-xyz"})
 
+    def test_open_session_rejects_explicit_host_disable_before_token_or_transport(self):
+        calls = []
+
+        async def fake_host_request(req_type, payload):
+            calls.append((req_type, payload))
+            return {
+                "enabled": False,
+                "url": "https://host.test/mcp",
+                "requiresAuth": False,
+                "headers": {"Authorization": "Basic explicit"},
+            }
+
+        def unexpected_transport(*args, **kwargs):
+            raise AssertionError("disabled integration must not create a transport")
+
+        with mock.patch.object(mcp_base, "host_request", fake_host_request), \
+             mock.patch.object(mcp_base, "_resolve_streamable_http", unexpected_transport), \
+             mock.patch.object(_Integration, "_resolve_token", side_effect=AssertionError("disabled integration must not resolve a token")):
+            with self.assertRaises(NotEnabled):
+                _run(_Integration()._open_session(AsyncExitStack()))
+        self.assertEqual(calls, [("mcp.config", {"server": "demo"})])
+
+    def test_open_session_missing_enabled_signal_remains_backward_compatible(self):
+        captured = {}
+
+        class _CM:
+            async def __aenter__(self_inner):
+                return ("read", "write", None)
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+        def transport(url, headers=None):
+            captured["headers"] = headers
+            return _CM()
+
+        self._run_open_session_with_transport(transport, config={"requiresAuth": False}, write_auth=False)
+        self.assertEqual(captured["headers"], {})
+
     def test_open_session_allows_anonymous_server(self):
         captured = {}
 

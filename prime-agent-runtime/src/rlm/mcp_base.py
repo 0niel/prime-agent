@@ -204,6 +204,10 @@ class McpIntegration:
             cfg = await host_request("mcp.config", {"server": self.server})
         except RuntimeError:
             cfg = {}
+        # An explicit host disable takes precedence over every connection path.
+        # Keep a missing signal backward-compatible with older hosts.
+        if isinstance(cfg, dict) and cfg.get("enabled") is False:
+            raise NotEnabled(self.server)
         url = cfg.get("url") if isinstance(cfg, dict) else None
         headers = cfg.get("headers") if isinstance(cfg, dict) else None
         requires_auth = cfg.get("requiresAuth") if isinstance(cfg, dict) else None
@@ -230,8 +234,6 @@ class McpIntegration:
         """
         import inspect  # noqa: PLC0415
 
-        from mcp import ClientSession  # noqa: PLC0415
-
         url, headers, requires_auth = await self._resolve_connection_config()
         if not url:
             raise ValueError(
@@ -241,6 +243,9 @@ class McpIntegration:
             token = await self._resolve_token()
             # Extra configured headers first, Authorization last so it always wins.
             headers = {**headers, "Authorization": f"Bearer {token}"}
+        # Do this only after the host enablement gate and authentication resolution.
+        from mcp import ClientSession  # noqa: PLC0415
+
         transport = _resolve_streamable_http()
 
         # SDK signatures vary: some take headers=, others only http_client=.
