@@ -186,6 +186,7 @@ describe("ACP mode end to end", () => {
 			headlessStatus: {
 				enabled: true,
 				continuationsUsed: 1,
+				gateAttempts: {},
 				limits: { maxContinuations: 3 },
 			},
 		});

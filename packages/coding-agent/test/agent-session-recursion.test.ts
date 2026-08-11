@@ -41,8 +41,8 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager, type SettingsStorage } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
-import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
+import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { invokeHostRequest } from "./host-request-context.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
@@ -679,7 +679,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(events).toContainEqual(
 			expect.objectContaining({
 				type: "rlm_child_update",
-				child: { id: childId, status: "cancelled" },
+				child: expect.objectContaining({ id: childId, status: "cancelled" }),
 			}),
 		);
 		expect(root.getRlmChildSnapshots()).toEqual([
@@ -691,9 +691,7 @@ describe("AgentSession rlm recursion", () => {
 			setBeforeSessionInvalidate() {},
 			dispose: async () => {},
 		} as unknown as AgentSessionRuntime);
-		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
-			children: [expect.objectContaining({ id: childId, status: "cancelled" })],
-		});
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({ children: [expect.objectContaining({ id: childId, status: "cancelled" })] });
 		await expect(root.deleteRlmSubagent("cancelled-cleanup-worker")).resolves.toMatchObject({
 			subagent: { rlm_child_id: childId },
 		});

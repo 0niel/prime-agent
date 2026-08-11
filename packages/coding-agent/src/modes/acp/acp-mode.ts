@@ -72,13 +72,8 @@ function canonicalCwd(path: string): string {
 function isJsonRpcResponse(message: unknown, requestId: unknown): boolean {
 	if (typeof message !== "object" || message === null) return false;
 	const record = message as Record<string, unknown>;
-	const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(record, key);
-	return (
-		record.jsonrpc === "2.0" &&
-		record.id === requestId &&
-		!has("method") &&
-		(has("result") !== has("error"))
-	);
+	const has = (key: string): boolean => Object.hasOwn(record, key);
+	return record.jsonrpc === "2.0" && record.id === requestId && !has("method") && has("result") !== has("error");
 }
 
 function sameCwd(left: string, right: string): boolean {
@@ -421,9 +416,7 @@ export async function runAcpModeWithConnection(
 	// commit callback. Observe the outgoing response at the supplied stream
 	// boundary instead. The SDK serializes every write, so opening the producer
 	// after this write resolves puts buffered notifications strictly behind it.
-	let pendingSessionNewResponse:
-		| { requestId: unknown; producer: AcpUpdateProducer }
-		| undefined;
+	let pendingSessionNewResponse: { requestId: unknown; producer: AcpUpdateProducer } | undefined;
 	const failPendingSessionNewResponse = (): void => {
 		const admission = pendingSessionNewResponse;
 		pendingSessionNewResponse = undefined;
