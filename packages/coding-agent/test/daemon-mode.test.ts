@@ -2799,6 +2799,47 @@ describe("daemon mode helpers", () => {
 		expect(observed.agents.map((agent) => agent.activeSessionId)).toEqual(["source"]);
 	});
 
+	it("fails closed for every agent ACL surface when the captured catalog duplicates a stable session ID", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-duplicate-captured-family.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" }, createRuntime: vi.fn(),
+		});
+		const parent = makeAgentFamilyState("parent", "parent");
+		const source = makeAgentFamilyState("source", "source", parent.state);
+		const target = makeAgentFamilyState("target", "target", parent.state);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries(): Promise<readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]>;
+			createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
+			createAgentObserveController(getCurrentState: () => ActiveSessionState): AgentObserveController;
+		};
+		for (const fixture of [parent, source, target]) internals.sessions.set(fixture.state.activeSessionId, fixture.state);
+		const sourceId = source.state.runtime.session.sessionId;
+		const parentId = parent.state.runtime.session.sessionId;
+		const targetId = target.state.runtime.session.sessionId;
+		const entries = [
+			{ id: parentId, depth: 0, status: "running" as const },
+			{ id: sourceId, depth: 1, status: "running" as const, parentSessionId: parentId },
+			{ id: sourceId, depth: 1, status: "running" as const, parentSessionId: "forged-parent" },
+			{ id: targetId, depth: 1, status: "running" as const, parentSessionId: parentId },
+		];
+
+		for (const catalog of [entries, [...entries.slice(0, 1), entries[2]!, entries[1]!, entries[3]!]]) {
+			internals.agentFamilyCatalogEntries = vi.fn(async () => Object.freeze(catalog));
+			const observe = internals.createAgentObserveController(() => source.state);
+			expect((await observe.listAgents()).agents.map((agent) => agent.activeSessionId)).toEqual(["source"]);
+			await expect(observe.getAgent(target.state.activeSessionId)).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
+			await expect(observe.recentMessages({ target: target.state.activeSessionId })).rejects.toThrow(
+				AGENT_FAMILY_REACH_ERROR,
+			);
+			await expect(
+				internals
+					.createAgentMessageController(() => source.state)
+					.sendAgentMessage({ target: target.state.activeSessionId, message: "must not deliver" }),
+			).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
+		}
+		expect(target.acceptAgentMessagePrompt).not.toHaveBeenCalled();
+	});
+
 	it("resolves a duplicate session name to the only family-reachable agent", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-family-name-resolution.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },

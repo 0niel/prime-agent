@@ -2893,8 +2893,7 @@ export class AgentDaemon {
 		for (const passive of await this.listPassiveRlmSubagents()) {
 			if (residentIds.has(passive.info.id)) continue;
 			try {
-				const passiveEntry = catalog.find((entry) => entry.id === passive.info.id);
-				if (!passiveEntry) continue;
+				const passiveEntry = this.authoritativeAgentFamilyEntryForSessionId(passive.info.id, catalog);
 				assertAgentFamilyReach(this.authoritativeAgentFamilyEntry(currentState, catalog), passiveEntry, catalog);
 			} catch (error) {
 				if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) continue;
@@ -5049,8 +5048,7 @@ export class AgentDaemon {
 
 	private async createAgentFamilyRoster(currentState: ActiveSessionState): Promise<AgentFamilyRosterResult> {
 		const catalog = await this.createAgentFamilyCatalog(currentState);
-		const current = catalog.find((entry) => entry.id === currentState.runtime.session.sessionId);
-		if (!current) throw new Error("Current agent is missing from the family catalog");
+		const current = this.authoritativeAgentFamilyEntry(currentState, catalog);
 		return buildAgentFamilyRoster(current, catalog);
 	}
 
@@ -5335,8 +5333,7 @@ export class AgentDaemon {
 		}
 		const passive = await this.findPassiveRlmSubagent(target);
 		if (!passive) return { targetState: await this.getOrHydrateBoundSessionState(target), catalog };
-		const passiveEntry = catalog.find((entry) => entry.id === passive.info.id);
-		if (!passiveEntry) throw new Error(AGENT_FAMILY_REACH_ERROR);
+		const passiveEntry = this.authoritativeAgentFamilyEntryForSessionId(passive.info.id, catalog);
 		assertAgentFamilyReach(this.authoritativeAgentFamilyEntry(currentState, catalog), passiveEntry, catalog);
 		return { targetState: await this.hydratePassiveRlmSubagent(passive), catalog };
 	}
@@ -5368,9 +5365,16 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		catalog: readonly AgentFamilyCatalogEntry[],
 	): AgentFamilyCatalogEntry {
-		const entry = catalog.find((candidate) => candidate.id === state.runtime.session.sessionId);
-		if (!entry) throw new Error(AGENT_FAMILY_REACH_ERROR);
-		return entry;
+		return this.authoritativeAgentFamilyEntryForSessionId(state.runtime.session.sessionId, catalog);
+	}
+
+	private authoritativeAgentFamilyEntryForSessionId(
+		sessionId: string,
+		catalog: readonly AgentFamilyCatalogEntry[],
+	): AgentFamilyCatalogEntry {
+		const entries = catalog.filter((candidate) => candidate.id === sessionId);
+		if (entries.length !== 1) throw new Error(AGENT_FAMILY_REACH_ERROR);
+		return entries[0]!;
 	}
 
 	private isAgentFamilyReachable(
@@ -5451,8 +5455,7 @@ export class AgentDaemon {
 					const passiveSubagent = await this.findPassiveRlmSubagent(targetSelector);
 					if (passiveSubagent) {
 						if (options.origin === "agent" && options.fromState) {
-							const passiveEntry = catalog!.find((entry) => entry.id === passiveSubagent.info.id);
-							if (!passiveEntry) throw new Error(AGENT_FAMILY_REACH_ERROR);
+							const passiveEntry = this.authoritativeAgentFamilyEntryForSessionId(passiveSubagent.info.id, catalog!);
 							assertAgentFamilyReach(this.authoritativeAgentFamilyEntry(options.fromState, catalog!), passiveEntry, catalog!);
 						}
 						targetState = await this.hydratePassiveRlmSubagent(passiveSubagent);
