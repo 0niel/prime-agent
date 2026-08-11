@@ -38,4 +38,58 @@ describe("KernelManager startup", () => {
 			await manager.dispose();
 		}
 	});
+
+	it("keeps a connection-resolution startup failure retryable", async () => {
+		const python = join(tempDir, "python");
+		writeExecutable(python, ["#!/bin/sh", "sleep 30", ""].join("\n"));
+		const manager = new KernelManager({ python, cwd: tempDir });
+		const internals = manager as unknown as {
+			doStart: () => Promise<void>;
+			state: "idle" | "starting" | "running" | "shutdown";
+			terminal: boolean;
+			waitForResolvedConnection: () => Promise<never>;
+		};
+		internals.waitForResolvedConnection = async () => {
+			throw new Error("connection unavailable");
+		};
+
+		await expect(manager.start()).rejects.toThrow("connection unavailable");
+		expect(internals.terminal).toBe(false);
+		expect(internals.state).toBe("idle");
+
+		const retryStart = vi.fn(async () => {});
+		internals.doStart = retryStart;
+		await expect(manager.start()).resolves.toBeUndefined();
+		expect(retryStart).toHaveBeenCalledOnce();
+		manager.disposeSync();
+	});
+
+	it("keeps disposal during startup terminal", async () => {
+		const python = join(tempDir, "python");
+		writeExecutable(python, ["#!/bin/sh", "sleep 30", ""].join("\n"));
+		const manager = new KernelManager({ python, cwd: tempDir });
+		let rejectConnection: (error: Error) => void = () => {};
+		let markConnectionWaitEntered: () => void = () => {};
+		const connectionWaitEntered = new Promise<void>((resolve) => {
+			markConnectionWaitEntered = resolve;
+		});
+		const internals = manager as unknown as {
+			terminal: boolean;
+			waitForResolvedConnection: () => Promise<never>;
+		};
+		internals.waitForResolvedConnection = () =>
+			new Promise<never>((_resolve, reject) => {
+				rejectConnection = reject;
+				markConnectionWaitEntered();
+			});
+
+		const start = manager.start();
+		await connectionWaitEntered;
+		manager.disposeSync();
+		rejectConnection(new Error("connection unavailable"));
+
+		await expect(start).rejects.toThrow("connection unavailable");
+		expect(internals.terminal).toBe(true);
+		await expect(manager.start()).rejects.toThrow("Kernel was disposed");
+	});
 });
