@@ -193,15 +193,6 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "acp" | "dae
 	return appMode === "json" ? "json" : "text";
 }
 
-/**
- * ACP sessions with a session file are resident so a subsequent --continue
- * can reattach. Every other mode, and ACP --no-session, remains owned by the
- * client that created it.
- */
-export function isClientOwnedDaemonSession(appMode: AppMode, noSession?: boolean): boolean {
-	return appMode !== "acp" || noSession === true;
-}
-
 // `prime-agent agents` opens the agents view directly.
 export function parseAgentsViewCommand(args: string[]): { explicitAgentsView: boolean; args: string[] } {
 	if (args[0] === "agents") {
@@ -964,13 +955,11 @@ async function createDaemonClientConnection(options: {
 	await client.connect();
 
 	try {
-		await client.waitForHello();
-		const clientOwned = options.clientOwned ?? false;
 		const attach = async (summary: SessionSummary) => {
 			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
 				closeClientOnDispose: true,
 				sendClientEnv: true,
-				ownedSession: clientOwned,
+				ownedSession: options.clientOwned,
 				supportsExtensionUi: options.supportsExtensionUi,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
@@ -983,7 +972,7 @@ async function createDaemonClientConnection(options: {
 			return await attach(summary);
 		}
 
-		if (options.sessionPath && !clientOwned) {
+		if (options.sessionPath && !options.clientOwned) {
 			const activeSummary = findActiveDaemonSessionSummaryForSessionFile(
 				await listActiveDaemonSessionSummaries(client),
 				options.sessionPath,
@@ -992,7 +981,8 @@ async function createDaemonClientConnection(options: {
 				return await attach(activeSummary);
 			}
 		}
-		if (clientOwned) {
+		if (options.clientOwned) {
+			await client.waitForHello();
 			if (!client.supportsServerCapability("client_owned_sessions")) {
 				throw new DaemonCapabilityUnavailableError("create", "client_owned_sessions");
 			}
@@ -1005,13 +995,8 @@ async function createDaemonClientConnection(options: {
 			continueRecent: options.continueRecent,
 			noSession: options.noSession,
 			env: collectDaemonClientEnv(),
-			lifecycle: clientOwned ? "client_owned" : "resident",
-			// Forward the caller's environment for BOTH lifecycles. A resident
-			// worker still has to be launched with the caller's env: an embedder
-			// such as the verifiers ACP harness passes the model endpoint, its
-			// bearer token, and proxy settings that way, and a worker started
-			// without them cannot reach the model at all.
-			launchEnv: collectDaemonLaunchEnv(),
+			lifecycle: options.clientOwned ? "client_owned" : "resident",
+			launchEnv: options.clientOwned ? collectDaemonLaunchEnv() : undefined,
 		});
 		if (!response.success) {
 			throw deserializeDaemonError(response);
@@ -1545,8 +1530,7 @@ export async function main(args: string[], options?: MainOptions) {
 				config: defaultSessionConfig,
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
 				continueRecent: parsed.continue,
-				// A no-session ACP invocation has nothing to reattach to; complete its worker on disconnect.
-				clientOwned: isClientOwnedDaemonSession(appMode, parsed.noSession),
+				clientOwned: true,
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
 			}));

@@ -169,12 +169,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import {
-	createHostRequestHandler,
-	type HostRequestContext,
-	type HostRequestHandler,
-	type KernelSentAgentMessage,
-} from "./kernel/index.js";
+import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -3787,18 +3782,9 @@ export class AgentSession {
 			return this._disposeAsyncPromise;
 		}
 		this._disposeAsyncPromise = (async () => {
-			// Revoke kernel-originated host requests before awaiting unrelated
-			// refinement work. The provisioner forwards this to KernelManager, which
-			// aborts each request and awaits its handler before its connection closes.
-			// This prevents an old session's host handler from surviving replacement.
-			// Capture the refinement drain before the first await: this preserves a
-			// final agent_end's serialized work while kernel disposal is pending.
-			const drain = this._drainPendingRefinementForDisposal();
-			const kernelDispose = this._ipythonKernelProvisioner?.dispose();
-			if (kernelDispose) await kernelDispose;
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
-			await drain;
+			await this._drainPendingRefinementForDisposal();
 			if (this._disposed) {
 				return this._disposeCallbacksPromise;
 			}
@@ -8772,44 +8758,33 @@ export class AgentSession {
 	}
 
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
-	private _createKernelHostHandlers(): Record<string, HostRequestHandler> {
-		const handlers: Record<string, HostRequestHandler> = {
+	private _createKernelHostHandlers(): HostRequestHandlers {
+		const handlers: HostRequestHandlers = {
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
 			})),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
-			"model.info": createHostRequestHandler(
-				async (_payload: Record<string, unknown>, _context: HostRequestContext) => ({
-					id: this.model?.id ?? null,
-					provider: this.model?.provider ?? null,
-					input: this.model?.input ?? [],
-				}),
-			),
+			"model.info": async () => ({
+				id: this.model?.id ?? null,
+				provider: this.model?.provider ?? null,
+				input: this.model?.input ?? [],
+			}),
 		};
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
-				handlers[type] = createHostRequestHandler(
-					async (payload: Record<string, unknown>, _context: HostRequestContext) =>
-						this.handleGoalHostRequest(type, payload),
-				);
+				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
 			}
 		}
 		if (this._includeCompactSkill) {
 			for (const type of ["compact.run", "compact.status"]) {
-				handlers[type] = createHostRequestHandler(
-					async (payload: Record<string, unknown>, _context: HostRequestContext) =>
-						this.handleCompactHostRequest(type, payload),
-				);
+				handlers[type] = async (payload) => this.handleCompactHostRequest(type, payload);
 			}
 		}
 		if (this._autoRefineAllowedForSession()) {
 			for (const type of ["refine.run", "refine.status"]) {
-				handlers[type] = createHostRequestHandler(
-					async (payload: Record<string, unknown>, _context: HostRequestContext) =>
-						this.handleRefineHostRequest(type, payload),
-				);
+				handlers[type] = async (payload) => this.handleRefineHostRequest(type, payload);
 			}
 		}
 		if (this._rlmHeartbeatController) {
@@ -8819,10 +8794,7 @@ export class AgentSession {
 				"rlm_heartbeat.update",
 				"rlm_heartbeat.delete",
 			]) {
-				handlers[type] = createHostRequestHandler(
-					async (payload: Record<string, unknown>, _context: HostRequestContext) =>
-						this.handleRlmHeartbeatHostRequest(type, payload),
-				);
+				handlers[type] = async (payload) => this.handleRlmHeartbeatHostRequest(type, payload);
 			}
 		}
 		const visibleKernelSkillNames = new Set(

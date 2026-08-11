@@ -1,11 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-	AGENT_MESSAGE_DISPLAY_MIME,
-	createHostRequestHandler,
-	type HostRequestHandler,
-	KernelManager,
-	type KernelSentAgentMessage,
-} from "../src/core/kernel/index.js";
+import { AGENT_MESSAGE_DISPLAY_MIME, KernelManager, type KernelSentAgentMessage } from "../src/core/kernel/index.js";
 
 async function waitForCalls(mock: { mock: { calls: unknown[][] } }, count: number): Promise<void> {
 	for (let i = 0; i < 20; i++) {
@@ -318,62 +312,5 @@ describe("KernelManager abort handling", () => {
 		expect(shellSend).toHaveBeenCalledTimes(1);
 		expect(controlSend).toHaveBeenCalled();
 		manager.disposeSync();
-	});
-	it("rejects unary host implementations before they can run", async () => {
-		let called = false;
-		const unary = async (_payload: Record<string, unknown>) => {
-			called = true;
-			return {};
-		};
-		// @ts-expect-error HostRequestHandler is nominal; raw unary callbacks cannot cross the boundary.
-		const _unbranded: HostRequestHandler = unary;
-		void _unbranded;
-		// @ts-expect-error Factory requires a payload and HostRequestContext implementation.
-		expect(() => createHostRequestHandler(unary)).toThrow("must accept payload and context");
-		expect(called).toBe(false);
-	});
-
-	it("rejects missing context at the branded wrapper before implementation", async () => {
-		let called = false;
-		const handler = createHostRequestHandler(
-			async (
-				_payload: Record<string, unknown>,
-				_context: import("../src/core/kernel/index.js").HostRequestContext,
-			) => {
-				called = true;
-				return {};
-			},
-		);
-		await expect((handler as any)({ type: "agent_observe.list" })).rejects.toThrow("context is invalid");
-		expect(called).toBe(false);
-	});
-	it("rejects a copied-symbol branded forgery before its logic runs", async () => {
-		let called = false;
-		const genuine = createHostRequestHandler(
-			async (
-				_payload: Record<string, unknown>,
-				_context: import("../src/core/kernel/index.js").HostRequestContext,
-			) => ({}),
-		);
-		const forged = async (_payload: Record<string, unknown>, _context: unknown) => {
-			called = true;
-			return {};
-		};
-		for (const symbol of Object.getOwnPropertySymbols(genuine)) {
-			Object.defineProperty(forged, symbol, { value: (genuine as any)[symbol] });
-		}
-		const manager = new KernelManager({ hostHandlers: { "agent_observe.list": forged as any } });
-		await expect(
-			(manager as any).handleHostRequest(
-				{ type: "agent_observe.list" },
-				{
-					requestId: "forged",
-					generation: 1,
-					signal: new AbortController().signal,
-					isCurrent: () => true,
-				},
-			),
-		).rejects.toThrow("not a dispatcher-created capability");
-		expect(called).toBe(false);
 	});
 });

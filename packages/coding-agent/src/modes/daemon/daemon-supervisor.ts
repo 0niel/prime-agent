@@ -54,7 +54,6 @@ import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-p
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
-	collectDaemonLaunchEnv,
 	createDaemonEventMeta,
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
@@ -72,7 +71,6 @@ import {
 	type DaemonResponse,
 	type DaemonUpdateRestartManifest,
 	failure,
-	filterPersistedDaemonLaunchEnv,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	salvageDaemonCommandId,
@@ -100,8 +98,6 @@ import {
 } from "./daemon-socket.js";
 import {
 	acquireDaemonSupervisorOwnership,
-	DAEMON_SUPERVISOR_REGISTRY_DIR_ENV,
-	getDaemonSupervisorRegistryDir,
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
@@ -433,12 +429,6 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
-		(descriptor.launchEnv === undefined ||
-			(typeof descriptor.launchEnv === "object" &&
-				descriptor.launchEnv !== null &&
-				Object.entries(descriptor.launchEnv).every(
-					([key, value]) => typeof key === "string" && typeof value === "string",
-				))) &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
 		typeof descriptor.rootActiveSessionId === "string" &&
@@ -612,8 +602,6 @@ export class DaemonSupervisor {
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly descriptorDir: string;
-	/** Captured from host authority and forwarded to every worker launch. */
-	private readonly supervisorRegistryDir = getDaemonSupervisorRegistryDir();
 	private readonly generation = randomUUID();
 	private readonly supervisorConfigPath: string;
 	private readonly defaultSessionConfig: AgentSessionRuntimeConfig;
@@ -657,14 +645,13 @@ export class DaemonSupervisor {
 				throw new Error("Daemon supervisor config is missing agentDir");
 			}
 			this.socketLease = await acquireDaemonSocketPathLease(this.socketPath);
-			await waitForDaemonStartupFence(this.socketPath, 10_000, this.supervisorRegistryDir);
+			await waitForDaemonStartupFence(this.socketPath);
 			this.ownership = await acquireDaemonSupervisorOwnership({
 				socketPath: this.socketPath,
 				descriptorDir: this.descriptorDir,
 				agentDir,
 				generation: this.generation,
 				appVersion: VERSION,
-				registryDir: this.supervisorRegistryDir,
 			});
 			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
 
@@ -941,12 +928,10 @@ export class DaemonSupervisor {
 				if (!isDaemonWorkerDescriptor(descriptor, this.socketPath)) {
 					continue;
 				}
-				const storedLaunchEnv = descriptor.launchEnv;
-				descriptor.launchEnv = filterPersistedDaemonLaunchEnv(storedLaunchEnv);
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
-				const worker: ResidentWorker = {
+				this.workers.set(descriptor.workerId, {
 					descriptor,
 					descriptorPath: path,
 					summaries: new Map(),
@@ -956,14 +941,7 @@ export class DaemonSupervisor {
 					snapshotLoads: new Map(),
 					intentionalStop: descriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
-					launchEnv: descriptor.launchEnv,
-				};
-				// Sanitization is a durable admission boundary. Do not expose a worker to
-				// recovery/adoption until its descriptor no longer contains caller secrets.
-				if (JSON.stringify(storedLaunchEnv) !== JSON.stringify(descriptor.launchEnv)) {
-					this.persistWorker(worker);
-				}
-				this.workers.set(descriptor.workerId, worker);
+				});
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
 			}
@@ -1812,16 +1790,9 @@ export class DaemonSupervisor {
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
 				: undefined;
-			// Hold this persisted topology through pre-wake and post-wake checks.
-			const familyCatalog = source && command.agentOrigin === true ? await this.familyCatalogEntries() : undefined;
-			// Session IDs are the stable identities for this authorization snapshot. Do not
-			// rebuild either endpoint from worker summaries after the snapshot is captured.
-			const sourceSessionId = source?.summary.sessionId;
-			let targetSessionId: string;
 			let target: WorkerMatch;
 			try {
 				target = await this.findWorkerForClient(client, command.targetActiveSessionId);
-				targetSessionId = target.summary.sessionId;
 			} catch (error) {
 				if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
 				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
@@ -1840,14 +1811,12 @@ export class DaemonSupervisor {
 					}
 					throw error;
 				}
-				const targetInfo = await readSessionInfo(sessionPath);
-				if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
-				targetSessionId = targetInfo.id;
 				if (source && command.agentOrigin === true) {
+					const targetInfo = await readSessionInfo(sessionPath);
+					if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
 					assertAgentFamilyReach(
-						this.authoritativeFamilyCatalogEntry(familyCatalog!, sourceSessionId!),
-						this.authoritativeFamilyCatalogEntry(familyCatalog!, targetSessionId),
-						familyCatalog!,
+						this.familyCatalogEntry(source.summary),
+						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
 					);
 				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
@@ -1863,16 +1832,7 @@ export class DaemonSupervisor {
 			}
 			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
 			if (source && command.agentOrigin === true) {
-				// Waking must not substitute a different live session for the target that
-				// was authorized by the captured topology.
-				if (target.summary.sessionId !== targetSessionId) {
-					throw new Error("Agent reach is limited to parent, siblings, and children");
-				}
-				assertAgentFamilyReach(
-					this.authoritativeFamilyCatalogEntry(familyCatalog!, sourceSessionId!),
-					this.authoritativeFamilyCatalogEntry(familyCatalog!, targetSessionId),
-					familyCatalog!,
-				);
+				assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
 			}
 			if (source) {
 				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
@@ -1946,16 +1906,11 @@ export class DaemonSupervisor {
 				return await forward();
 			}
 			this.persistWorkerStopTombstone(match.worker, true);
-			const releaseStopOwnership = this.acquireWorkerStopOwnership(match.worker);
 			let response: DaemonResponse;
 			try {
 				response = await this.forwardToWorker(match.worker, resolvedCommand);
 			} finally {
-				try {
-					await this.stopWorker(match.worker, true, false, true);
-				} finally {
-					releaseStopOwnership();
-				}
+				await this.stopWorker(match.worker, true, false, true);
 			}
 			return response;
 		} finally {
@@ -2163,18 +2118,11 @@ export class DaemonSupervisor {
 			throw new Error("Session is not owned by this client");
 		}
 		const previousDescriptor = worker.descriptor;
-		const previousLaunchEnv = worker.launchEnv;
-		const persistedLaunchEnv = filterPersistedDaemonLaunchEnv(previousLaunchEnv);
-		worker.descriptor = {
-			...previousDescriptor,
-			ownerClientId: undefined,
-			...(persistedLaunchEnv ? { launchEnv: persistedLaunchEnv } : { launchEnv: undefined }),
-		};
+		worker.descriptor = { ...previousDescriptor, ownerClientId: undefined };
 		try {
 			this.persistWorker(worker);
 		} catch (error) {
 			worker.descriptor = previousDescriptor;
-			worker.launchEnv = previousLaunchEnv;
 			throw error;
 		}
 		worker.promotedOwnerClientId = clientId;
@@ -2182,7 +2130,7 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
-		worker.launchEnv = persistedLaunchEnv;
+		worker.launchEnv = undefined;
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 	}
 
@@ -2196,29 +2144,8 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker ${existing.descriptor.workerId} recovery was cancelled`);
 		}
 		const recoveryStopRevision = existing?.stopRevision;
-		const ownerClientIdForDescriptor = existing?.descriptor.ownerClientId ?? ownerClientId;
-		// Only a first resident launch consumes the caller's full transient
-		// environment. A resident recovery uses the descriptor's allowlisted copy
-		// even while the old worker object still exists in memory. Client-owned
-		// workers are different: their reconnecting owner supplies fresh transient
-		// launch settings, which are never written to a descriptor.
-		const launchEnv = existing
-			? ownerClientIdForDescriptor === undefined
-				? existing.descriptor.launchEnv
-				: existing.launchEnv
-			: command.launchEnv;
-		// Only non-secret, explicitly allowed settings are durable. The initial
-		// spawn may still receive caller credentials through launchEnv, but those
-		// credentials must never be serialized into a worker descriptor.
-		const persistedLaunchEnv = filterPersistedDaemonLaunchEnv(launchEnv);
-		// A replacement supervisor can itself have been restarted by the old worker
-		// and therefore inherit that worker's original credentials. Automatic
-		// resident recovery must not copy those ambient secrets into the replacement
-		// worker. Client-owned recovery instead uses its live owner's transient env.
-		const inheritedEnv =
-			existing && ownerClientIdForDescriptor === undefined
-				? filterPersistedDaemonLaunchEnv(collectDaemonLaunchEnv(process.env))
-				: process.env;
+		const launchEnv =
+			ownerClientId || existing?.descriptor.ownerClientId ? (command.launchEnv ?? existing?.launchEnv) : undefined;
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
@@ -2239,15 +2166,13 @@ export class DaemonSupervisor {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
 			detached: true,
 			env: createCliSubprocessEnv({
-				...inheritedEnv,
+				...process.env,
 				...launchEnv,
 				[DAEMON_WORKER_ROLE_ENV]: "1",
 				[DAEMON_WORKER_TOKEN_ENV]: token,
 				[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
 				[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
 				[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath,
-				// Host authority, set after inherited and caller launch env so neither can override it.
-				[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV]: this.supervisorRegistryDir,
 				[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: String(WORKER_STARTUP_GATE_FD),
 				[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
 				[SESSION_LEASES_ENABLED_ENV]: "1",
@@ -2297,10 +2222,7 @@ export class DaemonSupervisor {
 				supervisorSocketPath: this.socketPath,
 				authenticationToken: token,
 				rootActiveSessionId,
-				ownerClientId: ownerClientIdForDescriptor,
-				...(ownerClientIdForDescriptor === undefined && persistedLaunchEnv
-					? { launchEnv: persistedLaunchEnv }
-					: {}),
+				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
 				createdAt: existing?.descriptor.createdAt ?? now,
 				updatedAt: now,
 				lifecycle: "starting",
@@ -2321,10 +2243,7 @@ export class DaemonSupervisor {
 			};
 			await this.assertRecoveryAllowed();
 			worker.descriptor = descriptor;
-			// Resident workers retain only the durable allowlist even in memory, so an
-			// automatic same-supervisor recovery cannot resurrect initial credentials.
-			// Client-owned workers may retain a fresh owner's transient environment.
-			worker.launchEnv = ownerClientIdForDescriptor === undefined ? persistedLaunchEnv : launchEnv;
+			worker.launchEnv = launchEnv;
 			descriptorAssigned = true;
 			this.persistWorker(worker);
 			worker.intentionalStop = false;
@@ -3084,17 +3003,19 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async familyCatalogEntries(): Promise<readonly AgentFamilyCatalogEntry[]> {
+	private async familyCatalogEntries(): Promise<AgentFamilyCatalogEntry[]> {
 		const active = [...this.workers.values()].flatMap((worker) => [...worker.summaries.values()]);
 		const activePaths = new Set(
 			active.flatMap((summary) => (summary.sessionFile ? [canonicalSessionPath(summary.sessionFile)] : [])),
 		);
-		// All persisted descendants participate. Retain duplicate stable identities so
-		// authoritative endpoint resolution can reject an ambiguous authorization snapshot.
-		const persisted = (await this.catalog.list())
-			.filter((info) => !activePaths.has(canonicalSessionPath(info.path)))
-			.map((info) => this.familyCatalogEntry(summaryForInactiveSession(info)));
-		return Object.freeze([...persisted, ...active.map((summary) => this.familyCatalogEntry(summary))]);
+		const savedRoots = (await this.catalog.list()).filter(
+			(info) =>
+				(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
+				!activePaths.has(canonicalSessionPath(info.path)),
+		);
+		return [...active, ...savedRoots.map((info) => summaryForInactiveSession(info))].map((summary) =>
+			this.familyCatalogEntry(summary),
+		);
 	}
 
 	private async withSessionNameReservation<T>(
@@ -3176,37 +3097,19 @@ export class DaemonSupervisor {
 
 	private assertSavedSiblingNameAvailable(siblings: SessionInfo[], target: SessionInfo, name: string): void {
 		const setDepth = target.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0;
-		const parentSessionPath = target.parentSessionPath ? canonicalSessionPath(target.parentSessionPath) : undefined;
-		// The bounded sibling catalog intentionally omits its parent. Add one local
-		// structural anchor so C05's exact-one-parent check can compare legacy rows
-		// whose depth is inferred from this modern sibling set.
-		const parent =
-			setDepth > 0 && parentSessionPath
-				? [
-						{
-							id: `saved-sibling-parent:${parentSessionPath}`,
-							depth: setDepth - 1,
-							status: "inactive" as const,
-							sessionPath: parentSessionPath,
-						},
-					]
-				: [];
 		assertAgentSessionNameAvailable(
-			[
-				...parent,
-				...siblings.map((info) => {
-					const summary = summaryForInactiveSession(info);
-					return {
-						id: summary.sessionId,
-						...(summary.sessionName ? { name: summary.sessionName } : {}),
-						depth: setDepth,
-						status: classifySessionRosterStatus(summary),
-						...(summary.parentSessionPath
-							? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
-							: {}),
-					};
-				}),
-			],
+			siblings.map((info) => {
+				const summary = summaryForInactiveSession(info);
+				return {
+					id: summary.sessionId,
+					...(summary.sessionName ? { name: summary.sessionName } : {}),
+					depth: setDepth,
+					status: classifySessionRosterStatus(summary),
+					...(summary.parentSessionPath
+						? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
+						: {}),
+				};
+			}),
 			{
 				name,
 				depth: setDepth,
@@ -3282,16 +3185,6 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker is ${this.effectiveWorkerState(worker)}`);
 		}
 		return worker.client;
-	}
-
-	/** Resolve both authorization endpoints exclusively from one captured topology snapshot. */
-	private authoritativeFamilyCatalogEntry(
-		catalog: readonly AgentFamilyCatalogEntry[],
-		sessionId: string,
-	): AgentFamilyCatalogEntry {
-		const matches = catalog.filter((entry) => entry.id === sessionId);
-		if (matches.length !== 1) throw new Error("Agent reach is limited to parent, siblings, and children");
-		return matches[0]!;
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
@@ -4349,14 +4242,9 @@ export class DaemonSupervisor {
 			!this.shuttingDown
 		) {
 			worker.intentionalStop = true;
-			// An exact stop owns its registration and descriptor cleanup until its
-			// tuple assertions complete. A synchronous root shutdown event can arrive
-			// before its request resolves, so leave both intact while it is active.
-			if ((this.workerStopCounts?.get(worker) ?? 0) === 0) {
-				this.workers.delete(worker.descriptor.workerId);
-				this.deleteWorkerDescriptor(worker);
-				void this.syncAgentPeers().catch(() => undefined);
-			}
+			this.workers.delete(worker.descriptor.workerId);
+			this.deleteWorkerDescriptor(worker);
+			void this.syncAgentPeers().catch(() => undefined);
 		}
 	}
 
@@ -4736,25 +4624,6 @@ export class DaemonSupervisor {
 		return observed === processStartId ? "current" : "replaced";
 	}
 
-	/**
-	 * Keep an exact stop's registration and descriptor authoritative while any
-	 * part of its cleanup is in flight. Root kills acquire this before forwarding
-	 * because a synchronous shutdown event may arrive before the worker replies.
-	 */
-	private acquireWorkerStopOwnership(worker: ResidentWorker): () => void {
-		if (!this.workerStopCounts) this.workerStopCounts = new Map();
-		const stopCounts = this.workerStopCounts;
-		stopCounts.set(worker, (stopCounts.get(worker) ?? 0) + 1);
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			const remaining = (stopCounts.get(worker) ?? 1) - 1;
-			if (remaining === 0) stopCounts.delete(worker);
-			else stopCounts.set(worker, remaining);
-		};
-	}
-
 	private async stopWorker(
 		worker: ResidentWorker,
 		removeDescriptor: boolean,
@@ -4763,11 +4632,15 @@ export class DaemonSupervisor {
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
 	): Promise<void> {
-		const releaseStopOwnership = this.acquireWorkerStopOwnership(worker);
+		if (!this.workerStopCounts) this.workerStopCounts = new Map();
+		const stopCounts = this.workerStopCounts;
+		stopCounts.set(worker, (stopCounts.get(worker) ?? 0) + 1);
 		try {
 			await this.stopWorkerUntracked(worker, removeDescriptor, force, archiveSession, recoveryCleanup, directChild);
 		} finally {
-			releaseStopOwnership();
+			const remaining = (stopCounts.get(worker) ?? 1) - 1;
+			if (remaining === 0) stopCounts.delete(worker);
+			else stopCounts.set(worker, remaining);
 		}
 	}
 
