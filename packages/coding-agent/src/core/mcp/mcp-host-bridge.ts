@@ -21,7 +21,7 @@ export interface McpHostBridgeOptions {
 	requestTimeoutMs?: number;
 }
 type Rpc = { jsonrpc: "2.0"; id?: string; method?: string; params?: unknown; result?: unknown; error?: { code: number; message: string; data?: unknown } };
-type State = { binding: McpHostBinding; nextId: number; initialize?: Promise<void>; sessionId?: string; generation: number; controllers: Set<AbortController>; inFlight: Set<Promise<void>>; epoch: number };
+type State = { binding: McpHostBinding; nextId: number; initialize?: Promise<void>; sessionId?: string; generation: number; controllers: Set<AbortController>; inFlight: Set<Promise<void>>; epoch: number; forward?: State };
 const MAX_RESPONSE_BYTES = 1_000_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -150,31 +150,41 @@ export class McpHostBridge {
 		} finally { clearTimeout(timer); this.controllers.delete(controller); state.controllers.delete(controller); if (!allowCancelled) context?.signal.removeEventListener("abort", abort); }
 	}); }
 	private async authenticated<T>(state: State, run: (token: string | undefined) => Promise<T>, refresh = false): Promise<T> { return state.binding.oauth ? this.options.withOAuthAccessToken(state.binding.server, run, refresh) : run(undefined); }
-	private adoptResolvedBinding(state: State, prior: McpHostBinding, resolved: McpHostBinding, message: Rpc): McpHostBinding {
-		const oldKey = bindingKey(prior); const resolvedKey = bindingKey(resolved); const currentKey = bindingKey(state.binding);
-		if (resolvedKey === oldKey || currentKey === resolvedKey) return state.binding;
-		// Only the exact old epoch may advance. If a peer already owns the newer
-		// canonical key, advance this caller without replacing that canonical state.
-		if (currentKey === oldKey) this.rekey(state, resolved, message.method === "initialize", !this.states.has(resolvedKey));
-		return state.binding;
+	private canonical(state: State): State {
+		while (state.forward) state = state.forward;
+		return state;
 	}
-	private async refreshBinding(state: State, prior: McpHostBinding, message: Rpc): Promise<{ binding: McpHostBinding; retired: boolean }> {
+	private adoptResolvedBinding(state: State, prior: McpHostBinding, resolved: McpHostBinding, message: Rpc): State {
+		state = this.canonical(state);
+		const oldKey = bindingKey(prior); const resolvedKey = bindingKey(resolved); const currentKey = bindingKey(state.binding);
+		if (resolvedKey === oldKey || currentKey === resolvedKey) return state;
+		const canonical = this.states.get(resolvedKey);
+		if (canonical && canonical !== state) {
+			// Fence and unlink the stale epoch, then route every late caller through
+			// the already tracked state so lifecycle disposal still owns its session.
+			if (this.states.get(currentKey) === state) this.states.delete(currentKey);
+			state.sessionId = undefined; state.epoch += 1; state.forward = canonical;
+			for (const controller of state.controllers) controller.abort();
+			return this.canonical(canonical);
+		}
+		if (currentKey === oldKey) this.rekey(state, resolved, message.method === "initialize");
+		return state;
+	}
+	private async refreshBinding(state: State, prior: McpHostBinding, message: Rpc): Promise<{ state: State; retired: boolean }> {
 		const key = bindingKey(prior);
 		let flight = this.bindingRefreshFlights.get(key);
 		if (!flight) {
 			flight = (async () => {
 				const initial = this.options.resolveBinding?.(prior) ?? prior;
-				if (bindingKey(initial) !== key) return { binding: this.adoptResolvedBinding(state, prior, initial, message), retired: true };
+				if (bindingKey(initial) !== key) return { state: this.adoptResolvedBinding(state, prior, initial, message), retired: true };
 				let retired = false;
 				try { retired = (await this.options.beforeForceRefresh?.(prior)) === true; } catch { /* cleanup is best effort */ }
-				// Retirement itself can rotate the sealed binding. Never issue another
-				// refresh against the old reference when that has already happened.
 				const afterRetirement = this.options.resolveBinding?.(prior) ?? prior;
-				if (bindingKey(afterRetirement) !== key) return { binding: this.adoptResolvedBinding(state, prior, afterRetirement, message), retired };
+				if (bindingKey(afterRetirement) !== key) return { state: this.adoptResolvedBinding(state, prior, afterRetirement, message), retired };
 				await this.authenticated(state, async () => undefined, true);
 				const renewed = this.options.resolveBinding?.(prior) ?? prior;
 				if (bindingKey(renewed) === key) throw new Error("MCP OAuth refresh did not rotate its binding revision.");
-				return { binding: this.adoptResolvedBinding(state, prior, renewed, message), retired };
+				return { state: this.adoptResolvedBinding(state, prior, renewed, message), retired };
 			})();
 			this.bindingRefreshFlights.set(key, flight);
 			void flight.finally(() => { if (this.bindingRefreshFlights.get(key) === flight) this.bindingRefreshFlights.delete(key); }).catch(() => {});
@@ -182,20 +192,20 @@ export class McpHostBridge {
 		return flight;
 	}
 	private async send(state: State, message: Rpc, context: HostRequestContext, response = true, allowCancelled = false): Promise<Rpc | undefined> {
-		const prior = state.binding;
+		state = this.canonical(state); const prior = state.binding;
 		try { return await this.authenticated(state, (token) => this.post(state, message, context, token, response, allowCancelled)); }
 		catch (error) {
 			const aborted = (error as { name?: string; mcpAbortReason?: string }).name === "AbortError";
 			const retryable = (error as { status?: number }).status === 401 || (aborted && (error as { mcpAbortReason?: string }).mcpAbortReason === "retired");
-			// User cancellation, timeout, and an unproven transport abort never refresh credentials.
 			if (this.disposed || !state.binding.oauth || !retryable || !context.isCurrent() || context.signal.aborted) throw error;
-			const refreshed = await this.refreshBinding(state, prior, message);
+			const refreshed = await this.refreshBinding(state, prior, message); const target = refreshed.state;
 			if (aborted && !refreshed.retired) throw error;
-			if (message.method !== "initialize") await this.initialize(state, context);
-			return this.authenticated(state, (token) => this.post(state, message, context, token, response, allowCancelled));
+			if (message.method !== "initialize") await this.initialize(target, context);
+			return this.authenticated(target, (token) => this.post(target, message, context, token, response, allowCancelled));
 		}
 	}
 	private async initialize(state: State, context: HostRequestContext): Promise<void> {
+		state = this.canonical(state);
 		if (state.initialize) return state.initialize;
 		const initialization = (async () => { const id = this.id(state); const result = await this.send(state, { jsonrpc: "2.0", id, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "Prime Agent", version: "0" } } }, context); if (!result || result.error || !Object.prototype.hasOwnProperty.call(result, "result") || !result.result || typeof result.result !== "object" || Array.isArray(result.result) || (result.result as { protocolVersion?: unknown }).protocolVersion !== "2025-03-26") throw new Error("MCP initialize returned an invalid protocol version."); await this.send(state, { jsonrpc: "2.0", method: "notifications/initialized" }, context, false); })();
 		state.initialize = initialization;
@@ -203,7 +213,7 @@ export class McpHostBridge {
 	}
 	private async doRequest(binding: McpHostBinding, method: string, params: unknown, context: HostRequestContext): Promise<unknown> {
 		if (!/^[A-Za-z0-9_.\-/]+$/.test(method) || method === "initialize" || method.startsWith("notifications/")) throw new Error("MCP method is unavailable.");
-		const state = this.state(binding); await this.initialize(state, context); const id = this.id(state);
+		let state = this.state(binding); await this.initialize(state, context); state = this.canonical(state); const id = this.id(state);
 		const cancelled = () => { void this.send(state, { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id, reason: "cancelled" } }, context, false, true).catch(() => {}); };
 		context.signal.addEventListener("abort", cancelled, { once: true });
 		try { const result = await this.send(state, { jsonrpc: "2.0", id, method, params }, context); if (!result || result.error) throw new Error(`MCP ${method} failed.`); return result.result; }

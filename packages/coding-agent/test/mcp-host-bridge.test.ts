@@ -272,4 +272,33 @@ describe("MCP host bridge", () => {
 		expect([...states.keys()].some((key) => key.includes("secret-r1") || key.includes("secret-r2"))).toBe(false);
 	});
 
+	it("routes late initialize adoption to the canonical session and disposes only that session", async () => {
+		let revision = "secret-r1"; let initCalls = 0; let toolCalls = 0; let deletes: string[] = []; let releaseLate!: () => void;
+		const bridge = new McpHostBridge({
+			fetch: async (_url, init) => {
+				if (init?.method === "DELETE") { deletes.push(new Headers(init.headers).get("mcp-session-id")!); return new Response(null, { status: 204 }); }
+				const message = JSON.parse(String(init?.body));
+				if (message.method === "notifications/initialized") return new Response("", { status: 202 });
+				if (message.method === "initialize") {
+					if (++initCalls === 1) return new Response("expired", { status: 401 }); // r1 -> r2 during initialize
+					if (initCalls === 3) { await new Promise<void>((resolve) => { releaseLate = resolve; }); return new Response("expired", { status: 401 }); }
+					return json({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2025-03-26" } }, 200, { "mcp-session-id": `session-${revision}` });
+				}
+				if (message.method === "tools/list" && revision === "secret-r2" && ++toolCalls === 2) return new Response("expired", { status: 401 });
+				return json({ jsonrpc: "2.0", id: message.id, result: { tools: [] } });
+			},
+			resolveBinding: (value) => ({ ...value, authRevision: revision }),
+			beforeForceRefresh: async () => true,
+			withOAuthAccessToken: async (_server, run, force) => { if (force) revision = revision === "secret-r1" ? "secret-r2" : "secret-r3"; return run("secret"); },
+		});
+		await bridge.request(binding, "tools/list", {}, context()); // r1 initialize 401 -> r2 session
+		const late = bridge.request(binding, "tools/list", {}, context()); // blocked old r1 initialize
+		for (let i = 0; i < 20 && !releaseLate; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+		await bridge.request({ ...binding, authRevision: "secret-r2" }, "tools/list", {}, context()); // r2 -> r3 canonical
+		releaseLate(); await expect(late).resolves.toEqual({ tools: [] });
+		const states = (bridge as unknown as { states: Map<string, { binding: { authRevision?: string }; sessionId?: string }> }).states;
+		expect([...states.values()]).toHaveLength(1); expect([...states.values()][0]?.binding.authRevision).toBe("secret-r3");
+		await bridge.dispose(); expect(deletes).toEqual(["session-secret-r3"]);
+	});
+
 });
