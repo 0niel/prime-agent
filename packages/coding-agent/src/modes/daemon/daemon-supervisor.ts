@@ -2138,13 +2138,31 @@ export class DaemonSupervisor {
 					return worker;
 				}
 			}
+			// Stage the durable state separately. persistWorker can update its
+			// descriptor before throwing, so rollback must restore the original
+			// object as well as the transient recovery capability.
+			const previousDescriptor = worker.descriptor;
+			const previousIntentionalStop = worker.intentionalStop;
 			worker.recoveryLaunchEnv = command.launchEnv;
 			worker.intentionalStop = false;
-			worker.descriptor.stopRequestedAt = undefined;
-			worker.descriptor.archiveOnStop = undefined;
-			worker.descriptor.lifecycle = "recovering";
-			worker.descriptor.consecutiveFailures = 0;
-			this.persistWorker(worker);
+			worker.descriptor = {
+				...previousDescriptor,
+				stopRequestedAt: undefined,
+				archiveOnStop: undefined,
+				lifecycle: "recovering",
+				consecutiveFailures: 0,
+			};
+			try {
+				this.persistWorker(worker);
+			} catch (error) {
+				// The fresh environment is a one-shot capability. Persistence is the
+				// hand-off point, so a failed hand-off must not leave it available for
+				// a later automatic recovery.
+				worker.recoveryLaunchEnv = undefined;
+				worker.intentionalStop = previousIntentionalStop;
+				worker.descriptor = previousDescriptor;
+				throw error;
+			}
 			await this.recoverWorker(worker);
 			if (!worker.client || worker.descriptor.lifecycle !== "ready") {
 				throw new Error(
