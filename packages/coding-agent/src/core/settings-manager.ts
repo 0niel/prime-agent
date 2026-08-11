@@ -4,7 +4,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
-import { isWithinProjectConfigDir } from "./workspace-trust.js";
+import { isProjectConfigDirTheUserGlobalDir, isWithinProjectConfigDir } from "./workspace-trust.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -359,7 +359,8 @@ export class SettingsManager {
 	/** Create a SettingsManager that loads from files */
 	static create(cwd: string, agentDir: string = getAgentDir(), options?: SettingsManagerOptions): SettingsManager {
 		const storage = new FileSettingsStorage(cwd, agentDir);
-		const globalConfigAliasedToProject = isWithinProjectConfigDir(join(agentDir, "settings.json"), cwd);
+		const globalConfigAliasedToProject =
+			isWithinProjectConfigDir(join(agentDir, "settings.json"), cwd) && !isProjectConfigDirTheUserGlobalDir(cwd);
 		return SettingsManager.fromStorage(storage, { globalConfigAliasedToProject, ...options });
 	}
 
@@ -399,6 +400,15 @@ export class SettingsManager {
 
 	setProjectTrusted(trusted: boolean): void {
 		this.projectTrusted = trusted;
+	}
+
+	/**
+	 * Whether the global settings file lives inside the project config
+	 * directory (portable agentDir), making "global" configuration
+	 * project-controlled. Always false for the default home-based agent dir.
+	 */
+	isGlobalConfigAliasedToProject(): boolean {
+		return this.globalConfigAliasedToProject;
 	}
 
 	/**

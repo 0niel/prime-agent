@@ -143,7 +143,12 @@ configuration only applies to workspaces you explicitly trust.
   time or for headless use. `prime-agent untrust [path]` revokes it,
   `prime-agent trust --list` shows all trusted workspaces.
 
-Global configuration in `~/.prime/agent/` is your own and always applies.
+Global configuration in `~/.prime/agent/` is your own and always applies. Two
+edge cases worth knowing: if the global agent directory is pointed inside the
+project (a portable setup), its files count as project-committed and are gated
+the same way; and ordinary context files (`AGENTS.md`, `CLAUDE.md`) are read
+from the project like any other repo content — they are not executable
+configuration and are not gated.
 
 Additional paths via `settings.json`:
 

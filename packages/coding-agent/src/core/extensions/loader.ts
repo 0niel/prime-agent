@@ -14,6 +14,7 @@ import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
 import { createSyntheticSourceInfo } from "../source-info.js";
+import { isWithinProjectConfigDir, isWorkspaceTrusted } from "../workspace-trust.js";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -576,12 +577,18 @@ export async function discoverAndLoadExtensions(
 	};
 
 	// 1. Project-local extensions: cwd/${CONFIG_DIR_NAME}/extensions/
-	const localExtDir = path.join(cwd, CONFIG_DIR_NAME, "extensions");
-	addPaths(discoverExtensionsInDir(localExtDir));
+	// Gated by workspace trust: they execute on load.
+	if (isWorkspaceTrusted(cwd, agentDir)) {
+		const localExtDir = path.join(cwd, CONFIG_DIR_NAME, "extensions");
+		addPaths(discoverExtensionsInDir(localExtDir));
+	}
 
-	// 2. Global extensions: agentDir/extensions/
+	// 2. Global extensions: agentDir/extensions/. Skipped when agentDir is
+	// project-controlled (portable agentDir) and the workspace is untrusted.
 	const globalExtDir = path.join(agentDir, "extensions");
-	addPaths(discoverExtensionsInDir(globalExtDir));
+	if (isWorkspaceTrusted(cwd, agentDir) || !isWithinProjectConfigDir(globalExtDir, cwd)) {
+		addPaths(discoverExtensionsInDir(globalExtDir));
+	}
 
 	// 3. Explicitly configured paths
 	for (const p of configuredPaths) {

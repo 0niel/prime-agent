@@ -18,6 +18,7 @@ import {
 import { basename, dirname, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir, getSessionsDir } from "./config.js";
 import { migrateKeybindingsConfig } from "./core/keybindings.js";
+import { isWorkspaceTrusted } from "./core/workspace-trust.js";
 import { readFirstLineSync } from "./utils/file-lines.js";
 
 const MIGRATION_GUIDE_URL =
@@ -365,9 +366,12 @@ function migrateExtensionSystem(cwd: string): string[] {
 	const agentDir = getAgentDir();
 	const projectDir = join(cwd, CONFIG_DIR_NAME);
 
-	// Migrate commands/ to prompts/
+	// Migrate commands/ to prompts/. The project side renames files inside the
+	// checkout, so it only runs for trusted workspaces.
 	migrateCommandsToPrompts(agentDir, "Global");
-	migrateCommandsToPrompts(projectDir, "Project");
+	if (isWorkspaceTrusted(cwd, agentDir)) {
+		migrateCommandsToPrompts(projectDir, "Project");
+	}
 
 	// Check for deprecated directories
 	const warnings = [

@@ -43,6 +43,7 @@ import {
 import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
 import { readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { SettingsManager } from "../../core/settings-manager.js";
+import { isWorkspaceTrusted } from "../../core/workspace-trust.js";
 import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
@@ -634,7 +635,13 @@ export class DaemonSupervisor {
 		this.defaultSessionConfig = this.loadPersistedSupervisorConfig() ?? options.defaultSessionConfig;
 		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
-		this.settingsManager = SettingsManager.create(process.cwd(), this.defaultSessionConfig.agentDir ?? agentDir);
+		// Only daemon policy (idle eviction) is read from this manager, but pass
+		// the trust decision so any future executable-setting consumer is gated.
+		const supervisorCwd = process.cwd();
+		const supervisorAgentDir = this.defaultSessionConfig.agentDir ?? agentDir;
+		this.settingsManager = SettingsManager.create(supervisorCwd, supervisorAgentDir, {
+			projectTrusted: isWorkspaceTrusted(supervisorCwd, supervisorAgentDir),
+		});
 	}
 
 	async start(): Promise<void> {

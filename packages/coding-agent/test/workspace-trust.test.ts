@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { discoverAndLoadExtensions } from "../src/core/extensions/loader.js";
 import { DefaultPackageManager } from "../src/core/package-manager.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -368,6 +369,109 @@ export default function () {}
 					process.env.PI_OFFLINE = previousOffline;
 				}
 			}
+		});
+	});
+
+	describe("aliased agent dir (portable setup)", () => {
+		const evilSource = (canaryPath: string) => `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(canaryPath)}, "executed", "utf-8");
+export default function () {}
+`;
+
+		it("treats global-scope extensions as project-controlled when untrusted", async () => {
+			// agentDir == project config dir: the "global" extensions directory
+			// is the same committed directory as the project one.
+			const aliasedAgentDir = configDir;
+			const canaryPath = join(tempDir, "aliased-canary.txt");
+			mkdirSync(join(configDir, "extensions"), { recursive: true });
+			writeFileSync(join(configDir, "extensions", "evil.ts"), evilSource(canaryPath));
+			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir: aliasedAgentDir });
+
+			await loader.reload();
+
+			expect(existsSync(canaryPath)).toBe(false);
+			expect(loader.getExtensions().extensions).toEqual([]);
+		});
+
+		it("ignores aliased global settings-driven extension paths and packages when untrusted", async () => {
+			const aliasedAgentDir = configDir;
+			const canaryPath = join(tempDir, "aliased-canary.txt");
+			const toolsDir = join(projectDir, "tools");
+			mkdirSync(toolsDir, { recursive: true });
+			writeFileSync(join(toolsDir, "evil.ts"), evilSource(canaryPath));
+			// The single committed settings.json is simultaneously the global and
+			// project file in an aliased setup.
+			writeProjectSettings({ extensions: ["./tools/evil.ts"], packages: ["npm:some-pkg"] });
+			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir: aliasedAgentDir });
+
+			await loader.reload();
+
+			expect(existsSync(canaryPath)).toBe(false);
+			expect(loader.getExtensions().extensions).toEqual([]);
+
+			const manager = new DefaultPackageManager({
+				cwd: projectDir,
+				agentDir: aliasedAgentDir,
+				settingsManager: SettingsManager.create(projectDir, aliasedAgentDir, { projectTrusted: false }),
+			});
+			await expect(manager.update("npm:some-pkg")).rejects.toThrow();
+		});
+
+		it("loads aliased global-scope extensions when the workspace is trusted", async () => {
+			const aliasedAgentDir = configDir;
+			const canaryPath = join(tempDir, "aliased-canary.txt");
+			mkdirSync(join(configDir, "extensions"), { recursive: true });
+			writeFileSync(join(configDir, "extensions", "evil.ts"), evilSource(canaryPath));
+			WorkspaceTrustStore.create(aliasedAgentDir).trust(projectDir);
+			const loader = new DefaultResourceLoader({ cwd: projectDir, agentDir: aliasedAgentDir });
+
+			await loader.reload();
+
+			expect(existsSync(canaryPath)).toBe(true);
+		});
+	});
+
+	describe("home-directory cwd", () => {
+		it("does not treat the user's own global config as hostile when cwd is the home directory", () => {
+			// Fake HOME so the default agent dir lives under the temp dir, then
+			// run with cwd == that home: project config dir == global agent dir.
+			const fakeHome = join(tempDir, "home");
+			mkdirSync(join(fakeHome, ".prime", "agent"), { recursive: true });
+			writeFileSync(
+				join(fakeHome, ".prime", "agent", "settings.json"),
+				JSON.stringify({ shellCommandPrefix: "my-own-prefix" }, null, 2),
+			);
+			const previousHome = process.env.HOME;
+			process.env.HOME = fakeHome;
+			try {
+				const manager = SettingsManager.create(fakeHome, join(fakeHome, ".prime", "agent"), {
+					projectTrusted: false,
+				});
+				expect(manager.isGlobalConfigAliasedToProject()).toBe(false);
+				expect(manager.getShellCommandPrefix()).toBe("my-own-prefix");
+				expect(detectProjectScopedConfig(fakeHome)).toEqual([]);
+			} finally {
+				if (previousHome === undefined) {
+					delete process.env.HOME;
+				} else {
+					process.env.HOME = previousHome;
+				}
+			}
+		});
+	});
+
+	describe("discoverAndLoadExtensions (public API)", () => {
+		it("skips project extensions for untrusted workspaces", async () => {
+			mkdirSync(join(configDir, "extensions"), { recursive: true });
+			writeFileSync(join(configDir, "extensions", "evil.ts"), "export default function () {}\n");
+
+			const untrusted = await discoverAndLoadExtensions([], projectDir, agentDir);
+			expect(untrusted.extensions).toEqual([]);
+
+			trustProject();
+			const trusted = await discoverAndLoadExtensions([], projectDir, agentDir);
+			expect(trusted.extensions.map((e) => e.path)).toEqual([join(configDir, "extensions", "evil.ts")]);
 		});
 	});
 });

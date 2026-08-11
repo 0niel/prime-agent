@@ -787,6 +787,20 @@ export class DefaultPackageManager implements PackageManager {
 		this.progressCallback = callback;
 	}
 
+	/**
+	 * Whether user-scoped ("global") packages and resource directories are
+	 * safe to load. A portable agentDir inside the project config directory
+	 * makes them project-committed content, so they count only when the
+	 * project itself is trusted.
+	 */
+	private globalScopeTrusted(): boolean {
+		return this.settingsManager.isProjectTrusted() || !this.settingsManager.isGlobalConfigAliasedToProject();
+	}
+
+	private effectiveGlobalSettings(): ReturnType<SettingsManager["getGlobalSettings"]> {
+		return this.globalScopeTrusted() ? this.settingsManager.getGlobalSettings() : {};
+	}
+
 	addSourceToSettings(source: string, options?: { local?: boolean }): boolean {
 		const scope: SourceScope = options?.local ? "project" : "user";
 		const currentSettings =
@@ -865,7 +879,7 @@ export class DefaultPackageManager implements PackageManager {
 
 	async resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
-		const globalSettings = this.settingsManager.getGlobalSettings();
+		const globalSettings = this.effectiveGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 		// Workspace trust: an untrusted project contributes no packages, resource
 		// entries, or auto-discovered directories. Committed configuration must
@@ -1015,7 +1029,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	async update(source?: string): Promise<void> {
-		const globalSettings = this.settingsManager.getGlobalSettings();
+		const globalSettings = this.effectiveGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 		// Workspace trust: updating installs package-controlled code (npm
 		// lifecycle scripts, git checkouts), so untrusted projects contribute
@@ -1151,7 +1165,7 @@ export class DefaultPackageManager implements PackageManager {
 			return [];
 		}
 
-		const globalSettings = this.settingsManager.getGlobalSettings();
+		const globalSettings = this.effectiveGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
 		if (this.settingsManager.isProjectTrusted()) {
@@ -2241,16 +2255,25 @@ export class DefaultPackageManager implements PackageManager {
 			);
 		}
 
-		addResources(
-			"extensions",
-			collectAutoExtensionEntries(userDirs.extensions),
-			userMetadata,
-			userOverrides.extensions,
-			globalBaseDir,
-		);
+		// User-scoped directories live under agentDir; when that is aliased into
+		// the project they are project-committed and load only with trust. The
+		// home-based ~/.agents/skills directory is always the user's own.
+		const globalAutoDirsTrusted = this.globalScopeTrusted();
+		if (globalAutoDirsTrusted) {
+			addResources(
+				"extensions",
+				collectAutoExtensionEntries(userDirs.extensions),
+				userMetadata,
+				userOverrides.extensions,
+				globalBaseDir,
+			);
+		}
 		addResources(
 			"skills",
-			[...collectAutoSkillEntries(userDirs.skills, "pi"), ...collectAutoSkillEntries(userAgentsSkillsDir, "agents")],
+			[
+				...(globalAutoDirsTrusted ? collectAutoSkillEntries(userDirs.skills, "pi") : []),
+				...collectAutoSkillEntries(userAgentsSkillsDir, "agents"),
+			],
 			userMetadata,
 			userOverrides.skills,
 			globalBaseDir,
@@ -2285,20 +2308,22 @@ export class DefaultPackageManager implements PackageManager {
 			];
 			addResources("skills", builtinEntries, builtinMetadata, builtinSkillOverrides, this.bundledSkillsDir);
 		}
-		addResources(
-			"prompts",
-			collectAutoPromptEntries(userDirs.prompts),
-			userMetadata,
-			userOverrides.prompts,
-			globalBaseDir,
-		);
-		addResources(
-			"themes",
-			collectAutoThemeEntries(userDirs.themes),
-			userMetadata,
-			userOverrides.themes,
-			globalBaseDir,
-		);
+		if (globalAutoDirsTrusted) {
+			addResources(
+				"prompts",
+				collectAutoPromptEntries(userDirs.prompts),
+				userMetadata,
+				userOverrides.prompts,
+				globalBaseDir,
+			);
+			addResources(
+				"themes",
+				collectAutoThemeEntries(userDirs.themes),
+				userMetadata,
+				userOverrides.themes,
+				globalBaseDir,
+			);
+		}
 	}
 
 	private collectFilesFromPaths(paths: string[], resourceType: ResourceType): string[] {

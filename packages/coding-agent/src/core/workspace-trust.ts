@@ -27,7 +27,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME } from "../config.js";
 
@@ -57,7 +57,23 @@ export function canonicalizeWorkspacePath(path: string): string {
 	try {
 		return realpathSync.native(resolved);
 	} catch {
-		return resolved;
+		// The path does not exist: canonicalize the nearest existing ancestor so
+		// symlinked prefixes still resolve consistently with existing paths.
+		const missing: string[] = [];
+		let current = resolved;
+		while (true) {
+			const parent = dirname(current);
+			if (parent === current) {
+				return resolved;
+			}
+			missing.unshift(basename(current));
+			current = parent;
+			try {
+				return join(realpathSync.native(current), ...missing);
+			} catch {
+				// Keep walking up.
+			}
+		}
 	}
 }
 
@@ -71,6 +87,19 @@ export function isWithinProjectConfigDir(target: string, cwd: string): boolean {
 	const root = canonicalizeWorkspacePath(join(cwd, CONFIG_DIR_NAME));
 	const resolved = canonicalizeWorkspacePath(target);
 	return resolved === root || resolved.startsWith(root + sep);
+}
+
+/**
+ * Whether the project's config directory is the user's own global config
+ * directory (home-directory cwd with the default agent dir). Those files are
+ * the user's own configuration, not checkout-controlled content, so the
+ * aliasing guards must not treat them as hostile.
+ */
+export function isProjectConfigDirTheUserGlobalDir(cwd: string): boolean {
+	return (
+		canonicalizeWorkspacePath(join(cwd, CONFIG_DIR_NAME)) ===
+		canonicalizeWorkspacePath(join(homedir(), CONFIG_DIR_NAME))
+	);
 }
 
 interface WorkspaceTrustFile {
@@ -102,7 +131,10 @@ export class WorkspaceTrustStore {
 	) {}
 
 	static create(agentDir: string): WorkspaceTrustStore {
-		return new WorkspaceTrustStore(join(agentDir, TRUST_FILE_NAME), readTrustFile(join(agentDir, TRUST_FILE_NAME)));
+		// Canonicalize so differently-spelled agent dirs (/tmp vs /private/tmp)
+		// share one file and one lock path.
+		const filePath = join(canonicalizeWorkspacePath(agentDir), TRUST_FILE_NAME);
+		return new WorkspaceTrustStore(filePath, readTrustFile(filePath));
 	}
 
 	isTrusted(cwd: string): boolean {
@@ -152,7 +184,9 @@ export class WorkspaceTrustStore {
 
 	private writeFile(trusted: Set<string>): void {
 		const contents: WorkspaceTrustFile = { version: 1, trusted: [...trusted].sort() };
-		const tmpPath = `${this.filePath}.tmp`;
+		// Per-process tmp name: concurrent first-writers must not rename each
+		// other's staging file out from under themselves.
+		const tmpPath = `${this.filePath}.${process.pid}.tmp`;
 		writeFileSync(tmpPath, `${JSON.stringify(contents, null, 2)}\n`, "utf-8");
 		renameSync(tmpPath, this.filePath);
 	}
@@ -295,6 +329,11 @@ function collectAncestorAgentsSkillDirs(cwd: string): string[] {
  */
 export function detectProjectScopedConfig(cwd: string): ProjectScopedConfigFinding[] {
 	const findings: ProjectScopedConfigFinding[] = [];
+	// Running from the home directory: the "project" config dir is the user's
+	// own global one; there is nothing checkout-controlled to report.
+	if (isProjectConfigDirTheUserGlobalDir(cwd)) {
+		return findings;
+	}
 	const configDir = join(cwd, CONFIG_DIR_NAME);
 
 	const extensionCount = countExtensionEntries(join(configDir, "extensions"));
