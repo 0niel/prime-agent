@@ -52,6 +52,7 @@ import {
 	createAgentSessionServices,
 } from "./core/agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
+import { composeMcpRuntimeProjectAdmission } from "./core/mcp/mcp-runtime-composition.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
@@ -735,6 +736,11 @@ async function prepareRuntimeServices(options: {
 }): Promise<PreparedRuntimeServices> {
 	const { config, sessionManager } = options;
 	const effectiveAgentDir = config.agentDir ?? options.agentDir;
+	// Read global scope and mint opaque admission before SettingsManager.create()
+	// can read the project scope. SDK callers omit this and remain user-only.
+	const mcpProjectAdmission = composeMcpRuntimeProjectAdmission(
+		SettingsManager.loadGlobalSettings(options.cwd, effectiveAgentDir), options.cwd,
+	);
 	const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
 		usePrimeCliConfig: effectiveAgentDir === options.agentDir,
 	});
@@ -742,6 +748,7 @@ async function prepareRuntimeServices(options: {
 		cwd: options.cwd,
 		agentDir: effectiveAgentDir,
 		authStorage,
+		mcpProjectAdmission,
 		extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
 		// Subagents share the parent's Herdr pane; their own reporter would race
 		// the parent's and a subagent quit would release the still-active pane.

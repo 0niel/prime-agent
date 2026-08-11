@@ -2,7 +2,7 @@ import { mkdtempSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { composeMcpProjectDeclarationAdmission } from "../src/cli/public-command.js";
+import { composeMcpRuntimeProjectAdmission } from "../src/core/mcp/mcp-runtime-composition.js";
 import { executeMcpDeclarationCommand, parseMcpDeclarationCommand } from "../src/core/mcp/mcp-declaration-command.js";
 import { SettingsManager, type SettingsScope, type SettingsStorage } from "../src/core/settings-manager.js";
 
@@ -30,7 +30,7 @@ function storage(global: unknown, project: unknown): TrackingStorage {
 }
 
 function admitFromGlobalStorage(store: TrackingStorage, workingDirectory: string) {
-	return composeMcpProjectDeclarationAdmission(command(), SettingsManager.loadGlobalSettingsFromStorage(store), workingDirectory);
+	return composeMcpRuntimeProjectAdmission(SettingsManager.loadGlobalSettingsFromStorage(store), workingDirectory);
 }
 
 const command = () => parseMcpDeclarationCommand(["list", "--project"]);

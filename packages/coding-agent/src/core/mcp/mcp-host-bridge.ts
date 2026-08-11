@@ -98,6 +98,9 @@ export class McpHostBridge {
 		const timer = setTimeout(abort, this.timeout);
 		try {
 			const headers: Record<string, string> = { Accept: "application/json, text/event-stream", "Content-Type": "application/json" };
+			// The initialize request negotiates the version in params. Every later
+			// protocol message carries the negotiated version explicitly.
+			if (message.method !== "initialize") headers["MCP-Protocol-Version"] = "2025-03-26";
 			// The only credential header that can ever cross this boundary is this host-derived bearer.
 			if (token) headers.Authorization = `Bearer ${token}`;
 			if (state.sessionId) headers["Mcp-Session-Id"] = state.sessionId;

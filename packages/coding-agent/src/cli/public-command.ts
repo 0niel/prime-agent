@@ -1,8 +1,7 @@
 import chalk from "chalk";
 import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { executeMcpDeclarationCommand, parseMcpDeclarationCommand } from "../core/mcp/mcp-declaration-command.js";
-import { createMcpProjectTrustAuthority } from "../core/index.js";
-import { admitProjectMcpDeclarations } from "../core/mcp/mcp-project-trust.js";
+import { composeMcpRuntimeProjectAdmission } from "../core/mcp/mcp-runtime-composition.js";
 import { SettingsManager, type Settings } from "../core/settings-manager.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
@@ -152,28 +151,13 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 }
 
 
-/**
- * Sole public-command composition point for project MCP policy. It receives a
- * SettingsManager already loaded by the CLI and reads only its global snapshot.
- * A project settings value can never create a grant.
- */
+/** Compatibility command wrapper around the Core global-only admission helper. */
 export function composeMcpProjectDeclarationAdmission(
 	command: ReturnType<typeof parseMcpDeclarationCommand>,
 	globalSettings: Pick<Settings, "mcpProjectTrustPolicy">,
 	workingDirectory: string,
 ) {
-	if (command.scope !== "project") return undefined;
-	const globalPolicy = globalSettings.mcpProjectTrustPolicy;
-	const authority = createMcpProjectTrustAuthority({
-		revision: typeof globalPolicy?.revision === "string" ? globalPolicy.revision : "",
-		allowedProjectDirectories:
-			Array.isArray(globalPolicy?.allowedProjectDirectories) && globalPolicy.allowedProjectDirectories.every((path) => typeof path === "string")
-				? globalPolicy.allowedProjectDirectories
-				: [],
-	});
-	// The only raw-path authorization. Downstream receives no path or authority
-	// policy, only the opaque admission returned here.
-	return admitProjectMcpDeclarations(workingDirectory, authority);
+	return command.scope === "project" ? composeMcpRuntimeProjectAdmission(globalSettings, workingDirectory) : undefined;
 }
 
 async function runMcpDeclarationCommand(args: string[]): Promise<PublicCommandResult> {

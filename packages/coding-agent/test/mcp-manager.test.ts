@@ -212,4 +212,31 @@ describe("McpManager", () => {
 		expect(deleteAttempts).toBe(1); expect(refreshCalls).toBe(1);
 	});
 
+	it("reference-counts concurrent close leases so old expired cleanup never refreshes", async () => {
+		const store = new McpOAuthSecretStore(new MemoryKeychain());
+		const binding = { mcpEndpoint: "https://mcp.linear.app/mcp", authServer: "https://auth.linear.test/", tokenEndpoint: "https://auth.linear.test/token", clientId: "client", scopes: "read" };
+		const reference = await store.put(MCP_OAUTH_SECRET_NAMESPACE, new TextEncoder().encode(JSON.stringify({ access: "old", refresh: "r", binding })));
+		authStorage.set("mcp:linear", { type: "mcp_oauth", kind: "opaque", secretReference: reference, ...binding, expires: Date.now() - 1 });
+		let refreshes = 0; const manager = new McpManager({ authStorage, secretStore: store });
+		registerOAuthProvider({ id: "mcp:linear", name: "Linear", login: async () => { throw new Error("unused"); }, getApiKey: () => { throw new Error("unused"); }, refreshToken: async () => { refreshes++; throw new Error("must not refresh during close"); } });
+		const raw = manager as unknown as { beginClosingCredential(server: string): void; endClosingCredential(server: string): void };
+		raw.beginClosingCredential("linear"); raw.beginClosingCredential("linear"); raw.endClosingCredential("linear");
+		await expect(manager.withOAuthAccessToken("linear", async (token) => token)).resolves.toBe("old");
+		expect(refreshes).toBe(0);
+		raw.endClosingCredential("linear");
+	});
+
+	it("single-flights concurrent forced refreshes to one rotation", async () => {
+		const store = new McpOAuthSecretStore(new MemoryKeychain());
+		const binding = { mcpEndpoint: "https://mcp.linear.app/mcp", authServer: "https://auth.linear.test/", tokenEndpoint: "https://auth.linear.test/token", clientId: "client", scopes: "read" };
+		const reference = await store.put(MCP_OAUTH_SECRET_NAMESPACE, new TextEncoder().encode(JSON.stringify({ access: "old", refresh: "r", binding })));
+		authStorage.set("mcp:linear", { type: "mcp_oauth", kind: "opaque", secretReference: reference, ...binding, expires: Date.now() - 1 });
+		let rotations = 0; let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+		const manager = new McpManager({ authStorage, secretStore: store });
+		registerOAuthProvider({ id: "mcp:linear", name: "Linear", login: async () => { throw new Error("unused"); }, getApiKey: () => { throw new Error("unused"); }, refreshToken: async () => { rotations++; await gate; const next = await store.put(MCP_OAUTH_SECRET_NAMESPACE, new TextEncoder().encode(JSON.stringify({ access: "new", refresh: "r", binding }))); return { kind: "opaque", secretReference: next, ...binding, expires: Date.now() + 60_000 }; } });
+		const first = manager.withOAuthAccessToken("linear", async (token) => token, true); const second = manager.withOAuthAccessToken("linear", async (token) => token, true);
+		await new Promise((resolve) => setTimeout(resolve, 0)); expect(rotations).toBe(1); release();
+		await expect(Promise.all([first, second])).resolves.toEqual(["new", "new"]); expect(rotations).toBe(1);
+	});
+
 });

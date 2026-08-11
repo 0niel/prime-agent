@@ -27,7 +27,9 @@ describe("MCP host bridge", () => {
 		expect(new Set(ids).size).toBe(ids.length);
 		for (const [index, call] of fetch.mock.calls.entries()) {
 			const headers = new Headers(call[1]?.headers);
+			const message = messages[index]!;
 			expect(headers.get("authorization")).toBe("Bearer secret");
+			expect(headers.get("mcp-protocol-version")).toBe(message.method === "initialize" ? null : "2025-03-26");
 			if (index > 0) expect(headers.get("mcp-session-id")).toBe("session");
 			expect([...headers.keys()].filter((name) => name.startsWith("x-")).length).toBe(0);
 		}

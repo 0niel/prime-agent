@@ -120,8 +120,14 @@ export class McpManager {
 	private registeredUserProviderIds = new Set<string>();
 	private readonly hostBridge: McpHostBridge;
 	private readonly runtimeDeclarationSnapshot?: McpRuntimeDeclarationSnapshot;
-	/** Allows an authenticated close to use the old sealed access token before rotation. */
-	private readonly closingCredentialServers = new Set<string>();
+	/** Per-server close leases keep every concurrent authenticated DELETE on its old token. */
+	private readonly closingCredentialServers = new Map<string, number>();
+	/** Deduplicates concurrent forced refreshes of the same server/endpoint/secret binding. */
+	private readonly refreshFlights = new Map<string, Promise<McpOAuthPublicRecord>>();
+	private refreshFlightKey(server: string, current: McpOAuthPublicRecord): string { return `${server}\0${current.mcpEndpoint}\0${current.secretReference.revision}`; }
+	private beginClosingCredential(server: string): void { this.closingCredentialServers.set(server, (this.closingCredentialServers.get(server) ?? 0) + 1); }
+	private endClosingCredential(server: string): void { const count = this.closingCredentialServers.get(server) ?? 0; if (count <= 1) this.closingCredentialServers.delete(server); else this.closingCredentialServers.set(server, count - 1); }
+	private isClosingCredential(server: string): boolean { return (this.closingCredentialServers.get(server) ?? 0) > 0; }
 
 	constructor(options: McpManagerOptions) {
 		this.authStorage = options.authStorage;
@@ -130,7 +136,7 @@ export class McpManager {
 		this.secretStore = options.secretStore;
 		this.runtimeDeclarationSnapshot = options.runtimeDeclarationSnapshot;
 		this.hostBridge = new McpHostBridge({
-			withOAuthAccessToken: (server, operation, forceRefresh) => this.withOAuthAccessToken(server, operation, forceRefresh),
+			withOAuthAccessToken: (server, operation, forceRefresh) => this.withOAuthAccessToken(server, operation, forceRefresh, false),
 			resolveBinding: (binding) => {
 				const integration = this.integrations.get(binding.server);
 				const endpoint = integration && canonicalEndpoint(integration.url);
@@ -139,9 +145,9 @@ export class McpManager {
 			beforeForceRefresh: async (binding) => {
 				// The pre-refresh DELETE must use the old sealed token even if its
 				// expiry clock has elapsed; otherwise cleanup recurses into refresh.
-				this.closingCredentialServers.add(binding.server);
+				this.beginClosingCredential(binding.server);
 				try { await this.hostBridge.closeBinding(binding); }
-				finally { this.closingCredentialServers.delete(binding.server); }
+				finally { this.endClosingCredential(binding.server); }
 			},
 		});
 		this.resolveIntegrations();
@@ -259,27 +265,37 @@ export class McpManager {
 		return overrides;
 	}
 
-	private async refreshOpaqueRecord(server: string, integration: ResolvedIntegration, current: McpOAuthPublicRecord): Promise<McpOAuthPublicRecord> {
+	private async refreshOpaqueRecordUnshared(server: string, integration: ResolvedIntegration, current: McpOAuthPublicRecord): Promise<McpOAuthPublicRecord> {
 		const endpoint = canonicalEndpoint(integration.url);
 		const provider = getOAuthProvider(this.providerId(server));
 		if (!endpoint || !provider || !this.secretStore) throw new Error("MCP OAuth credentials are unavailable.");
-		this.closingCredentialServers.add(server);
+		this.beginClosingCredential(server);
 		try { await this.hostBridge.closeBinding(this.bindingFor(server, integration, endpoint)); }
 		catch { /* old-session cleanup is non-authoritative; refresh remains authoritative */ }
-		finally { this.closingCredentialServers.delete(server); }
+		finally { this.endClosingCredential(server); }
 		const refreshed = await provider.refreshToken({ kind: "opaque", secretReference: current.secretReference, mcpEndpoint: current.mcpEndpoint, authServer: current.authServer, tokenEndpoint: current.tokenEndpoint, clientId: current.clientId, scopes: current.scopes, expires: current.expires });
 		const rotated = toOpaqueCredential(refreshed, endpoint);
 		if (!rotated || !this.authStorage.replaceMcpOAuthCredential(this.providerId(server), current.secretReference, rotated)) throw new Error("MCP OAuth credentials changed during refresh.");
 		return rotated;
 	}
 
+	private refreshOpaqueRecord(server: string, integration: ResolvedIntegration, current: McpOAuthPublicRecord): Promise<McpOAuthPublicRecord> {
+		const key = this.refreshFlightKey(server, current);
+		const inFlight = this.refreshFlights.get(key);
+		if (inFlight) return inFlight;
+		const refresh = this.refreshOpaqueRecordUnshared(server, integration, current);
+		this.refreshFlights.set(key, refresh);
+		void refresh.finally(() => { if (this.refreshFlights.get(key) === refresh) this.refreshFlights.delete(key); }).catch(() => {});
+		return refresh;
+	}
+
 	/** Host-only transient token retrieval. Never expose this through a kernel/RPC handler. */
-	async withOAuthAccessToken<T>(server: string, operation: (accessToken: string) => Promise<T>, forceRefresh = false): Promise<T> {
+	async withOAuthAccessToken<T>(server: string, operation: (accessToken: string) => Promise<T>, forceRefresh = false, refreshExpired = true): Promise<T> {
 		const integration = this.integrations.get(server);
 		const endpoint = integration && canonicalEndpoint(integration.url);
 		const stored = this.authStorage.get(this.providerId(server));
 		if (!integration || !endpoint || !this.secretStore || !isBoundMcpOAuth(stored, endpoint)) throw new Error("MCP OAuth credentials are unavailable.");
-		const record = forceRefresh || (Date.now() >= stored.expires && !this.closingCredentialServers.has(server)) ? await this.refreshOpaqueRecord(server, integration, stored) : stored;
+		const record = forceRefresh || (refreshExpired && Date.now() >= stored.expires && !this.isClosingCredential(server)) ? await this.refreshOpaqueRecord(server, integration, stored) : stored;
 		const expected: McpOAuthBinding = { mcpEndpoint: endpoint, authServer: record.authServer, tokenEndpoint: record.tokenEndpoint, clientId: record.clientId, scopes: record.scopes };
 		const accessToken = await getMcpOAuthAccessToken(record, expected, createS01SecretPort(this.secretStore));
 		return operation(accessToken);
@@ -333,6 +349,10 @@ export class McpManager {
 				const endpoint = canonicalEndpoint(integration.url);
 				if (!endpoint) throw new Error("MCP integration endpoint is invalid.");
 				if (integration.usesOAuth && !this.isAuthed(integration)) throw new Error("MCP OAuth credentials are unavailable.");
+				// Proactively rotate before constructing the bridge binding. This prevents
+				// an expired first request from initializing an epoch that refresh retires.
+				if (integration.usesOAuth) await this.withOAuthAccessToken(server, async () => undefined);
+				requireCurrent(context);
 				return { result: await this.hostBridge.request(this.bindingFor(server, integration, endpoint), method, payload.params, context) };
 			},
 		};

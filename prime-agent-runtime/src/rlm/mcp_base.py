@@ -49,7 +49,7 @@ class McpToolError(RuntimeError):
 
 
 class McpIntegration:
-    """Subclass and set :attr:`server` (and :attr:`url` for remote servers).
+    """Subclass and set :attr:`server` (for the host-owned remote endpoint).
 
     Tools are discovered on first use and bound as async methods via
     ``__getattr__``; ``await self.call_tool(name, args)`` is the explicit escape
@@ -59,8 +59,6 @@ class McpIntegration:
     #: Integration key used solely for host configuration lookups.
     server: str = ""
 
-    #: Remote MCP endpoint. Required unless a subclass overrides ``_open_streams``.
-    url: str | None = None
 
     def __init__(self) -> None:
         if not self.server:

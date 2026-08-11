@@ -13,6 +13,7 @@ import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
 import { createMcpRuntimeDeclarationSnapshot, type McpRuntimeDeclarationSnapshot } from "./mcp/mcp-runtime-declaration-snapshot.js";
+import type { ProjectMcpDeclarationAdmission } from "./mcp/mcp-project-trust.js";
 import type { McpOAuthSecretStore } from "./mcp/mcp-secret-store.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
@@ -46,6 +47,8 @@ export interface CreateAgentSessionServicesOptions {
 	mcpOAuthSecretStore?: McpOAuthSecretStore;
 	/** Already-admitted Core declaration snapshot. Supplying it avoids all project reads here. */
 	mcpRuntimeDeclarationSnapshot?: McpRuntimeDeclarationSnapshot;
+	/** Opaque Core admission minted before this service opens project settings. SDK defaults user-only. */
+	mcpProjectAdmission?: ProjectMcpDeclarationAdmission;
 	cwd: string;
 	agentDir?: string;
 	authStorage?: AuthStorage;
@@ -191,11 +194,14 @@ export async function createAgentSessionServices(
 
 	// MCP integrations: registers OAuth providers and gates the built-in
 	// integration skills by whether the user is logged in (enable-by-login).
+	const projectAdmission = options.mcpProjectAdmission;
 	const mcpRuntimeDeclarationSnapshot = options.mcpRuntimeDeclarationSnapshot ?? createMcpRuntimeDeclarationSnapshot({
-		// User settings are read once into an immutable Core snapshot. Project
-		// declarations require an explicit opaque admission and are therefore
-		// intentionally absent on this ordinary service-construction path.
+		// The project reader is present only after opaque global-policy admission;
+		// snapshot validates it before invoking this callback, so denied/project
+		// policy failures produce zero project-declaration reads.
 		userDocument: settingsManager.getMcpDeclarationDocument("user"),
+		projectAdmission,
+		...(projectAdmission ? { readProjectDocument: () => settingsManager.getMcpDeclarationDocument("project") } : {}),
 	});
 	const mcpManager = new McpManager({
 		authStorage,
