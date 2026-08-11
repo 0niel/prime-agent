@@ -97,10 +97,14 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "xhigh"]);
 	});
 
-	it("includes only high/xhigh plus off for DeepSeek V4 Flash on opencode-go", () => {
+	it("uses the default thinking levels for DeepSeek V4 Flash on opencode-go (anthropic-messages route)", () => {
+		// The opencode-go zen catalog serves this model through anthropic-messages
+		// (not the DeepSeek openai-completions format), so the DeepSeek-specific
+		// high/xhigh mapping does not apply on this provider.
 		const model = getModel("opencode-go", "deepseek-v4-flash");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "xhigh"]);
+		expect(model!.api).toBe("anthropic-messages");
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "minimal", "low", "medium", "high"]);
 	});
 
 	it("includes only high/xhigh plus off for DeepSeek V4 Flash on OpenRouter", () => {
