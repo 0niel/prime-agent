@@ -131,8 +131,9 @@ describe("McpManager", () => {
 		expect(await handlers["mcp.config"]({ server: "linear" })).toEqual({
 			url: "https://proxy.test/mcp",
 			headers: { "X-Extra": "1" },
+			hostOAuthOnly: true,
 		});
-		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({ url: "https://mcp.notion.com/mcp" });
+		expect(await handlers["mcp.config"]({ server: "notion" })).toEqual({ url: "https://mcp.notion.com/mcp", hostOAuthOnly: true });
 	});
 
 	it("does not treat an oauth override of a catalog name as authed via the official stored cred", () => {

@@ -8,20 +8,15 @@ methods, so the agent writes ordinary Python:
     import linear
     issues = await linear.list_issues(team="Engineering")
 
-Credentials live in the host's ``auth.json`` (single store, survives kernel
-rebuilds). This module reads that file directly for the common case; on token
-expiry it asks the host to refresh via ``rlm.host_request("mcp.refresh", ...)``
-and re-reads. Interactive login runs host-side, never here.
+OAuth credentials remain host-only. M02 deliberately has no kernel token path;
+interactive login and typed host transport ownership are host-side.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-import time
 from contextlib import AsyncExitStack
-from pathlib import Path
 from typing import Any
 
 from . import host_request
@@ -53,43 +48,6 @@ class McpToolError(RuntimeError):
     """Raised when an MCP tool call returns a result flagged as an error."""
 
 
-def _agent_dir() -> Path:
-    """Resolve the Prime Agent config dir the same way the rest of the runtime does."""
-    raw = (
-        os.environ.get("PRIME_AGENT_CODING_AGENT_DIR")
-        or os.environ.get("PI_CODING_AGENT_DIR")
-        or str(Path.home() / ".prime" / "agent")
-    )
-    # resolve() so a relative env override reads auth.json from the right place,
-    # not relative to the kernel's cwd.
-    return Path(raw).expanduser().resolve()
-
-
-def _read_auth(provider: str) -> dict[str, Any] | None:
-    """Read one credential entry from auth.json. Returns None if absent/unreadable."""
-    try:
-        data = json.loads((_agent_dir() / "auth.json").read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    cred = data.get(provider)
-    return cred if isinstance(cred, dict) else None
-
-
-def _resolve_config_value(value: str) -> str:
-    """Resolve a stored api_key value the way the host does.
-
-    A value may be a literal, an env-var name, or a `!command` indirection. The
-    command form can't run safely in the kernel (the host injects those resolved),
-    so skip it; otherwise treat the value as an env-var name if set, else literal.
-    """
-    value = value.strip()
-    if not value or value.startswith("!"):
-        return ""
-    return (os.environ.get(value) or value).strip()
-
-
 def _resolve_streamable_http():
     """Return an SDK streamable-HTTP transport callable.
 
@@ -117,15 +75,11 @@ class McpIntegration:
     hatch and the hook for hand-written typed wrappers.
     """
 
-    #: Credential / config key for this integration (matches the auth.json entry
-    #: ``mcp:<server>`` and the mcpServers settings key).
+    #: Integration key used solely for host configuration lookups.
     server: str = ""
 
     #: Remote MCP endpoint. Required unless a subclass overrides ``_open_streams``.
     url: str | None = None
-
-    #: Optional env var holding a static bearer token (used instead of auth.json OAuth).
-    bearer_token_env: str | None = None
 
     def __init__(self) -> None:
         if not self.server:
@@ -139,90 +93,48 @@ class McpIntegration:
     def _provider_id(self) -> str:
         return f"mcp:{self.server}"
 
-    def _token(self) -> str | None:
-        """Current usable bearer token, or None if missing/expired (needs refresh).
-
-        A static bearer-token env var wins (matches the host's `isAuthed` check);
-        otherwise read auth.json. OAuth tokens are only returned while still fresh.
-        """
-        if self.bearer_token_env:
-            env_token = os.environ.get(self.bearer_token_env, "").strip()
-            if env_token:
-                return env_token
-        cred = _read_auth(self._provider_id)
-        if cred is None:
-            return None
-        if cred.get("type") == "api_key":
-            return _resolve_config_value(str(cred.get("key") or "")) or None
-        # OAuth credential: {access, refresh, expires(ms)}.
-        access = str(cred.get("access") or "")
-        expires = cred.get("expires")
-        fresh = isinstance(expires, (int, float)) and (
-            time.time() * 1000 < expires - _EXPIRY_SKEW_SECONDS * 1000
-        )
-        if access and fresh:
-            return access
-        return None  # signal: needs refresh
-
     async def _resolve_token(self) -> str:
-        token = self._token()
-        if token:
-            return token
-        # Expired or missing-access: ask the host to refresh, then re-validate via
-        # _token() (which re-checks expiry) rather than trusting any access value.
-        if _read_auth(self._provider_id) is not None:
-            refresh_error: Exception | None = None
-            try:
-                await host_request("mcp.refresh", {"server": self.server})
-            except RuntimeError as exc:
-                refresh_error = exc
-            token = self._token()
-            if token:
-                return token
-            # A refresh that failed (vs. genuinely-absent creds) is a recoverable
-            # error; don't mislabel it as "not enabled / re-login".
-            if refresh_error is not None:
-                raise RuntimeError(
-                    f"Failed to refresh credentials for '{self.server}': {refresh_error}"
-                ) from refresh_error
+        """M02 has no kernel-visible OAuth token path. M03 owns host transport."""
         raise NotEnabled(self.server)
 
     # -- connection ---------------------------------------------------------
 
-    async def _resolve_config(self) -> tuple[str | None, dict[str, str]]:
-        """Host-resolved (url, extra_headers), honoring a user's mcpServers override.
-        Falls back to the class ``url`` and no extra headers on host error."""
+    async def _resolve_config(self) -> tuple[str | None, dict[str, str], bool]:
+        """Host-resolved endpoint configuration. OAuth is never kernel-owned."""
         try:
             cfg = await host_request("mcp.config", {"server": self.server})
         except RuntimeError:
             cfg = {}
         url = cfg.get("url") if isinstance(cfg, dict) else None
         headers = cfg.get("headers") if isinstance(cfg, dict) else None
+        host_oauth_only = cfg.get("hostOAuthOnly") is True if isinstance(cfg, dict) else False
         if not (isinstance(url, str) and url):
             url = self.url
         extra = headers if isinstance(headers, dict) else {}
-        return url, {str(k): str(v) for k, v in extra.items()}
+        return url, {str(k): str(v) for k, v in extra.items()}, host_oauth_only
 
     async def _open_session(self, stack: AsyncExitStack):
         """Open an initialized MCP ClientSession bound to ``stack``.
 
         Override for non-HTTP transports (e.g. stdio). The default connects over
-        streamable HTTP with a Bearer token from auth.json. The URL comes from the
-        host (mcpServers override) when available, else ``self.url``.
+        credential-free streamable HTTP. OAuth endpoints fail closed until M03
+        provides the host-owned typed transport. The URL is host-resolved.
         """
-        import inspect  # noqa: PLC0415
-
-        from mcp import ClientSession  # noqa: PLC0415
-
-        url, extra_headers = await self._resolve_config()
+        # Check host policy before importing the MCP SDK so an OAuth endpoint
+        # cannot create a transport or token-adjacent dependency in Python.
+        url, extra_headers, host_oauth_only = await self._resolve_config()
+        if host_oauth_only:
+            raise NotEnabled(self.server)
         if not url:
             raise ValueError(
                 f"{type(self).__name__} must set `url` or override `_open_session`"
             )
-        token = await self._resolve_token()
+        import inspect  # noqa: PLC0415
+        from mcp import ClientSession  # noqa: PLC0415
         transport = _resolve_streamable_http()
-        # Extra configured headers first, Authorization last so it always wins.
-        auth_header = {**extra_headers, "Authorization": f"Bearer {token}"}
+        # M02 never reads OAuth secrets or manufactures authentication headers in Python.
+        # Anonymous endpoints retain only explicit non-secret host headers.
+        auth_header = dict(extra_headers)
 
         # SDK signatures vary: some take headers=, others only http_client=.
         params = inspect.signature(transport).parameters

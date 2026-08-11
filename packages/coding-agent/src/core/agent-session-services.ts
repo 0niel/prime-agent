@@ -12,6 +12,7 @@ import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
 import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent-state.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
+import type { McpOAuthSecretStore } from "./mcp/mcp-secret-store.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
 import type { SubagentRuntimeHost } from "./rlm-runtime.js";
@@ -40,6 +41,8 @@ export interface AgentSessionRuntimeDiagnostic {
  * reach this function, so later cwd switches do not reinterpret them.
  */
 export interface CreateAgentSessionServicesOptions {
+	/** Optional Core S01 authority. Omission intentionally fails OAuth closed. */
+	mcpOAuthSecretStore?: McpOAuthSecretStore;
 	cwd: string;
 	agentDir?: string;
 	authStorage?: AuthStorage;
@@ -188,6 +191,7 @@ export async function createAgentSessionServices(
 	const mcpManager = new McpManager({
 		authStorage,
 		getUserServers: () => settingsManager.getMcpServers(),
+		secretStore: options.mcpOAuthSecretStore,
 	});
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());

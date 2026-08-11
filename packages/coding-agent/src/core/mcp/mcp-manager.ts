@@ -270,6 +270,9 @@ export class McpManager {
 				const integration = this.integrations.get(server);
 				if (!integration) return {};
 				const config: Record<string, unknown> = { url: integration.url };
+				// OAuth bearer material stays host-only. M03 will supply the typed
+				// request transport; until then the kernel must fail before transport.
+				if (integration.usesOAuth) config.hostOAuthOnly = true;
 				if (integration.headers && Object.keys(integration.headers).length > 0) {
 					config.headers = integration.headers;
 				}

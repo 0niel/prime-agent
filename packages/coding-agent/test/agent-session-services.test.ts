@@ -7,9 +7,18 @@ import { AGENT_MESSAGE_SKILL_NAME, type AgentSessionMessageController } from "..
 import { AGENT_OBSERVE_SKILL_NAME, type AgentObserveController } from "../src/core/agent-observe.js";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { McpOAuthSecretStore, type McpKeychainAdapter } from "../src/core/mcp/mcp-secret-store.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+
+class TestMcpKeychain implements McpKeychainAdapter {
+	private readonly values = new Map<string, Uint8Array>();
+	async create(id: string, value: Uint8Array) { this.values.set(id, Uint8Array.from(value)); }
+	async read(id: string) { const value = this.values.get(id); return value && Uint8Array.from(value); }
+	async replace(id: string, expected: Uint8Array, value: Uint8Array) { const current = this.values.get(id); if (!current || current.length !== expected.length || current.some((entry, index) => entry !== expected[index])) return false; this.values.set(id, Uint8Array.from(value)); return true; }
+	async delete(id: string, expected: Uint8Array) { const current = this.values.get(id); if (!current || current.length !== expected.length || current.some((entry, index) => entry !== expected[index])) return false; this.values.delete(id); return true; }
+}
 
 describe("createAgentSessionFromServices", () => {
 	const cleanupPaths: string[] = [];
@@ -26,6 +35,19 @@ describe("createAgentSessionFromServices", () => {
 				rmSync(path, { recursive: true, force: true });
 			}
 		}
+	});
+
+	it("accepts an explicitly injected Core S01 store for normal service composition", async () => {
+		const tempDir = join(tmpdir(), `pi-session-mcp-store-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+		const secretStore = new McpOAuthSecretStore(new TestMcpKeychain());
+		const services = await createAgentSessionServices({
+			cwd: tempDir, agentDir: tempDir, mcpOAuthSecretStore: secretStore,
+			settingsManager: SettingsManager.inMemory(), noBuiltinHerdrReporter: true,
+			resourceLoaderOptions: { noPromptTemplates: true, noThemes: true },
+		});
+		expect((services.mcpManager as unknown as { secretStore?: unknown }).secretStore).toBe(secretStore);
 	});
 
 	it("shows the telemetry disclosure independently of the Herdr reporter", async () => {
