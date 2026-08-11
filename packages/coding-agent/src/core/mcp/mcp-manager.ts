@@ -136,7 +136,13 @@ export class McpManager {
 				const endpoint = integration && canonicalEndpoint(integration.url);
 				return integration && endpoint === binding.endpoint ? this.bindingFor(binding.server, integration, endpoint) : binding;
 			},
-			beforeForceRefresh: (binding) => this.hostBridge.closeBinding(binding),
+			beforeForceRefresh: async (binding) => {
+				// The pre-refresh DELETE must use the old sealed token even if its
+				// expiry clock has elapsed; otherwise cleanup recurses into refresh.
+				this.closingCredentialServers.add(binding.server);
+				try { await this.hostBridge.closeBinding(binding); }
+				finally { this.closingCredentialServers.delete(binding.server); }
+			},
 		});
 		this.resolveIntegrations();
 		this.registerProviders();

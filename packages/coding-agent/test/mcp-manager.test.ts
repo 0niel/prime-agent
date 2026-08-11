@@ -198,4 +198,18 @@ describe("McpManager", () => {
 		expect((rotated as { secretReference: { revision: string } }).secretReference.revision).not.toBe(oldReference.revision);
 	});
 
+	it("closes an expired old binding without recursive refresh before the single forced rotation", async () => {
+		const store = new McpOAuthSecretStore(new MemoryKeychain());
+		const binding = { mcpEndpoint: "https://mcp.linear.app/mcp", authServer: "https://auth.linear.test/", tokenEndpoint: "https://auth.linear.test/token", clientId: "client", scopes: "read" };
+		const reference = await store.put(MCP_OAUTH_SECRET_NAMESPACE, new TextEncoder().encode(JSON.stringify({ access: "old", refresh: "old-refresh", binding })));
+		authStorage.set("mcp:linear", { type: "mcp_oauth", kind: "opaque", secretReference: reference, ...binding, expires: Date.now() - 1 });
+		let refreshCalls = 0; let deleteAttempts = 0;
+		const manager = new McpManager({ authStorage, secretStore: store });
+		registerOAuthProvider({ id: "mcp:linear", name: "Linear", login: async () => { throw new Error("unused"); }, getApiKey: () => { throw new Error("unused"); }, refreshToken: async () => { refreshCalls++; const next = await store.put(MCP_OAUTH_SECRET_NAMESPACE, new TextEncoder().encode(JSON.stringify({ access: "new", refresh: "r", binding }))); return { kind: "opaque", secretReference: next, ...binding, expires: Date.now() + 60_000 }; } });
+		const raw = manager as unknown as { hostBridge: { closeBinding: (value: unknown) => Promise<void> } };
+		raw.hostBridge.closeBinding = async () => { deleteAttempts++; await manager.withOAuthAccessToken("linear", async (token) => { expect(token).toBe("old"); }); };
+		await expect(manager.withOAuthAccessToken("linear", async (token) => token, true)).resolves.toBe("new");
+		expect(deleteAttempts).toBe(1); expect(refreshCalls).toBe(1);
+	});
+
 });
