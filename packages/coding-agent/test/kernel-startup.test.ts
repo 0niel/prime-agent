@@ -43,25 +43,37 @@ describe("KernelManager startup", () => {
 		const python = join(tempDir, "python");
 		writeExecutable(python, ["#!/bin/sh", "sleep 30", ""].join("\n"));
 		const manager = new KernelManager({ python, cwd: tempDir });
+		let rejectRetry: (error: Error) => void = () => {};
+		let markRetryEntered: () => void = () => {};
+		const retryEntered = new Promise<void>((resolve) => {
+			markRetryEntered = resolve;
+		});
+		let connectionAttempts = 0;
 		const internals = manager as unknown as {
-			doStart: () => Promise<void>;
 			state: "idle" | "starting" | "running" | "shutdown";
 			terminal: boolean;
+			hostRequestsClosed: boolean;
 			waitForResolvedConnection: () => Promise<never>;
 		};
-		internals.waitForResolvedConnection = async () => {
-			throw new Error("connection unavailable");
+		internals.waitForResolvedConnection = () => {
+			connectionAttempts++;
+			if (connectionAttempts === 1) return Promise.reject(new Error("connection unavailable"));
+			return new Promise<never>((_resolve, reject) => {
+				rejectRetry = reject;
+				markRetryEntered();
+			});
 		};
 
 		await expect(manager.start()).rejects.toThrow("connection unavailable");
 		expect(internals.terminal).toBe(false);
 		expect(internals.state).toBe("idle");
 
-		const retryStart = vi.fn(async () => {});
-		internals.doStart = retryStart;
-		await expect(manager.start()).resolves.toBeUndefined();
-		expect(retryStart).toHaveBeenCalledOnce();
+		const retry = manager.start();
+		await retryEntered;
+		expect(internals.hostRequestsClosed).toBe(false);
 		manager.disposeSync();
+		rejectRetry(new Error("connection unavailable"));
+		await expect(retry).rejects.toThrow("connection unavailable");
 	});
 
 	it("keeps disposal during startup terminal", async () => {
@@ -75,6 +87,7 @@ describe("KernelManager startup", () => {
 		});
 		const internals = manager as unknown as {
 			terminal: boolean;
+			hostRequestsClosed: boolean;
 			waitForResolvedConnection: () => Promise<never>;
 		};
 		internals.waitForResolvedConnection = () =>
@@ -90,6 +103,7 @@ describe("KernelManager startup", () => {
 
 		await expect(start).rejects.toThrow("connection unavailable");
 		expect(internals.terminal).toBe(true);
+		expect(internals.hostRequestsClosed).toBe(true);
 		await expect(manager.start()).rejects.toThrow("Kernel was disposed");
 	});
 });
