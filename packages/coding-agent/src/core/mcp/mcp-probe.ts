@@ -122,7 +122,9 @@ export async function runMcpDeclarationProbe(
 		// Keep the raw opening promise so a transport that resolves after our timeout
 		// is still closed. Awaiting only a deadline wrapper would lose that session.
 		// Deferring the call also sends synchronous adapter failures through redaction.
-		opening = Promise.resolve().then(() => transport.open({ url: declaration.url, signal: operationController.signal }));
+		opening = Promise.resolve().then(() =>
+			transport.open({ url: declaration.url, signal: operationController.signal }),
+		);
 		session = await withDeadline(opening, operationController.signal);
 		await withDeadline(
 			session.request({
