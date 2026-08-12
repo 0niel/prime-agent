@@ -5726,7 +5726,7 @@ export class AgentDaemon {
 			from:
 				options.sender ??
 				this.createAgentSessionMessageSender(options.fromState, options.clientId ?? options.origin),
-			fromRelationship: this.agentMessageRelationship(options.fromState, targetState, catalog ?? []),
+			fromRelationship: this.agentMessageRelationship(options.fromState, targetState, catalog),
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {
