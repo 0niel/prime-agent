@@ -2946,7 +2946,12 @@ export class DaemonSupervisor {
 			!isProcessAlive(worker.descriptor.pid)
 		) {
 			// Never recover resident credentials from a descriptor or the daemon's
-			// ambient environment. A new local client resume must supply them.
+			// ambient environment. A new local client resume must supply them. The
+			// dead worker cannot clean up its detached children, but leave uncertain
+			// operations durable until that fresh resume can launch a replacement.
+			await this.assertRecoveryAllowed();
+			this.reapOrphanedWorkerResources(worker);
+			if (this.isWorkerRecoveryCancelled(worker)) return;
 			worker.descriptor.lifecycle = "failed";
 			worker.descriptor.lastError = "Waiting for a client with fresh environment";
 			this.persistWorker(worker);
@@ -2972,6 +2977,9 @@ export class DaemonSupervisor {
 					!worker.recoveryLaunchEnv &&
 					!isProcessAlive(worker.descriptor.pid)
 				) {
+					await this.assertRecoveryAllowed();
+					this.reapOrphanedWorkerResources(worker);
+					if (this.isWorkerRecoveryCancelled(worker)) return;
 					worker.descriptor.lifecycle = "failed";
 					worker.descriptor.lastError = "Waiting for a client with fresh environment";
 					this.persistWorker(worker);
@@ -3086,34 +3094,35 @@ export class DaemonSupervisor {
 		);
 	}
 
+	private reapOrphanedWorkerResources(worker: ResidentWorker): void {
+		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
+		if (!orphanProcessJournalPath) return;
+		try {
+			for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
+				if (!isOrphanProcessIdentityCurrent(orphan)) continue;
+				const { pid } = orphan;
+				try {
+					process.kill(-pid, "SIGKILL");
+				} catch {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {
+						// The detached resource may already have exited.
+					}
+				}
+			}
+			clearOrphanProcessJournal(orphanProcessJournalPath);
+		} catch (error) {
+			this.log(`Could not reap orphaned worker resources: ${String(error)}`);
+		}
+	}
+
 	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
 		await this.assertRecoveryAllowed();
 		if (killWorkerProcess) {
 			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
 		}
-		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
-		if (orphanProcessJournalPath) {
-			try {
-				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
-					if (!isOrphanProcessIdentityCurrent(orphan)) {
-						continue;
-					}
-					const { pid } = orphan;
-					try {
-						process.kill(-pid, "SIGKILL");
-					} catch {
-						try {
-							process.kill(pid, "SIGKILL");
-						} catch {
-							// The detached resource may already have exited.
-						}
-					}
-				}
-				clearOrphanProcessJournal(orphanProcessJournalPath);
-			} catch (error) {
-				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
-			}
-		}
+		this.reapOrphanedWorkerResources(worker);
 		const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
 		const latest = journal.getLatest();
 		const uncertain = latest.filter((record) => record.busy);

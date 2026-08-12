@@ -1506,6 +1506,9 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: boolean;
 			persistWorker: ReturnType<typeof vi.fn>;
 			launchWorker: ReturnType<typeof vi.fn>;
+			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
+			reapOrphanedWorkerResources: ReturnType<typeof vi.fn>;
+			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
 			recoverWorker(worker: Worker): Promise<void>;
 		};
 		const worker: Worker = {
@@ -1518,6 +1521,9 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: false,
 			persistWorker: vi.fn(),
 			launchWorker: vi.fn(),
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			reapOrphanedWorkerResources: vi.fn(),
+			recoverUncertainWorkerOperations: vi.fn(),
 		}) as Harness;
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
 		try {
@@ -1528,6 +1534,9 @@ describe("daemon worker supervisor monitoring", () => {
 				lifecycle: "failed",
 				lastError: "Waiting for a client with fresh environment",
 			});
+			expect(supervisor.assertRecoveryAllowed).toHaveBeenCalledOnce();
+			expect(supervisor.reapOrphanedWorkerResources).toHaveBeenCalledWith(worker);
+			expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
 			expect(supervisor.persistWorker).toHaveBeenCalledOnce();
 			expect(supervisor.launchWorker).not.toHaveBeenCalled();
 		} finally {
