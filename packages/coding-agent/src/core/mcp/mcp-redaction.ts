@@ -21,7 +21,9 @@ export function redactMcpValue(value: unknown, key = ""): unknown {
 	}
 	if (Array.isArray(value)) return value.map((entry) => redactMcpValue(entry));
 	if (typeof value === "object" && value !== null) {
-		return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, redactMcpValue(child, childKey)]));
+		return Object.fromEntries(
+			Object.entries(value).map(([childKey, child]) => [childKey, redactMcpValue(child, childKey)]),
+		);
 	}
 	return value;
 }

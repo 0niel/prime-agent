@@ -1,4 +1,4 @@
-import type { McpDeclaration } from "./mcp-declarations.js";
+import { type McpDeclaration, previewMcpProbe } from "./mcp-declarations.js";
 
 /** The probe never constructs a network client. Callers must inject a local test transport. */
 export interface McpProbeTransport {
@@ -35,6 +35,14 @@ export interface McpDeclarationProbeOptions {
 export interface McpDeclarationProbeResult {
 	initialized: true;
 	toolsListed: true;
+}
+
+/** A bounded, offline declaration preview; it never opens a transport. */
+export type McpDeclarationProbePreview = ReturnType<typeof previewMcpProbe>;
+
+/** Returns a bounded, offline preview for an already-validated declaration. */
+export function previewMcpDeclarationProbe(declaration: McpDeclaration): McpDeclarationProbePreview {
+	return previewMcpProbe(declaration);
 }
 
 const DEFAULT_TIMEOUT_MS = 2_000;
