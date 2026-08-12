@@ -177,13 +177,15 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 			const runtimeConfig = {
 				cwd: "/repo",
 				apiKey: "top-level-secret",
+				initialGoal: { objective: "keep the non-secret budget", tokenBudget: 1234 },
 				extensionFlagValues: {
 					provider: {
 						apiKey: "nested-secret",
 						token: "nested-token",
+						tokenLimit: 5678,
 						headers: {
 							Authorization: "Bearer authorization-secret",
-							"X-Api-Key": "header-key-secret",
+							"X-Custom-Credential": "custom-header-secret",
 							"X-Request-Id": "safe-request-id",
 						},
 					},
@@ -194,8 +196,9 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 
 			expect(durable).toEqual({
 				cwd: "/repo",
+				initialGoal: { objective: "keep the non-secret budget", tokenBudget: 1234 },
 				extensionFlagValues: {
-					provider: { headers: { "X-Request-Id": "safe-request-id" } },
+					provider: { tokenLimit: 5678 },
 				},
 			});
 			expect(JSON.stringify(durable)).not.toContain("secret");

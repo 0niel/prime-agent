@@ -71,9 +71,6 @@ function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>
 		const result: unknown[] = [];
 		seen.set(value, result);
 		for (const entry of value) {
-			if (isSensitiveHeaderEntry(entry, parentKey)) {
-				continue;
-			}
 			result.push(redactRuntimeConfigValue(entry, seen, parentKey));
 		}
 		return result;
@@ -81,7 +78,10 @@ function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>
 	const result: Record<string, unknown> = {};
 	seen.set(value, result);
 	for (const [key, entry] of Object.entries(value)) {
-		if (isSecretBearingRuntimeConfigField(key) || isSensitiveHeaderField(key, parentKey)) {
+		const normalizedKey = normalizeRuntimeConfigField(key);
+		// Request headers are an open-ended credential surface. Preserve none of
+		// them durably; callers may use arbitrary provider-specific header names.
+		if (normalizedKey === "headers" || isSecretBearingRuntimeConfigField(normalizedKey)) {
 			continue;
 		}
 		result[key] = redactRuntimeConfigValue(entry, seen, key);
@@ -89,44 +89,35 @@ function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>
 	return result;
 }
 
-function isSecretBearingRuntimeConfigField(key: string): boolean {
-	const normalized = key.replaceAll(/[^a-z0-9]/gi, "").toLowerCase();
-	return (
-		normalized === "key" ||
-		normalized.endsWith("key") ||
-		normalized.includes("apikey") ||
-		normalized.includes("token") ||
-		normalized.includes("secret") ||
-		normalized === "password" ||
-		normalized === "credential" ||
-		normalized === "credentials" ||
-		normalized.includes("authorization") ||
-		normalized === "proxyauthorization" ||
-		normalized === "authheader" ||
-		normalized === "cookie" ||
-		normalized === "setcookie"
-	);
+function normalizeRuntimeConfigField(key: string): string {
+	return key.replaceAll(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
-function isSensitiveHeaderField(key: string, parentKey: string | undefined): boolean {
-	return (
-		parentKey?.replaceAll(/[^a-z0-9]/gi, "").toLowerCase() === "headers" && isSecretBearingRuntimeConfigField(key)
-	);
-}
+const SECRET_RUNTIME_CONFIG_FIELDS = new Set([
+	"key",
+	"apikey",
+	"token",
+	"accesstoken",
+	"refreshtoken",
+	"bearertoken",
+	"authtoken",
+	"idtoken",
+	"secret",
+	"clientsecret",
+	"password",
+	"credential",
+	"credentials",
+	"authorization",
+	"proxyauthorization",
+	"authheader",
+	"cookie",
+	"setcookie",
+	"privatekey",
+	"signingkey",
+]);
 
-function isSensitiveHeaderEntry(value: unknown, parentKey: string | undefined): boolean {
-	if (parentKey?.replaceAll(/[^a-z0-9]/gi, "").toLowerCase() !== "headers") {
-		return false;
-	}
-	if (Array.isArray(value)) {
-		return typeof value[0] === "string" && isSecretBearingRuntimeConfigField(value[0]);
-	}
-	if (!value || typeof value !== "object") {
-		return false;
-	}
-	const entry = value as Record<string, unknown>;
-	const name = entry.name ?? entry.key;
-	return typeof name === "string" && isSecretBearingRuntimeConfigField(name);
+function isSecretBearingRuntimeConfigField(normalizedKey: string): boolean {
+	return SECRET_RUNTIME_CONFIG_FIELDS.has(normalizedKey);
 }
 
 export function mergeAgentSessionRuntimeConfig(
