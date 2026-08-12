@@ -349,6 +349,46 @@ describe("daemon supervisor passive subagent topology", () => {
 		);
 	});
 
+	it("anchors saved sibling relative parents at their own session files", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-relative-saved-siblings-"));
+		tempDirs.push(directory);
+		const base = {
+			cwd: directory,
+			created: new Date(0),
+			modified: new Date(0),
+			messageCount: 0,
+			firstMessage: "",
+			allMessagesText: "",
+			rlmDepth: 1,
+		};
+		const target = {
+			...base,
+			id: "target",
+			path: join(directory, "children", "target.jsonl"),
+			parentSessionPath: "../parent.jsonl",
+		};
+		const sibling = {
+			...base,
+			id: "sibling",
+			path: join(directory, "children", "nested", "sibling.jsonl"),
+			parentSessionPath: "../../parent.jsonl",
+			name: "taken",
+		};
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+
+		expect(() => supervisor.assertSavedSiblingNameAvailable([target, sibling], target, "available")).not.toThrow();
+		expect(() =>
+			supervisor.assertSavedSiblingNameAvailable(
+				[target, { ...sibling, parentSessionPath: "../other-parent.jsonl" }],
+				target,
+				"available",
+			),
+		).toThrow("Saved sibling catalog is structurally ambiguous");
+	});
+
 	it("publishes an opening reservation before named create validation awaits", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-named-create-race-"));
 		tempDirs.push(directory);
