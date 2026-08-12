@@ -67,7 +67,9 @@ class _PrimeAgentBoundedBytes:
         return self.total > len(self.data)
 
     def text(self) -> str:
-        return bytes(self.data).decode("utf-8", errors="replace")
+        # latin-1 is byte-preserving: retained bytes cannot expand into multiple
+        # Unicode replacement bytes when IPython serializes the execute result.
+        return bytes(self.data).decode("latin-1")
 
 
 class _PrimeAgentBashResult:
@@ -96,11 +98,11 @@ class _PrimeAgentBashResult:
         if self.stdout:
             parts.append(self.stdout)
         if self.stdout_truncated:
-            parts.append(f"[stdout truncated; showing final {len(self.stdout.encode('utf-8'))} of {self.stdout_total_bytes} bytes]")
+            parts.append(f"[stdout truncated; showing final {len(self.stdout.encode('latin-1'))} of {self.stdout_total_bytes} bytes]")
         if self.stderr:
             parts.append(self.stderr)
         if self.stderr_truncated:
-            parts.append(f"[stderr truncated; showing final {len(self.stderr.encode('utf-8'))} of {self.stderr_total_bytes} bytes]")
+            parts.append(f"[stderr truncated; showing final {len(self.stderr.encode('latin-1'))} of {self.stderr_total_bytes} bytes]")
         text = chr(10).join(parts)
         if self.returncode != 0:
             text += chr(10) + chr(10) + f"Command exited with code {self.returncode}"
