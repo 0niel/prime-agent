@@ -2062,7 +2062,7 @@ export class DaemonSupervisor {
 		}
 		const opening = (async () => {
 			if (!createCommand.name) return this.launchWorker(createCommand, undefined, ownerClientId);
-			const savedSiblings = createCommand.sessionPath ? await this.catalog.siblings(createCommand.sessionPath) : [];
+			const savedSiblings = createCommand.sessionPath ? await this.catalog.siblings(createCommand.sessionPath, this.defaultSessionConfig.sessionDir) : [];
 			const target = savedSiblings.find(
 				(session) => canonicalSessionPath(session.path) === canonicalSessionPath(createCommand.sessionPath!),
 			);
@@ -3161,7 +3161,7 @@ export class DaemonSupervisor {
 			.flatMap((worker) => [...worker.summaries.values()])
 			.find((summary) => summary.sessionFile && canonicalSessionPath(summary.sessionFile) === targetPath);
 		if (active) return this.summaryNameReservationInput(active, name);
-		const siblings = await this.catalog.siblings(sessionPath);
+		const siblings = await this.catalog.siblings(sessionPath, this.defaultSessionConfig.sessionDir);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		return {
@@ -3190,7 +3190,7 @@ export class DaemonSupervisor {
 			.flatMap((worker) => [...worker.summaries.values()])
 			.find((summary) => summary.sessionFile && canonicalSessionPath(summary.sessionFile) === targetPath);
 		if (active) return this.assertSupervisorSessionNameAvailable(active, name);
-		const siblings = await this.catalog.siblings(sessionPath);
+		const siblings = await this.catalog.siblings(sessionPath, this.defaultSessionConfig.sessionDir);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		if (saved.parentSessionPath && (saved.rlmDepth ?? 0) > 0) {

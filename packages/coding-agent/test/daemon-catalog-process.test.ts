@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -25,12 +25,12 @@ describe("daemon catalog selector resolution", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-siblings-"));
 		const sessionDir = join(root, "sessions");
 		const parent = SessionManager.create(root, sessionDir);
-		parent.newSession();
+		parent.newSession({ rlmDepth: 0 });
 		parent.appendSessionInfo("parent");
-		const first = SessionManager.create(root, join(root, "first"));
+		const first = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-first"));
 		first.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
 		first.appendSessionInfo("first");
-		const second = SessionManager.create(root, join(root, "second"));
+		const second = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-second"));
 		second.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
 		second.appendSessionInfo("second");
 		const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
@@ -38,14 +38,14 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(
 			registry,
 			[
-				{ type: "rlm_subagent", childId: "first", sessionFile: first.getSessionFile(), status: "completed" },
-				{ type: "rlm_subagent", childId: "second", sessionFile: second.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: first.getSessionId(), sessionFile: first.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: second.getSessionId(), sessionFile: second.getSessionFile(), status: "completed" },
 			]
 				.map((entry) => JSON.stringify(entry))
 				.join("\n"),
 		);
 
-		await expect(listSavedSessionSiblings(first.getSessionFile()!)).resolves.toEqual([
+		await expect(listSavedSessionSiblings(first.getSessionFile()!, sessionDir)).resolves.toEqual([
 			expect.objectContaining({ id: first.getSessionId(), name: "first" }),
 			expect.objectContaining({ id: second.getSessionId(), name: "second" }),
 		]);
@@ -55,14 +55,14 @@ describe("daemon catalog selector resolution", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-relative-siblings-"));
 		const sessionDir = join(root, "sessions");
 		const parent = SessionManager.create(root, sessionDir);
-		parent.newSession();
+		parent.newSession({ rlmDepth: 0 });
 		parent.appendSessionInfo("parent");
 		const parentFile = parent.getSessionFile()!;
-		const firstDir = join(root, "first");
+		const firstDir = join(root, "session-artifacts", parent.getSessionId(), "sub-first");
 		const first = SessionManager.create(root, firstDir);
 		first.newSession({ parentSession: relative(firstDir, parentFile), rlmDepth: 1 });
 		first.appendSessionInfo("first");
-		const secondDir = join(root, "second");
+		const secondDir = join(root, "session-artifacts", parent.getSessionId(), "sub-second");
 		const second = SessionManager.create(root, secondDir);
 		second.newSession({ parentSession: relative(secondDir, parentFile), rlmDepth: 1 });
 		second.appendSessionInfo("second");
@@ -71,72 +71,104 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(
 			registry,
 			[
-				{ type: "rlm_subagent", childId: "first", sessionFile: first.getSessionFile(), status: "completed" },
-				{ type: "rlm_subagent", childId: "second", sessionFile: second.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: first.getSessionId(), sessionFile: first.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: second.getSessionId(), sessionFile: second.getSessionFile(), status: "completed" },
 			]
 				.map((entry) => JSON.stringify(entry))
 				.join("\n"),
 		);
 
-		await expect(listSavedSessionSiblings(first.getSessionFile()!)).resolves.toEqual([
+		await expect(listSavedSessionSiblings(first.getSessionFile()!, sessionDir)).resolves.toEqual([
 			expect.objectContaining({ id: first.getSessionId(), name: "first" }),
 			expect.objectContaining({ id: second.getSessionId(), name: "second" }),
 		]);
 	});
 
-	it("walks artifact family topology without accepting invalid rows or collapsing conflicting durable identities", async () => {
-		const root = mkdtempSync(join(tmpdir(), "prime-catalog-family-topology-"));
-		const sessionDir = join(root, "sessions");
-		const registryPath = (parentId: string) =>
-			join(root, "session-artifacts", parentId, "rlm-subagents.jsonl");
-		const writeRegistry = (parentId: string, entries: unknown[]) => {
-			const path = registryPath(parentId);
-			mkdirSync(dirname(path), { recursive: true });
-			writeFileSync(path, entries.map((entry) => (typeof entry === "string" ? entry : JSON.stringify(entry))).join("\n"));
+	it("walks a trusted depth-two artifact family and fails closed for hostile artifacts", async () => {
+		const makeFixture = (name: string, omitRootDepth = false) => {
+			const root = mkdtempSync(join(tmpdir(), name));
+			const sessionDir = join(root, "sessions");
+			const registryPath = (parentId: string) => {
+				const parentFile = [rootSession, parent, first, second].find((manager) => manager.getSessionId() === parentId)?.getSessionFile();
+				return parentFile && dirname(parentFile) !== sessionDir
+					? join(dirname(parentFile), "session-artifacts", parentId, "rlm-subagents.jsonl")
+					: join(root, "session-artifacts", parentId, "rlm-subagents.jsonl");
+			};
+			const writeRegistry = (parentId: string, entries: unknown[]) => {
+				const path = registryPath(parentId);
+				mkdirSync(dirname(path), { recursive: true });
+				writeFileSync(path, entries.map((entry) => (typeof entry === "string" ? entry : JSON.stringify(entry))).join("\n"));
+			};
+			const create = (id: string, dir: string, parentSession?: string, depth = 0) => {
+				const manager = SessionManager.create(root, dir);
+				manager.newSession({ id, parentSession, rlmDepth: depth });
+				manager.appendSessionInfo(id);
+				return manager;
+			};
+			const rootSession = create("root", sessionDir);
+			if (omitRootDepth) {
+				const rootFile = rootSession.getSessionFile()!;
+				const [header, ...entries] = readFileSync(rootFile, "utf8").trimEnd().split(/\r?\n/);
+				const persistedHeader = JSON.parse(header!) as Record<string, unknown>;
+				delete persistedHeader.rlmDepth;
+				writeFileSync(rootFile, [JSON.stringify(persistedHeader), ...entries].join("\n") + "\n");
+			}
+			const parent = create("parent", join(root, "session-artifacts", "root", "sub-parent"), rootSession.getSessionFile(), 1);
+			const first = create("first", join(root, "session-artifacts", "parent", "sub-first"), parent.getSessionFile(), 2);
+			const second = create("second", join(root, "session-artifacts", "parent", "sub-second"), parent.getSessionFile(), 2);
+			writeRegistry("root", [
+				{ type: "rlm_subagent", childId: "parent", sessionFile: parent.getSessionFile(), status: "completed" },
+			]);
+			writeRegistry("parent", [
+				{ type: "rlm_subagent", childId: "first", sessionFile: first.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: "second", sessionFile: second.getSessionFile(), status: "completed" },
+			]);
+			return { root, sessionDir, rootSession, parent, first, second, registryPath, writeRegistry };
 		};
-		const rootSession = SessionManager.create(root, sessionDir);
-		rootSession.newSession({ id: "root" });
-		rootSession.appendSessionInfo("root");
-		const parent = SessionManager.create(root, join(root, "parent"));
-		parent.newSession({ id: "parent", parentSession: rootSession.getSessionFile(), rlmDepth: 1 });
-		parent.appendSessionInfo("parent");
-		const child = SessionManager.create(root, join(root, "child"));
-		child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 2 });
-		child.appendSessionInfo("child");
-		const duplicate = SessionManager.create(root, join(root, "duplicate"));
-		duplicate.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 2 });
-		duplicate.appendSessionInfo("duplicate");
-		const deleted = SessionManager.create(root, join(root, "deleted"));
-		deleted.newSession({ id: "deleted", parentSession: rootSession.getSessionFile(), rlmDepth: 1 });
-		deleted.appendSessionInfo("deleted");
-		const unreadable = join(root, "unreadable.jsonl");
-		mkdirSync(unreadable, { recursive: true });
-
-		writeRegistry(rootSession.getSessionId(), [
-			{ type: "rlm_subagent", childId: "parent", sessionFile: parent.getSessionFile(), status: "completed" },
-			{ type: "rlm_subagent", childId: "deleted", sessionFile: deleted.getSessionFile(), status: "deleted" },
-			{ type: "rlm_subagent", childId: "unreadable", sessionFile: unreadable, status: "completed" },
-			{ type: "rlm_subagent", childId: "malformed", status: "completed" },
-			"{not json",
-		]);
-		writeRegistry(parent.getSessionId(), [
-			{ type: "rlm_subagent", childId: "child", sessionFile: child.getSessionFile(), status: "completed" },
-			{ type: "rlm_subagent", childId: "duplicate", sessionFile: duplicate.getSessionFile(), status: "completed" },
-		]);
-
-		const family = await listCatalogFamilySessions(sessionDir);
-		expect(family).toEqual(
+		const valid = makeFixture("prime-catalog-family-valid-", true);
+		await expect(listCatalogFamilySessions(valid.sessionDir)).resolves.toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ id: "root", rlmDepth: 0 }),
 				expect.objectContaining({ id: "parent", rlmDepth: 1 }),
-				expect.objectContaining({ id: "child", name: "child", rlmDepth: 2, path: child.getSessionFile() }),
-				expect.objectContaining({ id: "child", name: "duplicate", rlmDepth: 2, path: duplicate.getSessionFile() }),
+				expect.objectContaining({ id: "first", rlmDepth: 2 }),
+				expect.objectContaining({ id: "second", rlmDepth: 2 }),
 			]),
 		);
-		expect(family).toHaveLength(4);
-		expect(family.map((entry) => entry.path)).not.toContain(deleted.getSessionFile());
-		expect(family.map((entry) => entry.path)).not.toContain(unreadable);
-		expect(family.filter((entry) => entry.id === "child")).toHaveLength(2);
+		await expect(listSavedSessionSiblings(valid.first.getSessionFile()!, valid.sessionDir)).resolves.toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: "first" }), expect.objectContaining({ id: "second" })]),
+		);
+
+		const cases: Array<[string, (fixture: ReturnType<typeof makeFixture>) => void]> = [
+			["id mismatch", (fixture) => fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "wrong", sessionFile: fixture.first.getSessionFile(), status: "completed" }])],
+			["parent mismatch", (fixture) => {
+				const evil = SessionManager.create(fixture.root, join(fixture.root, "session-artifacts", "parent", "sub-evil"));
+				evil.newSession({ id: "evil", parentSession: fixture.rootSession.getSessionFile(), rlmDepth: 2 });
+				evil.appendSessionInfo("evil");
+				fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "evil", sessionFile: evil.getSessionFile(), status: "completed" }]);
+			}],
+			["depth mismatch", (fixture) => {
+				const evil = SessionManager.create(fixture.root, join(fixture.root, "session-artifacts", "parent", "sub-evil"));
+				evil.newSession({ id: "evil", parentSession: fixture.parent.getSessionFile(), rlmDepth: 7 });
+				evil.appendSessionInfo("evil");
+				fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "evil", sessionFile: evil.getSessionFile(), status: "completed" }]);
+			}],
+			["external path", (fixture) => fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "evil", sessionFile: join(tmpdir(), "outside.jsonl"), status: "completed" }])],
+			["path alias", (fixture) => fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "first", sessionFile: `${dirname(fixture.first.getSessionFile()!)}/../sub-first/first.jsonl`, status: "completed" }])],
+			["cycle", (fixture) => fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "root", sessionFile: fixture.rootSession.getSessionFile(), status: "completed" }])],
+			["malformed", (fixture) => fixture.writeRegistry("parent", ["{not json"])] ,
+			["record limit", (fixture) => fixture.writeRegistry("parent", Array.from({ length: 10_001 }, (_, index) => ({ type: "rlm_subagent", childId: `bad-${index}`, sessionFile: fixture.first.getSessionFile(), status: "completed" })))],
+		];
+		for (const [label, mutate] of cases) {
+			const fixture = makeFixture(`prime-catalog-family-${label.replace(/\s/g, "-")}-`);
+			mutate(fixture);
+			await expect(listCatalogFamilySessions(fixture.sessionDir), label).rejects.toThrow("Invalid RLM artifact family topology");
+		}
+		const symlink = makeFixture("prime-catalog-family-symlink-");
+		const alias = join(symlink.root, "session-artifacts", "parent", "sub-alias", "first.jsonl");
+		mkdirSync(dirname(alias), { recursive: true });
+		symlinkSync(symlink.first.getSessionFile()!, alias);
+		symlink.writeRegistry("parent", [{ type: "rlm_subagent", childId: "first", sessionFile: alias, status: "completed" }]);
+		await expect(listCatalogFamilySessions(symlink.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
 	});
 
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {
