@@ -2073,7 +2073,9 @@ export class DaemonSupervisor {
 				(session) => canonicalSessionPath(session.path) === canonicalSessionPath(createCommand.sessionPath!),
 			);
 			const targetSummary = target ? summaryForInactiveSession(target) : { sessionId: "new-root", rlmDepth: 0 };
-			const reservation = this.summaryNameReservationInput(targetSummary, createCommand.name);
+			const reservation = target
+				? this.savedSiblingNameReservationInput(target, savedSiblings, createCommand.name)
+				: this.summaryNameReservationInput(targetSummary, createCommand.name);
 			return this.withSessionNameReservation(reservation, async () => {
 				if (target?.parentSessionPath && (target.rlmDepth ?? 0) > 0) {
 					this.assertSavedSiblingNameAvailable(savedSiblings, target, createCommand.name!);
@@ -3149,10 +3151,19 @@ export class DaemonSupervisor {
 		const siblings = await this.catalog.siblings(sessionPath);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
+		return this.savedSiblingNameReservationInput(saved, siblings, name);
+	}
+
+	private savedSiblingNameReservationInput(
+		saved: SessionInfo,
+		siblings: readonly SessionInfo[],
+		name: string,
+	): { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string } {
+		const parentSessionPath = canonicalSavedSiblingParentPath(saved);
 		return {
 			name,
 			depth: saved.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0,
-			parentSessionPath: saved.parentSessionPath,
+			...(parentSessionPath ? { parentSessionPath } : {}),
 		};
 	}
 

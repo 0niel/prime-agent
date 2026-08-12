@@ -75,6 +75,39 @@ describe("project settings openat", () => {
 		}
 	});
 
+	it("treats absent project storage and an omitted declaration setting as an empty document", async () => {
+		for (const setup of [
+			(cwd: string) => cwd,
+			(cwd: string) => {
+				mkdirSync(join(cwd, ".prime", "agent"), { recursive: true });
+				writeFileSync(join(cwd, ".prime", "agent", "settings.json"), JSON.stringify({ ordinary: true }));
+				return cwd;
+			},
+		]) {
+			const cwd = setup(root());
+			const grant = admission(cwd);
+			try {
+				const reader = await McpProjectDeclarationReader.create(grant);
+				expect(reader.getDocument()).toEqual(document());
+			} finally {
+				releaseProjectMcpDeclarationAdmission(grant);
+			}
+		}
+	});
+
+	it("fails closed for an explicitly null project declaration setting", async () => {
+		const cwd = root();
+		mkdirSync(join(cwd, ".prime", "agent"), { recursive: true });
+		writeFileSync(join(cwd, ".prime", "agent", "settings.json"), JSON.stringify({ mcpDeclarations: null }));
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			expect(() => reader.getDocument()).toThrow(unavailable);
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
 	it("fails closed for component and leaf symlinks", async () => {
 		for (const kind of ["prime", "agent", "leaf"] as const) {
 			const cwd = root();

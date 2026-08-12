@@ -91,9 +91,16 @@ def main():
  try:
   try: prime=directory(3,".prime",action=="write"); agent=directory(prime,"agent",action=="write")
   except FileNotFoundError:
-   if action=="read": print('{"mcpDeclarations":null}'); return
+   if action=="read": print("{}"); return
    raise
-  if action=="read": print(json.dumps({"mcpDeclarations":read(agent).get("mcpDeclarations")},ensure_ascii=False,allow_nan=False,separators=(",", ":")))
+  if action=="read":
+   doc=read(agent)
+   # Omission is the sole encoding for an absent declaration setting. This
+   # preserves an explicitly stored JSON null for the TypeScript parser to
+   # reject rather than conflating it with a fresh project.
+   if "mcpDeclarations" in doc:
+    print(json.dumps({"mcpDeclarations":doc["mcpDeclarations"]},ensure_ascii=False,allow_nan=False,separators=(",", ":")))
+   else: print("{}")
   elif action=="write" and "document" in request: write(agent,request["document"]); print("{}")
   else: reject()
  finally:
@@ -174,15 +181,18 @@ export class ProjectSettingsOpenat {
 
 	getDocument(): McpDeclarationDocument {
 		const response = this.invoke({ action: "read" });
-		if (
-			typeof response !== "object" ||
-			response === null ||
-			Array.isArray(response) ||
-			!Object.hasOwn(response, "mcpDeclarations")
-		)
-			unavailable();
+		if (typeof response !== "object" || response === null || Array.isArray(response)) unavailable();
+		const keys = Object.keys(response);
+		if (keys.length > 1 || (keys.length === 1 && keys[0] !== "mcpDeclarations")) unavailable();
 		try {
-			return parseMcpDeclarationDocument((response as { mcpDeclarations: unknown }).mcpDeclarations);
+			// The helper omits this member only when the directory or setting is
+			// genuinely absent. An explicit stored null remains data and is rejected
+			// by the declaration parser below.
+			return parseMcpDeclarationDocument(
+				Object.hasOwn(response, "mcpDeclarations")
+					? (response as { mcpDeclarations: unknown }).mcpDeclarations
+					: undefined,
+			);
 		} catch {
 			unavailable();
 		}
