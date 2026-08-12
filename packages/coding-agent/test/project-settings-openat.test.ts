@@ -1,9 +1,12 @@
 import * as childProcess from "node:child_process";
 import {
+	closeSync,
+	constants,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
@@ -331,6 +334,146 @@ describe("project settings openat", () => {
 			} finally {
 				releaseProjectMcpDeclarationAdmission(grant);
 			}
+		}
+	});
+
+	it("retries mkdir when a released lock disappears before its no-follow open", async () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		const lock = `${settings}.lock`;
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, JSON.stringify({ ordinary: true }));
+		mkdirSync(lock, { mode: 0o700 });
+		const realSpawnSync = childProcessSpies.originalSpawnSync!;
+		childProcessSpies.spawnSync.mockImplementationOnce(((...spawnArgs: Parameters<typeof realSpawnSync>) => {
+			const [python, rawArgs, options] = spawnArgs;
+			const args = rawArgs as readonly string[];
+			const helper = args[2]!
+				.replace("def acquire(agent):", "INJECT_ENOENT=True\ndef acquire(agent):")
+				.replace(
+					'   try: existing=directory(agent,"settings.json.lock",False)',
+					'   try:\n    if globals().pop("INJECT_ENOENT",False):\n     os.rmdir("settings.json.lock",dir_fd=agent); raise FileNotFoundError()\n    existing=directory(agent,"settings.json.lock",False)',
+				);
+			expect(helper).not.toBe(args[2]);
+			return realSpawnSync(python, [args[0]!, args[1]!, helper], options);
+		}) as typeof childProcess.spawnSync);
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			reader.setDocument(document());
+			expect(existsSync(lock)).toBe(false);
+			expect(JSON.parse(readFileSync(settings, "utf8"))).toMatchObject({
+				ordinary: true,
+				mcpDeclarations: { version: 1 },
+			});
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
+	it("cleans a signal delivered between lock creation and acquisition return", async () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		const lock = `${settings}.lock`;
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, JSON.stringify({ ordinary: true }));
+		let helper: string | undefined;
+		childProcessSpies.spawnSync.mockImplementationOnce(((_python: string, args: readonly string[]) => {
+			helper = args[2];
+			return { status: 1, stdout: "", stderr: "captured" };
+		}) as typeof childProcess.spawnSync);
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			expect(() => reader.setDocument(document())).toThrow(unavailable);
+			const interruptedHelper = helper!.replace(
+				'try: return directory(agent,"settings.json.lock",False)',
+				'try:\n    result=directory(agent,"settings.json.lock",False)\n    os.kill(os.getpid(),signal.SIGTERM)\n    return result',
+			);
+			expect(interruptedHelper).not.toBe(helper);
+			const rootFd = openSync(cwd, constants.O_RDONLY);
+			const result = childProcessSpies.originalSpawnSync!(
+				await resolveTrustedProjectSettingsPython(),
+				["-I", "-c", interruptedHelper],
+				{
+					input: JSON.stringify({ action: "write", document: document() }),
+					encoding: "utf8",
+					timeout: 5_000,
+					stdio: ["pipe", "pipe", "pipe", rootFd],
+				},
+			);
+			closeSync(rootFd);
+			expect(result.status).toBe(1);
+			expect(result.signal).toBeNull();
+			expect(existsSync(lock)).toBe(false);
+			const release = lockfile.lockSync(settings, { realpath: false });
+			release();
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
+	it("cleans its owned lock promptly when an external SIGTERM interrupts the helper", async () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		const lock = `${settings}.lock`;
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, JSON.stringify({ ordinary: true }));
+		let helper: string | undefined;
+		childProcessSpies.spawnSync.mockImplementationOnce(((_python: string, args: readonly string[]) => {
+			helper = args[2];
+			return { status: 1, stdout: "", stderr: "captured" };
+		}) as typeof childProcess.spawnSync);
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			expect(() => reader.setDocument(document())).toThrow(unavailable);
+			expect(helper).toBeDefined();
+			const heldHelper = helper!
+				.replace(
+					"  try: lockdir=acquire(agent); owned=True",
+					'  try: lockdir=acquire(agent); owned=True\n  finally:\n   print("LOCK_OWNED",flush=True)\n   signal.pthread_sigmask(signal.SIG_SETMASK,previous)\n  time.sleep(30)',
+				)
+				.replace(
+					"  finally: signal.pthread_sigmask(signal.SIG_SETMASK,previous)\n  doc=read(agent)",
+					"  doc=read(agent)",
+				);
+			expect(heldHelper).not.toBe(helper);
+			const rootFd = openSync(cwd, constants.O_RDONLY);
+			const child = childProcess.spawn(await resolveTrustedProjectSettingsPython(), ["-I", "-c", heldHelper], {
+				stdio: ["pipe", "pipe", "pipe", rootFd],
+			});
+			closeSync(rootFd);
+			child.stdin!.end(JSON.stringify({ action: "write", document: document() }));
+			await new Promise<void>((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error("ownership marker timed out")), 2_000);
+				child.stdout!.on("data", (chunk) => {
+					if (!String(chunk).includes("LOCK_OWNED")) return;
+					clearTimeout(timer);
+					expect(lstatSync(lock).isDirectory()).toBe(true);
+					resolve();
+				});
+				child.once("error", reject);
+			});
+			const signaledAt = Date.now();
+			child.kill("SIGTERM");
+			const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error("SIGTERM cleanup timed out")), 2_000);
+				child.once("exit", (code, signal) => {
+					clearTimeout(timer);
+					resolve({ code, signal });
+				});
+			});
+			expect(result).toEqual({ code: 1, signal: null });
+			expect(Date.now() - signaledAt).toBeLessThan(2_000);
+			expect(existsSync(lock)).toBe(false);
+			const release = lockfile.lockSync(settings, { realpath: false });
+			release();
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
 		}
 	});
 
