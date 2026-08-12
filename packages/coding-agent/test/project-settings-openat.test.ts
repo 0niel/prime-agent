@@ -372,7 +372,7 @@ describe("project settings openat", () => {
 		}
 	});
 
-	it("cleans a signal delivered between lock creation and acquisition return", async () => {
+	it("cleans a signal raised while opening a newly created lock", async () => {
 		const cwd = root();
 		const agentDir = join(cwd, ".prime", "agent");
 		const settings = join(agentDir, "settings.json");
@@ -407,6 +407,63 @@ describe("project settings openat", () => {
 			closeSync(rootFd);
 			expect(result.status).toBe(1);
 			expect(result.signal).toBeNull();
+			expect(existsSync(lock)).toBe(false);
+			const release = lockfile.lockSync(settings, { realpath: false });
+			release();
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
+	it("linearizes a signal between acquisition return and owned assignment", async () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		const lock = `${settings}.lock`;
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, JSON.stringify({ ordinary: true }));
+		let helper: string | undefined;
+		childProcessSpies.spawnSync.mockImplementationOnce(((_python: string, args: readonly string[]) => {
+			helper = args[2];
+			return { status: 1, stdout: "", stderr: "captured" };
+		}) as typeof childProcess.spawnSync);
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			expect(() => reader.setDocument(document())).toThrow(unavailable);
+			const patchedBoundary = helper!.replace(
+				"lockdir=acquire(agent); owned=True",
+				"lockdir=acquire(agent); os.kill(os.getpid(),signal.SIGTERM); owned=True",
+			);
+			expect(patchedBoundary).not.toBe(helper);
+			const predecessorBoundary = patchedBoundary
+				.replace(
+					"  blocked={signal.SIGTERM,signal.SIGINT}\n  previous=signal.pthread_sigmask(signal.SIG_BLOCK,blocked)\n  try: ",
+					"  ",
+				)
+				.replace("\n  finally: signal.pthread_sigmask(signal.SIG_SETMASK,previous)", "");
+			expect(predecessorBoundary).not.toBe(patchedBoundary);
+			const python = await resolveTrustedProjectSettingsPython();
+			const run = (source: string) => {
+				const rootFd = openSync(cwd, constants.O_RDONLY);
+				try {
+					return childProcessSpies.originalSpawnSync!(python, ["-I", "-c", source], {
+						input: JSON.stringify({ action: "write", document: document() }),
+						encoding: "utf8",
+						timeout: 5_000,
+						stdio: ["pipe", "pipe", "pipe", rootFd],
+					});
+				} finally {
+					closeSync(rootFd);
+				}
+			};
+			const predecessor = run(predecessorBoundary);
+			expect(predecessor.status).toBe(1);
+			expect(lstatSync(lock).isDirectory()).toBe(true);
+			rmdirSync(lock);
+			const patched = run(patchedBoundary);
+			expect(patched.status).toBe(1);
+			expect(patched.signal).toBeNull();
 			expect(existsSync(lock)).toBe(false);
 			const release = lockfile.lockSync(settings, { realpath: false });
 			release();
