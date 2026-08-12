@@ -20,7 +20,7 @@ import type { ResourceLoader } from "../src/core/resource-loader.js";
 import { createAgentSession } from "../src/core/sdk.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager, type SettingsScope, type SettingsStorage } from "../src/core/settings-manager.js";
-import { invokeHostRequest } from "./host-request-context.js";
+import { invokeHostRequestThroughKernelForTest } from "./host-request-context.js";
 
 const mcpBoundarySpies = vi.hoisted(() => ({
 	composeProjectReader: vi.fn(),
@@ -153,10 +153,14 @@ describe("SDK MCP boundary", () => {
 			expect(mcp.listStatus().map((status) => status.server)).toContain("global");
 			expect(mcp.listStatus().map((status) => status.server)).not.toContain("project");
 			const handlers = mcp.hostHandlers();
-			expect(await invokeHostRequest(handlers["mcp.config"] as never, { server: "global" })).toEqual({
+			expect(
+				await invokeHostRequestThroughKernelForTest(handlers["mcp.config"] as never, { server: "global" }),
+			).toEqual({
 				url: "https://global.example/mcp",
 			});
-			expect(await invokeHostRequest(handlers["mcp.config"] as never, { server: "project" })).toEqual({});
+			expect(
+				await invokeHostRequestThroughKernelForTest(handlers["mcp.config"] as never, { server: "project" }),
+			).toEqual({});
 			expect(handlers).not.toHaveProperty("mcp.declarations");
 			const snapshot = mcp.getDeclarationSnapshot()!;
 			expect(snapshot.declarations).toHaveProperty("user");
@@ -304,7 +308,9 @@ describe("SDK MCP boundary", () => {
 					testCase.name,
 				).toContain("caller");
 				expect(
-					await invokeHostRequest(supplied.hostHandlers()["mcp.config"] as never, { server: "caller" }),
+					await invokeHostRequestThroughKernelForTest(supplied.hostHandlers()["mcp.config"] as never, {
+						server: "caller",
+					}),
 					testCase.name,
 				).toEqual({
 					url: "https://caller.example/mcp",
