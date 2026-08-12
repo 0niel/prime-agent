@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
-import { listCatalogFamilySessions, listSavedSessionSiblings, getOpenCatalogAuthorityFdCountForTest, resolveCatalogSessionMatch, setCatalogBeforeTrustedOpenForTest } from "../src/modes/daemon/daemon-catalog-process.js";
+import {
+	getOpenCatalogAuthorityFdCountForTest,
+	listCatalogFamilySessions,
+	listSavedSessionSiblings,
+	resolveCatalogSessionMatch,
+	setCatalogBeforeTrustedOpenForTest,
+} from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
 	return {
@@ -38,8 +44,18 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(
 			registry,
 			[
-				{ type: "rlm_subagent", childId: first.getSessionId(), sessionFile: first.getSessionFile(), status: "completed" },
-				{ type: "rlm_subagent", childId: second.getSessionId(), sessionFile: second.getSessionFile(), status: "completed" },
+				{
+					type: "rlm_subagent",
+					childId: first.getSessionId(),
+					sessionFile: first.getSessionFile(),
+					status: "completed",
+				},
+				{
+					type: "rlm_subagent",
+					childId: second.getSessionId(),
+					sessionFile: second.getSessionFile(),
+					status: "completed",
+				},
 			]
 				.map((entry) => JSON.stringify(entry))
 				.join("\n"),
@@ -71,8 +87,18 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(
 			registry,
 			[
-				{ type: "rlm_subagent", childId: first.getSessionId(), sessionFile: first.getSessionFile(), status: "completed" },
-				{ type: "rlm_subagent", childId: second.getSessionId(), sessionFile: second.getSessionFile(), status: "completed" },
+				{
+					type: "rlm_subagent",
+					childId: first.getSessionId(),
+					sessionFile: first.getSessionFile(),
+					status: "completed",
+				},
+				{
+					type: "rlm_subagent",
+					childId: second.getSessionId(),
+					sessionFile: second.getSessionFile(),
+					status: "completed",
+				},
 			]
 				.map((entry) => JSON.stringify(entry))
 				.join("\n"),
@@ -84,12 +110,27 @@ describe("daemon catalog selector resolution", () => {
 		]);
 	});
 
+	it("treats an absent session-artifacts directory as an empty family registry", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-no-artifacts-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+
+		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([
+			expect.objectContaining({ id: "parent", rlmDepth: 0 }),
+		]);
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
+	});
+
 	it("walks a trusted depth-two artifact family and fails closed for hostile artifacts", async () => {
 		const makeFixture = (name: string, omitRootDepth = false) => {
 			const root = mkdtempSync(join(tmpdir(), name));
 			const sessionDir = join(root, "sessions");
 			const registryPath = (parentId: string) => {
-				const parentFile = [rootSession, parent, first, second].find((manager) => manager.getSessionId() === parentId)?.getSessionFile();
+				const parentFile = [rootSession, parent, first, second]
+					.find((manager) => manager.getSessionId() === parentId)
+					?.getSessionFile();
 				return parentFile && dirname(parentFile) !== sessionDir
 					? join(dirname(parentFile), "session-artifacts", parentId, "rlm-subagents.jsonl")
 					: join(root, "session-artifacts", parentId, "rlm-subagents.jsonl");
@@ -97,7 +138,10 @@ describe("daemon catalog selector resolution", () => {
 			const writeRegistry = (parentId: string, entries: unknown[]) => {
 				const path = registryPath(parentId);
 				mkdirSync(dirname(path), { recursive: true });
-				writeFileSync(path, entries.map((entry) => (typeof entry === "string" ? entry : JSON.stringify(entry))).join("\n"));
+				writeFileSync(
+					path,
+					entries.map((entry) => (typeof entry === "string" ? entry : JSON.stringify(entry))).join("\n"),
+				);
 			};
 			const create = (id: string, dir: string, parentSession?: string, depth = 0) => {
 				const manager = SessionManager.create(root, dir);
@@ -111,11 +155,26 @@ describe("daemon catalog selector resolution", () => {
 				const [header, ...entries] = readFileSync(rootFile, "utf8").trimEnd().split(/\r?\n/);
 				const persistedHeader = JSON.parse(header!) as Record<string, unknown>;
 				delete persistedHeader.rlmDepth;
-				writeFileSync(rootFile, [JSON.stringify(persistedHeader), ...entries].join("\n") + "\n");
+				writeFileSync(rootFile, `${[JSON.stringify(persistedHeader), ...entries].join("\n")}\n`);
 			}
-			const parent = create("parent", join(root, "session-artifacts", "root", "sub-parent"), rootSession.getSessionFile(), 1);
-			const first = create("first", join(root, "session-artifacts", "parent", "sub-first"), parent.getSessionFile(), 2);
-			const second = create("second", join(root, "session-artifacts", "parent", "sub-second"), parent.getSessionFile(), 2);
+			const parent = create(
+				"parent",
+				join(root, "session-artifacts", "root", "sub-parent"),
+				rootSession.getSessionFile(),
+				1,
+			);
+			const first = create(
+				"first",
+				join(root, "session-artifacts", "parent", "sub-first"),
+				parent.getSessionFile(),
+				2,
+			);
+			const second = create(
+				"second",
+				join(root, "session-artifacts", "parent", "sub-second"),
+				parent.getSessionFile(),
+				2,
+			);
 			writeRegistry("root", [
 				{ type: "rlm_subagent", childId: "parent", sessionFile: parent.getSessionFile(), status: "completed" },
 			]);
@@ -139,38 +198,115 @@ describe("daemon catalog selector resolution", () => {
 		);
 
 		const cases: Array<[string, (fixture: ReturnType<typeof makeFixture>) => void]> = [
-			["id mismatch", (fixture) => fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "wrong", sessionFile: fixture.first.getSessionFile(), status: "completed" }])],
-			["parent mismatch", (fixture) => {
-				const evil = SessionManager.create(fixture.root, join(fixture.root, "session-artifacts", "parent", "sub-evil"));
-				evil.newSession({ id: "evil", parentSession: fixture.rootSession.getSessionFile(), rlmDepth: 2 });
-				evil.appendSessionInfo("evil");
-				fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "evil", sessionFile: evil.getSessionFile(), status: "completed" }]);
-			}],
-			["depth mismatch", (fixture) => {
-				const evil = SessionManager.create(fixture.root, join(fixture.root, "session-artifacts", "parent", "sub-evil"));
-				evil.newSession({ id: "evil", parentSession: fixture.parent.getSessionFile(), rlmDepth: 7 });
-				evil.appendSessionInfo("evil");
-				fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "evil", sessionFile: evil.getSessionFile(), status: "completed" }]);
-			}],
-			["external path", (fixture) => fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "evil", sessionFile: join(tmpdir(), "outside.jsonl"), status: "completed" }])],
-			["path alias", (fixture) => fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "first", sessionFile: `${dirname(fixture.first.getSessionFile()!)}/../sub-first/first.jsonl`, status: "completed" }])],
-			["cycle", (fixture) => fixture.writeRegistry("parent", [{ type: "rlm_subagent", childId: "root", sessionFile: fixture.rootSession.getSessionFile(), status: "completed" }])],
-			["malformed", (fixture) => fixture.writeRegistry("parent", ["{not json"])] ,
-			["record limit", (fixture) => fixture.writeRegistry("parent", Array.from({ length: 10_001 }, (_, index) => ({ type: "rlm_subagent", childId: `bad-${index}`, sessionFile: fixture.first.getSessionFile(), status: "completed" })))],
+			[
+				"id mismatch",
+				(fixture) =>
+					fixture.writeRegistry("parent", [
+						{
+							type: "rlm_subagent",
+							childId: "wrong",
+							sessionFile: fixture.first.getSessionFile(),
+							status: "completed",
+						},
+					]),
+			],
+			[
+				"parent mismatch",
+				(fixture) => {
+					const evil = SessionManager.create(
+						fixture.root,
+						join(fixture.root, "session-artifacts", "parent", "sub-evil"),
+					);
+					evil.newSession({ id: "evil", parentSession: fixture.rootSession.getSessionFile(), rlmDepth: 2 });
+					evil.appendSessionInfo("evil");
+					fixture.writeRegistry("parent", [
+						{ type: "rlm_subagent", childId: "evil", sessionFile: evil.getSessionFile(), status: "completed" },
+					]);
+				},
+			],
+			[
+				"depth mismatch",
+				(fixture) => {
+					const evil = SessionManager.create(
+						fixture.root,
+						join(fixture.root, "session-artifacts", "parent", "sub-evil"),
+					);
+					evil.newSession({ id: "evil", parentSession: fixture.parent.getSessionFile(), rlmDepth: 7 });
+					evil.appendSessionInfo("evil");
+					fixture.writeRegistry("parent", [
+						{ type: "rlm_subagent", childId: "evil", sessionFile: evil.getSessionFile(), status: "completed" },
+					]);
+				},
+			],
+			[
+				"external path",
+				(fixture) =>
+					fixture.writeRegistry("parent", [
+						{
+							type: "rlm_subagent",
+							childId: "evil",
+							sessionFile: join(tmpdir(), "outside.jsonl"),
+							status: "completed",
+						},
+					]),
+			],
+			[
+				"path alias",
+				(fixture) =>
+					fixture.writeRegistry("parent", [
+						{
+							type: "rlm_subagent",
+							childId: "first",
+							sessionFile: `${dirname(fixture.first.getSessionFile()!)}/../sub-first/first.jsonl`,
+							status: "completed",
+						},
+					]),
+			],
+			[
+				"cycle",
+				(fixture) =>
+					fixture.writeRegistry("parent", [
+						{
+							type: "rlm_subagent",
+							childId: "root",
+							sessionFile: fixture.rootSession.getSessionFile(),
+							status: "completed",
+						},
+					]),
+			],
+			["malformed", (fixture) => fixture.writeRegistry("parent", ["{not json"])],
+			[
+				"record limit",
+				(fixture) =>
+					fixture.writeRegistry(
+						"parent",
+						Array.from({ length: 10_001 }, (_, index) => ({
+							type: "rlm_subagent",
+							childId: `bad-${index}`,
+							sessionFile: fixture.first.getSessionFile(),
+							status: "completed",
+						})),
+					),
+			],
 		];
 		for (const [label, mutate] of cases) {
 			const fixture = makeFixture(`prime-catalog-family-${label.replace(/\s/g, "-")}-`);
 			mutate(fixture);
-			await expect(listCatalogFamilySessions(fixture.sessionDir), label).rejects.toThrow("Invalid RLM artifact family topology");
+			await expect(listCatalogFamilySessions(fixture.sessionDir), label).rejects.toThrow(
+				"Invalid RLM artifact family topology",
+			);
 		}
 		const symlink = makeFixture("prime-catalog-family-symlink-");
 		const alias = join(symlink.root, "session-artifacts", "parent", "sub-alias", "first.jsonl");
 		mkdirSync(dirname(alias), { recursive: true });
 		symlinkSync(symlink.first.getSessionFile()!, alias);
-		symlink.writeRegistry("parent", [{ type: "rlm_subagent", childId: "first", sessionFile: alias, status: "completed" }]);
-		await expect(listCatalogFamilySessions(symlink.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		symlink.writeRegistry("parent", [
+			{ type: "rlm_subagent", childId: "first", sessionFile: alias, status: "completed" },
+		]);
+		await expect(listCatalogFamilySessions(symlink.sessionDir)).rejects.toThrow(
+			"Invalid RLM artifact family topology",
+		);
 	});
-
 
 	it("rejects symlinked roots and deterministic intermediate/final replacement races", async () => {
 		const make = (name: string) => {
@@ -185,7 +321,15 @@ describe("daemon catalog selector resolution", () => {
 			child.appendSessionInfo("child");
 			const registry = join(root, "session-artifacts", "parent", "rlm-subagents.jsonl");
 			mkdirSync(dirname(registry), { recursive: true });
-			writeFileSync(registry, JSON.stringify({ type: "rlm_subagent", childId: "child", sessionFile: child.getSessionFile(), status: "completed" }));
+			writeFileSync(
+				registry,
+				JSON.stringify({
+					type: "rlm_subagent",
+					childId: "child",
+					sessionFile: child.getSessionFile(),
+					status: "completed",
+				}),
+			);
 			return { root, sessionDir, parent, child, childDir, registry };
 		};
 
@@ -193,7 +337,9 @@ describe("daemon catalog selector resolution", () => {
 		const movedSessions = `${rootLink.sessionDir}-real`;
 		renameSync(rootLink.sessionDir, movedSessions);
 		symlinkSync(movedSessions, rootLink.sessionDir);
-		await expect(listCatalogFamilySessions(rootLink.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		await expect(listCatalogFamilySessions(rootLink.sessionDir)).rejects.toThrow(
+			"Invalid RLM artifact family topology",
+		);
 
 		const intermediate = make("prime-catalog-intermediate-swap-");
 		let swappedIntermediate = false;
@@ -204,7 +350,9 @@ describe("daemon catalog selector resolution", () => {
 			renameSync(intermediate.childDir, moved);
 			symlinkSync(moved, intermediate.childDir);
 		});
-		await expect(listCatalogFamilySessions(intermediate.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		await expect(listCatalogFamilySessions(intermediate.sessionDir)).rejects.toThrow(
+			"Invalid RLM artifact family topology",
+		);
 
 		const finalSwap = make("prime-catalog-final-swap-");
 		let swappedFinal = false;
@@ -215,7 +363,9 @@ describe("daemon catalog selector resolution", () => {
 			renameSync(path, moved);
 			symlinkSync(moved, path);
 		});
-		await expect(listCatalogFamilySessions(finalSwap.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		await expect(listCatalogFamilySessions(finalSwap.sessionDir)).rejects.toThrow(
+			"Invalid RLM artifact family topology",
+		);
 		setCatalogBeforeTrustedOpenForTest(undefined);
 	});
 
@@ -239,7 +389,6 @@ describe("daemon catalog selector resolution", () => {
 		setCatalogBeforeTrustedOpenForTest(undefined);
 		rmSync(root, { recursive: true, force: true });
 	});
-
 
 	it("closes authority descriptors after repeated hostile seed failures", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-fd-release-"));

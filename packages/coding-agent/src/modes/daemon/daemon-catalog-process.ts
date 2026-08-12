@@ -1,12 +1,16 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, openSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
-import { readSessionInfo, readSessionInfoFromBuffer, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import {
+	readSessionInfo,
+	readSessionInfoFromBuffer,
+	type SessionInfo,
+	SessionManager,
+} from "../../core/session-manager.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 
@@ -98,11 +102,11 @@ interface TrustedSession extends SessionInfo {
 	persistedParentPath?: string;
 }
 
-function rlmSubagentRegistryPath(parent: SessionInfo, roots: ManagedRoots): string {
+function rlmSubagentRegistryPath(parent: SessionInfo, roots: ManagedRoots): string | undefined {
 	const parentDir = dirname(parent.path);
-	const artifactDir = parentDir === roots.session.lexical ? roots.artifacts?.lexical : join(parentDir, "session-artifacts");
-	if (!artifactDir) throw invalidFamilyTopology("managed artifact directory is absent");
-	return join(artifactDir, parent.id, "rlm-subagents.jsonl");
+	const artifactDir =
+		parentDir === roots.session.lexical ? roots.artifacts?.lexical : join(parentDir, "session-artifacts");
+	return artifactDir ? join(artifactDir, parent.id, "rlm-subagents.jsonl") : undefined;
 }
 
 function isWithin(root: string, target: string): boolean {
@@ -197,7 +201,8 @@ export function setCatalogBeforeTrustedOpenForTest(hook: ((path: string) => void
 }
 
 function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number): TrustedFile {
-	if (!isAbsolute(rawPath) || rawPath !== resolve(rawPath)) throw invalidFamilyTopology("session path is not canonical");
+	if (!isAbsolute(rawPath) || rawPath !== resolve(rawPath))
+		throw invalidFamilyTopology("session path is not canonical");
 	const root = [roots.session, roots.artifacts].find((candidate) => candidate && isWithin(candidate.lexical, rawPath));
 	if (!root) throw invalidFamilyTopology("session path escapes managed roots");
 	const suffix = relative(root.lexical, rawPath);
@@ -206,18 +211,40 @@ function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number)
 		throw invalidFamilyTopology("session path lacks a trusted file component");
 	}
 	beforeTrustedOpenForTest?.(rawPath);
-	const result = spawnSync(process.execPath === process.env.PRIME_AGENT_KERNEL_PYTHON ? process.execPath : (process.env.PRIME_AGENT_KERNEL_PYTHON ?? "python3"), ["-I", "-c", OPENAT_READ_HELPER], {
-		input: JSON.stringify({ parts, limit: maxBytes }), encoding: "utf8", timeout: 5_000, maxBuffer: maxBytes * 2 + 64 * 1024,
-		stdio: ["pipe", "pipe", "pipe", root.fd], shell: false,
-	});
+	const result = spawnSync(
+		process.execPath === process.env.PRIME_AGENT_KERNEL_PYTHON
+			? process.execPath
+			: (process.env.PRIME_AGENT_KERNEL_PYTHON ?? "python3"),
+		["-I", "-c", OPENAT_READ_HELPER],
+		{
+			input: JSON.stringify({ parts, limit: maxBytes }),
+			encoding: "utf8",
+			timeout: 5_000,
+			maxBuffer: maxBytes * 2 + 64 * 1024,
+			stdio: ["pipe", "pipe", "pipe", root.fd],
+			shell: false,
+		},
+	);
 	if (result.status === 44) throw invalidFamilyTopology("descriptor-relative artifact is absent");
 	if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
 		throw invalidFamilyTopology("descriptor-relative artifact read failed");
 	}
 	try {
 		const wire = JSON.parse(result.stdout) as { data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
-		if (typeof wire.data !== "string" || typeof wire.mtimeMs !== "number" || typeof wire.dev !== "string" || typeof wire.ino !== "string") throw new Error("invalid");
-		return { path: rawPath, contents: Buffer.from(wire.data, "base64"), mtimeMs: wire.mtimeMs, dev: wire.dev, ino: wire.ino };
+		if (
+			typeof wire.data !== "string" ||
+			typeof wire.mtimeMs !== "number" ||
+			typeof wire.dev !== "string" ||
+			typeof wire.ino !== "string"
+		)
+			throw new Error("invalid");
+		return {
+			path: rawPath,
+			contents: Buffer.from(wire.data, "base64"),
+			mtimeMs: wire.mtimeMs,
+			dev: wire.dev,
+			ino: wire.ino,
+		};
 	} catch {
 		throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
 	}
@@ -225,19 +252,43 @@ function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number)
 
 async function readTrustedSession(path: string, roots: ManagedRoots): Promise<TrustedSession> {
 	const trusted = readTrustedFile(path, roots, 128 * 1024 * 1024);
-	const headerLine = trusted.contents.toString("utf8", 0, Math.min(trusted.contents.length, 256 * 1024)).split(/\r?\n/, 1)[0];
+	const headerLine = trusted.contents
+		.toString("utf8", 0, Math.min(trusted.contents.length, 256 * 1024))
+		.split(/\r?\n/, 1)[0];
 	let header: { type?: unknown; id?: unknown; parentSession?: unknown; rlmDepth?: unknown };
-	try { header = JSON.parse(headerLine ?? "") as typeof header; } catch { throw invalidFamilyTopology("session header is malformed"); }
+	try {
+		header = JSON.parse(headerLine ?? "") as typeof header;
+	} catch {
+		throw invalidFamilyTopology("session header is malformed");
+	}
 	const hasParent = header.parentSession !== undefined;
 	const hasDepth = Number.isSafeInteger(header.rlmDepth) && (header.rlmDepth as number) >= 0;
-	if (header.type !== "session" || typeof header.id !== "string" || header.id === "" || (hasParent && typeof header.parentSession !== "string") || (hasParent && header.parentSession === "") || (hasParent && !hasDepth) || (!hasParent && header.rlmDepth !== undefined && !hasDepth)) throw invalidFamilyTopology("session header lacks trustworthy topology claims");
+	if (
+		header.type !== "session" ||
+		typeof header.id !== "string" ||
+		header.id === "" ||
+		(hasParent && typeof header.parentSession !== "string") ||
+		(hasParent && header.parentSession === "") ||
+		(hasParent && !hasDepth) ||
+		(!hasParent && header.rlmDepth !== undefined && !hasDepth)
+	)
+		throw invalidFamilyTopology("session header lacks trustworthy topology claims");
 	const persistedDepth = hasDepth ? (header.rlmDepth as number) : 0;
 	const info = await readSessionInfoFromBuffer(path, trusted.contents, { mtimeMs: trusted.mtimeMs });
 	if (!info || info.id !== header.id) throw invalidFamilyTopology("session metadata does not match its header");
-	return { ...info, path, rlmDepth: persistedDepth, persistedDepth, ...(hasParent ? { persistedParentPath: header.parentSession as string } : {}) };
+	return {
+		...info,
+		path,
+		rlmDepth: persistedDepth,
+		persistedDepth,
+		...(hasParent ? { persistedParentPath: header.parentSession as string } : {}),
+	};
 }
 
-async function readLatestRegistry(path: string, roots: ManagedRoots): Promise<SavedRlmSubagentRegistryEntry[] | undefined> {
+async function readLatestRegistry(
+	path: string,
+	roots: ManagedRoots,
+): Promise<SavedRlmSubagentRegistryEntry[] | undefined> {
 	let contents: string;
 	try {
 		contents = readTrustedFile(path, roots, MAX_RLM_REGISTRY_BYTES).contents.toString("utf8");
@@ -283,7 +334,8 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				throw invalidFamilyTopology("managed session seed claims a parent");
 			}
 			const existingPath = ids.get(trusted.id);
-			if (existingPath && existingPath !== trusted.path) throw invalidFamilyTopology("family contains a duplicate session id");
+			if (existingPath && existingPath !== trusted.path)
+				throw invalidFamilyTopology("family contains a duplicate session id");
 			ids.set(trusted.id, trusted.path);
 			sessions.set(trusted.path, trusted);
 		}
@@ -296,6 +348,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 			if (visited.has(parentPath)) return;
 			visited.add(parentPath);
 			const registryPath = rlmSubagentRegistryPath(parent, authority);
+			if (!registryPath) return;
 			const entries = await readLatestRegistry(registryPath, authority);
 			if (!entries) return;
 			const childAncestors = new Set(ancestors);
@@ -307,18 +360,28 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
 				const child = await readTrustedSession(childPath, authority);
 				if (child.id !== entry.childId) throw invalidFamilyTopology("registry child id does not match session id");
-				if (child.persistedParentPath === undefined) throw invalidFamilyTopology("child lacks a persisted parent path");
+				if (child.persistedParentPath === undefined)
+					throw invalidFamilyTopology("child lacks a persisted parent path");
 				const claimedParentPath = resolve(dirname(child.path), child.persistedParentPath);
 				readTrustedFile(claimedParentPath, authority, 128 * 1024 * 1024);
-				if (claimedParentPath !== parentPath) throw invalidFamilyTopology("child parent path does not match traversed parent");
-				if (child.persistedDepth !== parent.persistedDepth + 1) throw invalidFamilyTopology("child depth does not equal parent depth plus one");
+				if (claimedParentPath !== parentPath)
+					throw invalidFamilyTopology("child parent path does not match traversed parent");
+				if (child.persistedDepth !== parent.persistedDepth + 1)
+					throw invalidFamilyTopology("child depth does not equal parent depth plus one");
 				const existingPath = ids.get(child.id);
-				if (existingPath && existingPath !== child.path) throw invalidFamilyTopology("family contains a duplicate session id");
+				if (existingPath && existingPath !== child.path)
+					throw invalidFamilyTopology("family contains a duplicate session id");
 				const existing = sessions.get(child.path);
-				if (existing && (existing.id !== child.id || existing.persistedParentPath !== child.persistedParentPath || existing.persistedDepth !== child.persistedDepth)) {
+				if (
+					existing &&
+					(existing.id !== child.id ||
+						existing.persistedParentPath !== child.persistedParentPath ||
+						existing.persistedDepth !== child.persistedDepth)
+				) {
 					throw invalidFamilyTopology("family contains a conflicting duplicate");
 				}
-				if (!existing && sessions.size >= MAX_RLM_FAMILY_NODES) throw invalidFamilyTopology("family node limit exhausted");
+				if (!existing && sessions.size >= MAX_RLM_FAMILY_NODES)
+					throw invalidFamilyTopology("family node limit exhausted");
 				ids.set(child.id, child.path);
 				sessions.set(child.path, child);
 				await visit(child, depth + 1, childAncestors);
@@ -478,7 +541,11 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					type: "response",
 					id: request.id,
 					success: true,
-					data: { sessions: (await listSavedSessionSiblings(request.sessionPath, request.sessionDir)).map(serializeSessionInfo) },
+					data: {
+						sessions: (await listSavedSessionSiblings(request.sessionPath, request.sessionDir)).map(
+							serializeSessionInfo,
+						),
+					},
 				});
 				return;
 			case "rename":
