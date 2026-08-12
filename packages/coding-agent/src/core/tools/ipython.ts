@@ -103,11 +103,9 @@ class _PrimeAgentBashResult:
         return text
 
     def __repr__(self) -> str:
-        truncated = self.stdout_truncated or self.stderr_truncated
-        return (
-            f"BashResult(returncode={self.returncode}, stdout={len(self.stdout)} chars, "
-            f"stderr={len(self.stderr)} chars, truncated={truncated})"
-        )
+        # IPython renders a cell's final expression with repr(), so expose the
+        # captured command output instead of hiding it behind a metadata summary.
+        return str(self)
 
 
 async def _prime_agent_bash_drain(stream, capture: _PrimeAgentBoundedBytes) -> None:

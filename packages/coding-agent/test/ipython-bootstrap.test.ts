@@ -94,6 +94,19 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 		}
 	}, 60_000);
 
+	it("renders command output when await bash is the final expression", async () => {
+		const manager = new KernelManager({ python: python as string, cwd: dir });
+		try {
+			await manager.start();
+			expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+			const result = await manager.execute('await bash("printf visible-output")');
+			expect(result.status).toBe("ok");
+			expect(result.result).toContain("visible-output");
+		} finally {
+			await manager.dispose();
+		}
+	}, 60_000);
+
 	it("runs async bash with bounded stdout and stderr capture", async () => {
 		const manager = new KernelManager({ python: python as string, cwd: dir });
 		try {
