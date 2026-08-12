@@ -503,6 +503,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 			},
 		];
 		supervisor.catalog.list = vi.fn(async () => catalog);
+		Object.assign(supervisor.catalog, { family: vi.fn(async () => catalog) });
 		const entries = await supervisor.familyCatalogEntries();
 		expect(entries.map((entry) => entry.id)).toEqual(["root", "middle", "first", "second"]);
 		const { assertAgentFamilyReach } = await import("../src/core/agent-messages.js");
@@ -534,7 +535,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 		supervisor.workers.set("source", source);
 		supervisor.workers.set("target", target);
 		const timestamp = new Date(now);
-		supervisor.catalog.list = vi.fn(async () => [
+		const catalog = [
 			{
 				id: "root",
 				path: "/tmp/root.jsonl",
@@ -556,7 +557,9 @@ describe("daemon supervisor whole-tree eviction", () => {
 				messageCount: 0,
 				firstMessage: "",
 			},
-		]);
+			];
+		supervisor.catalog.list = vi.fn(async () => catalog);
+		Object.assign(supervisor.catalog, { family: vi.fn(async () => catalog) });
 
 		await expect(
 			supervisor.handleCommand(

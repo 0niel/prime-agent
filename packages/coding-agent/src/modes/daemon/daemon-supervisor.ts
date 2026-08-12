@@ -253,7 +253,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
-type FamilyCatalogSource = "persisted" | "live";
+type FamilyCatalogSource = "persisted" | "artifact" | "live";
 
 type FamilyCatalogCandidate = AgentFamilyCatalogEntry & {
 	source: FamilyCatalogSource;
@@ -2068,7 +2068,7 @@ export class DaemonSupervisor {
 		}
 		const opening = (async () => {
 			if (!createCommand.name) return this.launchWorker(createCommand, undefined, ownerClientId);
-			const savedSiblings = createCommand.sessionPath ? await this.catalog.siblings(createCommand.sessionPath) : [];
+			const savedSiblings = createCommand.sessionPath ? await this.catalog.siblings(createCommand.sessionPath, this.defaultSessionConfig.sessionDir) : [];
 			const target = savedSiblings.find(
 				(session) => canonicalSessionPath(session.path) === canonicalSessionPath(createCommand.sessionPath!),
 			);
@@ -3045,13 +3045,30 @@ export class DaemonSupervisor {
 		// Keep the persisted row even when its path is currently active. A live
 		// overlay may fill in missing claims, but it may not silently replace a
 		// conflicting durable topology claim.
-		const persisted = (await this.catalog.list()).map(
+		const saved = await this.catalog.list();
+		const savedPaths = new Set(saved.map((info) => canonicalSessionPath(info.path)));
+		const persisted = saved.map(
 			(info): FamilyCatalogCandidate => ({
 				...this.familyCatalogEntry(summaryForInactiveSession(info)),
 				source: "persisted",
 			}),
 		);
-		return Object.freeze(this.mergeEquivalentFamilyCatalogEntries([...persisted, ...live]));
+		// The catalog's bounded registry walk supplies artifact-resident parents
+		// and descendants missing from list(). Preserve their durable rows in the
+		// immutable authorization snapshot; live overlays still cannot replace a
+		// conflicting topology claim.
+		const artifactSessions = this.catalog.family
+			? await this.catalog.family(this.defaultSessionConfig.sessionDir)
+			: saved;
+		const artifacts = artifactSessions
+			.filter((info) => !savedPaths.has(canonicalSessionPath(info.path)))
+			.map(
+				(info): FamilyCatalogCandidate => ({
+					...this.familyCatalogEntry(summaryForInactiveSession(info)),
+					source: "artifact",
+				}),
+			);
+		return Object.freeze(this.mergeEquivalentFamilyCatalogEntries([...persisted, ...artifacts, ...live]));
 	}
 
 	/**
@@ -3084,7 +3101,11 @@ export class DaemonSupervisor {
 			get: (row: FamilyCatalogCandidate) => T | undefined,
 		): T | undefined =>
 			[...rows]
-				.sort((left, right) => (right.source === "live" ? 1 : 0) - (left.source === "live" ? 1 : 0))
+				.sort(
+					(left, right) =>
+						({ persisted: 0, artifact: 1, live: 2 }[right.source] ?? 0) -
+						({ persisted: 0, artifact: 1, live: 2 }[left.source] ?? 0),
+				)
 				.map(get)
 				.find((value): value is T => value !== undefined);
 		return groups.map((rows) => {
@@ -3146,7 +3167,7 @@ export class DaemonSupervisor {
 			.flatMap((worker) => [...worker.summaries.values()])
 			.find((summary) => summary.sessionFile && canonicalSessionPath(summary.sessionFile) === targetPath);
 		if (active) return this.summaryNameReservationInput(active, name);
-		const siblings = await this.catalog.siblings(sessionPath);
+		const siblings = await this.catalog.siblings(sessionPath, this.defaultSessionConfig.sessionDir);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		return {
@@ -3175,7 +3196,7 @@ export class DaemonSupervisor {
 			.flatMap((worker) => [...worker.summaries.values()])
 			.find((summary) => summary.sessionFile && canonicalSessionPath(summary.sessionFile) === targetPath);
 		if (active) return this.assertSupervisorSessionNameAvailable(active, name);
-		const siblings = await this.catalog.siblings(sessionPath);
+		const siblings = await this.catalog.siblings(sessionPath, this.defaultSessionConfig.sessionDir);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		if (saved.parentSessionPath && (saved.rlmDepth ?? 0) > 0) {
