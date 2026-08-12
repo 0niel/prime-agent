@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
+import {
+	type AgentSessionRuntimeConfig,
+	mergeAgentSessionRuntimeConfig,
+	sanitizeAgentSessionRuntimeConfigForDurableStorage,
+} from "../src/core/agent-session-config.js";
 
 describe("mergeAgentSessionRuntimeConfig", () => {
 	it("applies session overrides without mutating default config", () => {
@@ -167,5 +171,36 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 		expect(mergeAgentSessionRuntimeConfig({ telemetryDisabled: true }, {}).telemetryDisabled).toBe(true);
 		expect(mergeAgentSessionRuntimeConfig({}, { telemetryDisabled: true }).telemetryDisabled).toBe(true);
 		expect(mergeAgentSessionRuntimeConfig({}, {}).telemetryDisabled).toBeUndefined();
+	});
+	describe("sanitizeAgentSessionRuntimeConfigForDurableStorage", () => {
+		it("removes recursive provider credentials and authorization headers without mutating live config", () => {
+			const runtimeConfig = {
+				cwd: "/repo",
+				apiKey: "top-level-secret",
+				extensionFlagValues: {
+					provider: {
+						apiKey: "nested-secret",
+						token: "nested-token",
+						headers: {
+							Authorization: "Bearer authorization-secret",
+							"X-Api-Key": "header-key-secret",
+							"X-Request-Id": "safe-request-id",
+						},
+					},
+				},
+			} as unknown as AgentSessionRuntimeConfig;
+
+			const durable = sanitizeAgentSessionRuntimeConfigForDurableStorage(runtimeConfig);
+
+			expect(durable).toEqual({
+				cwd: "/repo",
+				extensionFlagValues: {
+					provider: { headers: { "X-Request-Id": "safe-request-id" } },
+				},
+			});
+			expect(JSON.stringify(durable)).not.toContain("secret");
+			expect(runtimeConfig.apiKey).toBe("top-level-secret");
+			expect((runtimeConfig.extensionFlagValues?.provider as { apiKey?: string }).apiKey).toBe("nested-secret");
+		});
 	});
 });

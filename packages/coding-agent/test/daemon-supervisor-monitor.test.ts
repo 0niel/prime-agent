@@ -1928,12 +1928,13 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(supervisor.launchWorker).toHaveBeenCalledWith(worker.descriptor.createCommand, worker);
 	});
 
-	it("does not relaunch a live worker whose process identity is unknown", async () => {
+	it("does not replace a verified live ownerless resident after repeated socket/auth failures without fresh env", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
 			descriptor: {
 				workerId: string;
 				pid: number;
+				processStartId?: string;
 				rootActiveSessionId: string;
 				createCommand: { type: "create" };
 				lifecycle?: string;
@@ -1961,8 +1962,9 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		const worker: RecoveryWorker = {
 			descriptor: {
-				workerId: "worker-unknown-identity",
+				workerId: "live-ownerless-worker-with-failed-auth",
 				pid: process.pid,
+				processStartId: getProcessStartId(process.pid),
 				rootActiveSessionId: "active-1",
 				createCommand: { type: "create" },
 				consecutiveFailures: 0,
@@ -1991,7 +1993,10 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(supervisor.connectWorker).toHaveBeenCalledTimes(3);
 		expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
 		expect(supervisor.launchWorker).not.toHaveBeenCalled();
-		expect(worker.descriptor.lifecycle).toBe("failed");
+		expect(worker.descriptor).toMatchObject({
+			lifecycle: "failed",
+			lastError: "Waiting for a client with fresh environment",
+		});
 	});
 
 	it("keeps a recovered worker ready when peer synchronization fails", async () => {

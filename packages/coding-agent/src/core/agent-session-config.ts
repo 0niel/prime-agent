@@ -47,6 +47,88 @@ export interface AgentSessionRuntimeConfig {
 	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
+/**
+ * Returns a copy suitable for durable daemon state. Runtime authentication can
+ * arrive in the create config, but a descriptor is a recovery recipe rather
+ * than a credential store. Keep this recursive because provider overrides and
+ * extension-owned config may add nested request options over time.
+ */
+export function sanitizeAgentSessionRuntimeConfigForDurableStorage(
+	config: AgentSessionRuntimeConfig,
+): AgentSessionRuntimeConfig {
+	return redactRuntimeConfigValue(config, new WeakMap()) as AgentSessionRuntimeConfig;
+}
+
+function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>, parentKey?: string): unknown {
+	if (!value || typeof value !== "object") {
+		return value;
+	}
+	const prior = seen.get(value);
+	if (prior !== undefined) {
+		return prior;
+	}
+	if (Array.isArray(value)) {
+		const result: unknown[] = [];
+		seen.set(value, result);
+		for (const entry of value) {
+			if (isSensitiveHeaderEntry(entry, parentKey)) {
+				continue;
+			}
+			result.push(redactRuntimeConfigValue(entry, seen, parentKey));
+		}
+		return result;
+	}
+	const result: Record<string, unknown> = {};
+	seen.set(value, result);
+	for (const [key, entry] of Object.entries(value)) {
+		if (isSecretBearingRuntimeConfigField(key) || isSensitiveHeaderField(key, parentKey)) {
+			continue;
+		}
+		result[key] = redactRuntimeConfigValue(entry, seen, key);
+	}
+	return result;
+}
+
+function isSecretBearingRuntimeConfigField(key: string): boolean {
+	const normalized = key.replaceAll(/[^a-z0-9]/gi, "").toLowerCase();
+	return (
+		normalized === "key" ||
+		normalized.endsWith("key") ||
+		normalized.includes("apikey") ||
+		normalized.includes("token") ||
+		normalized.includes("secret") ||
+		normalized === "password" ||
+		normalized === "credential" ||
+		normalized === "credentials" ||
+		normalized.includes("authorization") ||
+		normalized === "proxyauthorization" ||
+		normalized === "authheader" ||
+		normalized === "cookie" ||
+		normalized === "setcookie"
+	);
+}
+
+function isSensitiveHeaderField(key: string, parentKey: string | undefined): boolean {
+	return (
+		parentKey?.replaceAll(/[^a-z0-9]/gi, "").toLowerCase() === "headers" && isSecretBearingRuntimeConfigField(key)
+	);
+}
+
+function isSensitiveHeaderEntry(value: unknown, parentKey: string | undefined): boolean {
+	if (parentKey?.replaceAll(/[^a-z0-9]/gi, "").toLowerCase() !== "headers") {
+		return false;
+	}
+	if (Array.isArray(value)) {
+		return typeof value[0] === "string" && isSecretBearingRuntimeConfigField(value[0]);
+	}
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const entry = value as Record<string, unknown>;
+	const name = entry.name ?? entry.key;
+	return typeof name === "string" && isSecretBearingRuntimeConfigField(name);
+}
+
 export function mergeAgentSessionRuntimeConfig(
 	base: AgentSessionRuntimeConfig,
 	override?: AgentSessionRuntimeConfig,

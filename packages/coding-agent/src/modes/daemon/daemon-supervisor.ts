@@ -21,7 +21,11 @@ import {
 	formatAgentSessionNameUnavailable,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
-import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import {
+	type AgentSessionRuntimeConfig,
+	mergeAgentSessionRuntimeConfig,
+	sanitizeAgentSessionRuntimeConfigForDurableStorage,
+} from "../../core/agent-session-config.js";
 import {
 	type AgentCronJob,
 	AgentCronJobStore,
@@ -275,6 +279,8 @@ interface ResidentWorker {
 	launchEnv?: Record<string, string>;
 	/** Fresh client environment used once for a resident replacement, never persisted. */
 	recoveryLaunchEnv?: Record<string, string>;
+	/** Fresh client create command used once for a resident replacement, never persisted. */
+	recoveryCreateCommand?: DaemonCreateCommand;
 	stopFinalization?: Promise<void>;
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
@@ -944,7 +950,12 @@ export class DaemonSupervisor {
 					continue;
 				}
 				const storedLaunchEnv = descriptor.launchEnv;
+				const storedCreateConfig = descriptor.createCommand.config;
 				descriptor.launchEnv = filterPersistedDaemonLaunchEnv(storedLaunchEnv);
+				descriptor.createCommand = {
+					...descriptor.createCommand,
+					config: sanitizeAgentSessionRuntimeConfigForDurableStorage(storedCreateConfig ?? {}),
+				};
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
@@ -960,7 +971,10 @@ export class DaemonSupervisor {
 					stopRevision: 0,
 					launchEnv: descriptor.launchEnv,
 				};
-				if (JSON.stringify(storedLaunchEnv) !== JSON.stringify(descriptor.launchEnv)) {
+				if (
+					JSON.stringify(storedLaunchEnv) !== JSON.stringify(descriptor.launchEnv) ||
+					JSON.stringify(storedCreateConfig) !== JSON.stringify(descriptor.createCommand.config)
+				) {
 					this.persistWorker(worker);
 				}
 				this.workers.set(descriptor.workerId, worker);
@@ -994,7 +1008,7 @@ export class DaemonSupervisor {
 		const persisted: PersistedSupervisorConfig = {
 			version: 1,
 			socketPath: this.socketPath,
-			defaultSessionConfig: this.defaultSessionConfig,
+			defaultSessionConfig: sanitizeAgentSessionRuntimeConfigForDurableStorage(this.defaultSessionConfig),
 		};
 		const tempPath = `${this.supervisorConfigPath}.${process.pid}.tmp`;
 		writeFileSync(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
@@ -1011,7 +1025,14 @@ export class DaemonSupervisor {
 	private persistWorker(worker: ResidentWorker): void {
 		worker.descriptor.updatedAt = new Date().toISOString();
 		const tempPath = `${worker.descriptorPath}.${process.pid}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify(worker.descriptor, null, 2)}\n`, { mode: 0o600 });
+		const durableDescriptor: DaemonWorkerDescriptor = {
+			...worker.descriptor,
+			createCommand: {
+				...worker.descriptor.createCommand,
+				config: sanitizeAgentSessionRuntimeConfigForDurableStorage(worker.descriptor.createCommand.config ?? {}),
+			},
+		};
+		writeFileSync(tempPath, `${JSON.stringify(durableDescriptor, null, 2)}\n`, { mode: 0o600 });
 		chmodSync(tempPath, 0o600);
 		renameSync(tempPath, worker.descriptorPath);
 	}
@@ -2137,6 +2158,7 @@ export class DaemonSupervisor {
 			const previousDescriptor = worker.descriptor;
 			const previousIntentionalStop = worker.intentionalStop;
 			worker.recoveryLaunchEnv = command.launchEnv;
+			worker.recoveryCreateCommand = command;
 			worker.intentionalStop = false;
 			worker.descriptor = {
 				...previousDescriptor,
@@ -2151,6 +2173,7 @@ export class DaemonSupervisor {
 				// Persistence is the hand-off point; do not retain an unrecorded
 				// credential capability for a later automatic recovery.
 				worker.recoveryLaunchEnv = undefined;
+				worker.recoveryCreateCommand = undefined;
 				worker.intentionalStop = previousIntentionalStop;
 				worker.descriptor = previousDescriptor;
 				throw error;
@@ -2348,7 +2371,11 @@ export class DaemonSupervisor {
 				createdAt: existing?.descriptor.createdAt ?? now,
 				updatedAt: now,
 				lifecycle: "starting",
-				createCommand: { ...createCommand, id: undefined },
+				createCommand: {
+					...createCommand,
+					id: undefined,
+					config: sanitizeAgentSessionRuntimeConfigForDurableStorage(createCommand.config ?? {}),
+				},
 				consecutiveFailures: existing?.descriptor.consecutiveFailures ?? 0,
 			};
 			worker = existing ?? {
@@ -2377,6 +2404,7 @@ export class DaemonSupervisor {
 			// client resume instead of retaining its transient credentials.
 			if (existing) {
 				existing.recoveryLaunchEnv = undefined;
+				existing.recoveryCreateCommand = undefined;
 			}
 			if (startupGate instanceof Writable) {
 				startupGate.destroy();
@@ -2438,10 +2466,12 @@ export class DaemonSupervisor {
 			// The replacement consumed the fresh environment. Never retain it for a
 			// later automatic recovery.
 			worker.recoveryLaunchEnv = undefined;
+			worker.recoveryCreateCommand = undefined;
 			return worker;
 		} catch (error) {
 			// Every launch or persistence failure consumes the one-shot capability.
 			worker.recoveryLaunchEnv = undefined;
+			worker.recoveryCreateCommand = undefined;
 			if (isSupervisorGenerationStale(error)) {
 				throw error;
 			}
@@ -2907,6 +2937,7 @@ export class DaemonSupervisor {
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
 		if (this.isWorkerRecoveryCancelled(worker)) {
 			worker.recoveryLaunchEnv = undefined;
+			worker.recoveryCreateCommand = undefined;
 			return;
 		}
 		if (
@@ -2993,13 +3024,22 @@ export class DaemonSupervisor {
 							`Cannot safely replace live session worker ${worker.descriptor.workerId} without a verified process identity`,
 						);
 					}
+					if (worker.descriptor.ownerClientId === undefined && !worker.recoveryLaunchEnv) {
+						// A verified live resident may be adopted without credentials, but a
+						// replacement would kill it and launch a new process. Do neither
+						// unless this recovery attempt owns a current one-shot client env.
+						worker.descriptor.lifecycle = "failed";
+						worker.descriptor.lastError = "Waiting for a client with fresh environment";
+						this.persistWorker(worker);
+						return;
+					}
 					const safeToKillWorkerProcess =
 						processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined;
 					await this.recoverUncertainWorkerOperations(worker, safeToKillWorkerProcess);
 					if (this.isWorkerRecoveryCancelled(worker)) {
 						return;
 					}
-					await this.launchWorker(worker.descriptor.createCommand, worker);
+					await this.launchWorker(worker.recoveryCreateCommand ?? worker.descriptor.createCommand, worker);
 					return;
 				} catch (error) {
 					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker)) {
@@ -3031,6 +3071,7 @@ export class DaemonSupervisor {
 			// Fresh credentials belong to this recovery attempt, including failed,
 			// cancelled, reconnect-only, and stale-generation paths.
 			worker.recoveryLaunchEnv = undefined;
+			worker.recoveryCreateCommand = undefined;
 			worker.recovery = undefined;
 		});
 		return worker.recovery;
