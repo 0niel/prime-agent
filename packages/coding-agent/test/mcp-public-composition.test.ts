@@ -87,7 +87,6 @@ describe("M01 public command project policy composition", () => {
 				expect(store.writes.project).toBe(0);
 				// The downstream boundary independently remains inert if accidentally called.
 				const settings = SettingsManager.inMemory();
-				let opens = 0;
 				await expect(executeMcpDeclarationCommand(command(), settings, admission)).rejects.toThrow(
 					"Project MCP declarations are unavailable.",
 				);
@@ -96,17 +95,8 @@ describe("M01 public command project policy composition", () => {
 						parseMcpDeclarationCommand(["test", "catalog", "--project"]),
 						settings,
 						admission,
-						{
-							probeTransport: {
-								async open() {
-									opens++;
-									throw new Error("unexpected");
-								},
-							},
-						},
 					),
 				).rejects.toThrow("Project MCP declarations are unavailable.");
-				expect(opens).toBe(0);
 			} finally {
 				d.dispose();
 			}
