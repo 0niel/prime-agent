@@ -9933,6 +9933,126 @@ describe("daemon mode helpers", () => {
 		).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
 		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
 	});
+
+	it("labels CLI sibling sends from an authoritative depth-1 catalog", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-cli-sibling-label.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const { state: parentState } = makeAgentFamilyState("parent", "Parent");
+		const { state: fromState } = makeAgentFamilyState("source", "Source", parentState);
+		const { state: targetState, acceptAgentMessagePrompt } = makeAgentFamilyState("target", "Target", parentState);
+		const agentFamilyCatalogEntries = vi.fn(async () =>
+			Object.freeze([
+				{
+					id: parentState.runtime.session.sessionId,
+					depth: 0,
+					status: "running" as const,
+				},
+				{
+					id: fromState.runtime.session.sessionId,
+					depth: 1,
+					status: "running" as const,
+					parentSessionId: parentState.runtime.session.sessionId,
+				},
+				{
+					id: targetState.runtime.session.sessionId,
+					depth: 1,
+					status: "running" as const,
+					parentSessionId: parentState.runtime.session.sessionId,
+				},
+			]),
+		);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries: typeof agentFamilyCatalogEntries;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(parentState.activeSessionId, parentState);
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+		internals.agentFamilyCatalogEntries = agentFamilyCatalogEntries;
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "sent by the CLI sibling",
+				fromState,
+				origin: "cli",
+			}),
+		).resolves.toMatchObject({ deliveryStatus: "delivered" });
+		expect(agentFamilyCatalogEntries).toHaveBeenCalledOnce();
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({
+			customMessage: { details: { fromRelationship: "sibling" } },
+		});
+	});
+
+	it("omits a CLI sibling label when the catalog has ambiguous parents", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-cli-ambiguous-sibling.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const { state: firstParent } = makeAgentFamilyState("first-parent", "First parent");
+		const { state: fromState } = makeAgentFamilyState("source", "Source", firstParent);
+		const { state: targetState, acceptAgentMessagePrompt } = makeAgentFamilyState("target", "Target", firstParent);
+		const agentFamilyCatalogEntries = vi.fn(async () =>
+			Object.freeze([
+				{
+					id: firstParent.runtime.session.sessionId,
+					depth: 0,
+					status: "running" as const,
+				},
+				{
+					id: firstParent.runtime.session.sessionId,
+					depth: 0,
+					status: "running" as const,
+				},
+				{
+					id: fromState.runtime.session.sessionId,
+					depth: 1,
+					status: "running" as const,
+					parentSessionId: firstParent.runtime.session.sessionId,
+				},
+				{
+					id: targetState.runtime.session.sessionId,
+					depth: 1,
+					status: "running" as const,
+					parentSessionId: firstParent.runtime.session.sessionId,
+				},
+			]),
+		);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries: typeof agentFamilyCatalogEntries;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+		internals.agentFamilyCatalogEntries = agentFamilyCatalogEntries;
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "sent with ambiguous parent evidence",
+				fromState,
+				origin: "cli",
+			}),
+		).resolves.toMatchObject({ deliveryStatus: "delivered" });
+		expect(agentFamilyCatalogEntries).toHaveBeenCalledOnce();
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({
+			customMessage: { details: { fromRelationship: undefined } },
+		});
+	});
 });
 
 type CronAdmissionActivity = Partial<{

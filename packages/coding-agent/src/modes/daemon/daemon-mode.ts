@@ -5649,8 +5649,7 @@ export class AgentDaemon {
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
 		// Use one immutable persisted topology through selector resolution, wake, and delivery.
-		const catalog =
-			options.origin === "agent" && options.fromState ? await this.agentFamilyCatalogEntries() : undefined;
+		const catalog = options.fromState ? await this.agentFamilyCatalogEntries() : undefined;
 		let targetState: ActiveSessionState;
 		try {
 			targetState = this.getBoundSessionState(targetSelector);
