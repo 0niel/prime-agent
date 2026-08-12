@@ -51,7 +51,7 @@ const MAX_TIMEOUT_MS = 10_000;
 function boundedTimeout(value: number | undefined): number {
 	if (value === undefined) return DEFAULT_TIMEOUT_MS;
 	if (!Number.isFinite(value) || value <= 0) throw new Error("MCP probe timeout must be a positive finite number.");
-	return Math.min(Math.floor(value), MAX_TIMEOUT_MS);
+	return Math.max(1, Math.min(Math.floor(value), MAX_TIMEOUT_MS));
 }
 
 function publicProbeError(kind: "disabled" | "offline" | "untrusted" | "timeout" | "failed"): Error {

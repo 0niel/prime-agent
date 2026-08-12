@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { executeMcpDeclarationCommand, parseMcpDeclarationCommand } from "../src/core/mcp/mcp-declaration-command.js";
 import {
 	type McpProbeSession,
@@ -164,6 +164,27 @@ describe("MCP injected probe execution boundary", () => {
 		});
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(reported.map((error) => error.message)).toEqual(["MCP probe failed."]);
+	});
+
+	it("keeps fractional positive timeout budgets above zero", async () => {
+		const calls: string[] = [];
+		const delays: number[] = [];
+		const originalSetTimeout = globalThis.setTimeout;
+		const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(
+			((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+				delays.push(Number(delay));
+				return originalSetTimeout(callback, delay, ...args);
+			}) as typeof setTimeout,
+		);
+		try {
+			await expect(
+				runMcpDeclarationProbe(declaration, fakeTransport(calls), { trusted: true, timeoutMs: 0.5 }),
+			).resolves.toEqual({ initialized: true, toolsListed: true });
+			expect(delays).toContain(1);
+			expect(delays).not.toContain(0);
+		} finally {
+			timerSpy.mockRestore();
+		}
 	});
 
 	it("does not retain deadline listeners or timers after a completed probe", async () => {
