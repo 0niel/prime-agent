@@ -267,6 +267,64 @@ describe("AgentSession concurrent prompt guard", () => {
 		}
 	});
 
+	it("finalizes exactly once and shares a kernel disposal failure across callers", async () => {
+		createSession();
+		const kernelFailure = new Error("kernel disposal failed");
+		const kernelDispose = vi.fn(async () => {
+			throw kernelFailure;
+		});
+		let releaseCallback: () => void = () => {};
+		const callbackGate = new Promise<void>((resolve) => {
+			releaseCallback = resolve;
+		});
+		const callback = vi.fn(async () => callbackGate);
+		session.registerDisposeCallback(callback);
+		const internals = session as unknown as {
+			_ipythonKernelProvisioner?: { dispose(): Promise<void> };
+			_disposed: boolean;
+		};
+		internals._ipythonKernelProvisioner = { dispose: kernelDispose };
+
+		let settled = false;
+		const first = session.disposeAsync().finally(() => {
+			settled = true;
+		});
+		const second = session.disposeAsync();
+		await vi.waitFor(() => expect(callback).toHaveBeenCalledOnce());
+		expect(settled).toBe(false);
+		releaseCallback();
+		await expect(first).rejects.toBe(kernelFailure);
+		await expect(second).rejects.toBe(kernelFailure);
+		expect(kernelDispose).toHaveBeenCalledTimes(1);
+		expect(callback).toHaveBeenCalledTimes(1);
+		expect(internals._disposed).toBe(true);
+	});
+
+	it("runs finalizers and aggregates concurrent drain and kernel disposal failures", async () => {
+		createSession();
+		const kernelFailure = new Error("kernel disposal failed");
+		const drainFailure = new Error("refinement drain failed");
+		const callback = vi.fn();
+		session.registerDisposeCallback(callback);
+		const internals = session as unknown as {
+			_drainPendingRefinementForDisposal: () => Promise<void>;
+			_ipythonKernelProvisioner?: { dispose(): Promise<void> };
+			_disposed: boolean;
+		};
+		vi.spyOn(internals, "_drainPendingRefinementForDisposal").mockRejectedValue(drainFailure);
+		internals._ipythonKernelProvisioner = {
+			dispose: vi.fn(async () => {
+				throw kernelFailure;
+			}),
+		};
+
+		const failure = await session.disposeAsync().catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(AggregateError);
+		expect((failure as AggregateError).errors).toEqual([kernelFailure, drainFailure]);
+		expect(callback).toHaveBeenCalledTimes(1);
+		expect(internals._disposed).toBe(true);
+	});
+
 	it("should throw when prompt() called while streaming", async () => {
 		createSession();
 
