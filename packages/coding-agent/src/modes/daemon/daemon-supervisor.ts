@@ -2029,7 +2029,12 @@ export class DaemonSupervisor {
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
-				return await this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath, command);
+				return await this.reuseWorkerForCreate(
+					activeMatches[0]!.worker,
+					ownerClientId,
+					command.sessionPath,
+					command,
+				);
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -2370,7 +2375,9 @@ export class DaemonSupervisor {
 		} catch (error) {
 			// A replacement never passed its startup gate, so require another fresh
 			// client resume instead of retaining its transient credentials.
-			existing?.recoveryLaunchEnv = undefined;
+			if (existing) {
+				existing.recoveryLaunchEnv = undefined;
+			}
 			if (startupGate instanceof Writable) {
 				startupGate.destroy();
 			}

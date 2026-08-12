@@ -328,10 +328,7 @@ describe("ACP daemon lifecycle negotiation", () => {
 	it("closes resident child stdin before waiting for exit", async () => {
 		const child = spawn(
 			process.execPath,
-			[
-				"-e",
-				'process.stdin.once("end", () => process.exit(0)); process.stdin.resume();',
-			],
+			["-e", 'process.stdin.once("end", () => process.exit(0)); process.stdin.resume();'],
 			{ stdio: ["pipe", "ignore", "ignore"] },
 		);
 		children.add(child);
@@ -352,63 +349,62 @@ describe("ACP daemon lifecycle negotiation", () => {
 		expect(isClientOwnedDaemonSession("print", false)).toBe(true);
 	});
 
-	it(
-		"recovers a crashed resident ACP worker only with fresh environment-backed model authentication",
-		{ tags: ["kernel-heavy"], timeout: 240_000 },
-		async () => {
-			const root = mkdtempSync(join(tmpdir(), "pi-acp-resident-"));
-			temporaryRoots.push(root);
-			const agentDir = join(root, "agent");
-			const projectDir = join(root, "project");
-			const daemonSocket = join(root, "daemon.sock");
-			daemonSockets.push(daemonSocket);
-			mkdirSync(agentDir, { recursive: true });
-			mkdirSync(projectDir, { recursive: true });
-			const fixture = await startIpythonFixture();
-			writeModels(agentDir, fixture.baseUrl);
+	it("recovers a crashed resident ACP worker only with fresh environment-backed model authentication", {
+		tags: ["kernel-heavy"],
+		timeout: 240_000,
+	}, async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-acp-resident-"));
+		temporaryRoots.push(root);
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const daemonSocket = join(root, "daemon.sock");
+		daemonSockets.push(daemonSocket);
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(projectDir, { recursive: true });
+		const fixture = await startIpythonFixture();
+		writeModels(agentDir, fixture.baseUrl);
 
-			const initialSecret = "acp-initial-fixture-secret";
-			const recoveredSecret = "acp-fresh-recovery-secret";
-			const first = launchAcp(agentDir, projectDir, daemonSocket, false, initialSecret);
-			const firstSession = await first.start(projectDir);
-			await first.prompt(firstSession, "set reconnect state");
-			await first.close();
-			children.delete(first.child);
+		const initialSecret = "acp-initial-fixture-secret";
+		const recoveredSecret = "acp-fresh-recovery-secret";
+		const first = launchAcp(agentDir, projectDir, daemonSocket, false, initialSecret);
+		const firstSession = await first.start(projectDir);
+		await first.prompt(firstSession, "set reconnect state");
+		await first.close();
+		children.delete(first.child);
 
-			const reattached = launchAcp(agentDir, projectDir, daemonSocket, true, initialSecret);
-			const reattachedSession = await reattached.start(projectDir);
-			await reattached.prompt(reattachedSession, "read reconnect state");
-			await reattached.close();
-			children.delete(reattached.child);
+		const reattached = launchAcp(agentDir, projectDir, daemonSocket, true, initialSecret);
+		const reattachedSession = await reattached.start(projectDir);
+		await reattached.prompt(reattachedSession, "read reconnect state");
+		await reattached.close();
+		children.delete(reattached.child);
 
-			// `object()` restores as a distinct object, so True proves this was the
-			// live kernel namespace rather than a replacement kernel revived from disk.
-			expect(fixture.sawLiveNamespace()).toBe(true);
+		// `object()` restores as a distinct object, so True proves this was the
+		// live kernel namespace rather than a replacement kernel revived from disk.
+		expect(fixture.sawLiveNamespace()).toBe(true);
 
-			const descriptorPath = residentWorkerDescriptorPath(agentDir);
-			const descriptorText = readFileSync(descriptorPath, "utf8");
-			expect(descriptorText).not.toContain(initialSecret);
-			expect(descriptorText).not.toContain(recoveredSecret);
-			expect(descriptorText).not.toContain("ACP_FIXTURE_API_KEY");
-			const descriptor = JSON.parse(descriptorText) as { pid?: number };
-			if (typeof descriptor.pid !== "number") throw new Error("Resident ACP worker did not expose its pid");
-			const authenticatedBeforeCrash = fixture.authenticatedRequestCount(initialSecret);
-			expect(authenticatedBeforeCrash).toBeGreaterThan(0);
+		const descriptorPath = residentWorkerDescriptorPath(agentDir);
+		const descriptorText = readFileSync(descriptorPath, "utf8");
+		expect(descriptorText).not.toContain(initialSecret);
+		expect(descriptorText).not.toContain(recoveredSecret);
+		expect(descriptorText).not.toContain("ACP_FIXTURE_API_KEY");
+		const descriptor = JSON.parse(descriptorText) as { pid?: number };
+		if (typeof descriptor.pid !== "number") throw new Error("Resident ACP worker did not expose its pid");
+		const authenticatedBeforeCrash = fixture.authenticatedRequestCount(initialSecret);
+		expect(authenticatedBeforeCrash).toBeGreaterThan(0);
 
-			process.kill(-descriptor.pid, "SIGKILL");
-			await waitForFailedResidentWorker(descriptorPath);
+		process.kill(-descriptor.pid, "SIGKILL");
+		await waitForFailedResidentWorker(descriptorPath);
 
-			const recovered = launchAcp(agentDir, projectDir, daemonSocket, true, recoveredSecret);
-			const recoveredSession = await recovered.start(projectDir);
-			await recovered.prompt(recoveredSession, "recover authenticated model access");
-			await recovered.close();
-			children.delete(recovered.child);
+		const recovered = launchAcp(agentDir, projectDir, daemonSocket, true, recoveredSecret);
+		const recoveredSession = await recovered.start(projectDir);
+		await recovered.prompt(recoveredSession, "recover authenticated model access");
+		await recovered.close();
+		children.delete(recovered.child);
 
-			expect(fixture.authenticatedRequestCount(recoveredSecret)).toBeGreaterThan(0);
-			expect(fixture.authenticatedRequestCount(initialSecret)).toBe(authenticatedBeforeCrash);
-			const recoveredDescriptorText = readFileSync(descriptorPath, "utf8");
-			expect(recoveredDescriptorText).not.toContain(initialSecret);
-			expect(recoveredDescriptorText).not.toContain(recoveredSecret);
-		},
-	);
+		expect(fixture.authenticatedRequestCount(recoveredSecret)).toBeGreaterThan(0);
+		expect(fixture.authenticatedRequestCount(initialSecret)).toBe(authenticatedBeforeCrash);
+		const recoveredDescriptorText = readFileSync(descriptorPath, "utf8");
+		expect(recoveredDescriptorText).not.toContain(initialSecret);
+		expect(recoveredDescriptorText).not.toContain(recoveredSecret);
+	});
 });
