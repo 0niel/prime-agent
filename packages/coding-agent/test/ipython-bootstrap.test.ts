@@ -130,13 +130,26 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 		}
 	}, 60_000);
 
+	it("preserves valid UTF-8 command output", async () => {
+		const manager = new KernelManager({ python: python as string, cwd: dir });
+		try {
+			await manager.start();
+			expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+			const result = await manager.execute(`r = await bash("printf héllo")\nprint(repr(r.stdout))`);
+			expect(result.status).toBe("ok");
+			expect(result.stdout).toContain("héllo");
+		} finally {
+			await manager.dispose();
+		}
+	}, 60_000);
+
 	it("keeps malformed byte output within the rendered capture bound", async () => {
 		const manager = new KernelManager({ python: python as string, cwd: dir });
 		try {
 			await manager.start();
 			expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
 			const result = await manager.execute(
-				'r = await bash("yes ÿ | head -c 100000", max_output_bytes=4096)\nprint(len(r.stdout), len(repr(r)), r.stdout_truncated)',
+				'r = await bash("yes ÿ | head -c 100000", max_output_bytes=4096)\nprint(len(r.stdout.encode("utf-8")), len(repr(r).encode("utf-8")), r.stdout_truncated)',
 			);
 			expect(result.status).toBe("ok");
 			expect(result.stdout).toContain("4096");

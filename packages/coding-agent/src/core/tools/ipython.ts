@@ -51,6 +51,7 @@ class _PrimeAgentBoundedBytes:
         self.limit = limit
         self.data = bytearray()
         self.total = 0
+        self.render_truncated = False
 
     def append(self, chunk: bytes) -> None:
         self.total += len(chunk)
@@ -67,9 +68,14 @@ class _PrimeAgentBoundedBytes:
         return self.total > len(self.data)
 
     def text(self) -> str:
-        # latin-1 is byte-preserving: retained bytes cannot expand into multiple
-        # Unicode replacement bytes when IPython serializes the execute result.
-        return bytes(self.data).decode("latin-1")
+        text = bytes(self.data).decode("utf-8", errors="replace")
+        rendered = text.encode("utf-8")
+        if len(rendered) <= self.limit:
+            return text
+        # Replacement characters can expand malformed bytes. Bound the actual
+        # UTF-8 payload IPython will serialize, trimming only from the head.
+        self.render_truncated = True
+        return rendered[-self.limit:].decode("utf-8", errors="ignore")
 
 
 class _PrimeAgentBashResult:
@@ -98,11 +104,11 @@ class _PrimeAgentBashResult:
         if self.stdout:
             parts.append(self.stdout)
         if self.stdout_truncated:
-            parts.append(f"[stdout truncated; showing final {len(self.stdout.encode('latin-1'))} of {self.stdout_total_bytes} bytes]")
+            parts.append(f"[stdout truncated; showing final {len(self.stdout.encode('utf-8'))} of {self.stdout_total_bytes} bytes]")
         if self.stderr:
             parts.append(self.stderr)
         if self.stderr_truncated:
-            parts.append(f"[stderr truncated; showing final {len(self.stderr.encode('latin-1'))} of {self.stderr_total_bytes} bytes]")
+            parts.append(f"[stderr truncated; showing final {len(self.stderr.encode('utf-8'))} of {self.stderr_total_bytes} bytes]")
         text = chr(10).join(parts)
         if self.returncode != 0:
             text += chr(10) + chr(10) + f"Command exited with code {self.returncode}"
@@ -241,12 +247,14 @@ async def bash(
             collector.cancel()
             await _prime_agent_asyncio.gather(collector, return_exceptions=True)
 
+    stdout_text = stdout_capture.text()
+    stderr_text = stderr_capture.text()
     return _PrimeAgentBashResult(
-        stdout=stdout_capture.text(),
-        stderr=stderr_capture.text(),
+        stdout=stdout_text,
+        stderr=stderr_text,
         returncode=proc.returncode if proc.returncode is not None else -1,
-        stdout_truncated=stdout_capture.truncated,
-        stderr_truncated=stderr_capture.truncated,
+        stdout_truncated=stdout_capture.truncated or stdout_capture.render_truncated,
+        stderr_truncated=stderr_capture.truncated or stderr_capture.render_truncated,
         stdout_total_bytes=stdout_capture.total,
         stderr_total_bytes=stderr_capture.total,
     )
