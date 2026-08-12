@@ -177,7 +177,7 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 			const runtimeConfig = {
 				cwd: "/repo",
 				apiKey: "top-level-secret",
-				initialGoal: { objective: "keep the non-secret budget", tokenBudget: 1234 },
+				initialGoal: { objective: "keep the configured budget", tokenBudget: 1234 },
 				extensionFlagValues: {
 					provider: {
 						apiKey: "nested-secret",
@@ -196,7 +196,7 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 
 			expect(durable).toEqual({
 				cwd: "/repo",
-				initialGoal: { objective: "keep the non-secret budget", tokenBudget: 1234 },
+				initialGoal: { objective: "keep the configured budget", tokenBudget: 1234 },
 				extensionFlagValues: {
 					provider: { tokenLimit: 5678 },
 				},
