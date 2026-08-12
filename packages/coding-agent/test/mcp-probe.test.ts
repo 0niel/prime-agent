@@ -20,7 +20,15 @@ function fakeTransport(calls: string[], overrides: Partial<McpProbeSession> = {}
 	};
 }
 
-describe("M01 injected MCP probe", () => {
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
+describe("MCP injected probe execution boundary", () => {
 	it("uses only initialize then tools/list and always closes the injected session", async () => {
 		const calls: string[] = [];
 		await expect(runMcpDeclarationProbe(declaration, fakeTransport(calls), { trusted: true })).resolves.toEqual({
@@ -69,19 +77,57 @@ describe("M01 injected MCP probe", () => {
 		expect(calls).toEqual(["open:https://catalog.test/mcp", "initialize", "tools/list", "close"]);
 	});
 
-	it("aborts a hanging injected transport within its bounded timeout", async () => {
-		let aborted = false;
+	it("closes a transport session that resolves after the operation deadline", async () => {
+		const lateOpen = deferred<McpProbeSession>();
+		let closeCalls = 0;
+		let abortListeners = 0;
 		const transport: McpProbeTransport = {
 			open({ signal }) {
 				signal.addEventListener("abort", () => {
-					aborted = true;
+					abortListeners++;
 				});
-				return new Promise(() => undefined);
+				return lateOpen.promise;
 			},
 		};
 		await expect(runMcpDeclarationProbe(declaration, transport, { trusted: true, timeoutMs: 10 })).rejects.toThrow(
-			"timed out",
+			"MCP probe timed out.",
 		);
-		expect(aborted).toBe(true);
+		expect(abortListeners).toBe(1);
+		lateOpen.resolve({
+			request: async () => undefined,
+			close: async () => {
+				closeCalls++;
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(closeCalls).toBe(1);
+	});
+
+	it("reports late close failures without revealing transport data", async () => {
+		const lateOpen = deferred<McpProbeSession>();
+		const reported: Error[] = [];
+		const transport: McpProbeTransport = { open: () => lateOpen.promise };
+		await expect(
+			runMcpDeclarationProbe(declaration, transport, {
+				trusted: true,
+				timeoutMs: 10,
+				onLateCleanupFailure: (error) => reported.push(error),
+			}),
+		).rejects.toThrow("MCP probe timed out.");
+		lateOpen.resolve({
+			request: async () => undefined,
+			close: async () => {
+				throw new Error("https://alice:secret@catalog.test/mcp?token=secret");
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(reported.map((error) => error.message)).toEqual(["MCP probe failed."]);
+	});
+
+	it("does not retain deadline listeners or timers after a completed probe", async () => {
+		const calls: string[] = [];
+		await runMcpDeclarationProbe(declaration, fakeTransport(calls), { trusted: true, timeoutMs: 10 });
+		await new Promise((resolve) => setTimeout(resolve, 15));
+		expect(calls).toEqual(["open:https://catalog.test/mcp", "initialize", "tools/list", "close"]);
 	});
 });

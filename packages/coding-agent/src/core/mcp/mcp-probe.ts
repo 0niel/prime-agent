@@ -26,8 +26,10 @@ export interface McpDeclarationProbeOptions {
 	offline?: boolean;
 	/** A project declaration must have passed the C05 trust boundary first. */
 	trusted?: boolean;
-	/** Total wall-clock budget for opening, both protocol requests, and close. */
+	/** Total wall-clock budget for opening and protocol requests. */
 	timeoutMs?: number;
+	/** Receives a redacted failure when a timed-out open later needs cleanup. */
+	onLateCleanupFailure?: (error: Error) => void;
 }
 
 export interface McpDeclarationProbeResult {
@@ -65,6 +67,28 @@ function withDeadline<T>(promise: Promise<T> | T, signal: AbortSignal): Promise<
 	});
 }
 
+/** Close with a fresh bounded signal: a failed operation must not strand its session. */
+async function closeSession(session: McpProbeSession, timeoutMs: number): Promise<Error | undefined> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		await withDeadline(session.close(), controller.signal);
+	} catch {
+		return controller.signal.aborted ? publicProbeError("timeout") : publicProbeError("failed");
+	} finally {
+		clearTimeout(timer);
+	}
+	return undefined;
+}
+
+function reportLateCleanupFailure(options: McpDeclarationProbeOptions, error: Error): void {
+	try {
+		options.onLateCleanupFailure?.(error);
+	} catch {
+		// The probe has already completed. A diagnostic observer cannot revive it.
+	}
+}
+
 /**
  * Executes the smallest possible read-only MCP handshake using an injected
  * transport. It has no SDK, fetch, auth, or endpoint implementation, and is
@@ -81,15 +105,17 @@ export async function runMcpDeclarationProbe(
 	if (options.trusted !== true) throw publicProbeError("untrusted");
 
 	const timeoutMs = boundedTimeout(options.timeoutMs);
-	const controller = new AbortController();
-	const deadlineTimer = setTimeout(() => controller.abort(), timeoutMs);
+	const operationController = new AbortController();
+	const operationTimer = setTimeout(() => operationController.abort(), timeoutMs);
+	let opening: Promise<McpProbeSession> | undefined;
 	let session: McpProbeSession | undefined;
 	let failure: Error | undefined;
 	try {
-		session = await withDeadline(
-			transport.open({ url: declaration.url, signal: controller.signal }),
-			controller.signal,
-		);
+		// Keep the raw opening promise so a transport that resolves after our timeout
+		// is still closed. Awaiting only a deadline wrapper would lose that session.
+		// Deferring the call also sends synchronous adapter failures through redaction.
+		opening = Promise.resolve().then(() => transport.open({ url: declaration.url, signal: operationController.signal }));
+		session = await withDeadline(opening, operationController.signal);
 		await withDeadline(
 			session.request({
 				method: "initialize",
@@ -98,29 +124,33 @@ export async function runMcpDeclarationProbe(
 					capabilities: {},
 					clientInfo: { name: "Prime Agent" },
 				},
-				signal: controller.signal,
+				signal: operationController.signal,
 			}),
-			controller.signal,
+			operationController.signal,
 		);
-		await withDeadline(session.request({ method: "tools/list", signal: controller.signal }), controller.signal);
+		await withDeadline(
+			session.request({ method: "tools/list", signal: operationController.signal }),
+			operationController.signal,
+		);
 	} catch (error) {
-		controller.abort();
+		operationController.abort();
 		failure = error instanceof Error && error.message === "MCP probe timed out." ? error : publicProbeError("failed");
 	} finally {
+		clearTimeout(operationTimer);
 		if (session) {
-			try {
-				// Invoke close even after cancellation. The injected session owns its
-				// local cleanup and cannot be left open by a failed handshake.
-				await withDeadline(session.close(), controller.signal);
-			} catch {
-				// A close failure must never disclose transport data. Preserve an
-				// earlier request failure, but do not report a false success when
-				// cleanup itself failed or exceeded the total deadline.
-				if (!failure)
-					failure = controller.signal.aborted ? publicProbeError("timeout") : publicProbeError("failed");
-			}
+			const closeFailure = await closeSession(session, timeoutMs);
+			if (!failure && closeFailure) failure = closeFailure;
+		} else if (opening) {
+			// A timeout can win while `open` is still pending. It is not safe to
+			// abandon the eventual session, so arrange bounded, redacted cleanup.
+			void opening.then(
+				async (lateSession) => {
+					const closeFailure = await closeSession(lateSession, timeoutMs);
+					if (closeFailure) reportLateCleanupFailure(options, closeFailure);
+				},
+				() => undefined,
+			);
 		}
-		clearTimeout(deadlineTimer);
 	}
 	if (failure) throw failure;
 	return { initialized: true, toolsListed: true };
