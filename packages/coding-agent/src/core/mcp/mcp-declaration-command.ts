@@ -79,7 +79,7 @@ export async function executeMcpDeclarationCommand(
 ): Promise<unknown> {
 	const document = documentForScope(settings, command.scope, admission);
 	if (command.kind === "list") return redactMcpDeclarationDocument(document);
-	const declaration = document.servers[command.name];
+	const declaration = Object.hasOwn(document.servers, command.name) ? document.servers[command.name] : undefined;
 	if (command.kind === "add") {
 		const next = addMcpDeclaration(document, command.name, command.url);
 		writeDocumentForScope(settings, command.scope, next, admission);
