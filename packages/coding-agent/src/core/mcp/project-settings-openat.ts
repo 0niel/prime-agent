@@ -84,7 +84,10 @@ def acquire(agent):
 def write(agent,declarations):
  owned=False; lockdir=None; temp=None; tempname=None
  try:
-  lockdir=acquire(agent); owned=True
+  blocked={signal.SIGTERM,signal.SIGINT}
+  previous=signal.pthread_sigmask(signal.SIG_BLOCK,blocked)
+  try: lockdir=acquire(agent); owned=True
+  finally: signal.pthread_sigmask(signal.SIG_SETMASK,previous)
   doc=read(agent); doc["mcpDeclarations"]=declarations
   raw=(json.dumps(doc,ensure_ascii=False,allow_nan=False,indent=2,separators=(",", ":"))+"\n").encode("utf-8")
   if len(raw)>MAX: reject()

@@ -372,6 +372,49 @@ describe("project settings openat", () => {
 		}
 	});
 
+	it("cleans a signal delivered between lock creation and acquisition return", async () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		const lock = `${settings}.lock`;
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, JSON.stringify({ ordinary: true }));
+		let helper: string | undefined;
+		childProcessSpies.spawnSync.mockImplementationOnce(((_python: string, args: readonly string[]) => {
+			helper = args[2];
+			return { status: 1, stdout: "", stderr: "captured" };
+		}) as typeof childProcess.spawnSync);
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			expect(() => reader.setDocument(document())).toThrow(unavailable);
+			const interruptedHelper = helper!.replace(
+				'try: return directory(agent,"settings.json.lock",False)',
+				'try:\n    result=directory(agent,"settings.json.lock",False)\n    os.kill(os.getpid(),signal.SIGTERM)\n    return result',
+			);
+			expect(interruptedHelper).not.toBe(helper);
+			const rootFd = openSync(cwd, constants.O_RDONLY);
+			const result = childProcessSpies.originalSpawnSync!(
+				await resolveTrustedProjectSettingsPython(),
+				["-I", "-c", interruptedHelper],
+				{
+					input: JSON.stringify({ action: "write", document: document() }),
+					encoding: "utf8",
+					timeout: 5_000,
+					stdio: ["pipe", "pipe", "pipe", rootFd],
+				},
+			);
+			closeSync(rootFd);
+			expect(result.status).toBe(1);
+			expect(result.signal).toBeNull();
+			expect(existsSync(lock)).toBe(false);
+			const release = lockfile.lockSync(settings, { realpath: false });
+			release();
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
 	it("cleans its owned lock promptly when an external SIGTERM interrupts the helper", async () => {
 		const cwd = root();
 		const agentDir = join(cwd, ".prime", "agent");
@@ -389,10 +432,15 @@ describe("project settings openat", () => {
 			const reader = await McpProjectDeclarationReader.create(grant);
 			expect(() => reader.setDocument(document())).toThrow(unavailable);
 			expect(helper).toBeDefined();
-			const heldHelper = helper!.replace(
-				"  lockdir=acquire(agent); owned=True",
-				'  lockdir=acquire(agent); owned=True\n  print("LOCK_OWNED",flush=True); time.sleep(30)',
-			);
+			const heldHelper = helper!
+				.replace(
+					"  try: lockdir=acquire(agent); owned=True",
+					'  try: lockdir=acquire(agent); owned=True\n  finally:\n   print("LOCK_OWNED",flush=True)\n   signal.pthread_sigmask(signal.SIG_SETMASK,previous)\n  time.sleep(30)',
+				)
+				.replace(
+					"  finally: signal.pthread_sigmask(signal.SIG_SETMASK,previous)\n  doc=read(agent)",
+					"  doc=read(agent)",
+				);
 			expect(heldHelper).not.toBe(helper);
 			const rootFd = openSync(cwd, constants.O_RDONLY);
 			const child = childProcess.spawn(await resolveTrustedProjectSettingsPython(), ["-I", "-c", heldHelper], {
