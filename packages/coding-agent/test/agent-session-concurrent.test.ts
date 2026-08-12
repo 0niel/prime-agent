@@ -300,6 +300,25 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(internals._disposed).toBe(true);
 	});
 
+	it("blocks runtime reload from replacing the authoritative kernel during async disposal", async () => {
+		createSession();
+		let releaseKernel: () => void = () => {};
+		const kernelGate = new Promise<void>((resolve) => {
+			releaseKernel = resolve;
+		});
+		const kernelDispose = vi.fn(async () => kernelGate);
+		const internals = session as unknown as {
+			_ipythonKernelProvisioner?: { dispose(): Promise<void> };
+		};
+		internals._ipythonKernelProvisioner = { dispose: kernelDispose };
+
+		const disposal = session.disposeAsync();
+		await expect(session.reload()).rejects.toThrow("Cannot reload a session during disposal.");
+		releaseKernel();
+		await disposal;
+		expect(kernelDispose).toHaveBeenCalledTimes(1);
+	});
+
 	it("runs finalizers and aggregates concurrent drain and kernel disposal failures", async () => {
 		createSession();
 		const kernelFailure = new Error("kernel disposal failed");
