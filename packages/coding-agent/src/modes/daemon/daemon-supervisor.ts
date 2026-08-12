@@ -338,6 +338,12 @@ function throwIfAdmissionCancelled(admission: SupervisorPromptAdmission | undefi
 	if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
 }
 
+/** Match catalog sibling topology: relative parents are rooted at each child session file. */
+function canonicalSavedSiblingParentPath(session: Pick<SessionInfo, "path" | "parentSessionPath">): string | undefined {
+	if (!session.parentSessionPath) return undefined;
+	return canonicalSessionPath(resolve(dirname(session.path), session.parentSessionPath));
+}
+
 class SupervisorRecoveryCancelledError extends Error {
 	readonly code = "supervisor_recovery_cancelled" as const;
 }
@@ -3182,7 +3188,7 @@ export class DaemonSupervisor {
 	private assertSavedSiblingNameAvailable(siblings: SessionInfo[], target: SessionInfo, name: string): void {
 		const setDepth = target.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0;
 		const targetPath = canonicalSessionPath(target.path);
-		const parentSessionPath = target.parentSessionPath ? canonicalSessionPath(target.parentSessionPath) : undefined;
+		const parentSessionPath = canonicalSavedSiblingParentPath(target);
 		if (setDepth <= 0 || !parentSessionPath) {
 			throw new Error("Saved sibling catalog has no direct parent");
 		}
@@ -3198,9 +3204,7 @@ export class DaemonSupervisor {
 		let targetCount = 0;
 		for (const sibling of siblings) {
 			const siblingPath = canonicalSessionPath(sibling.path);
-			const siblingParentPath = sibling.parentSessionPath
-				? canonicalSessionPath(sibling.parentSessionPath)
-				: undefined;
+			const siblingParentPath = canonicalSavedSiblingParentPath(sibling);
 			if (
 				ids.has(sibling.id) ||
 				paths.has(siblingPath) ||
