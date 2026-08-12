@@ -1,9 +1,9 @@
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
-import { listCatalogFamilySessions, listSavedSessionSiblings, resolveCatalogSessionMatch } from "../src/modes/daemon/daemon-catalog-process.js";
+import { listCatalogFamilySessions, listSavedSessionSiblings, resolveCatalogSessionMatch, setCatalogBeforeTrustedOpenForTest } from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
 	return {
@@ -169,6 +169,75 @@ describe("daemon catalog selector resolution", () => {
 		symlinkSync(symlink.first.getSessionFile()!, alias);
 		symlink.writeRegistry("parent", [{ type: "rlm_subagent", childId: "first", sessionFile: alias, status: "completed" }]);
 		await expect(listCatalogFamilySessions(symlink.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+	});
+
+
+	it("rejects symlinked roots and deterministic intermediate/final replacement races", async () => {
+		const make = (name: string) => {
+			const root = mkdtempSync(join(tmpdir(), name));
+			const sessionDir = join(root, "sessions");
+			const parent = SessionManager.create(root, sessionDir);
+			parent.newSession({ id: "parent", rlmDepth: 0 });
+			parent.appendSessionInfo("parent");
+			const childDir = join(root, "session-artifacts", "parent", "sub-child");
+			const child = SessionManager.create(root, childDir);
+			child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+			child.appendSessionInfo("child");
+			const registry = join(root, "session-artifacts", "parent", "rlm-subagents.jsonl");
+			mkdirSync(dirname(registry), { recursive: true });
+			writeFileSync(registry, JSON.stringify({ type: "rlm_subagent", childId: "child", sessionFile: child.getSessionFile(), status: "completed" }));
+			return { root, sessionDir, parent, child, childDir, registry };
+		};
+
+		const rootLink = make("prime-catalog-root-link-");
+		const movedSessions = `${rootLink.sessionDir}-real`;
+		renameSync(rootLink.sessionDir, movedSessions);
+		symlinkSync(movedSessions, rootLink.sessionDir);
+		await expect(listCatalogFamilySessions(rootLink.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+
+		const intermediate = make("prime-catalog-intermediate-swap-");
+		let swappedIntermediate = false;
+		setCatalogBeforeTrustedOpenForTest((path) => {
+			if (swappedIntermediate || path !== intermediate.child.getSessionFile()) return;
+			swappedIntermediate = true;
+			const moved = `${intermediate.childDir}-real`;
+			renameSync(intermediate.childDir, moved);
+			symlinkSync(moved, intermediate.childDir);
+		});
+		await expect(listCatalogFamilySessions(intermediate.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+
+		const finalSwap = make("prime-catalog-final-swap-");
+		let swappedFinal = false;
+		setCatalogBeforeTrustedOpenForTest((path) => {
+			if (swappedFinal || path !== finalSwap.child.getSessionFile()) return;
+			swappedFinal = true;
+			const moved = `${path}.real`;
+			renameSync(path, moved);
+			symlinkSync(moved, path);
+		});
+		await expect(listCatalogFamilySessions(finalSwap.sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		setCatalogBeforeTrustedOpenForTest(undefined);
+	});
+
+	it("parses session metadata from the same descriptor-bound bytes without a pathname reopen", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-no-reopen-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("bound-name");
+		let removed = false;
+		setCatalogBeforeTrustedOpenForTest((path) => {
+			if (removed || path !== parent.getSessionFile()) return;
+			removed = true;
+			const original = `${path}.opened`;
+			renameSync(path, original);
+			writeFileSync(path, "not a session\n");
+		});
+		// The helper opens after the hook, so it must reject the replacement instead of
+		// authorizing stale bytes. This pins the absence of a later readSessionInfo reopen.
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		setCatalogBeforeTrustedOpenForTest(undefined);
+		rmSync(root, { recursive: true, force: true });
 	});
 
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {
