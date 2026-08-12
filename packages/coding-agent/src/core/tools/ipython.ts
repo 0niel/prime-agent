@@ -37,15 +37,59 @@ except Exception:
 import asyncio as _prime_agent_asyncio
 import subprocess as _prime_agent_subprocess
 import shutil as _prime_agent_shutil
+import signal as _prime_agent_signal
 import os as _prime_agent_bash_os
+
+_PRIME_AGENT_BASH_CAPTURE_LIMIT = 1024 * 1024
+_PRIME_AGENT_BASH_READ_CHUNK = 64 * 1024
+_PRIME_AGENT_BASH_STOP_GRACE = 0.25
+
+
+class _PrimeAgentBoundedBytes:
+    """Tail buffer with a fixed memory ceiling and total-byte accounting."""
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.data = bytearray()
+        self.total = 0
+
+    def append(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        if len(chunk) >= self.limit:
+            self.data[:] = chunk[-self.limit:]
+            return
+        overflow = len(self.data) + len(chunk) - self.limit
+        if overflow > 0:
+            del self.data[:overflow]
+        self.data.extend(chunk)
+
+    @property
+    def truncated(self) -> bool:
+        return self.total > len(self.data)
+
+    def text(self) -> str:
+        return bytes(self.data).decode("utf-8", errors="replace")
 
 
 class _PrimeAgentBashResult:
-    """Result of an async bash command."""
-    def __init__(self, stdout: str, stderr: str, returncode: int):
+    """Result of an async bash command with bounded captured output."""
+    def __init__(
+        self,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+        *,
+        stdout_truncated: bool = False,
+        stderr_truncated: bool = False,
+        stdout_total_bytes: int = 0,
+        stderr_total_bytes: int = 0,
+    ):
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
+        self.stdout_truncated = stdout_truncated
+        self.stderr_truncated = stderr_truncated
+        self.stdout_total_bytes = stdout_total_bytes
+        self.stderr_total_bytes = stderr_total_bytes
 
     def __str__(self) -> str:
         parts = []
@@ -59,49 +103,161 @@ class _PrimeAgentBashResult:
         return text
 
     def __repr__(self) -> str:
-        return f"BashResult(returncode={self.returncode}, stdout={len(self.stdout)} chars)"
+        truncated = self.stdout_truncated or self.stderr_truncated
+        return (
+            f"BashResult(returncode={self.returncode}, stdout={len(self.stdout)} chars, "
+            f"stderr={len(self.stderr)} chars, truncated={truncated})"
+        )
 
 
-async def bash(command: str, *, timeout: float | None = None, cwd: str | None = None) -> _PrimeAgentBashResult:
-    """Run a shell command asynchronously without blocking the IPython kernel event loop.
+async def _prime_agent_bash_drain(stream, capture: _PrimeAgentBoundedBytes) -> None:
+    while True:
+        chunk = await stream.read(_PRIME_AGENT_BASH_READ_CHUNK)
+        if not chunk:
+            return
+        capture.append(chunk)
 
-    Unlike %%bash cells (which block the kernel), 'await bash("...")' uses
-    asyncio.create_subprocess_exec so the kernel stays responsive to interrupts
-    and other messages while the command runs.
 
-    Args:
-        command: Shell command string.
-        timeout: Optional timeout in seconds. Raises TimeoutError if exceeded.
-        cwd: Working directory (defaults to kernel cwd).
+async def _prime_agent_bash_collect(proc, stdout_task, stderr_task) -> None:
+    await proc.wait()
+    await _prime_agent_asyncio.gather(stdout_task, stderr_task)
 
-    Returns:
-        _PrimeAgentBashResult with stdout, stderr, and returncode.
+
+def _prime_agent_bash_signal_group(proc, sig) -> None:
+    # The shell may have exited while descendants still hold its pipes open, so
+    # always signal the session by the original leader PID.
+    try:
+        _prime_agent_bash_os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+async def _prime_agent_bash_taskkill(proc) -> None:
+    # taskkill /T can still find descendants by the original shell PID after
+    # the shell itself exits, so do not short-circuit on proc.returncode.
+    taskkill = _prime_agent_shutil.which("taskkill")
+    if taskkill:
+        killer = await _prime_agent_asyncio.create_subprocess_exec(
+            taskkill, "/PID", str(proc.pid), "/T", "/F",
+            stdin=_prime_agent_subprocess.DEVNULL,
+            stdout=_prime_agent_subprocess.DEVNULL,
+            stderr=_prime_agent_subprocess.DEVNULL,
+        )
+        try:
+            await _prime_agent_asyncio.wait_for(_prime_agent_asyncio.shield(killer.wait()), timeout=2)
+        except _prime_agent_asyncio.TimeoutError:
+            killer.kill()
+            await killer.wait()
+        except BaseException:
+            if killer.returncode is None:
+                killer.kill()
+            await _prime_agent_asyncio.shield(killer.wait())
+            raise
+    if proc.returncode is None:
+        proc.kill()
+
+
+async def _prime_agent_bash_stop(proc, collector, stdout_task, stderr_task) -> None:
+    """Stop the command tree and finish or cancel every pipe-drain task."""
+    if _prime_agent_bash_os.name == "nt":
+        await _prime_agent_bash_taskkill(proc)
+    else:
+        _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGTERM)
+        try:
+            await _prime_agent_asyncio.wait_for(
+                _prime_agent_asyncio.shield(collector), timeout=_PRIME_AGENT_BASH_STOP_GRACE
+            )
+            return
+        except _prime_agent_asyncio.TimeoutError:
+            _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGKILL)
+
+    try:
+        await _prime_agent_asyncio.wait_for(_prime_agent_asyncio.shield(collector), timeout=2)
+        return
+    except _prime_agent_asyncio.TimeoutError:
+        if proc.returncode is None:
+            proc.kill()
+    finally:
+        if not collector.done():
+            collector.cancel()
+        for task in (stdout_task, stderr_task):
+            if not task.done():
+                task.cancel()
+        await _prime_agent_asyncio.gather(collector, stdout_task, stderr_task, return_exceptions=True)
+
+
+async def bash(
+    command: str,
+    *,
+    timeout: float | None = None,
+    cwd: str | None = None,
+    max_output_bytes: int = _PRIME_AGENT_BASH_CAPTURE_LIMIT,
+) -> _PrimeAgentBashResult:
+    """Run a shell command without blocking the IPython kernel event loop.
+
+    At most max_output_bytes from the tail of each output stream is retained;
+    both pipes are continuously drained so large output cannot deadlock or grow
+    the persistent kernel without bound. Truncation and total byte counts are
+    reported on the result.
     """
-    shell = _prime_agent_shutil.which("bash") or "/bin/bash"
+    if not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
+        raise ValueError("max_output_bytes must be a positive integer")
+    shell = _prime_agent_shutil.which("bash")
+    if shell is None:
+        if _prime_agent_bash_os.name == "nt":
+            raise RuntimeError("bash() requires bash.exe on Windows")
+        shell = "/bin/bash"
     env = dict(_prime_agent_bash_os.environ)
     work_dir = cwd or _prime_agent_bash_os.getcwd()
+    spawn_options = {}
+    if _prime_agent_bash_os.name == "nt":
+        spawn_options["creationflags"] = _prime_agent_subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        spawn_options["start_new_session"] = True
 
     proc = await _prime_agent_asyncio.create_subprocess_exec(
         shell, "-c", command,
+        stdin=_prime_agent_subprocess.DEVNULL,
         stdout=_prime_agent_subprocess.PIPE,
         stderr=_prime_agent_subprocess.PIPE,
         cwd=work_dir,
         env=env,
+        limit=_PRIME_AGENT_BASH_READ_CHUNK,
+        **spawn_options,
     )
+    stdout_capture = _PrimeAgentBoundedBytes(max_output_bytes)
+    stderr_capture = _PrimeAgentBoundedBytes(max_output_bytes)
+    stdout_task = _prime_agent_asyncio.create_task(_prime_agent_bash_drain(proc.stdout, stdout_capture))
+    stderr_task = _prime_agent_asyncio.create_task(_prime_agent_bash_drain(proc.stderr, stderr_capture))
+    collector = _prime_agent_asyncio.create_task(_prime_agent_bash_collect(proc, stdout_task, stderr_task))
 
     try:
-        stdout_bytes, stderr_bytes = await _prime_agent_asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
+        await _prime_agent_asyncio.wait_for(_prime_agent_asyncio.shield(collector), timeout=timeout)
     except _prime_agent_asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise TimeoutError(f"bash command timed out after {timeout}s: {command}")
+        cleanup = _prime_agent_asyncio.create_task(
+            _prime_agent_bash_stop(proc, collector, stdout_task, stderr_task)
+        )
+        await _prime_agent_asyncio.shield(cleanup)
+        raise TimeoutError(f"bash command timed out after {timeout}s") from None
+    except BaseException:
+        cleanup = _prime_agent_asyncio.create_task(
+            _prime_agent_bash_stop(proc, collector, stdout_task, stderr_task)
+        )
+        await _prime_agent_asyncio.shield(cleanup)
+        raise
+    finally:
+        if not collector.done() and proc.returncode is not None:
+            collector.cancel()
+            await _prime_agent_asyncio.gather(collector, return_exceptions=True)
 
     return _PrimeAgentBashResult(
-        stdout=stdout_bytes.decode("utf-8", errors="replace"),
-        stderr=stderr_bytes.decode("utf-8", errors="replace"),
+        stdout=stdout_capture.text(),
+        stderr=stderr_capture.text(),
         returncode=proc.returncode if proc.returncode is not None else -1,
+        stdout_truncated=stdout_capture.truncated,
+        stderr_truncated=stderr_capture.truncated,
+        stdout_total_bytes=stdout_capture.total,
+        stderr_total_bytes=stderr_capture.total,
     )
 
 

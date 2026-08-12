@@ -23,6 +23,20 @@ describe("IPython RLM bootstrap", () => {
 		expect(buildRlmBootstrapCode()).toContain('_prime_agent_os.environ["NO_COLOR"] = "1"');
 	});
 
+	it("bounds async bash output and cleans process groups on exceptional exits", () => {
+		const code = buildRlmBootstrapCode();
+		expect(code).not.toContain("proc.communicate()");
+		expect(code).toContain("_PrimeAgentBoundedBytes");
+		expect(code).toContain("start_new_session");
+		expect(code).toContain("killpg");
+		expect(code).toContain("except BaseException");
+		expect(code).toContain('taskkill, "/PID", str(proc.pid), "/T", "/F"');
+		expect(code).toContain("await killer.wait()");
+		expect(code).not.toContain(
+			"async def _prime_agent_bash_taskkill(proc) -> None:\n    if proc.returncode is not None",
+		);
+	});
+
 	it("guards Python skill imports so a broken skill does not abort bootstrap", () => {
 		const code = buildRlmBootstrapCode([
 			{
@@ -82,6 +96,64 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 			await manager.dispose();
 		}
 	}, 60_000);
+
+	it("runs async bash with bounded stdout and stderr capture", async () => {
+		const manager = new KernelManager({ python: python as string, cwd: dir });
+		try {
+			await manager.start();
+			expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+			const code = [
+				"import sys",
+				'r = await bash("yes A | head -c 200000; yes B | head -c 200000 >&2", max_output_bytes=4096)',
+				"print(r.returncode, len(r.stdout), len(r.stderr), r.stdout_truncated, r.stderr_truncated)",
+				"print(r.stdout_total_bytes, r.stderr_total_bytes)",
+			].join("\n");
+			const result = await manager.execute(code);
+			expect(result.status).toBe("ok");
+			expect(result.stdout).toContain("0 4096 4096 True True");
+			expect(result.stdout).toContain("200000 200000");
+		} finally {
+			await manager.dispose();
+		}
+	}, 60_000);
+
+	it.skipIf(process.platform === "win32")(
+		"kills descendants on timeout and cancellation",
+		async () => {
+			const manager = new KernelManager({ python: python as string, cwd: dir });
+			try {
+				await manager.start();
+				expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+				const timeoutMarker = join(dir, "timeout-marker");
+				const cancelMarker = join(dir, "cancel-marker");
+				const timeout = await manager.execute(
+					`try:
+    await bash("(sleep 1; touch '${timeoutMarker}') & wait", timeout=0.1)
+except TimeoutError:
+    print("timed-out")`,
+				);
+				expect(timeout.status).toBe("ok");
+				expect(timeout.stdout).toContain("timed-out");
+				const cancelled = await manager.execute(
+					`task = asyncio.create_task(bash("(sleep 1; touch '${cancelMarker}') & wait"))
+await asyncio.sleep(0.1)
+task.cancel()
+try:
+    await task
+except asyncio.CancelledError:
+    print("cancelled")`,
+				);
+				expect(cancelled.status).toBe("ok");
+				expect(cancelled.stdout).toContain("cancelled");
+				await new Promise((resolve) => setTimeout(resolve, 1300));
+				expect(existsSync(timeoutMarker)).toBe(false);
+				expect(existsSync(cancelMarker)).toBe(false);
+			} finally {
+				await manager.dispose();
+			}
+		},
+		60_000,
+	);
 
 	it("emits canonical paths for edits after the kernel changes directories", async () => {
 		const firstDir = join(dir, "first");
