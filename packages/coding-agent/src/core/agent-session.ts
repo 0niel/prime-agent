@@ -3790,6 +3790,10 @@ export class AgentSession {
 			// Capture the refinement drain before the first await: this preserves a
 			// final agent_end's serialized work while kernel disposal is pending.
 			const drain = this._drainPendingRefinementForDisposal();
+			// Observe a concurrent drain failure immediately. Its original promise is
+			// still awaited below so disposal propagates the same failure after the
+			// kernel teardown ordering is preserved.
+			void drain.catch(() => {});
 			const kernelDispose = this._ipythonKernelProvisioner?.dispose();
 			if (kernelDispose) await kernelDispose;
 			// Drain before marking _disposing so a refine triggered at the final
