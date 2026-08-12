@@ -16,6 +16,7 @@ interface SessionInfoWire extends Omit<SessionInfo, "created" | "modified"> {
 
 type CatalogRequest =
 	| { type: "request"; id: string; command: "list"; cwd?: string; sessionDir?: string }
+	| { type: "request"; id: string; command: "family"; sessionDir?: string }
 	| { type: "request"; id: string; command: "resolve"; selector: string; cwd: string; sessionDir?: string }
 	| { type: "request"; id: string; command: "siblings"; sessionPath: string }
 	| { type: "request"; id: string; command: "rename"; sessionPath: string; name: string }
@@ -66,6 +67,60 @@ interface SavedRlmSubagentRegistryEntry {
 	status?: unknown;
 }
 
+function rlmSubagentRegistryPath(parent: SessionInfo): string {
+	return join(dirname(dirname(parent.path)), "session-artifacts", parent.id, "rlm-subagents.jsonl");
+}
+
+/**
+ * Includes artifact-resident descendants that are intentionally absent from the
+ * saved-session scan. This is topology evidence only: malformed or unavailable
+ * registry entries contribute no row, so callers remain fail-closed.
+ */
+export async function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
+	const roots = await SessionManager.listAll(undefined, sessionDir);
+	const sessions = new Map(roots.map((session) => [resolve(session.path), session]));
+	const visited = new Set<string>();
+	const visit = async (parent: SessionInfo): Promise<void> => {
+		const parentPath = resolve(parent.path);
+		if (visited.has(parentPath)) return;
+		visited.add(parentPath);
+		let contents: string;
+		try {
+			contents = await readFile(rlmSubagentRegistryPath(parent), "utf8");
+		} catch {
+			return;
+		}
+		const latest = new Map<string, SavedRlmSubagentRegistryEntry>();
+		for (const line of contents.split(/\r?\n/)) {
+			if (!line.trim()) continue;
+			try {
+				const entry = JSON.parse(line) as SavedRlmSubagentRegistryEntry;
+				if (
+					entry.type === "rlm_subagent" &&
+					typeof entry.childId === "string" &&
+					entry.childId &&
+					typeof entry.sessionFile === "string" &&
+					entry.sessionFile &&
+					(entry.status === "running" || entry.status === "completed" || entry.status === "deleted")
+				) {
+					latest.set(entry.childId, entry);
+				}
+			} catch {
+				// Ignore malformed registry history just like the owning worker does.
+			}
+		}
+		for (const entry of latest.values()) {
+			if (entry.status === "deleted") continue;
+			const child = await readSessionInfo(entry.sessionFile as string);
+			if (!child) continue;
+			sessions.set(resolve(child.path), child);
+			await visit(child);
+		}
+	};
+	for (const root of roots) await visit(root);
+	return [...sessions.values()];
+}
+
 export async function listSavedSessionSiblings(sessionPath: string): Promise<SessionInfo[]> {
 	const target = await readSessionInfo(sessionPath);
 	if (!target) throw new Error(`Session not found: ${sessionPath}`);
@@ -73,7 +128,7 @@ export async function listSavedSessionSiblings(sessionPath: string): Promise<Ses
 	const parentPath = resolve(dirname(target.path), target.parentSessionPath);
 	const parent = await readSessionInfo(parentPath);
 	if (!parent) return [target];
-	const registryPath = join(dirname(dirname(parent.path)), "session-artifacts", parent.id, "rlm-subagents.jsonl");
+	const registryPath = rlmSubagentRegistryPath(parent);
 	let contents: string;
 	try {
 		contents = await readFile(registryPath, "utf8");
@@ -141,6 +196,7 @@ function isCatalogRequest(value: unknown): value is CatalogRequest {
 		candidate.type === "request" &&
 		typeof candidate.id === "string" &&
 		(candidate.command === "list" ||
+			candidate.command === "family" ||
 			candidate.command === "resolve" ||
 			candidate.command === "siblings" ||
 			candidate.command === "rename" ||
@@ -186,6 +242,16 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				const sessions = request.cwd
 					? await SessionManager.list(request.cwd, request.sessionDir, callbacks)
 					: await SessionManager.listAll(callbacks, request.sessionDir);
+				sendCatalogMessage({
+					type: "response",
+					id: request.id,
+					success: true,
+					data: { sessions: sessions.map(serializeSessionInfo) },
+				});
+				return;
+			}
+			case "family": {
+				const sessions = await listCatalogFamilySessions(request.sessionDir);
 				sendCatalogMessage({
 					type: "response",
 					id: request.id,
@@ -325,6 +391,16 @@ export class DaemonCatalogClient {
 			{ type: "request", id: randomUUID(), command: "list", cwd, sessionDir },
 			callbacks,
 		);
+		return data.sessions.map(deserializeSessionInfo);
+	}
+
+	async family(sessionDir?: string): Promise<SessionInfo[]> {
+		const data = await this.request<{ sessions: SessionInfoWire[] }>({
+			type: "request",
+			id: randomUUID(),
+			command: "family",
+			sessionDir,
+		});
 		return data.sessions.map(deserializeSessionInfo);
 	}
 

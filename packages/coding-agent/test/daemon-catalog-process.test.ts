@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
-import { listSavedSessionSiblings, resolveCatalogSessionMatch } from "../src/modes/daemon/daemon-catalog-process.js";
+import { listCatalogFamilySessions, listSavedSessionSiblings, resolveCatalogSessionMatch } from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
 	return {
@@ -82,6 +82,61 @@ describe("daemon catalog selector resolution", () => {
 			expect.objectContaining({ id: first.getSessionId(), name: "first" }),
 			expect.objectContaining({ id: second.getSessionId(), name: "second" }),
 		]);
+	});
+
+	it("walks artifact family topology without accepting invalid rows or collapsing conflicting durable identities", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-family-topology-"));
+		const sessionDir = join(root, "sessions");
+		const registryPath = (parentId: string) =>
+			join(root, "session-artifacts", parentId, "rlm-subagents.jsonl");
+		const writeRegistry = (parentId: string, entries: unknown[]) => {
+			const path = registryPath(parentId);
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, entries.map((entry) => (typeof entry === "string" ? entry : JSON.stringify(entry))).join("\n"));
+		};
+		const rootSession = SessionManager.create(root, sessionDir);
+		rootSession.newSession({ id: "root" });
+		rootSession.appendSessionInfo("root");
+		const parent = SessionManager.create(root, join(root, "parent"));
+		parent.newSession({ id: "parent", parentSession: rootSession.getSessionFile(), rlmDepth: 1 });
+		parent.appendSessionInfo("parent");
+		const child = SessionManager.create(root, join(root, "child"));
+		child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 2 });
+		child.appendSessionInfo("child");
+		const duplicate = SessionManager.create(root, join(root, "duplicate"));
+		duplicate.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 2 });
+		duplicate.appendSessionInfo("duplicate");
+		const deleted = SessionManager.create(root, join(root, "deleted"));
+		deleted.newSession({ id: "deleted", parentSession: rootSession.getSessionFile(), rlmDepth: 1 });
+		deleted.appendSessionInfo("deleted");
+		const unreadable = join(root, "unreadable.jsonl");
+		mkdirSync(unreadable, { recursive: true });
+
+		writeRegistry(rootSession.getSessionId(), [
+			{ type: "rlm_subagent", childId: "parent", sessionFile: parent.getSessionFile(), status: "completed" },
+			{ type: "rlm_subagent", childId: "deleted", sessionFile: deleted.getSessionFile(), status: "deleted" },
+			{ type: "rlm_subagent", childId: "unreadable", sessionFile: unreadable, status: "completed" },
+			{ type: "rlm_subagent", childId: "malformed", status: "completed" },
+			"{not json",
+		]);
+		writeRegistry(parent.getSessionId(), [
+			{ type: "rlm_subagent", childId: "child", sessionFile: child.getSessionFile(), status: "completed" },
+			{ type: "rlm_subagent", childId: "duplicate", sessionFile: duplicate.getSessionFile(), status: "completed" },
+		]);
+
+		const family = await listCatalogFamilySessions(sessionDir);
+		expect(family).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "root", rlmDepth: 0 }),
+				expect.objectContaining({ id: "parent", rlmDepth: 1 }),
+				expect.objectContaining({ id: "child", name: "child", rlmDepth: 2, path: child.getSessionFile() }),
+				expect.objectContaining({ id: "child", name: "duplicate", rlmDepth: 2, path: duplicate.getSessionFile() }),
+			]),
+		);
+		expect(family).toHaveLength(4);
+		expect(family.map((entry) => entry.path)).not.toContain(deleted.getSessionFile());
+		expect(family.map((entry) => entry.path)).not.toContain(unreadable);
+		expect(family.filter((entry) => entry.id === "child")).toHaveLength(2);
 	});
 
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {
