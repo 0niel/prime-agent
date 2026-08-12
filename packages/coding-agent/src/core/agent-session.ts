@@ -3787,9 +3787,14 @@ export class AgentSession {
 			return this._disposeAsyncPromise;
 		}
 		this._disposeAsyncPromise = (async () => {
+			// Capture the refinement drain before the first await: this preserves a
+			// final agent_end's serialized work while kernel disposal is pending.
+			const drain = this._drainPendingRefinementForDisposal();
+			const kernelDispose = this._ipythonKernelProvisioner?.dispose();
+			if (kernelDispose) await kernelDispose;
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
-			await this._drainPendingRefinementForDisposal();
+			await drain;
 			if (this._disposed) {
 				return this._disposeCallbacksPromise;
 			}
