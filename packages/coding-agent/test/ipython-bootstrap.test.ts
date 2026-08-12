@@ -23,14 +23,13 @@ describe("IPython RLM bootstrap", () => {
 		expect(buildRlmBootstrapCode()).toContain('_prime_agent_os.environ["NO_COLOR"] = "1"');
 	});
 
-	it("bounds async bash output and cleans POSIX process groups on exceptional exits", () => {
+	it("bounds async bash output and cleans process groups on exceptional exits", () => {
 		const code = buildRlmBootstrapCode();
 		expect(code).not.toContain("proc.communicate()");
 		expect(code).toContain("_PrimeAgentBoundedBytes");
 		expect(code).toContain("start_new_session");
 		expect(code).toContain("killpg");
 		expect(code).toContain("except BaseException");
-		expect(code).toContain("bash() is unavailable on Windows");
 		expect(code).toContain("isinstance(max_output_bytes, bool)");
 		expect(code).toContain("captured {self.stdout_total_bytes} raw bytes; showing a bounded decoded tail");
 		expect(code).not.toContain("of {self.stdout_total_bytes} bytes");
@@ -161,86 +160,72 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 		}
 	}, 60_000);
 
-	it.skipIf(process.platform === "win32")(
-		"cleans background descendants after the shell exits",
-		async () => {
-			const manager = new KernelManager({ python: python as string, cwd: dir });
-			const marker = join(dir, "background-marker");
-			try {
-				await manager.start();
-				expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
-				const result = await manager.execute(
-					`r = await bash("(sleep 1; touch '${marker}') &")\nprint(r.returncode)`,
-				);
-				expect(result.status).toBe("ok");
-				expect(result.stdout).toContain("0");
-				await new Promise((resolve) => setTimeout(resolve, 1300));
-				expect(existsSync(marker)).toBe(false);
-			} finally {
-				await manager.dispose();
-			}
-		},
-		60_000,
-	);
+	it("cleans background descendants after the shell exits", async () => {
+		const manager = new KernelManager({ python: python as string, cwd: dir });
+		const marker = join(dir, "background-marker");
+		try {
+			await manager.start();
+			expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+			const result = await manager.execute(`r = await bash("(sleep 1; touch '${marker}') &")\nprint(r.returncode)`);
+			expect(result.status).toBe("ok");
+			expect(result.stdout).toContain("0");
+			await new Promise((resolve) => setTimeout(resolve, 1300));
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			await manager.dispose();
+		}
+	}, 60_000);
 
-	it.skipIf(process.platform === "win32")(
-		"escalates when a descendant ignores SIGTERM and closes pipes",
-		async () => {
-			const manager = new KernelManager({ python: python as string, cwd: dir });
-			const marker = join(dir, "term-resistant-marker");
-			try {
-				await manager.start();
-				expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
-				const result = await manager.execute(
-					`await bash("(trap '' TERM; exec 1>&- 2>&-; sleep 1; touch '${marker}') &")`,
-				);
-				expect(result.status).toBe("ok");
-				await new Promise((resolve) => setTimeout(resolve, 1300));
-				expect(existsSync(marker)).toBe(false);
-			} finally {
-				await manager.dispose();
-			}
-		},
-		60_000,
-	);
+	it("escalates when a descendant ignores SIGTERM and closes pipes", async () => {
+		const manager = new KernelManager({ python: python as string, cwd: dir });
+		const marker = join(dir, "term-resistant-marker");
+		try {
+			await manager.start();
+			expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+			const result = await manager.execute(
+				`await bash("(trap '' TERM; exec 1>&- 2>&-; sleep 1; touch '${marker}') &")`,
+			);
+			expect(result.status).toBe("ok");
+			await new Promise((resolve) => setTimeout(resolve, 1300));
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			await manager.dispose();
+		}
+	}, 60_000);
 
-	it.skipIf(process.platform === "win32")(
-		"kills descendants on timeout and cancellation",
-		async () => {
-			const manager = new KernelManager({ python: python as string, cwd: dir });
-			try {
-				await manager.start();
-				expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
-				const timeoutMarker = join(dir, "timeout-marker");
-				const cancelMarker = join(dir, "cancel-marker");
-				const timeout = await manager.execute(
-					`try:
+	it("kills descendants on timeout and cancellation", async () => {
+		const manager = new KernelManager({ python: python as string, cwd: dir });
+		try {
+			await manager.start();
+			expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+			const timeoutMarker = join(dir, "timeout-marker");
+			const cancelMarker = join(dir, "cancel-marker");
+			const timeout = await manager.execute(
+				`try:
     await bash("(sleep 1; touch '${timeoutMarker}') & wait", timeout=0.1)
 except TimeoutError:
     print("timed-out")`,
-				);
-				expect(timeout.status).toBe("ok");
-				expect(timeout.stdout).toContain("timed-out");
-				const cancelled = await manager.execute(
-					`task = asyncio.create_task(bash("(sleep 1; touch '${cancelMarker}') & wait"))
+			);
+			expect(timeout.status).toBe("ok");
+			expect(timeout.stdout).toContain("timed-out");
+			const cancelled = await manager.execute(
+				`task = asyncio.create_task(bash("(sleep 1; touch '${cancelMarker}') & wait"))
 await asyncio.sleep(0.1)
 task.cancel()
 try:
     await task
 except asyncio.CancelledError:
     print("cancelled")`,
-				);
-				expect(cancelled.status).toBe("ok");
-				expect(cancelled.stdout).toContain("cancelled");
-				await new Promise((resolve) => setTimeout(resolve, 1300));
-				expect(existsSync(timeoutMarker)).toBe(false);
-				expect(existsSync(cancelMarker)).toBe(false);
-			} finally {
-				await manager.dispose();
-			}
-		},
-		60_000,
-	);
+			);
+			expect(cancelled.status).toBe("ok");
+			expect(cancelled.stdout).toContain("cancelled");
+			await new Promise((resolve) => setTimeout(resolve, 1300));
+			expect(existsSync(timeoutMarker)).toBe(false);
+			expect(existsSync(cancelMarker)).toBe(false);
+		} finally {
+			await manager.dispose();
+		}
+	}, 60_000);
 
 	it("emits canonical paths for edits after the kernel changes directories", async () => {
 		const firstDir = join(dir, "first");
