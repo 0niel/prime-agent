@@ -194,6 +194,8 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 						OAUTH_EXPIRES: "LEAK_ME_OAUTH_EXPIRES_CASE",
 						ProviderToken: "LEAK_ME_PROVIDER_TOKEN_CASE",
 						apiSecret: "LEAK_ME_API_SECRET",
+						"secret-key": "LEAK_ME_SECRET_KEY_KEBAB",
+						auth: "LEAK_ME_AUTH",
 						access: "LEAK_ME_ACCESS",
 						expires: 123456,
 						expiresAt: 123457,
@@ -202,7 +204,7 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 						productAccess: "enabled",
 						productKeyId: "product-key",
 						tokenLimit: 5678,
-						auth: {
+						aws: {
 							accessKeyId: "LEAK_ME_AWS_ID",
 							secretAccessKey: "LEAK_ME_AWS_SECRET",
 							awsSecretAccessKey: "LEAK_ME_AWS_CAMEL",
@@ -231,7 +233,7 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 						productAccess: "enabled",
 						productKeyId: "product-key",
 						tokenLimit: 5678,
-						auth: { sessions: [{ region: "us-east-1" }] },
+						aws: { sessions: [{ region: "us-east-1" }] },
 						first: { productKeyId: "catalog-key" },
 						second: { productKeyId: "catalog-key" },
 					},
@@ -241,6 +243,9 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 			const provider = durable.extensionFlagValues?.provider as unknown as Record<string, unknown>;
 			expect(provider.first).toBe(provider.second);
 			expect(runtimeConfig.apiKey).toBe("LEAK_ME_TOP");
+			const liveProvider = runtimeConfig.extensionFlagValues?.provider as unknown as Record<string, unknown>;
+			expect(liveProvider["secret-key"]).toBe("LEAK_ME_SECRET_KEY_KEBAB");
+			expect(liveProvider.auth).toBe("LEAK_ME_AUTH");
 			expect((runtimeConfig.extensionFlagValues?.provider as { first?: unknown }).first).toBe(shared);
 		});
 
