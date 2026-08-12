@@ -1448,8 +1448,7 @@ export class AgentDaemon {
 			releaseOpenReservation();
 			throw error;
 		}
-		// A scoped create (agents view new agent) anchors the fresh session under
-		// the scope root so live and saved listings link it as the root's child.
+		// Anchor a scoped agents-view create under its scope root.
 		const requestedMetadata = command.runtimeMetadata;
 		if (
 			!sessionPath &&
@@ -5612,8 +5611,7 @@ export class AgentDaemon {
 		if (state.clients.size > 0) {
 			return false;
 		}
-		// Kernel-managed RLM children carry rlmChildId; a user-created scoped
-		// agent draft is discardable like a top-level draft.
+		// A user-created scoped agent draft is discardable; kernel children (rlmChildId) are not.
 		if (state.runtime.metadata.kind === "subagent" && state.runtime.metadata.rlmChildId) {
 			return false;
 		}

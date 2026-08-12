@@ -969,8 +969,7 @@ describe("daemon mode helpers", () => {
 
 	it("honors the worker-assigned root active session id for a scoped root create", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-worker-scoped-root-"));
-		// A test daemon has no recovery journal; keep a host worker's env from
-		// leaking one in (recordWorkerRecoveryState would touch a foreign file).
+		// Keep a host worker's env from leaking a foreign recovery journal in.
 		const previousRecoveryJournal = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 		delete process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 		try {
@@ -1002,8 +1001,7 @@ describe("daemon mode helpers", () => {
 				): Promise<ActiveSessionState>;
 			};
 
-			// Kernel-managed subagent runtimes pass an explicit id (e.g. rehydration):
-			// it wins over and does not consume the worker's one-shot root id.
+			// An explicit id (rehydration) wins without consuming the one-shot root id.
 			const rehydratedManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
 			rehydratedManager.newSession();
 			const rehydrated = await internals.addRuntime(
@@ -1023,8 +1021,6 @@ describe("daemon mode helpers", () => {
 			);
 			expect(rehydrated.activeSessionId).toBe("explicit-restore");
 
-			// The worker's root create keeps its supervisor-assigned id even when a
-			// scoped agents-view create carries subagent metadata.
 			const scopedRoot = await internals.createRuntime({
 				type: "create",
 				runtimeMetadata: {

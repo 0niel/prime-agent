@@ -822,8 +822,7 @@ describe("AgentsViewMode persistent catalog state", () => {
 			stopped: false,
 			scopeRootSummary: scopeRoot,
 			options: { config: {} },
-			// Model the real handshake race: the capability is unknown until the
-			// daemon_hello arrives, so the gate must wait for it.
+			// The capability is unknown until daemon_hello arrives; the gate must wait.
 			connectDedicatedClient: async () => {
 				let helloResolved = false;
 				return {
