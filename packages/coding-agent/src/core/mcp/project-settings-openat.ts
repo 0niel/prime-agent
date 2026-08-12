@@ -12,8 +12,21 @@ const MAX_BYTES = 128 * 1024;
 const TIMEOUT_MS = 5_000;
 
 /** stdlib-only; receives a bounded action/document JSON on stdin and trusted root on fd 3. */
-const OPENAT_HELPER = String.raw`import json, os, secrets, stat, sys, time
+const OPENAT_HELPER = String.raw`import json, os, secrets, signal, stat, sys, time
 MAX=131072
+interrupted=False
+cleaning=False
+class Interrupted(Exception): pass
+def interrupt(_signum,_frame):
+ global interrupted
+ interrupted=True
+ # Raise outside cleanup so blocking Python operations unwind immediately.
+ # Once authoritative cleanup starts, only record the signal and finish it.
+ if not cleaning: raise Interrupted()
+signal.signal(signal.SIGTERM,interrupt)
+signal.signal(signal.SIGINT,interrupt)
+# SIGKILL cannot run cleanup. Its lock deliberately remains fail-closed until
+# manual removal, rather than permitting unsafe stale-lock reclamation.
 def reject(_=None): raise ValueError("invalid")
 def unique(pairs):
  d={}
@@ -61,7 +74,10 @@ def acquire(agent):
   except FileExistsError:
    # Retry only a genuine no-follow directory owned by another participant.
    # Regular files and symlinks are hostile/legacy poison and fail closed.
-   existing=directory(agent,"settings.json.lock",False)
+   try: existing=directory(agent,"settings.json.lock",False)
+   except FileNotFoundError:
+    if time.monotonic()>=deadline: reject()
+    continue
    os.close(existing)
    if time.monotonic()>=deadline: reject()
    time.sleep(0.02)
@@ -87,6 +103,8 @@ def write(agent,declarations):
   finally: os.close(temp); temp=None
   os.replace(tempname,"settings.json",src_dir_fd=agent,dst_dir_fd=agent); tempname=None; os.fsync(agent)
  finally:
+  global cleaning
+  cleaning=True
   if temp is not None: os.close(temp)
   if tempname is not None:
    try: os.unlink(tempname,dir_fd=agent)
@@ -103,6 +121,8 @@ def write(agent,declarations):
     os.close(lockdir); lockdir=None; reject()
   if owned: os.rmdir("settings.json.lock",dir_fd=agent)
   if lockdir is not None: os.close(lockdir)
+ cleaning=False
+ if interrupted: raise Interrupted()
 def main():
  raw=sys.stdin.buffer.read(MAX+1)
  if len(raw)>MAX: reject()
@@ -179,6 +199,8 @@ export class ProjectSettingsOpenat {
 					input,
 					encoding: "utf8",
 					timeout: TIMEOUT_MS,
+					// A signal racing after os.replace may report failure even though the
+					// atomic commit landed; SIGKILL leaves the lock for manual cleanup.
 					maxBuffer: MAX_BYTES,
 					stdio: ["pipe", "pipe", "pipe", rootFd],
 					shell: false,
