@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, constants, openSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import { getSessionsDir } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import {
@@ -323,8 +324,9 @@ async function readLatestRegistry(
 }
 
 export async function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
-	const roots = await SessionManager.listAll(undefined, sessionDir);
-	const authority = managedRoots(sessionDir);
+	const effectiveSessionDir = sessionDir ?? getSessionsDir();
+	const roots = await SessionManager.listAll(undefined, effectiveSessionDir);
+	const authority = managedRoots(effectiveSessionDir);
 	try {
 		const sessions = new Map<string, TrustedSession>();
 		const ids = new Map<string, string>();

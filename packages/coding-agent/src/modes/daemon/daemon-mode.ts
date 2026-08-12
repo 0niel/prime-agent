@@ -5634,6 +5634,19 @@ export class AgentDaemon {
 		);
 	}
 
+	private cliAgentMessageRelationship(
+		fromState: ActiveSessionState,
+		targetState: ActiveSessionState,
+		catalog: readonly AgentFamilyCatalogEntry[],
+	): AgentFamilyRelationship | undefined {
+		try {
+			return this.agentMessageRelationship(fromState, targetState, catalog);
+		} catch (error) {
+			if (error instanceof Error && error.message === AGENT_FAMILY_REACH_ERROR) return undefined;
+			throw error;
+		}
+	}
+
 	private async sendAgentSessionMessage(options: {
 		targetSelector: string;
 		message: string;
@@ -5648,9 +5661,20 @@ export class AgentDaemon {
 		}
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
-		// Use one immutable persisted topology through selector resolution, wake, and delivery.
-		const catalog =
-			options.origin === "agent" && options.fromState ? await this.agentFamilyCatalogEntries() : undefined;
+		// Agent-origin authorization uses one immutable persisted topology through
+		// selector resolution, wake, and delivery. CLI-origin topology is advisory
+		// label metadata and must not make an otherwise valid delivery unavailable.
+		let catalog: readonly AgentFamilyCatalogEntry[] | undefined;
+		if (options.fromState) {
+			try {
+				catalog = await this.agentFamilyCatalogEntries();
+			} catch (error) {
+				if (options.origin === "agent") throw error;
+				this.log(
+					`Agent family catalog unavailable for CLI message relationship: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 		let targetState: ActiveSessionState;
 		try {
 			targetState = this.getBoundSessionState(targetSelector);
@@ -5726,7 +5750,12 @@ export class AgentDaemon {
 			from:
 				options.sender ??
 				this.createAgentSessionMessageSender(options.fromState, options.clientId ?? options.origin),
-			fromRelationship: this.agentMessageRelationship(options.fromState, targetState, catalog),
+			fromRelationship:
+				options.origin === "cli" && options.fromState
+					? catalog
+						? this.cliAgentMessageRelationship(options.fromState, targetState, catalog)
+						: undefined
+					: this.agentMessageRelationship(options.fromState, targetState, catalog),
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {

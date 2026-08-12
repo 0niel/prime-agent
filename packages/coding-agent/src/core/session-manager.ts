@@ -1036,11 +1036,7 @@ export async function readSessionInfoFromBuffer(
 			start = end + 1;
 		}
 	}
-	return scanSessionInfo(
-		filePath,
-		{ mtime: new Date(metadata.mtimeMs) } as Awaited<ReturnType<typeof stat>>,
-		lines(),
-	);
+	return scanSessionInfo(filePath, { mtime: new Date(metadata.mtimeMs) } as Awaited<ReturnType<typeof stat>>, lines());
 }
 
 async function scanSessionInfo(
