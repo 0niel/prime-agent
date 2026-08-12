@@ -22,7 +22,7 @@ interface SupervisorInternals {
 		clientId: string,
 		command: { type: "create"; name?: string; sessionPath?: string },
 	): Promise<WorkerFixture>;
-	assertSupervisorSavedSessionNameAvailable(sessionPath: string, name: string): Promise<void>;
+	assertSupervisorSavedSessionNameAvailable(sessionPath: string, name: string, sessionDir?: string): Promise<void>;
 	assertSavedSiblingNameAvailable(
 		siblings: Array<Record<string, unknown>>,
 		target: Record<string, unknown>,
@@ -42,7 +42,7 @@ interface WorkerFixture {
 		pid: number;
 		authenticationToken: string;
 		ownerClientId?: string;
-		createCommand: { config: { cwd: string } };
+		createCommand: { config: { cwd: string; sessionDir?: string } };
 	};
 	client: {
 		request: ReturnType<typeof vi.fn>;
@@ -492,6 +492,7 @@ describe("daemon supervisor passive subagent topology", () => {
 			releaseRename = resolve;
 		});
 		const firstWorker = worker("first", [firstSummary]);
+		firstWorker.descriptor.createCommand.config.sessionDir = join(directory, "custom-sessions");
 		firstWorker.client.request.mockImplementation(async () => {
 			await renameGate;
 			return success(undefined, "rename_saved_session", firstSummary);
@@ -504,10 +505,12 @@ describe("daemon supervisor passive subagent topology", () => {
 		}) as unknown as SupervisorInternals;
 		supervisor.workers.set("first", firstWorker);
 		supervisor.workers.set("second", secondWorker);
+		const siblings = vi.fn(async () => []);
+		const list = vi.fn(async () => []);
 		Object.assign(supervisor, {
 			catalog: {
-				siblings: vi.fn(async () => []),
-				list: vi.fn(async () => []),
+				siblings,
+				list,
 			},
 		});
 		const client = { id: "client", attachedActiveSessionIds: new Set<string>() };
@@ -535,6 +538,8 @@ describe("daemon supervisor passive subagent topology", () => {
 		expect(secondWorker.client.request).not.toHaveBeenCalled();
 		releaseRename();
 		await expect(first).resolves.toMatchObject({ success: true });
+		expect(siblings).not.toHaveBeenCalled();
+		expect(list).toHaveBeenCalledWith(undefined, join(directory, "custom-sessions"));
 	});
 
 	it("serializes same-scope inactive renames across catalog validation and commit", async () => {
@@ -564,9 +569,10 @@ describe("daemon supervisor passive subagent topology", () => {
 			defaultSessionConfig: { agentDir: directory, cwd: directory },
 			descriptorDir: join(directory, "workers"),
 		}) as unknown as SupervisorInternals;
+		const siblings = vi.fn(async () => saved);
 		Object.assign(supervisor, {
 			catalog: {
-				siblings: vi.fn(async () => saved),
+				siblings,
 				rename,
 			},
 		});
@@ -576,6 +582,7 @@ describe("daemon supervisor passive subagent topology", () => {
 			type: "rename_saved_session",
 			sessionPath: firstPath,
 			name: "shared",
+			sessionDir: join(directory, "custom-sessions"),
 		});
 		await vi.waitFor(() => expect(rename).toHaveBeenCalledOnce());
 		await expect(
@@ -583,10 +590,12 @@ describe("daemon supervisor passive subagent topology", () => {
 				type: "rename_saved_session",
 				sessionPath: secondPath,
 				name: "shared",
+				sessionDir: join(directory, "custom-sessions"),
 			}),
 		).rejects.toThrow("an agent of that name already exists at depth 1 under this parent");
 		releaseRename();
 		await expect(first).resolves.toMatchObject({ success: true });
+		expect(siblings).toHaveBeenCalledWith(firstPath, join(directory, "custom-sessions"));
 	});
 
 	it("reserves named child creates by parent scope until worker launch completes", async () => {
@@ -692,14 +701,17 @@ describe("daemon supervisor passive subagent topology", () => {
 		Object.assign(supervisor, { catalog: { list: vi.fn(async () => []), family: vi.fn(async () => [parent]) } });
 
 		await expect(
-			supervisor.handleCommand({ id: "client", attachedActiveSessionIds: new Set<string>() }, {
-				id: "message",
-				type: "send_message",
-				agentOrigin: true,
-				fromActiveSessionId: source.activeSessionId,
-				targetActiveSessionId: target.activeSessionId,
-				message: "hello sibling",
-			}),
+			supervisor.handleCommand(
+				{ id: "client", attachedActiveSessionIds: new Set<string>() },
+				{
+					id: "message",
+					type: "send_message",
+					agentOrigin: true,
+					fromActiveSessionId: source.activeSessionId,
+					targetActiveSessionId: target.activeSessionId,
+					message: "hello sibling",
+				},
+			),
 		).resolves.toMatchObject({ success: true });
 		expect(targetWorker.client.requestWorker).toHaveBeenCalledWith(
 			expect.objectContaining({ type: "worker_deliver_message", targetActiveSessionId: target.activeSessionId }),
@@ -709,11 +721,49 @@ describe("daemon supervisor passive subagent topology", () => {
 
 	it.each([
 		["missing", []],
-		["malformed", [{ id: "artifact-parent", path: join(tmpdir(), "malformed.jsonl"), cwd: "", created: new Date(0), modified: new Date(0), messageCount: 0, firstMessage: "", allMessagesText: "", rlmDepth: 0 }]],
-		["conflicting", [
-			{ id: "artifact-parent", path: join(tmpdir(), "first-parent.jsonl"), cwd: "", created: new Date(0), modified: new Date(0), messageCount: 0, firstMessage: "", allMessagesText: "", rlmDepth: 1 },
-			{ id: "artifact-parent", path: join(tmpdir(), "second-parent.jsonl"), cwd: "", created: new Date(0), modified: new Date(0), messageCount: 0, firstMessage: "", allMessagesText: "", rlmDepth: 1 },
-		]],
+		[
+			"malformed",
+			[
+				{
+					id: "artifact-parent",
+					path: join(tmpdir(), "malformed.jsonl"),
+					cwd: "",
+					created: new Date(0),
+					modified: new Date(0),
+					messageCount: 0,
+					firstMessage: "",
+					allMessagesText: "",
+					rlmDepth: 0,
+				},
+			],
+		],
+		[
+			"conflicting",
+			[
+				{
+					id: "artifact-parent",
+					path: join(tmpdir(), "first-parent.jsonl"),
+					cwd: "",
+					created: new Date(0),
+					modified: new Date(0),
+					messageCount: 0,
+					firstMessage: "",
+					allMessagesText: "",
+					rlmDepth: 1,
+				},
+				{
+					id: "artifact-parent",
+					path: join(tmpdir(), "second-parent.jsonl"),
+					cwd: "",
+					created: new Date(0),
+					modified: new Date(0),
+					messageCount: 0,
+					firstMessage: "",
+					allMessagesText: "",
+					rlmDepth: 1,
+				},
+			],
+		],
 	] as const)("denies live depth-two siblings when the artifact parent is %s", async (_kind, parents) => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-artifact-family-deny-"));
 		tempDirs.push(directory);
@@ -739,14 +789,17 @@ describe("daemon supervisor passive subagent topology", () => {
 		Object.assign(supervisor, { catalog: { list: vi.fn(async () => []), family: vi.fn(async () => parents) } });
 
 		await expect(
-			supervisor.handleCommand({ id: "client", attachedActiveSessionIds: new Set<string>() }, {
-				id: "message",
-				type: "send_message",
-				agentOrigin: true,
-				fromActiveSessionId: source.activeSessionId,
-				targetActiveSessionId: target.activeSessionId,
-				message: "hello sibling",
-			}),
+			supervisor.handleCommand(
+				{ id: "client", attachedActiveSessionIds: new Set<string>() },
+				{
+					id: "message",
+					type: "send_message",
+					agentOrigin: true,
+					fromActiveSessionId: source.activeSessionId,
+					targetActiveSessionId: target.activeSessionId,
+					message: "hello sibling",
+				},
+			),
 		).rejects.toThrow("Agent reach is limited to parent, siblings, and children");
 		expect(targetWorker.client.requestWorker).not.toHaveBeenCalled();
 	});

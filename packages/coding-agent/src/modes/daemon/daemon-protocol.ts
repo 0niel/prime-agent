@@ -60,8 +60,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
 // Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
-export const DAEMON_SCHEMA_REVISION = 16;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-1bcb9e7f1a49";
+// Revision 17 carries the catalog authority root for inactive saved-session renames.
+export const DAEMON_SCHEMA_REVISION = 17;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-ea658e1e8208";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -597,7 +598,14 @@ export type DaemonCommand =
 	| { id?: string; type: "set_session_name"; activeSessionId: string; name: string; workerToken?: string }
 	| { id?: string; type: "get_rlm_max_depth_status"; activeSessionId: string }
 	| { id?: string; type: "set_rlm_max_depth"; activeSessionId: string; maxDepth: number; global?: boolean }
-	| { id?: string; type: "rename_saved_session"; activeSessionId?: string; sessionPath: string; name: string }
+	| {
+			id?: string;
+			type: "rename_saved_session";
+			activeSessionId?: string;
+			sessionPath: string;
+			name: string;
+			sessionDir?: string;
+	  }
 	| { id?: string; type: "delete_saved_session"; activeSessionId?: string; sessionPath: string }
 	| { id?: string; type: "get_session_context"; activeSessionId: string }
 	| { id?: string; type: "get_session_tree"; activeSessionId: string }
@@ -735,7 +743,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	set_session_name: LEGACY_DAEMON_COMMAND,
 	get_rlm_max_depth_status: RLM_MAX_DEPTH_COMMAND,
 	set_rlm_max_depth: RLM_MAX_DEPTH_COMMAND,
-	rename_saved_session: LEGACY_DAEMON_COMMAND,
+	rename_saved_session: { minProtocol: 7, minSchemaRevision: 17 },
 	delete_saved_session: LEGACY_DAEMON_COMMAND,
 	get_session_context: LEGACY_DAEMON_COMMAND,
 	get_session_tree: FLAT_SESSION_TREE_COMMAND,
