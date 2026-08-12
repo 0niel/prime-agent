@@ -174,4 +174,30 @@ describeIfKernel("kernel state snapshot round-trip (real kernel)", { tags: ["ker
 			rmSync(autoDir, { recursive: true, force: true });
 		}
 	}, 60_000);
+
+	it.each([
+		["dispose", async (manager: KernelManager) => manager.dispose()],
+		["shutdown(snapshot:true)", async (manager: KernelManager) => manager.shutdown({ snapshot: true })],
+	] as const)("persists the final namespace through %s after the terminal fence", async (_label, terminate) => {
+		const finalDir = mkdtempSync(join(tmpdir(), "prime-agent-state-final-"));
+		const finalPath = join(finalDir, "final.dill");
+		const cfg = { path: finalPath, manifestPath: join(finalDir, "final.json"), debounceMs: 60_000 };
+		const writer = new KernelManager({ python: python as string, cwd: finalDir, snapshot: cfg });
+		await writer.execute("final_only = 42");
+		await terminate(writer);
+		await expect(writer.execute("late = 1")).rejects.toThrow("Kernel was disposed");
+		expect(existsSync(finalPath)).toBe(true);
+
+		const reader = new KernelManager({ python: python as string, cwd: finalDir, snapshot: cfg });
+		try {
+			const restore = await reader.restoreState();
+			expect(restore?.restored).toContain("final_only");
+			const result = await reader.execute("print(final_only)");
+			expect(result.stdout.trim()).toBe("42");
+		} finally {
+			await reader.dispose();
+			rmSync(finalDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 });
