@@ -54,6 +54,7 @@ import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-p
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
+	collectDaemonLaunchEnv,
 	createDaemonEventMeta,
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
@@ -71,6 +72,7 @@ import {
 	type DaemonResponse,
 	type DaemonUpdateRestartManifest,
 	failure,
+	filterPersistedDaemonLaunchEnv,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	salvageDaemonCommandId,
@@ -98,6 +100,8 @@ import {
 } from "./daemon-socket.js";
 import {
 	acquireDaemonSupervisorOwnership,
+	DAEMON_SUPERVISOR_REGISTRY_DIR_ENV,
+	getDaemonSupervisorRegistryDir,
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
@@ -429,6 +433,12 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
+		(descriptor.launchEnv === undefined ||
+			(typeof descriptor.launchEnv === "object" &&
+				descriptor.launchEnv !== null &&
+				Object.entries(descriptor.launchEnv).every(
+					([key, value]) => typeof key === "string" && typeof value === "string",
+				))) &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
 		typeof descriptor.rootActiveSessionId === "string" &&
@@ -602,6 +612,8 @@ export class DaemonSupervisor {
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly descriptorDir: string;
+	/** Captured from the host and forwarded unchanged to every worker. */
+	private readonly supervisorRegistryDir = getDaemonSupervisorRegistryDir();
 	private readonly generation = randomUUID();
 	private readonly supervisorConfigPath: string;
 	private readonly defaultSessionConfig: AgentSessionRuntimeConfig;
@@ -645,13 +657,14 @@ export class DaemonSupervisor {
 				throw new Error("Daemon supervisor config is missing agentDir");
 			}
 			this.socketLease = await acquireDaemonSocketPathLease(this.socketPath);
-			await waitForDaemonStartupFence(this.socketPath);
+			await waitForDaemonStartupFence(this.socketPath, 10_000, this.supervisorRegistryDir);
 			this.ownership = await acquireDaemonSupervisorOwnership({
 				socketPath: this.socketPath,
 				descriptorDir: this.descriptorDir,
 				agentDir,
 				generation: this.generation,
 				appVersion: VERSION,
+				registryDir: this.supervisorRegistryDir,
 			});
 			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
 
@@ -928,10 +941,12 @@ export class DaemonSupervisor {
 				if (!isDaemonWorkerDescriptor(descriptor, this.socketPath)) {
 					continue;
 				}
+				const storedLaunchEnv = descriptor.launchEnv;
+				descriptor.launchEnv = filterPersistedDaemonLaunchEnv(storedLaunchEnv);
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
-				this.workers.set(descriptor.workerId, {
+				const worker: ResidentWorker = {
 					descriptor,
 					descriptorPath: path,
 					summaries: new Map(),
@@ -941,7 +956,12 @@ export class DaemonSupervisor {
 					snapshotLoads: new Map(),
 					intentionalStop: descriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
-				});
+					launchEnv: descriptor.launchEnv,
+				};
+				if (JSON.stringify(storedLaunchEnv) !== JSON.stringify(descriptor.launchEnv)) {
+					this.persistWorker(worker);
+				}
+				this.workers.set(descriptor.workerId, worker);
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
 			}
@@ -2118,11 +2138,18 @@ export class DaemonSupervisor {
 			throw new Error("Session is not owned by this client");
 		}
 		const previousDescriptor = worker.descriptor;
-		worker.descriptor = { ...previousDescriptor, ownerClientId: undefined };
+		const previousLaunchEnv = worker.launchEnv;
+		const persistedLaunchEnv = filterPersistedDaemonLaunchEnv(previousLaunchEnv);
+		worker.descriptor = {
+			...previousDescriptor,
+			ownerClientId: undefined,
+			...(persistedLaunchEnv ? { launchEnv: persistedLaunchEnv } : { launchEnv: undefined }),
+		};
 		try {
 			this.persistWorker(worker);
 		} catch (error) {
 			worker.descriptor = previousDescriptor;
+			worker.launchEnv = previousLaunchEnv;
 			throw error;
 		}
 		worker.promotedOwnerClientId = clientId;
@@ -2130,7 +2157,7 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
-		worker.launchEnv = undefined;
+		worker.launchEnv = persistedLaunchEnv;
 		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 	}
 
@@ -2144,8 +2171,21 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker ${existing.descriptor.workerId} recovery was cancelled`);
 		}
 		const recoveryStopRevision = existing?.stopRevision;
-		const launchEnv =
-			ownerClientId || existing?.descriptor.ownerClientId ? (command.launchEnv ?? existing?.launchEnv) : undefined;
+		const ownerClientIdForDescriptor = existing?.descriptor.ownerClientId ?? ownerClientId;
+		// A resident recovery uses the descriptor's non-secret copy. Client-owned
+		// recovery instead uses the live owner's transient environment.
+		const launchEnv = existing
+			? ownerClientIdForDescriptor === undefined
+				? existing.descriptor.launchEnv
+				: existing.launchEnv
+			: command.launchEnv;
+		const persistedLaunchEnv = filterPersistedDaemonLaunchEnv(launchEnv);
+		// Do not propagate credentials inherited by a replacement supervisor during
+		// automatic resident recovery; the allowlist is sufficient for a relaunch.
+		const inheritedEnv =
+			existing && ownerClientIdForDescriptor === undefined
+				? filterPersistedDaemonLaunchEnv(collectDaemonLaunchEnv(process.env))
+				: process.env;
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
@@ -2166,13 +2206,15 @@ export class DaemonSupervisor {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
 			detached: true,
 			env: createCliSubprocessEnv({
-				...process.env,
+				...inheritedEnv,
 				...launchEnv,
 				[DAEMON_WORKER_ROLE_ENV]: "1",
 				[DAEMON_WORKER_TOKEN_ENV]: token,
 				[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
 				[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
 				[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath,
+				// Host authority wins over inherited or caller-provided values.
+				[DAEMON_SUPERVISOR_REGISTRY_DIR_ENV]: this.supervisorRegistryDir,
 				[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: String(WORKER_STARTUP_GATE_FD),
 				[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
 				[SESSION_LEASES_ENABLED_ENV]: "1",
@@ -2222,7 +2264,10 @@ export class DaemonSupervisor {
 				supervisorSocketPath: this.socketPath,
 				authenticationToken: token,
 				rootActiveSessionId,
-				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
+				...(ownerClientIdForDescriptor !== undefined ? { ownerClientId: ownerClientIdForDescriptor } : {}),
+				...(ownerClientIdForDescriptor === undefined && persistedLaunchEnv
+					? { launchEnv: persistedLaunchEnv }
+					: {}),
 				createdAt: existing?.descriptor.createdAt ?? now,
 				updatedAt: now,
 				lifecycle: "starting",
@@ -2243,7 +2288,9 @@ export class DaemonSupervisor {
 			};
 			await this.assertRecoveryAllowed();
 			worker.descriptor = descriptor;
-			worker.launchEnv = launchEnv;
+			// Retain only durable settings for resident recovery; client-owned workers
+			// retain their live owner's transient environment only in memory.
+			worker.launchEnv = ownerClientIdForDescriptor === undefined ? persistedLaunchEnv : launchEnv;
 			descriptorAssigned = true;
 			this.persistWorker(worker);
 			worker.intentionalStop = false;
