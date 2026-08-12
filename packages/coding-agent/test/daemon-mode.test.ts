@@ -9867,6 +9867,72 @@ describe("daemon mode helpers", () => {
 			}),
 		).rejects.toThrow("Unknown active session: missing");
 	});
+
+	it("delivers CLI sends with a sender state while preserving agent-origin catalog ACLs", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-cli-from-state.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const { state: fromState } = makeAgentFamilyState("source", "Source");
+		const { state: targetState, acceptAgentMessagePrompt } = makeAgentFamilyState("target", "Target");
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries(): Promise<
+				readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]
+			>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "sent by the CLI on behalf of source",
+				fromState,
+				origin: "cli",
+			}),
+		).resolves.toMatchObject({
+			deliveryStatus: "delivered",
+			target: { activeSessionId: targetState.activeSessionId },
+		});
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({
+			customMessage: { details: { fromRelationship: "sibling" } },
+		});
+
+		// Only an agent-origin send captures and enforces the authoritative catalog.
+		// These unresolved, distinct parent claims must remain unreachable.
+		internals.agentFamilyCatalogEntries = vi.fn(async () =>
+			Object.freeze([
+				{
+					id: fromState.runtime.session.sessionId,
+					depth: 1,
+					status: "running" as const,
+					parentSessionId: "source-parent",
+				},
+				{
+					id: targetState.runtime.session.sessionId,
+					depth: 1,
+					status: "running" as const,
+					parentSessionId: "target-parent",
+				},
+			]),
+		);
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "agent ACL must reject this",
+				fromState,
+				origin: "agent",
+			}),
+		).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
+		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
+	});
 });
 
 type CronAdmissionActivity = Partial<{
