@@ -1489,6 +1489,393 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.recovery).toBeUndefined();
 	});
 
+	it("fails closed for a dead env-less resident until a fresh resume supplies credentials", async () => {
+		type Worker = {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				rootActiveSessionId: string;
+				lifecycle?: string;
+				lastError?: string;
+			};
+			intentionalStop: boolean;
+			stopRevision: number;
+		};
+		type Harness = {
+			workers: Map<string, Worker>;
+			shuttingDown: boolean;
+			persistWorker: ReturnType<typeof vi.fn>;
+			launchWorker: ReturnType<typeof vi.fn>;
+			recoverWorker(worker: Worker): Promise<void>;
+		};
+		const worker: Worker = {
+			descriptor: { workerId: "resident-without-env", pid: 42, rootActiveSessionId: "active-resident" },
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			persistWorker: vi.fn(),
+			launchWorker: vi.fn(),
+		}) as Harness;
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
+		try {
+			await supervisor.recoverWorker(worker);
+			// An ambient supervisor environment and a descriptor's durable safe
+			// settings are never a substitute for a fresh client capability.
+			expect(worker.descriptor).toMatchObject({
+				lifecycle: "failed",
+				lastError: "Waiting for a client with fresh environment",
+			});
+			expect(supervisor.persistWorker).toHaveBeenCalledOnce();
+			expect(supervisor.launchWorker).not.toHaveBeenCalled();
+		} finally {
+			aliveSpy.mockRestore();
+		}
+	});
+
+	it("consumes a fresh recovery environment after a successful reconnect", async () => {
+		vi.useFakeTimers();
+		type Worker = {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				rootActiveSessionId: string;
+				createCommand: { type: "create" };
+				lifecycle?: string;
+				consecutiveFailures: number;
+			};
+			client?: { close(): void };
+			recovery?: Promise<void>;
+			recoveryLaunchEnv?: Record<string, string>;
+			intentionalStop: boolean;
+			stopRevision: number;
+		};
+		type Harness = {
+			workers: Map<string, Worker>;
+			shuttingDown: boolean;
+			connectWorker: ReturnType<typeof vi.fn>;
+			subscribeWorker: ReturnType<typeof vi.fn>;
+			refreshWorkerSummaries: ReturnType<typeof vi.fn>;
+			persistWorker: ReturnType<typeof vi.fn>;
+			syncAgentPeers: ReturnType<typeof vi.fn>;
+			broadcastHeartbeatsChanged: ReturnType<typeof vi.fn>;
+			log: ReturnType<typeof vi.fn>;
+			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
+			recoverWorker(worker: Worker): Promise<void>;
+		};
+		const worker: Worker = {
+			descriptor: {
+				workerId: "reconnect-consumes-env",
+				pid: process.pid,
+				rootActiveSessionId: "active-reconnect",
+				createCommand: { type: "create" },
+				consecutiveFailures: 0,
+			},
+			recoveryLaunchEnv: { ACP_FIXTURE_API_KEY: "one-shot" },
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			connectWorker: vi.fn(async () => {
+				worker.client = { close: vi.fn() };
+				return worker.client;
+			}),
+			subscribeWorker: vi.fn(async () => undefined),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+			persistWorker: vi.fn(),
+			syncAgentPeers: vi.fn(async () => undefined),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+		}) as Harness;
+		const recovery = supervisor.recoverWorker(worker);
+		await vi.advanceTimersByTimeAsync(250);
+		await recovery;
+		expect(worker.descriptor.lifecycle).toBe("ready");
+		expect(worker.recoveryLaunchEnv).toBeUndefined();
+	});
+
+	it("consumes a fresh recovery environment after failed replacement launch", async () => {
+		vi.useFakeTimers();
+		type Worker = {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				rootActiveSessionId: string;
+				createCommand: { type: "create" };
+				lifecycle?: string;
+				consecutiveFailures: number;
+				lastFailureAt?: string;
+				lastError?: string;
+			};
+			client?: { close(): void };
+			recovery?: Promise<void>;
+			recoveryLaunchEnv?: Record<string, string>;
+			intentionalStop: boolean;
+			stopRevision: number;
+		};
+		type Harness = {
+			workers: Map<string, Worker>;
+			shuttingDown: boolean;
+			launchWorker: ReturnType<typeof vi.fn>;
+			persistWorker: ReturnType<typeof vi.fn>;
+			syncAgentPeers: ReturnType<typeof vi.fn>;
+			log: ReturnType<typeof vi.fn>;
+			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
+			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
+			recoverWorker(worker: Worker): Promise<void>;
+		};
+		const worker: Worker = {
+			descriptor: {
+				workerId: "failed-launch-consumes-env",
+				pid: 42,
+				rootActiveSessionId: "active-failed-launch",
+				createCommand: { type: "create" },
+				consecutiveFailures: 0,
+			},
+			recoveryLaunchEnv: { ACP_FIXTURE_API_KEY: "one-shot" },
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
+		try {
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				shuttingDown: false,
+				assertRecoveryAllowed: vi.fn(async () => undefined),
+				recoverUncertainWorkerOperations: vi.fn(async () => undefined),
+				launchWorker: vi.fn(async () => {
+					throw new Error("replacement launch failed");
+				}),
+				persistWorker: vi.fn(),
+				syncAgentPeers: vi.fn(async () => undefined),
+				log: vi.fn(),
+			}) as Harness;
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.runAllTimersAsync();
+			await recovery;
+			expect(supervisor.launchWorker).toHaveBeenCalledTimes(3);
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect(worker.recoveryLaunchEnv).toBeUndefined();
+		} finally {
+			aliveSpy.mockRestore();
+		}
+	});
+
+	it("accepts the first fresh ownerless resident resume and single-flights concurrent resumes", async () => {
+		type Worker = {
+			descriptor: {
+				workerId: string;
+				rootActiveSessionId: string;
+				lifecycle: "failed" | "recovering" | "ready";
+				consecutiveFailures: number;
+				stopRequestedAt?: string;
+				archiveOnStop?: boolean;
+				lastError?: string;
+			};
+			client?: object;
+			recovery?: Promise<void>;
+			recoveryLaunchEnv?: Record<string, string>;
+			intentionalStop: boolean;
+		};
+		type Harness = {
+			persistWorker: ReturnType<typeof vi.fn>;
+			recoverWorker: ReturnType<typeof vi.fn>;
+			reuseWorkerForCreate(
+				worker: Worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+				command: { type: "create"; lifecycle?: "client_owned"; launchEnv: Record<string, string> },
+			): Promise<Worker>;
+		};
+		const worker: Worker = {
+			descriptor: {
+				workerId: "fresh-resident",
+				rootActiveSessionId: "active-fresh-resident",
+				lifecycle: "failed",
+				consecutiveFailures: 2,
+			},
+			intentionalStop: false,
+		};
+		const started = createDeferred<void>();
+		const finish = createDeferred<void>();
+		const recoverWorker = vi.fn(async (target: Worker) => {
+			const recovery = (async () => {
+				started.resolve();
+				await finish.promise;
+				target.client = {};
+				target.descriptor.lifecycle = "ready";
+			})();
+			target.recovery = recovery.finally(() => {
+				target.recovery = undefined;
+			});
+			return target.recovery;
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			persistWorker: vi.fn(),
+			recoverWorker,
+		}) as Harness;
+		const first = supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/fresh-resident", {
+			type: "create",
+			launchEnv: { ACP_FIXTURE_API_KEY: "first-secret" },
+		});
+		await started.promise;
+		const second = supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/fresh-resident", {
+			type: "create",
+			launchEnv: { ACP_FIXTURE_API_KEY: "second-secret" },
+		});
+		expect(worker.recoveryLaunchEnv).toEqual({ ACP_FIXTURE_API_KEY: "first-secret" });
+		expect(recoverWorker).toHaveBeenCalledOnce();
+		finish.resolve();
+		await expect(Promise.all([first, second])).resolves.toEqual([worker, worker]);
+		expect(recoverWorker).toHaveBeenCalledOnce();
+	});
+
+	it("fences a fresh resume behind stale automatic recovery before adopting its environment", async () => {
+		type Worker = {
+			descriptor: {
+				workerId: string;
+				rootActiveSessionId: string;
+				lifecycle: "failed" | "recovering" | "ready";
+				consecutiveFailures: number;
+				lastError?: string;
+			};
+			client?: object;
+			recovery?: Promise<void>;
+			recoveryLaunchEnv?: Record<string, string>;
+			intentionalStop: boolean;
+		};
+		type Harness = {
+			persistWorker: ReturnType<typeof vi.fn>;
+			recoverWorker: ReturnType<typeof vi.fn>;
+			reuseWorkerForCreate(
+				worker: Worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+				command: { type: "create"; launchEnv: Record<string, string> },
+			): Promise<Worker>;
+		};
+		const worker: Worker = {
+			descriptor: {
+				workerId: "stale-automatic-recovery",
+				rootActiveSessionId: "active-stale-automatic-recovery",
+				lifecycle: "recovering",
+				consecutiveFailures: 1,
+			},
+			intentionalStop: false,
+		};
+		const automaticFinished = createDeferred<void>();
+		worker.recovery = automaticFinished.promise.finally(() => {
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = "Waiting for a client with fresh environment";
+			worker.recovery = undefined;
+		});
+		let adopted: Record<string, string> | undefined;
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			persistWorker: vi.fn(),
+			recoverWorker: vi.fn(async (target: Worker) => {
+				adopted = target.recoveryLaunchEnv;
+				target.client = {};
+				target.descriptor.lifecycle = "ready";
+			}),
+		}) as Harness;
+		const resumed = supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/stale-auto", {
+			type: "create",
+			launchEnv: { ACP_FIXTURE_API_KEY: "fresh-after-stale" },
+		});
+		await Promise.resolve();
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+		automaticFinished.resolve();
+		await expect(resumed).resolves.toBe(worker);
+		expect(adopted).toEqual({ ACP_FIXTURE_API_KEY: "fresh-after-stale" });
+	});
+
+	it("denies a fresh resume that does not match the worker owner", async () => {
+		type Worker = {
+			descriptor: { workerId: string; rootActiveSessionId: string; ownerClientId: string; lifecycle: "failed" };
+			intentionalStop: boolean;
+		};
+		type Harness = {
+			reuseWorkerForCreate(
+				worker: Worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+				command: { type: "create"; launchEnv: Record<string, string> },
+			): Promise<Worker>;
+		};
+		const worker: Worker = {
+			descriptor: {
+				workerId: "owned-worker",
+				rootActiveSessionId: "active-owned",
+				ownerClientId: "owner-A",
+				lifecycle: "failed",
+			},
+			intentionalStop: false,
+		};
+		const supervisor = Object.create(DaemonSupervisor.prototype) as Harness;
+		await expect(
+			supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/owned-worker", {
+				type: "create",
+				launchEnv: { ACP_FIXTURE_API_KEY: "unauthorized" },
+			}),
+		).rejects.toMatchObject({ name: "SessionAlreadyActiveError", activeSessionId: "active-owned" });
+	});
+
+	it("clears a fresh recovery environment when persistence fails", async () => {
+		type Worker = {
+			descriptor: {
+				workerId: string;
+				rootActiveSessionId: string;
+				lifecycle: "failed" | "recovering";
+				consecutiveFailures: number;
+				lastError?: string;
+			};
+			recoveryLaunchEnv?: Record<string, string>;
+			intentionalStop: boolean;
+		};
+		type Harness = {
+			persistWorker: ReturnType<typeof vi.fn>;
+			recoverWorker: ReturnType<typeof vi.fn>;
+			reuseWorkerForCreate(
+				worker: Worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+				command: { type: "create"; launchEnv: Record<string, string> },
+			): Promise<Worker>;
+		};
+		const worker: Worker = {
+			descriptor: {
+				workerId: "unpersisted-fresh-resume",
+				rootActiveSessionId: "active-unpersisted",
+				lifecycle: "failed",
+				consecutiveFailures: 3,
+				lastError: "previous recovery failure",
+			},
+			intentionalStop: false,
+		};
+		const originalDescriptor = worker.descriptor;
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			persistWorker: vi.fn((target: Worker) => {
+				target.descriptor.lastError = "partially persisted";
+				throw new Error("simulated persistence failure");
+			}),
+			recoverWorker: vi.fn(),
+		}) as Harness;
+		await expect(
+			supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/unpersisted", {
+				type: "create",
+				launchEnv: { ACP_FIXTURE_API_KEY: "must-not-survive" },
+			}),
+		).rejects.toThrow("simulated persistence failure");
+		expect(worker.recoveryLaunchEnv).toBeUndefined();
+		expect(worker.descriptor).toBe(originalDescriptor);
+		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
+	});
+
 	it("relaunches a worker instead of reconnecting to a reused pid", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
