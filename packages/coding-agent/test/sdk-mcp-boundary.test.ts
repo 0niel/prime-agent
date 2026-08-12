@@ -173,6 +173,34 @@ describe("SDK MCP boundary", () => {
 		}
 	});
 
+	it("creates an SDK session for an admitted fresh project without .prime storage", async () => {
+		const root = mkdtempSync(join(tmpdir(), "sdk-mcp-fresh-project-"));
+		const cwd = realpathSync.native(root);
+		const agentDir = join(root, "agent");
+		cleanup.push(root);
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({
+				mcpProjectTrustPolicy: { revision: "r1", allowedProjectDirectories: [cwd] },
+				mcpDeclarations: {
+					version: 1,
+					servers: { user: { name: "user", url: "https://user.example/mcp", enabled: true } },
+				},
+			}),
+		);
+
+		const { session } = await sdk({ cwd, agentDir, authStorage: AuthStorage.inMemory() });
+		try {
+			const declarations = manager(session).getDeclarationSnapshot()!.declarations;
+			expect(declarations).toHaveProperty("user");
+			expect(declarations).not.toHaveProperty("project");
+			expect(existsSync(join(cwd, ".prime"))).toBe(false);
+		} finally {
+			session.dispose();
+		}
+	});
+
 	it("makes missing, forged, and root-swapped admissions user-only for injected settings", async () => {
 		const root = mkdtempSync(join(tmpdir(), "sdk-mcp-inert-"));
 		const cwd = realpathSync.native(root);
