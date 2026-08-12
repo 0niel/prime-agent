@@ -23,18 +23,15 @@ describe("IPython RLM bootstrap", () => {
 		expect(buildRlmBootstrapCode()).toContain('_prime_agent_os.environ["NO_COLOR"] = "1"');
 	});
 
-	it("bounds async bash output and cleans process groups on exceptional exits", () => {
+	it("bounds async bash output and cleans POSIX process groups on exceptional exits", () => {
 		const code = buildRlmBootstrapCode();
 		expect(code).not.toContain("proc.communicate()");
 		expect(code).toContain("_PrimeAgentBoundedBytes");
 		expect(code).toContain("start_new_session");
 		expect(code).toContain("killpg");
 		expect(code).toContain("except BaseException");
-		expect(code).toContain('taskkill, "/PID", str(proc.pid), "/T", "/F"');
-		expect(code).toContain("await killer.wait()");
-		expect(code).not.toContain(
-			"async def _prime_agent_bash_taskkill(proc) -> None:\n    if proc.returncode is not None",
-		);
+		expect(code).toContain("bash() is unavailable on Windows");
+		expect(code).not.toContain("taskkill");
 	});
 
 	it("guards Python skill imports so a broken skill does not abort bootstrap", () => {

@@ -132,44 +132,18 @@ def _prime_agent_bash_signal_group(proc, sig) -> None:
         pass
 
 
-async def _prime_agent_bash_taskkill(proc) -> None:
-    # taskkill /T can still find descendants by the original shell PID after
-    # the shell itself exits, so do not short-circuit on proc.returncode.
-    taskkill = _prime_agent_shutil.which("taskkill")
-    if taskkill:
-        killer = await _prime_agent_asyncio.create_subprocess_exec(
-            taskkill, "/PID", str(proc.pid), "/T", "/F",
-            stdin=_prime_agent_subprocess.DEVNULL,
-            stdout=_prime_agent_subprocess.DEVNULL,
-            stderr=_prime_agent_subprocess.DEVNULL,
-        )
-        try:
-            await _prime_agent_asyncio.wait_for(_prime_agent_asyncio.shield(killer.wait()), timeout=2)
-        except _prime_agent_asyncio.TimeoutError:
-            killer.kill()
-            await killer.wait()
-        except BaseException:
-            if killer.returncode is None:
-                killer.kill()
-            await _prime_agent_asyncio.shield(killer.wait())
-            raise
-    if proc.returncode is None:
-        proc.kill()
 
 
 async def _prime_agent_bash_stop(proc, collector, stdout_task, stderr_task) -> None:
     """Stop the command tree and finish or cancel every pipe-drain task."""
-    if _prime_agent_bash_os.name == "nt":
-        await _prime_agent_bash_taskkill(proc)
-    else:
-        _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGTERM)
-        try:
-            await _prime_agent_asyncio.wait_for(
-                _prime_agent_asyncio.shield(collector), timeout=_PRIME_AGENT_BASH_STOP_GRACE
-            )
-            return
-        except _prime_agent_asyncio.TimeoutError:
-            _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGKILL)
+    _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGTERM)
+    try:
+        await _prime_agent_asyncio.wait_for(
+            _prime_agent_asyncio.shield(collector), timeout=_PRIME_AGENT_BASH_STOP_GRACE
+        )
+        return
+    except _prime_agent_asyncio.TimeoutError:
+        _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGKILL)
 
     try:
         await _prime_agent_asyncio.wait_for(_prime_agent_asyncio.shield(collector), timeout=2)
@@ -202,18 +176,12 @@ async def bash(
     """
     if not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
         raise ValueError("max_output_bytes must be a positive integer")
-    shell = _prime_agent_shutil.which("bash")
-    if shell is None:
-        if _prime_agent_bash_os.name == "nt":
-            raise RuntimeError("bash() requires bash.exe on Windows")
-        shell = "/bin/bash"
+    if _prime_agent_bash_os.name == "nt":
+        raise RuntimeError("bash() is unavailable on Windows because reliable process-tree cleanup is not supported")
+    shell = _prime_agent_shutil.which("bash") or "/bin/bash"
     env = dict(_prime_agent_bash_os.environ)
     work_dir = cwd or _prime_agent_bash_os.getcwd()
-    spawn_options = {}
-    if _prime_agent_bash_os.name == "nt":
-        spawn_options["creationflags"] = _prime_agent_subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        spawn_options["start_new_session"] = True
+    spawn_options = {"start_new_session": True}
 
     proc = await _prime_agent_asyncio.create_subprocess_exec(
         shell, "-c", command,
