@@ -273,6 +273,8 @@ interface ResidentWorker {
 	intentionalStop: boolean;
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
+	/** Fresh client environment used once for a resident replacement, never persisted. */
+	recoveryLaunchEnv?: Record<string, string>;
 	stopFinalization?: Promise<void>;
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
@@ -2027,7 +2029,7 @@ export class DaemonSupervisor {
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
-				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
+				return await this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath, command);
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -2039,7 +2041,7 @@ export class DaemonSupervisor {
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing.worker))) {
-				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath);
+				return await this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath, command);
 			}
 			// A passive child from a stopped worker reopens as top-level here (pre-existing behavior);
 			// the recursive-harness residency/eviction PR will revisit it.
@@ -2078,15 +2080,85 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private reuseWorkerForCreate(
+	private async reuseWorkerForCreate(
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
 		sessionPath: string,
-	): ResidentWorker {
-		if (worker.descriptor.ownerClientId === ownerClientId) {
-			return worker;
+		command: DaemonCreateCommand,
+	): Promise<ResidentWorker> {
+		if (worker.descriptor.ownerClientId !== ownerClientId) {
+			throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
 		}
-		throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
+		// Only an ownerless resident create received over the daemon's protected
+		// local socket can supply the one-shot credentials required to replace a
+		// failed worker. The descriptor remains a non-secret recovery recipe.
+		if (
+			ownerClientId === undefined &&
+			command.lifecycle !== "client_owned" &&
+			command.launchEnv &&
+			(!worker.client || worker.descriptor.lifecycle !== "ready")
+		) {
+			// A fresh-environment recovery is single-flight. A concurrent resume may
+			// join but must never replace the first caller's credentials. If an
+			// automatic env-less recovery is winding down, fence behind it before
+			// adopting the new one-shot capability.
+			const inFlightRecovery = worker.recovery;
+			if (inFlightRecovery) {
+				if (worker.recoveryLaunchEnv) {
+					await inFlightRecovery;
+					if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+						throw new Error(
+							worker.descriptor.lastError ??
+								`Session worker ${worker.descriptor.workerId} did not recover for the first fresh resume`,
+						);
+					}
+					return worker;
+				}
+				await inFlightRecovery;
+				if (worker.client && worker.descriptor.lifecycle === "ready") {
+					return worker;
+				}
+				if (worker.recovery) {
+					await worker.recovery;
+					if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+						throw new Error(
+							worker.descriptor.lastError ??
+								`Session worker ${worker.descriptor.workerId} did not recover for the first fresh resume`,
+						);
+					}
+					return worker;
+				}
+			}
+			const previousDescriptor = worker.descriptor;
+			const previousIntentionalStop = worker.intentionalStop;
+			worker.recoveryLaunchEnv = command.launchEnv;
+			worker.intentionalStop = false;
+			worker.descriptor = {
+				...previousDescriptor,
+				stopRequestedAt: undefined,
+				archiveOnStop: undefined,
+				lifecycle: "recovering",
+				consecutiveFailures: 0,
+			};
+			try {
+				this.persistWorker(worker);
+			} catch (error) {
+				// Persistence is the hand-off point; do not retain an unrecorded
+				// credential capability for a later automatic recovery.
+				worker.recoveryLaunchEnv = undefined;
+				worker.intentionalStop = previousIntentionalStop;
+				worker.descriptor = previousDescriptor;
+				throw error;
+			}
+			await this.recoverWorker(worker);
+			if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+				throw new Error(
+					worker.descriptor.lastError ??
+						`Session worker ${worker.descriptor.workerId} did not recover with its fresh environment`,
+				);
+			}
+		}
+		return worker;
 	}
 
 	/**
@@ -2172,11 +2244,11 @@ export class DaemonSupervisor {
 		}
 		const recoveryStopRevision = existing?.stopRevision;
 		const ownerClientIdForDescriptor = existing?.descriptor.ownerClientId ?? ownerClientId;
-		// A resident recovery uses the descriptor's non-secret copy. Client-owned
-		// recovery instead uses the live owner's transient environment.
+		// A resident descriptor is deliberately a non-secret recovery recipe. Only
+		// a fresh local client resume may supply a transient recovery environment.
 		const launchEnv = existing
 			? ownerClientIdForDescriptor === undefined
-				? existing.descriptor.launchEnv
+				? (existing.recoveryLaunchEnv ?? existing.descriptor.launchEnv)
 				: existing.launchEnv
 			: command.launchEnv;
 		const persistedLaunchEnv = filterPersistedDaemonLaunchEnv(launchEnv);
@@ -2296,6 +2368,9 @@ export class DaemonSupervisor {
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
 		} catch (error) {
+			// A replacement never passed its startup gate, so require another fresh
+			// client resume instead of retaining its transient credentials.
+			existing?.recoveryLaunchEnv = undefined;
 			if (startupGate instanceof Writable) {
 				startupGate.destroy();
 			}
@@ -2353,8 +2428,13 @@ export class DaemonSupervisor {
 			this.persistWorker(worker);
 			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
 			this.broadcastHeartbeatsChanged();
+			// The replacement consumed the fresh environment. Never retain it for a
+			// later automatic recovery.
+			worker.recoveryLaunchEnv = undefined;
 			return worker;
 		} catch (error) {
+			// Every launch or persistence failure consumes the one-shot capability.
+			worker.recoveryLaunchEnv = undefined;
 			if (isSupervisorGenerationStale(error)) {
 				throw error;
 			}
@@ -2819,6 +2899,19 @@ export class DaemonSupervisor {
 
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
 		if (this.isWorkerRecoveryCancelled(worker)) {
+			worker.recoveryLaunchEnv = undefined;
+			return;
+		}
+		if (
+			worker.descriptor.ownerClientId === undefined &&
+			!worker.recoveryLaunchEnv &&
+			!isProcessAlive(worker.descriptor.pid)
+		) {
+			// Never recover resident credentials from a descriptor or the daemon's
+			// ambient environment. A new local client resume must supply them.
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = "Waiting for a client with fresh environment";
+			this.persistWorker(worker);
 			return;
 		}
 		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
@@ -2834,6 +2927,16 @@ export class DaemonSupervisor {
 			for (const [retryIndex, retryDelay] of WORKER_RETRY_DELAYS_MS.entries()) {
 				await delay(retryDelay);
 				if (this.isWorkerRecoveryCancelled(worker)) {
+					return;
+				}
+				if (
+					worker.descriptor.ownerClientId === undefined &&
+					!worker.recoveryLaunchEnv &&
+					!isProcessAlive(worker.descriptor.pid)
+				) {
+					worker.descriptor.lifecycle = "failed";
+					worker.descriptor.lastError = "Waiting for a client with fresh environment";
+					this.persistWorker(worker);
 					return;
 				}
 				try {
@@ -2918,6 +3021,9 @@ export class DaemonSupervisor {
 			await this.syncAgentPeers().catch(() => undefined);
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
 		})().finally(() => {
+			// Fresh credentials belong to this recovery attempt, including failed,
+			// cancelled, reconnect-only, and stale-generation paths.
+			worker.recoveryLaunchEnv = undefined;
 			worker.recovery = undefined;
 		});
 		return worker.recovery;
