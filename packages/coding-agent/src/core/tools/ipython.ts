@@ -40,7 +40,7 @@ import shutil as _prime_agent_shutil
 import signal as _prime_agent_signal
 import os as _prime_agent_bash_os
 
-_PRIME_AGENT_BASH_CAPTURE_LIMIT = 1024 * 1024
+_PRIME_AGENT_BASH_CAPTURE_LIMIT = 32 * 1024
 _PRIME_AGENT_BASH_READ_CHUNK = 64 * 1024
 _PRIME_AGENT_BASH_STOP_GRACE = 0.25
 
@@ -95,8 +95,12 @@ class _PrimeAgentBashResult:
         parts = []
         if self.stdout:
             parts.append(self.stdout)
+        if self.stdout_truncated:
+            parts.append(f"[stdout truncated; showing final {len(self.stdout.encode('utf-8'))} of {self.stdout_total_bytes} bytes]")
         if self.stderr:
             parts.append(self.stderr)
+        if self.stderr_truncated:
+            parts.append(f"[stderr truncated; showing final {len(self.stderr.encode('utf-8'))} of {self.stderr_total_bytes} bytes]")
         text = chr(10).join(parts)
         if self.returncode != 0:
             text += chr(10) + chr(10) + f"Command exited with code {self.returncode}"
@@ -117,8 +121,21 @@ async def _prime_agent_bash_drain(stream, capture: _PrimeAgentBoundedBytes) -> N
 
 
 async def _prime_agent_bash_collect(proc, stdout_task, stderr_task) -> None:
-    await proc.wait()
-    await _prime_agent_asyncio.gather(stdout_task, stderr_task)
+    # asyncio's process wait can remain pending while descendants hold inherited
+    # pipes, even after the shell's returncode is set. Observe that state directly.
+    while proc.returncode is None:
+        await _prime_agent_asyncio.sleep(0.01)
+    # A successful shell may leave background descendants in its session. Stop
+    # them before waiting for inherited pipe descriptors to close.
+    _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGTERM)
+    drains = _prime_agent_asyncio.gather(stdout_task, stderr_task)
+    try:
+        await _prime_agent_asyncio.wait_for(
+            _prime_agent_asyncio.shield(drains), timeout=_PRIME_AGENT_BASH_STOP_GRACE
+        )
+    except _prime_agent_asyncio.TimeoutError:
+        _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGKILL)
+        await drains
 
 
 def _prime_agent_bash_signal_group(proc, sig) -> None:

@@ -117,15 +117,39 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 				'r = await bash("yes A | head -c 200000; yes B | head -c 200000 >&2", max_output_bytes=4096)',
 				"print(r.returncode, len(r.stdout), len(r.stderr), r.stdout_truncated, r.stderr_truncated)",
 				"print(r.stdout_total_bytes, r.stderr_total_bytes)",
+				'print(str(r).count("truncated"))',
 			].join("\n");
 			const result = await manager.execute(code);
 			expect(result.status).toBe("ok");
 			expect(result.stdout).toContain("0 4096 4096 True True");
 			expect(result.stdout).toContain("200000 200000");
+			expect(result.stdout).toContain("2");
 		} finally {
 			await manager.dispose();
 		}
 	}, 60_000);
+
+	it.skipIf(process.platform === "win32")(
+		"cleans background descendants after the shell exits",
+		async () => {
+			const manager = new KernelManager({ python: python as string, cwd: dir });
+			const marker = join(dir, "background-marker");
+			try {
+				await manager.start();
+				expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+				const result = await manager.execute(
+					`r = await bash("(sleep 1; touch '${marker}') &")\nprint(r.returncode)`,
+				);
+				expect(result.status).toBe("ok");
+				expect(result.stdout).toContain("0");
+				await new Promise((resolve) => setTimeout(resolve, 1300));
+				expect(existsSync(marker)).toBe(false);
+			} finally {
+				await manager.dispose();
+			}
+		},
+		60_000,
+	);
 
 	it.skipIf(process.platform === "win32")(
 		"kills descendants on timeout and cancellation",
