@@ -1876,7 +1876,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(supervisor.recoverWorker).not.toHaveBeenCalled();
 	});
 
-	it("relaunches a worker instead of reconnecting to a reused pid", async () => {
+	it("does not relaunch an ownerless resident after its pid is reused without fresh environment", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
 			descriptor: {
@@ -1885,6 +1885,8 @@ describe("daemon worker supervisor monitoring", () => {
 				processStartId: string;
 				rootActiveSessionId: string;
 				createCommand: { type: "create" };
+				lifecycle?: string;
+				lastError?: string;
 			};
 			intentionalStop: boolean;
 			stopRevision: number;
@@ -1926,8 +1928,13 @@ describe("daemon worker supervisor monitoring", () => {
 		await recovery;
 
 		expect(supervisor.connectWorker).not.toHaveBeenCalled();
-		expect(supervisor.recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker, false);
-		expect(supervisor.launchWorker).toHaveBeenCalledWith(worker.descriptor.createCommand, worker);
+		expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
+		expect(supervisor.launchWorker).not.toHaveBeenCalled();
+		expect(supervisor.persistWorker).toHaveBeenCalledWith(worker);
+		expect(worker.descriptor).toMatchObject({
+			lifecycle: "failed",
+			lastError: "Waiting for a client with fresh environment",
+		});
 	});
 
 	it("does not replace a verified live ownerless resident after repeated socket/auth failures without fresh env", async () => {
