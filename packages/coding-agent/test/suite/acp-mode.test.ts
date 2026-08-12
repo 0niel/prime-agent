@@ -578,6 +578,26 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("recovers the update queue after a failed publish hook", async () => {
+		let rejectOnce = true;
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection, {
+			beforeAcpUpdatePublish: () => {
+				if (!rejectOnce) return;
+				rejectOnce = false;
+				throw new Error("publish hook failed");
+			},
+		});
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		connection.emitHeartbeat();
+		connection.emitHeartbeat();
+		await vi.waitFor(() => expect(updates).toHaveLength(1));
+		expect(updates[0].update?._meta?.[PRIME_AGENT_META_NAMESPACE]).toMatchObject({ eventSequence: 2 });
+		await expect(client.request("session/close", { sessionId: session.sessionId })).resolves.toEqual({});
+		close();
+	});
+
 	it("settles queued updates before close resolves without a post-close notification", async () => {
 		let entered!: () => void;
 		let release!: () => void;

@@ -228,16 +228,20 @@ class AcpUpdateProducer {
 				},
 			},
 		};
-		// Keep the chain alive after a disconnect, while preserving the order of
-		// every later notification and allowing callers to await its drain.
+		// Keep the chain alive after a failed hook or notification, while preserving
+		// the order of every later notification and allowing callers to await its drain.
 		this.tail = this.tail.then(async () => {
-			await this.admissionReady;
-			if (!this.admissionOpen) return;
-			await this.beforePublish?.(correlatedUpdate);
-			await this.client
-				.notify(acp.methods.client.session.update, { sessionId: this.sessionId, update: correlatedUpdate })
-				.then(() => undefined)
-				.catch(() => undefined);
+			try {
+				await this.admissionReady;
+				if (!this.admissionOpen) return;
+				await this.beforePublish?.(correlatedUpdate);
+				await this.client.notify(acp.methods.client.session.update, {
+					sessionId: this.sessionId,
+					update: correlatedUpdate,
+				});
+			} catch {
+				// Drop only this update; a rejected queue tail would strand later updates.
+			}
 		});
 		return this.tail;
 	}
