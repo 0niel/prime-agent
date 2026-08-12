@@ -1666,6 +1666,104 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it.each(["sessionFile", "createCommand.sessionPath"] as const)(
+		"matches an empty-summary restarted resident by authoritative descriptor %s",
+		(descriptorField) => {
+			const sessionPath = join(tmpdir(), "resident-restart", "session.jsonl");
+			const worker = {
+				descriptor: {
+					workerId: `restarted-${descriptorField}`,
+					rootActiveSessionId: "active-restarted",
+					...(descriptorField === "sessionFile" ? { sessionFile: sessionPath } : {}),
+					createCommand: {
+						type: "create" as const,
+						...(descriptorField === "createCommand.sessionPath" ? { sessionPath } : {}),
+					},
+				},
+				summaries: new Map<string, SessionSummary>(),
+			};
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+			}) as {
+				findWorkerBySessionFile(target: string): typeof worker | undefined;
+			};
+
+			expect(supervisor.findWorkerBySessionFile(join(sessionPath, "..", "session.jsonl"))).toBe(worker);
+			expect(supervisor.findWorkerBySessionFile(join(tmpdir(), "different-session.jsonl"))).toBeUndefined();
+		},
+	);
+
+	it("fails closed for conflicting paths in one restarted descriptor", () => {
+		const sessionPath = join(tmpdir(), "resident-conflict", "session.jsonl");
+		const worker = {
+			descriptor: {
+				workerId: "conflicting-resident",
+				sessionFile: sessionPath,
+				createCommand: { type: "create" as const, sessionPath: join(tmpdir(), "other.jsonl") },
+			},
+			summaries: new Map<string, SessionSummary>(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+		}) as { findWorkerBySessionFile(target: string): typeof worker | undefined };
+
+		expect(() => supervisor.findWorkerBySessionFile(sessionPath)).toThrow("Conflicting resident session paths");
+	});
+
+	it("fails closed when restarted descriptors collide on a session path", () => {
+		const sessionPath = join(tmpdir(), "resident-collision", "session.jsonl");
+		const workers = ["one", "two"].map((workerId) => ({
+			descriptor: { workerId, sessionFile: sessionPath, createCommand: { type: "create" as const } },
+			summaries: new Map<string, SessionSummary>(),
+		}));
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map(workers.map((worker) => [worker.descriptor.workerId, worker])),
+		}) as { findWorkerBySessionFile(target: string): (typeof workers)[number] | undefined };
+
+		expect(() => supervisor.findWorkerBySessionFile(sessionPath)).toThrow("Ambiguous resident session path");
+	});
+
+	it.each(["sessionFile", "createCommand.sessionPath"] as const)(
+		"reuses an empty-summary restarted descriptor by %s without launching another worker",
+		async (descriptorField) => {
+			const sessionPath = join(tmpdir(), `restart-reuse-${descriptorField}`, "session.jsonl");
+			const worker = {
+				descriptor: {
+					workerId: `restart-reuse-${descriptorField}`,
+					rootActiveSessionId: "active-restarted",
+					...(descriptorField === "sessionFile" ? { sessionFile: sessionPath } : {}),
+					createCommand: {
+						type: "create" as const,
+						...(descriptorField === "createCommand.sessionPath" ? { sessionPath } : {}),
+					},
+				},
+				summaries: new Map<string, SessionSummary>(),
+				intentionalStop: false,
+			};
+			const launchWorker = vi.fn();
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				openingWorkers: new Map(),
+				defaultSessionConfig: {},
+				reclaimStaleWorkerRegistration: vi.fn(async () => false),
+				launchWorker,
+			}) as {
+				createOrReuseWorker(
+					clientId: string,
+					command: { type: "create"; sessionPath: string },
+				): Promise<typeof worker>;
+			};
+
+			await expect(
+				supervisor.createOrReuseWorker("client", {
+					type: "create",
+					sessionPath: join(sessionPath, "..", "session.jsonl"),
+				}),
+			).resolves.toBe(worker);
+			expect(launchWorker).not.toHaveBeenCalled();
+		},
+	);
+
 	it("accepts the first fresh ownerless resident resume and single-flights concurrent resumes", async () => {
 		type Worker = {
 			descriptor: {
@@ -1900,6 +1998,7 @@ describe("daemon worker supervisor monitoring", () => {
 			launchWorker: ReturnType<typeof vi.fn>;
 			persistWorker: ReturnType<typeof vi.fn>;
 			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
+			catalog: { markInterrupted: ReturnType<typeof vi.fn> };
 			recoverWorker(worker: RecoveryWorker): Promise<void>;
 		};
 		const worker: RecoveryWorker = {
@@ -1921,20 +2020,152 @@ describe("daemon worker supervisor monitoring", () => {
 			launchWorker: vi.fn(async () => worker),
 			persistWorker: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => {}),
+			catalog: { markInterrupted: vi.fn(async () => undefined) },
 		}) as RecoveryHarness;
+		const signalSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		const processKillSpy = vi.spyOn(process, "kill");
 
-		const recovery = supervisor.recoverWorker(worker);
-		await vi.advanceTimersByTimeAsync(250);
-		await recovery;
+		try {
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.advanceTimersByTimeAsync(250);
+			await recovery;
 
-		expect(supervisor.connectWorker).not.toHaveBeenCalled();
-		expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
-		expect(supervisor.launchWorker).not.toHaveBeenCalled();
-		expect(supervisor.persistWorker).toHaveBeenCalledWith(worker);
-		expect(worker.descriptor).toMatchObject({
-			lifecycle: "failed",
-			lastError: "Waiting for a client with fresh environment",
+			expect(supervisor.connectWorker).not.toHaveBeenCalled();
+			expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
+			expect(supervisor.launchWorker).not.toHaveBeenCalled();
+			expect(supervisor.catalog.markInterrupted).not.toHaveBeenCalled();
+			expect(signalSpy).not.toHaveBeenCalled();
+			// The only permitted process.kill use is the liveness probe. Reused PID
+			// recovery must not signal or otherwise touch the new process owner.
+			expect(processKillSpy.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+			expect(supervisor.persistWorker).toHaveBeenCalledWith(worker);
+			expect(worker.descriptor).toMatchObject({
+				lifecycle: "failed",
+				lastError: "Waiting for a client with fresh environment",
+			});
+		} finally {
+			processKillSpy.mockRestore();
+			signalSpy.mockRestore();
+		}
+	});
+
+	it("replaces a reused pid only with a fresh environment and without signalling its new owner", async () => {
+		vi.useFakeTimers();
+		type RecoveryWorker = {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				processStartId: string;
+				rootActiveSessionId: string;
+				recoveryJournalPath: string;
+				orphanProcessJournalPath: string;
+				createCommand: { type: "create"; prompt: string };
+				consecutiveFailures: number;
+			};
+			recoveryLaunchEnv?: Record<string, string>;
+			recoveryCreateCommand?: { type: "create"; prompt: string };
+			intentionalStop: boolean;
+			stopRevision: number;
+			recovery?: Promise<void>;
+		};
+		type RecoveryHarness = {
+			workers: Map<string, RecoveryWorker>;
+			shuttingDown: boolean;
+			connectWorker: ReturnType<typeof vi.fn>;
+			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
+			launchWorker: ReturnType<typeof vi.fn>;
+			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
+			catalog: { markInterrupted: ReturnType<typeof vi.fn> };
+			recoverWorker(worker: RecoveryWorker): Promise<void>;
+		};
+		const freshCommand = { type: "create" as const, prompt: "fresh resume" };
+		const recoveryRoot = mkdtempSync(join(tmpdir(), "pi-reused-pid-recovery-"));
+		const recoveryJournalPath = join(recoveryRoot, "worker.recovery.jsonl");
+		const orphanProcessJournalPath = join(recoveryRoot, "worker.orphans.jsonl");
+		// An empty but real journal exercises the orphan cleanup path without
+		// furnishing an identity that could be signalled.
+		writeFileSync(orphanProcessJournalPath, "");
+		const sessionFile = join(recoveryRoot, "session.jsonl");
+		new WorkerRecoveryJournal(recoveryJournalPath).record({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile,
+			busy: true,
+			operation: "prompt",
 		});
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-reused-pid-with-fresh-env",
+				pid: process.pid,
+				processStartId: "different-process-start",
+				rootActiveSessionId: "active-1",
+				recoveryJournalPath,
+				orphanProcessJournalPath,
+				createCommand: { type: "create", prompt: "stale descriptor" },
+				consecutiveFailures: 0,
+			},
+			recoveryLaunchEnv: { ACP_FIXTURE_API_KEY: "one-shot" },
+			recoveryCreateCommand: freshCommand,
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const signalSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		const processKillSpy = vi.spyOn(process, "kill");
+		const events: string[] = [];
+		try {
+			const recoverUncertainWorkerOperations = vi.fn(async function (
+				this: object,
+				target: RecoveryWorker,
+				killWorkerProcess: boolean,
+			) {
+				const implementation = Reflect.get(DaemonSupervisor.prototype, "recoverUncertainWorkerOperations");
+				if (typeof implementation !== "function") throw new Error("Could not access recovery cleanup");
+				await Reflect.apply(implementation, this, [target, killWorkerProcess]);
+			});
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers: new Map([[worker.descriptor.workerId, worker]]),
+				shuttingDown: false,
+				connectWorker: vi.fn(),
+				recoverUncertainWorkerOperations,
+				launchWorker: vi.fn(async (command, target) => {
+					events.push("launch");
+					expect(events).toEqual(["markInterrupted", "launch"]);
+					expect(WorkerRecoveryJournal.readLatest(recoveryJournalPath)).toMatchObject([
+						{ activeSessionId: "active-1", busy: false, operation: "recovery_hold" },
+					]);
+					expect(command).toBe(freshCommand);
+					expect(target.recoveryLaunchEnv).toEqual({ ACP_FIXTURE_API_KEY: "one-shot" });
+					return target;
+				}),
+				assertRecoveryAllowed: vi.fn(async () => undefined),
+				catalog: {
+					markInterrupted: vi.fn(async () => {
+						events.push("markInterrupted");
+					}),
+				},
+				log: vi.fn(),
+			}) as RecoveryHarness;
+
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.advanceTimersByTimeAsync(250);
+			await recovery;
+
+			expect(supervisor.connectWorker).not.toHaveBeenCalled();
+			expect(supervisor.recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker, false);
+			expect(supervisor.catalog.markInterrupted).toHaveBeenCalledWith(sessionFile, "active-1", ["prompt"]);
+			expect(WorkerRecoveryJournal.readLatest(recoveryJournalPath)).toMatchObject([
+				{ activeSessionId: "active-1", busy: false, operation: "recovery_hold" },
+			]);
+			expect(signalSpy).not.toHaveBeenCalled();
+			expect(processKillSpy.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+			expect(supervisor.launchWorker).toHaveBeenCalledWith(freshCommand, worker);
+			expect(worker.recoveryLaunchEnv).toBeUndefined();
+			expect(worker.recoveryCreateCommand).toBeUndefined();
+		} finally {
+			processKillSpy.mockRestore();
+			signalSpy.mockRestore();
+			rmSync(recoveryRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("does not replace a verified live ownerless resident after repeated socket/auth failures without fresh env", async () => {

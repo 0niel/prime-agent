@@ -81,7 +81,7 @@ function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>
 		const normalizedKey = normalizeRuntimeConfigField(key);
 		// Request headers are an open-ended credential surface. Preserve none of
 		// them durably; callers may use arbitrary provider-specific header names.
-		if (normalizedKey === "headers" || isSecretBearingRuntimeConfigField(normalizedKey)) {
+		if (normalizedKey.endsWith("headers") || isSecretBearingRuntimeConfigField(normalizedKey)) {
 			continue;
 		}
 		result[key] = redactRuntimeConfigValue(entry, seen, key);
@@ -96,18 +96,36 @@ function normalizeRuntimeConfigField(key: string): string {
 const SECRET_RUNTIME_CONFIG_FIELDS = new Set([
 	"key",
 	"apikey",
+	"apisecret",
 	"token",
+	"access",
+	"refresh",
+	"expires",
+	"expiresat",
+	"expiresin",
+	"expiry",
+	"oauthaccess",
+	"oauthrefresh",
+	"oauthexpires",
+	"oauthexpiresat",
+	"oauthexpiresin",
 	"accesstoken",
 	"refreshtoken",
 	"bearertoken",
 	"authtoken",
 	"idtoken",
 	"secret",
+	"secretaccesskey",
+	"awssecretaccesskey",
+	"accesskeyid",
+	"awsaccesskeyid",
+	"sessiontoken",
 	"clientsecret",
 	"password",
 	"credential",
 	"credentials",
 	"authorization",
+	"authorizationheader",
 	"proxyauthorization",
 	"authheader",
 	"cookie",
@@ -117,7 +135,15 @@ const SECRET_RUNTIME_CONFIG_FIELDS = new Set([
 ]);
 
 function isSecretBearingRuntimeConfigField(normalizedKey: string): boolean {
-	return SECRET_RUNTIME_CONFIG_FIELDS.has(normalizedKey);
+	if (SECRET_RUNTIME_CONFIG_FIELDS.has(normalizedKey)) {
+		return true;
+	}
+	// Provider/extension config is open-ended. Match composed credential names
+	// narrowly while preserving product fields such as networkAccess, productAccess,
+	// productKeyId, tokenBudget, and tokenLimit.
+	return /(?:apikey|apisecret|secretaccesskey|accesskeyid|accesstoken|refreshtoken|sessiontoken|clientsecret|bearertoken|authtoken|idtoken|token|password|credential|authorization|cookie|privatekey|signingkey)$/.test(
+		normalizedKey,
+	);
 }
 
 export function mergeAgentSessionRuntimeConfig(

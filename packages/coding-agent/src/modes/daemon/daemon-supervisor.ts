@@ -2066,8 +2066,8 @@ export class DaemonSupervisor {
 				: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
 			createCommand = { ...createCommand, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
-			if (existing && !(await this.reclaimStaleWorkerRegistration(existing.worker))) {
-				return await this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath, command);
+			if (existing && !(await this.reclaimStaleWorkerRegistration(existing))) {
+				return await this.reuseWorkerForCreate(existing, ownerClientId, sessionPath, command);
 			}
 			// A passive child from a stopped worker reopens as top-level here (pre-existing behavior);
 			// the recursive-harness residency/eviction PR will revisit it.
@@ -3520,16 +3520,37 @@ export class DaemonSupervisor {
 		});
 	}
 
-	private findWorkerBySessionFile(sessionFile: string): WorkerMatch | undefined {
+	private findWorkerBySessionFile(sessionFile: string): ResidentWorker | undefined {
 		const target = canonicalSessionPath(sessionFile);
+		const matches = new Set<ResidentWorker>();
 		for (const worker of this.workers.values()) {
 			for (const summary of worker.summaries.values()) {
 				if (summary.sessionFile && canonicalSessionPath(summary.sessionFile) === target) {
-					return { worker, summary };
+					matches.add(worker);
 				}
 			}
+			// Summaries are empty until a restarted supervisor reconnects. The durable
+			// root path is authoritative only when internally consistent. Never pick
+			// the first of colliding/corrupt registrations and accidentally launch or
+			// recover beside an existing worker.
+			const descriptorSessionFile = worker.descriptor.sessionFile;
+			const configuredSessionPath = worker.descriptor.createCommand.sessionPath;
+			if (descriptorSessionFile && configuredSessionPath) {
+				const descriptorTarget = canonicalSessionPath(descriptorSessionFile);
+				const configuredTarget = canonicalSessionPath(configuredSessionPath);
+				if (descriptorTarget !== configuredTarget) {
+					throw new Error(`Conflicting resident session paths for worker ${worker.descriptor.workerId}`);
+				}
+			}
+			const authoritativePath = descriptorSessionFile ?? configuredSessionPath;
+			if (authoritativePath && canonicalSessionPath(authoritativePath) === target) {
+				matches.add(worker);
+			}
 		}
-		return undefined;
+		if (matches.size > 1) {
+			throw new Error(`Ambiguous resident session path "${sessionFile}"`);
+		}
+		return matches.values().next().value;
 	}
 
 	private async forwardToWorker(
