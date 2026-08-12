@@ -923,11 +923,19 @@ export class KernelManager {
 	}
 
 	/** Queue and run a cell, serializing against all other executions. */
-	private async enqueueExecute(code: string, opts: ExecuteOptions): Promise<ExecuteResult> {
+	private async enqueueExecute(
+		code: string,
+		opts: ExecuteOptions,
+		lifecycle?: { allowTerminalRunning: true },
+	): Promise<ExecuteResult> {
 		if (opts.signal?.aborted) {
 			return { stdout: "", stderr: "", status: "aborted", durationMs: 0 };
 		}
-		await this.start({ signal: opts.signal });
+		if (lifecycle?.allowTerminalRunning) {
+			if (!this.terminal || !this.isRunning) throw new Error("Kernel is not running for terminal snapshot");
+		} else {
+			await this.start({ signal: opts.signal });
+		}
 		if ((this.state as string) === "shutdown") {
 			throw new Error("Kernel has been shut down");
 		}
@@ -1547,11 +1555,19 @@ export class KernelManager {
 	 * the kernel isn't running or no snapshot target was configured. Never throws.
 	 */
 	async snapshotState(): Promise<SnapshotResult | null> {
+		return this.snapshotStateInternal(false);
+	}
+
+	private async snapshotStateInternal(allowTerminalRunning: boolean): Promise<SnapshotResult | null> {
 		const cfg = this.options.snapshot;
 		if (!cfg || !this.isRunning) return null;
 		const code = buildSnapshotCode(cfg.path, cfg.manifestPath, cfg.maxBytes ?? DEFAULT_SNAPSHOT_MAX_BYTES);
 		try {
-			const r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS, internal: true });
+			const r = await this.enqueueExecute(
+				code,
+				{ maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS, internal: true },
+				allowTerminalRunning ? { allowTerminalRunning: true } : undefined,
+			);
 			if (r.status !== "ok") {
 				this.appendKernelDiagnostic(`state snapshot failed: ${r.error?.evalue ?? r.stderr}`);
 				return null;
@@ -1634,7 +1650,7 @@ export class KernelManager {
 			if (timeout && typeof timeout === "object" && "unref" in timeout) timeout.unref();
 		});
 		try {
-			await Promise.race([this.snapshotState().then(() => undefined), guard]);
+			await Promise.race([this.snapshotStateInternal(true).then(() => undefined), guard]);
 		} finally {
 			if (timeout) clearTimeout(timeout);
 		}
