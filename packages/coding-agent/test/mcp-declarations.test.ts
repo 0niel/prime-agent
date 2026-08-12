@@ -91,6 +91,16 @@ describe("M01 declarative MCP contract", () => {
 		});
 	});
 
+	it("rejects absent Object prototype declaration names", async () => {
+		const settings = SettingsManager.inMemory({ mcpDeclarations: emptyMcpDeclarationDocument() });
+		for (const kind of ["inspect", "preview", "test", "enable", "disable"] as const) {
+			const command = parseMcpDeclarationCommand([kind, "constructor"]);
+			await expect(executeMcpDeclarationCommand(command, settings)).rejects.toThrow(
+				"No MCP declaration has that name.",
+			);
+		}
+	});
+
 	it("rejects a structurally forged authority before authorization or project reads", () => {
 		let calls = 0;
 		const fake = {
