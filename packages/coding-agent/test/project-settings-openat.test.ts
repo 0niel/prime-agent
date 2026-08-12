@@ -1,16 +1,20 @@
 import * as childProcess from "node:child_process";
 import {
+	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
+	rmdirSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import lockfile from "proper-lockfile";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const childProcessSpies = vi.hoisted(() => ({
@@ -203,6 +207,130 @@ describe("project settings openat", () => {
 			});
 		} finally {
 			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
+	it("interoperates with the ordinary settings lock and preserves independent updates", async () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, JSON.stringify({ ordinary: { before: true } }));
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			const release = lockfile.lockSync(settings, { realpath: false });
+			try {
+				expect(() => reader.setDocument(document())).toThrow(unavailable);
+				expect(JSON.parse(readFileSync(settings, "utf8"))).toEqual({ ordinary: { before: true } });
+				expect(lstatSync(`${settings}.lock`).isDirectory()).toBe(true);
+			} finally {
+				release();
+			}
+
+			reader.setDocument(document());
+			expect(existsSync(`${settings}.lock`)).toBe(false);
+			expect(JSON.parse(readFileSync(settings, "utf8"))).toMatchObject({
+				ordinary: { before: true },
+				mcpDeclarations: { version: 1 },
+			});
+			const releaseAfter = lockfile.lockSync(settings, { realpath: false });
+			releaseAfter();
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
+	it("makes a helper-protocol lock visible to the ordinary settings writer", () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		const lock = `${settings}.lock`;
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, JSON.stringify({ ordinary: true }));
+		mkdirSync(lock, { mode: 0o700 });
+		try {
+			expect(() => lockfile.lockSync(settings, { realpath: false })).toThrow();
+			expect(lstatSync(lock).isDirectory()).toBe(true);
+		} finally {
+			rmdirSync(lock);
+		}
+		const release = lockfile.lockSync(settings, { realpath: false });
+		release();
+	});
+
+	it("serializes a concurrent ordinary settings update without clobbering either field", async () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, JSON.stringify({ ordinary: { before: true } }));
+		const worker = childProcess.spawn(
+			process.execPath,
+			[
+				"-e",
+				`const fs=require("node:fs");const lock=require("proper-lockfile");const p=${JSON.stringify(settings)};const release=lock.lockSync(p,{realpath:false});setTimeout(()=>{const d=JSON.parse(fs.readFileSync(p,"utf8"));d.ordinary={concurrent:true};fs.writeFileSync(p,JSON.stringify(d));release();},100);`,
+			],
+			{ cwd: process.cwd(), stdio: "ignore" },
+		);
+		const workerExit = new Promise<number | null>((resolve) => worker.once("exit", resolve));
+		const waitUntil = Date.now() + 2_000;
+		while (!existsSync(`${settings}.lock`) && Date.now() < waitUntil) {
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+		}
+		expect(existsSync(`${settings}.lock`)).toBe(true);
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			reader.setDocument(document());
+			expect(await workerExit).toBe(0);
+			expect(JSON.parse(readFileSync(settings, "utf8"))).toMatchObject({
+				ordinary: { concurrent: true },
+				mcpDeclarations: { version: 1 },
+			});
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
+	it("removes its owned lock after a transactional helper failure", async () => {
+		const cwd = root();
+		const agentDir = join(cwd, ".prime", "agent");
+		const settings = join(agentDir, "settings.json");
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(settings, "{");
+		const grant = admission(cwd);
+		try {
+			const reader = await McpProjectDeclarationReader.create(grant);
+			expect(() => reader.setDocument(document())).toThrow(unavailable);
+			expect(existsSync(`${settings}.lock`)).toBe(false);
+			expect(readFileSync(settings, "utf8")).toBe("{");
+		} finally {
+			releaseProjectMcpDeclarationAdmission(grant);
+		}
+	});
+
+	it("fails closed for hostile lock leaves without changing settings or outside targets", async () => {
+		for (const kind of ["regular", "symlink"] as const) {
+			const cwd = root();
+			const outside = root();
+			const agentDir = join(cwd, ".prime", "agent");
+			const settings = join(agentDir, "settings.json");
+			const lock = `${settings}.lock`;
+			mkdirSync(agentDir, { recursive: true });
+			writeFileSync(settings, JSON.stringify({ ordinary: true }));
+			if (kind === "regular") writeFileSync(lock, "legacy lock");
+			else symlinkSync(outside, lock, "dir");
+			const grant = admission(cwd);
+			try {
+				const reader = await McpProjectDeclarationReader.create(grant);
+				expect(() => reader.setDocument(document())).toThrow(unavailable);
+				expect(JSON.parse(readFileSync(settings, "utf8"))).toEqual({ ordinary: true });
+				expect(lstatSync(lock).isSymbolicLink()).toBe(kind === "symlink");
+				expect(readFileSync(settings, "utf8")).not.toContain(outside);
+			} finally {
+				releaseProjectMcpDeclarationAdmission(grant);
+			}
 		}
 	});
 
