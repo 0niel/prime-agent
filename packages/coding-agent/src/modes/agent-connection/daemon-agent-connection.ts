@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { unlink } from "node:fs/promises";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import { appendRotatingLog, getAgentLogPath, getDaemonLogPath } from "../../config.js";
@@ -211,6 +212,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly unsubscribeDaemonClose: () => void;
 	private readonly clientId = `daemon-agent-connection:${randomUUID()}`;
 	private ownedSessionPromotionTail = Promise.resolve();
+	private sessionTransitionTail = Promise.resolve();
 	private lastEventCursor: DaemonEventCursor | undefined;
 	private readonly retiredEventGenerations = new Set<string>();
 	private lastEventSequence: number | undefined;
@@ -1208,6 +1210,69 @@ export class DaemonAgentConnection implements AgentConnection {
 		entryId: string,
 		options?: AgentConnectionForkOptions,
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		return this.withSessionTransition(() => this.performFork(entryId, options));
+	}
+
+	private async performFork(
+		entryId: string,
+		options?: AgentConnectionForkOptions,
+	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		if (!this.client.supportsServerCapability("fork_export")) {
+			return this.legacyFork(entryId, options);
+		}
+		const sourceActiveSessionId = this.activeSessionId;
+		const exported = await this.requestData<{
+			cancelled: boolean;
+			sessionPath: string | null;
+			selectedText?: string;
+		}>({
+			type: "fork_export",
+			activeSessionId: sourceActiveSessionId,
+			entryId,
+			position: options?.position,
+		});
+		if (exported.cancelled) {
+			return { cancelled: true };
+		}
+		// A non-persisted source has nothing durable to hand to a new worker.
+		if (exported.sessionPath === null) {
+			return this.legacyFork(entryId, options);
+		}
+		const sessionPath = exported.sessionPath;
+		let summary: SessionSummary;
+		try {
+			summary = await this.requestData<SessionSummary>({
+				type: "create",
+				sessionPath,
+				config: this.options.telemetryDisabled ? { telemetryDisabled: true } : undefined,
+				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+				lifecycle: this.options.ownedSession ? "client_owned" : undefined,
+				launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
+			});
+		} catch (error) {
+			// Remove the orphan export only when the daemon explicitly rejected
+			// the create; on timeout/transport errors the worker may already be
+			// live on that file.
+			if (error instanceof Error && this.definitiveRequestErrors.has(error)) {
+				await unlink(sessionPath).catch(() => undefined);
+			}
+			throw error;
+		}
+		const forkActiveSessionId = summary.activeSessionId ?? summary.id;
+		try {
+			await this.reattachSession(sourceActiveSessionId, forkActiveSessionId);
+		} catch (error) {
+			// The fork worker is resident but unattached; stop it best-effort.
+			await this.requestOk({ type: "kill", activeSessionId: forkActiveSessionId }).catch(() => undefined);
+			throw error;
+		}
+		return { cancelled: false, selectedText: exported.selectedText };
+	}
+
+	private legacyFork(
+		entryId: string,
+		options?: AgentConnectionForkOptions,
+	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		return this.requestData<{ cancelled: boolean; selectedText?: string }>({
 			type: "fork",
 			activeSessionId: this.activeSessionId,
@@ -1342,6 +1407,15 @@ export class DaemonAgentConnection implements AgentConnection {
 			if (!promoteOwnedSession) return;
 			await this.requestOk({ type: "promote_owned_session", activeSessionId: this.activeSessionId });
 		});
+	}
+
+	private withSessionTransition<T>(operation: () => Promise<T>): Promise<T> {
+		const run = this.sessionTransitionTail.then(operation);
+		this.sessionTransitionTail = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
 	}
 
 	private withOwnedSessionPromotion<T>(operation: (promoteOwnedSession: boolean) => Promise<T>): Promise<T> {

@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
+- Fixed `/fork` stopping the original session; it now creates the forked chat as a new session and switches to it, leaving the original running and listed ([ENG-5180](https://linear.app/primeintellect/issue/ENG-5180)).
 
 ## [0.7.2] - 2026-08-11
 

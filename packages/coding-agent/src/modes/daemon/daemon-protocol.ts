@@ -60,8 +60,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
 // Revision 15 adds the mutate_queued_message command and queue_message_mutation capability.
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
-export const DAEMON_SCHEMA_REVISION = 16;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-16-1bcb9e7f1a49";
+// Revision 17 adds the fork_export command and capability for non-destructive session forking.
+export const DAEMON_SCHEMA_REVISION = 17;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-da360e6884d5";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -100,7 +101,11 @@ export type DaemonServerCapability =
 	| "transient_bash"
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
-	| "queue_message_mutation";
+	| "queue_message_mutation"
+	// The daemon can export a fork branch as a new session file without
+	// replacing the source session (non-destructive /fork). Clients must
+	// check before sending fork_export and fall back to legacy fork.
+	| "fork_export";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -139,6 +144,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_admission",
 	"prompt_admission_cancellation",
 	"queue_message_mutation",
+	"fork_export",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -583,6 +589,13 @@ export type DaemonCommand =
 	| { id?: string; type: "fork"; activeSessionId: string; entryId: string; position?: "before" | "at" }
 	| {
 			id?: string;
+			type: "fork_export";
+			activeSessionId: string;
+			entryId: string;
+			position?: "before" | "at";
+	  }
+	| {
+			id?: string;
 			type: "navigate_tree";
 			activeSessionId: string;
 			targetId: string;
@@ -646,6 +659,10 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
+} as const;
+const FORK_EXPORT_COMMAND = {
+	minProtocol: 7,
+	capability: "fork_export",
 } as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 const TELEMETRY_POLICY_COMMAND = { minProtocol: 7, minSchemaRevision: 14 } as const;
@@ -728,6 +745,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	new_session: LEGACY_DAEMON_COMMAND,
 	switch_session: LEGACY_DAEMON_COMMAND,
 	fork: LEGACY_DAEMON_COMMAND,
+	fork_export: FORK_EXPORT_COMMAND,
 	navigate_tree: LEGACY_DAEMON_COMMAND,
 	import_jsonl: LEGACY_DAEMON_COMMAND,
 	export_html: LEGACY_DAEMON_COMMAND,
