@@ -12,7 +12,7 @@ const MAX_BYTES = 128 * 1024;
 const TIMEOUT_MS = 5_000;
 
 /** stdlib-only; receives a bounded action/document JSON on stdin and trusted root on fd 3. */
-const OPENAT_HELPER = String.raw`import fcntl, json, os, secrets, stat, sys
+const OPENAT_HELPER = String.raw`import json, os, secrets, stat, sys, time
 MAX=131072
 def reject(_=None): raise ValueError("invalid")
 def unique(pairs):
@@ -49,12 +49,26 @@ def read(agent):
   if not isinstance(doc,dict): reject()
   return doc
  finally: os.close(fd)
+def acquire(agent):
+ deadline=time.monotonic()+0.25
+ while True:
+  try:
+   os.mkdir("settings.json.lock",0o700,dir_fd=agent)
+   try: return directory(agent,"settings.json.lock",False)
+   except Exception:
+    try: os.rmdir("settings.json.lock",dir_fd=agent)
+    finally: raise
+  except FileExistsError:
+   # Retry only a genuine no-follow directory owned by another participant.
+   # Regular files and symlinks are hostile/legacy poison and fail closed.
+   existing=directory(agent,"settings.json.lock",False)
+   os.close(existing)
+   if time.monotonic()>=deadline: reject()
+   time.sleep(0.02)
 def write(agent,declarations):
- lock=temp=None; tempname=None
+ owned=False; lockdir=None; temp=None; tempname=None
  try:
-  lock=os.open("settings.json.lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600,dir_fd=agent)
-  if not stat.S_ISREG(os.fstat(lock).st_mode): os.close(lock); lock=None; reject()
-  fcntl.flock(lock,fcntl.LOCK_EX)
+  lockdir=acquire(agent); owned=True
   doc=read(agent); doc["mcpDeclarations"]=declarations
   raw=(json.dumps(doc,ensure_ascii=False,allow_nan=False,indent=2,separators=(",", ":"))+"\n").encode("utf-8")
   if len(raw)>MAX: reject()
@@ -77,9 +91,18 @@ def write(agent,declarations):
   if tempname is not None:
    try: os.unlink(tempname,dir_fd=agent)
    except FileNotFoundError: pass
-  if lock is not None:
-   try: fcntl.flock(lock,fcntl.LOCK_UN)
-   finally: os.close(lock)
+  if lockdir is not None:
+   # Match proper-lockfile's cooperative same-user protocol. POSIX has no
+   # portable identity-bound rmdir-by-fd; a project owner can already replace
+   # either participant's lock path. We never follow it and fail closed when
+   # this immediate no-follow identity check detects a mismatch.
+   opened=os.fstat(lockdir)
+   try: named=os.stat("settings.json.lock",dir_fd=agent,follow_symlinks=False)
+   except FileNotFoundError: named=None
+   if named is None or not stat.S_ISDIR(named.st_mode) or opened.st_dev!=named.st_dev or opened.st_ino!=named.st_ino:
+    os.close(lockdir); lockdir=None; reject()
+  if owned: os.rmdir("settings.json.lock",dir_fd=agent)
+  if lockdir is not None: os.close(lockdir)
 def main():
  raw=sys.stdin.buffer.read(MAX+1)
  if len(raw)>MAX: reject()
