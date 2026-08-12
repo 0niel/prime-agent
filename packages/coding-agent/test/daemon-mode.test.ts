@@ -9868,46 +9868,14 @@ describe("daemon mode helpers", () => {
 		).rejects.toThrow("Unknown active session: missing");
 	});
 
-	it("delivers CLI sends with a sender state while preserving agent-origin catalog ACLs", async () => {
+	it("delivers disjoint CLI sends while preserving agent-origin catalog ACLs", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-cli-from-state.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: vi.fn(),
 		});
 		const { state: fromState } = makeAgentFamilyState("source", "Source");
 		const { state: targetState, acceptAgentMessagePrompt } = makeAgentFamilyState("target", "Target");
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			agentFamilyCatalogEntries(): Promise<
-				readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]
-			>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "sent by the CLI on behalf of source",
-				fromState,
-				origin: "cli",
-			}),
-		).resolves.toMatchObject({
-			deliveryStatus: "delivered",
-			target: { activeSessionId: targetState.activeSessionId },
-		});
-		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({
-			customMessage: { details: { fromRelationship: "sibling" } },
-		});
-
-		// Only an agent-origin send captures and enforces the authoritative catalog.
-		// These unresolved, distinct parent claims must remain unreachable.
-		internals.agentFamilyCatalogEntries = vi.fn(async () =>
+		const agentFamilyCatalogEntries = vi.fn(async () =>
 			Object.freeze([
 				{
 					id: fromState.runtime.session.sessionId,
@@ -9923,6 +9891,34 @@ describe("daemon mode helpers", () => {
 				},
 			]),
 		);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries: typeof agentFamilyCatalogEntries;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+		internals.agentFamilyCatalogEntries = agentFamilyCatalogEntries;
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "CLI delivery ignores the family reach ACL",
+				fromState,
+				origin: "cli",
+			}),
+		).resolves.toMatchObject({
+			deliveryStatus: "delivered",
+			target: { activeSessionId: targetState.activeSessionId },
+		});
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({
+			customMessage: { details: { fromRelationship: undefined } },
+		});
 		await expect(
 			internals.sendAgentSessionMessage({
 				targetSelector: targetState.activeSessionId,
@@ -10052,6 +10048,119 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({
 			customMessage: { details: { fromRelationship: undefined } },
 		});
+	});
+
+	it.each(["sender", "target"] as const)(
+		"delivers an unlabeled CLI message with a duplicate %s endpoint while agent origin rejects it",
+		async (duplicate) => {
+			const daemon = new AgentDaemon(`/tmp/prime-agent-cli-duplicate-${duplicate}.sock`, {
+				defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+				createRuntime: vi.fn(),
+			});
+			const { state: fromState } = makeAgentFamilyState("source", "Source");
+			const { state: targetState, acceptAgentMessagePrompt } = makeAgentFamilyState("target", "Target");
+			const fromEntry = {
+				id: fromState.runtime.session.sessionId,
+				depth: 0,
+				status: "running" as const,
+			};
+			const targetEntry = {
+				id: targetState.runtime.session.sessionId,
+				depth: 0,
+				status: "running" as const,
+			};
+			const duplicateEntry = duplicate === "sender" ? fromEntry : targetEntry;
+			const agentFamilyCatalogEntries = vi.fn(async () =>
+				Object.freeze([fromEntry, targetEntry, { ...duplicateEntry }]),
+			);
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				agentFamilyCatalogEntries: typeof agentFamilyCatalogEntries;
+				sendAgentSessionMessage(options: {
+					targetSelector: string;
+					message: string;
+					fromState?: ActiveSessionState;
+					origin: "agent" | "cli";
+				}): Promise<unknown>;
+			};
+			internals.sessions.set(fromState.activeSessionId, fromState);
+			internals.sessions.set(targetState.activeSessionId, targetState);
+			internals.agentFamilyCatalogEntries = agentFamilyCatalogEntries;
+
+			await expect(
+				internals.sendAgentSessionMessage({
+					targetSelector: targetState.activeSessionId,
+					message: "CLI delivery treats topology as advisory",
+					fromState,
+					origin: "cli",
+				}),
+			).resolves.toMatchObject({ deliveryStatus: "delivered" });
+			expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({
+				customMessage: { details: { fromRelationship: undefined } },
+			});
+			await expect(
+				internals.sendAgentSessionMessage({
+					targetSelector: targetState.activeSessionId,
+					message: "agent origin rejects ambiguous authority",
+					fromState,
+					origin: "agent",
+				}),
+			).rejects.toThrow(AGENT_FAMILY_REACH_ERROR);
+			expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
+		},
+	);
+
+	it("delivers an unlabeled CLI message when catalog acquisition fails while agent origin rejects it", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-cli-catalog-failure.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const { state: fromState } = makeAgentFamilyState("source", "Source");
+		const { state: targetState, acceptAgentMessagePrompt } = makeAgentFamilyState("target", "Target");
+		const catalogError = new Error("catalog unavailable");
+		const agentFamilyCatalogEntries = vi.fn(async () => {
+			throw catalogError;
+		});
+		const log = vi.fn();
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentFamilyCatalogEntries: typeof agentFamilyCatalogEntries;
+			log: typeof log;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+		internals.agentFamilyCatalogEntries = agentFamilyCatalogEntries;
+		internals.log = log;
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "CLI delivery survives catalog failure",
+				fromState,
+				origin: "cli",
+			}),
+		).resolves.toMatchObject({ deliveryStatus: "delivered" });
+		expect(log).toHaveBeenCalledWith(
+			"Agent family catalog unavailable for CLI message relationship: catalog unavailable",
+		);
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({
+			customMessage: { details: { fromRelationship: undefined } },
+		});
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "agent origin rejects catalog failure",
+				fromState,
+				origin: "agent",
+			}),
+		).rejects.toBe(catalogError);
+		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
 	});
 });
 
