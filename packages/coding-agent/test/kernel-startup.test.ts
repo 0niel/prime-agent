@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KernelManager } from "../src/core/kernel/index.js";
 
 let tempDir = "";
+let originalForkserver: string | undefined;
 
 function writeExecutable(filePath: string, content: string): void {
 	writeFileSync(filePath, content);
@@ -13,10 +14,14 @@ function writeExecutable(filePath: string, content: string): void {
 
 describe("KernelManager startup", () => {
 	beforeEach(() => {
+		originalForkserver = process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+		process.env.PRIME_AGENT_KERNEL_FORKSERVER = "0";
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-kernel-startup-"));
 	});
 
 	afterEach(() => {
+		if (originalForkserver === undefined) delete process.env.PRIME_AGENT_KERNEL_FORKSERVER;
+		else process.env.PRIME_AGENT_KERNEL_FORKSERVER = originalForkserver;
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
 			tempDir = "";
