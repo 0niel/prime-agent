@@ -80,21 +80,15 @@ describe("M01 declarative MCP contract", () => {
 		});
 	});
 
-	it("keeps user scope unchanged and routes a test only through an explicitly injected local transport", async () => {
+	it("keeps user scope unchanged and returns a declaration-only test preview", async () => {
 		const settings = SettingsManager.inMemory({ mcpDeclarations: projectDocument });
 		const command = parseMcpDeclarationCommand(["test", "catalog"]);
-		await expect(executeMcpDeclarationCommand(command, settings)).rejects.toThrow("unavailable");
-		const methods: string[] = [];
-		await expect(
-			executeMcpDeclarationCommand(command, settings, undefined, {
-				probeTransport: {
-					async open() {
-						return { request: async ({ method }) => void methods.push(method), close: () => undefined };
-					},
-				},
-			}),
-		).resolves.toEqual({ initialized: true, toolsListed: true });
-		expect(methods).toEqual(["initialize", "tools/list"]);
+		await expect(executeMcpDeclarationCommand(command, settings)).resolves.toEqual({
+			url: "https://catalog.test/mcp",
+			method: "POST",
+			redirect: "error",
+			requestKind: "mcp-initialize",
+		});
 	});
 
 	it("rejects a structurally forged authority before authorization or project reads", () => {
@@ -164,18 +158,9 @@ describe("M01 declarative MCP contract", () => {
 				await expect(executeMcpDeclarationCommand(add, settings, admission)).rejects.toThrow(
 					"Project MCP declarations are unavailable.",
 				);
-				let opens = 0;
-				await expect(
-					executeMcpDeclarationCommand(test, settings, admission, {
-						probeTransport: {
-							async open() {
-								opens++;
-								throw new Error("must not open");
-							},
-						},
-					}),
-				).rejects.toThrow("Project MCP declarations are unavailable.");
-				expect(opens).toBe(0);
+				await expect(executeMcpDeclarationCommand(test, settings, admission)).rejects.toThrow(
+					"Project MCP declarations are unavailable.",
+				);
 			}
 			expect(forgedAuthorityCalls).toBe(0);
 			// A binding becomes stale once its bound directory no longer exists.
@@ -189,7 +174,7 @@ describe("M01 declarative MCP contract", () => {
 		}
 	});
 
-	it("opens a project test probe only after a validated Core grant", async () => {
+	it("returns a project test preview only after a validated Core grant", async () => {
 		const f = fixture();
 		try {
 			const admission = admitProjectMcpDeclarations(f.directory, f.authority)!;
@@ -199,28 +184,18 @@ describe("M01 declarative MCP contract", () => {
 				settings,
 				admission,
 			);
-			const calls: string[] = [];
 			await expect(
 				executeMcpDeclarationCommand(
 					parseMcpDeclarationCommand(["test", "catalog", "--project"]),
 					settings,
 					admission,
-					{
-						probeTransport: {
-							async open() {
-								calls.push("open");
-								return {
-									async request({ method }) {
-										calls.push(method);
-									},
-									close() {},
-								};
-							},
-						},
-					},
 				),
-			).resolves.toEqual({ initialized: true, toolsListed: true });
-			expect(calls).toEqual(["open", "initialize", "tools/list"]);
+			).resolves.toEqual({
+				url: "https://catalog.test/mcp",
+				method: "POST",
+				redirect: "error",
+				requestKind: "mcp-initialize",
+			});
 		} finally {
 			f.dispose();
 		}
