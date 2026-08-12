@@ -1013,12 +1013,41 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
 		return cached.info;
 	}
-	const info = await scanSessionInfo(filePath, stats);
+	const info = await scanSessionInfo(filePath, stats, readLinesAsBuffers(filePath));
 	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
 	return info;
 }
 
-async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
+/** Parse catalog-authorized bytes without reopening their pathname. */
+export async function readSessionInfoFromBuffer(
+	filePath: string,
+	contents: Buffer,
+	metadata: { mtimeMs: number },
+): Promise<SessionInfo | null> {
+	async function* lines(): AsyncGenerator<Buffer> {
+		let start = 0;
+		while (start < contents.length) {
+			const end = contents.indexOf(0x0a, start);
+			if (end === -1) {
+				yield contents.subarray(start);
+				return;
+			}
+			yield contents.subarray(start, end);
+			start = end + 1;
+		}
+	}
+	return scanSessionInfo(
+		filePath,
+		{ mtime: new Date(metadata.mtimeMs) } as Awaited<ReturnType<typeof stat>>,
+		lines(),
+	);
+}
+
+async function scanSessionInfo(
+	filePath: string,
+	stats: Awaited<ReturnType<typeof stat>>,
+	lines: AsyncIterable<Buffer>,
+): Promise<SessionInfo | null> {
 	try {
 		let header: SessionHeader | undefined;
 		let messageCount = 0;
@@ -1029,7 +1058,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 		let agentStatus: AgentStatus | undefined;
 		let lastActivityTime: number | undefined;
 
-		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
+		for await (const lineBuffer of lines) {
 			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
 

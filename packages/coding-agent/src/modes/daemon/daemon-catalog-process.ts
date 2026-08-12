@@ -1,11 +1,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { closeSync, constants, openSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
-import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import { readSessionInfo, readSessionInfoFromBuffer, type SessionInfo, SessionManager } from "../../core/session-manager.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 
@@ -16,8 +17,9 @@ interface SessionInfoWire extends Omit<SessionInfo, "created" | "modified"> {
 
 type CatalogRequest =
 	| { type: "request"; id: string; command: "list"; cwd?: string; sessionDir?: string }
+	| { type: "request"; id: string; command: "family"; sessionDir?: string }
 	| { type: "request"; id: string; command: "resolve"; selector: string; cwd: string; sessionDir?: string }
-	| { type: "request"; id: string; command: "siblings"; sessionPath: string }
+	| { type: "request"; id: string; command: "siblings"; sessionPath: string; sessionDir?: string }
 	| { type: "request"; id: string; command: "rename"; sessionPath: string; name: string }
 	| { type: "request"; id: string; command: "delete"; sessionPath: string }
 	| { type: "request"; id: string; command: "archive"; sessionPath: string; sessionId: string }
@@ -66,42 +68,279 @@ interface SavedRlmSubagentRegistryEntry {
 	status?: unknown;
 }
 
-export async function listSavedSessionSiblings(sessionPath: string): Promise<SessionInfo[]> {
-	const target = await readSessionInfo(sessionPath);
-	if (!target) throw new Error(`Session not found: ${sessionPath}`);
-	if (!target.parentSessionPath) return [target];
-	const parentPath = resolve(dirname(target.path), target.parentSessionPath);
-	const parent = await readSessionInfo(parentPath);
-	if (!parent) return [target];
-	const registryPath = join(dirname(dirname(parent.path)), "session-artifacts", parent.id, "rlm-subagents.jsonl");
+const MAX_RLM_REGISTRY_BYTES = 1024 * 1024;
+const MAX_RLM_REGISTRY_RECORDS = 10_000;
+const MAX_RLM_FAMILY_EDGES = 10_000;
+const MAX_RLM_FAMILY_NODES = 10_000;
+const MAX_RLM_FAMILY_DEPTH = 64;
+
+interface ManagedRoot {
+	lexical: string;
+	fd: number;
+}
+
+interface ManagedRoots {
+	session: ManagedRoot;
+	artifacts: ManagedRoot | undefined;
+}
+
+interface TrustedFile {
+	path: string;
+	contents: Buffer;
+	mtimeMs: number;
+	dev: string;
+	ino: string;
+}
+
+interface TrustedSession extends SessionInfo {
+	/** The header claim is intentionally separate from SessionInfo's legacy fallback. */
+	persistedDepth: number;
+	persistedParentPath?: string;
+}
+
+function rlmSubagentRegistryPath(parent: SessionInfo, roots: ManagedRoots): string {
+	const parentDir = dirname(parent.path);
+	const artifactDir = parentDir === roots.session.lexical ? roots.artifacts?.lexical : join(parentDir, "session-artifacts");
+	if (!artifactDir) throw invalidFamilyTopology("managed artifact directory is absent");
+	return join(artifactDir, parent.id, "rlm-subagents.jsonl");
+}
+
+function isWithin(root: string, target: string): boolean {
+	const path = relative(root, target);
+	return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+function invalidFamilyTopology(reason: string): Error {
+	return new Error(`Invalid RLM artifact family topology: ${reason}`);
+}
+
+let openAuthorityFdCountForTest = 0;
+/** @internal */
+export function getOpenCatalogAuthorityFdCountForTest(): number {
+	return openAuthorityFdCountForTest;
+}
+
+function openAuthorityRoot(path: string, optional = false): ManagedRoot | undefined {
+	try {
+		// O_NOFOLLOW binds authority to the directory itself, never a pathname target.
+		const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+		openAuthorityFdCountForTest++;
+		return { lexical: path, fd };
+	} catch (error) {
+		if (optional && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw invalidFamilyTopology(`managed authority root is unavailable: ${String(error)}`);
+	}
+}
+
+function managedRoots(sessionDir: string | undefined): ManagedRoots {
+	const sessionLexical = resolve(sessionDir ?? "");
+	const session = openAuthorityRoot(sessionLexical)!;
+	try {
+		const artifacts = openAuthorityRoot(join(dirname(sessionLexical), "session-artifacts"), true);
+		return { session, artifacts };
+	} catch (error) {
+		closeSync(session.fd);
+		throw error;
+	}
+}
+
+function closeManagedRoots(roots: ManagedRoots): void {
+	closeSync(roots.session.fd);
+	openAuthorityFdCountForTest--;
+	if (roots.artifacts) {
+		closeSync(roots.artifacts.fd);
+		openAuthorityFdCountForTest--;
+	}
+}
+
+const OPENAT_READ_HELPER = String.raw`import base64,json,os,stat,sys
+MAX=134217728
+def reject(): raise ValueError("invalid")
+def flags(directory=False):
+ value=os.O_RDONLY|os.O_NOFOLLOW
+ if directory: value|=os.O_DIRECTORY
+ return value
+def main():
+ req=json.loads(sys.stdin.buffer.read(131073))
+ parts=req.get("parts"); limit=req.get("limit")
+ if not isinstance(parts,list) or not parts or not isinstance(limit,int) or limit<0 or limit>MAX: reject()
+ if any(not isinstance(p,str) or not p or p in (".","..") or "/" in p or "\\" in p for p in parts): reject()
+ current=os.dup(3)
+ try:
+  for part in parts[:-1]:
+   nxt=os.open(part,flags(True),dir_fd=current); os.close(current); current=nxt
+  fd=os.open(parts[-1],flags(False),dir_fd=current)
+  try:
+   before=os.fstat(fd)
+   if not stat.S_ISREG(before.st_mode) or before.st_size>limit: reject()
+   chunks=[]; total=0
+   while True:
+    chunk=os.read(fd,min(65536,limit+1-total))
+    if not chunk: break
+    chunks.append(chunk); total+=len(chunk)
+    if total>limit: reject()
+   after=os.fstat(fd)
+   if (before.st_dev,before.st_ino,before.st_mode)!=(after.st_dev,after.st_ino,after.st_mode): reject()
+   print(json.dumps({"data":base64.b64encode(b"".join(chunks)).decode("ascii"),"mtimeMs":after.st_mtime_ns/1000000,"dev":str(after.st_dev),"ino":str(after.st_ino)},separators=(",",":")))
+  finally: os.close(fd)
+ finally: os.close(current)
+try: main()
+except FileNotFoundError: sys.exit(44)
+except Exception: sys.stderr.write("catalog openat helper failed\n"); sys.exit(1)
+`;
+
+/** Test-only seam runs after authority selection but before descriptor-relative traversal. */
+let beforeTrustedOpenForTest: ((path: string) => void) | undefined;
+/** @internal */
+export function setCatalogBeforeTrustedOpenForTest(hook: ((path: string) => void) | undefined): void {
+	beforeTrustedOpenForTest = hook;
+}
+
+function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number): TrustedFile {
+	if (!isAbsolute(rawPath) || rawPath !== resolve(rawPath)) throw invalidFamilyTopology("session path is not canonical");
+	const root = [roots.session, roots.artifacts].find((candidate) => candidate && isWithin(candidate.lexical, rawPath));
+	if (!root) throw invalidFamilyTopology("session path escapes managed roots");
+	const suffix = relative(root.lexical, rawPath);
+	const parts = suffix.split(sep);
+	if (!suffix || parts.some((part) => !part || part === "." || part === "..")) {
+		throw invalidFamilyTopology("session path lacks a trusted file component");
+	}
+	beforeTrustedOpenForTest?.(rawPath);
+	const result = spawnSync(process.execPath === process.env.PRIME_AGENT_KERNEL_PYTHON ? process.execPath : (process.env.PRIME_AGENT_KERNEL_PYTHON ?? "python3"), ["-I", "-c", OPENAT_READ_HELPER], {
+		input: JSON.stringify({ parts, limit: maxBytes }), encoding: "utf8", timeout: 5_000, maxBuffer: maxBytes * 2 + 64 * 1024,
+		stdio: ["pipe", "pipe", "pipe", root.fd], shell: false,
+	});
+	if (result.status === 44) throw invalidFamilyTopology("descriptor-relative artifact is absent");
+	if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
+		throw invalidFamilyTopology("descriptor-relative artifact read failed");
+	}
+	try {
+		const wire = JSON.parse(result.stdout) as { data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
+		if (typeof wire.data !== "string" || typeof wire.mtimeMs !== "number" || typeof wire.dev !== "string" || typeof wire.ino !== "string") throw new Error("invalid");
+		return { path: rawPath, contents: Buffer.from(wire.data, "base64"), mtimeMs: wire.mtimeMs, dev: wire.dev, ino: wire.ino };
+	} catch {
+		throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
+	}
+}
+
+async function readTrustedSession(path: string, roots: ManagedRoots): Promise<TrustedSession> {
+	const trusted = readTrustedFile(path, roots, 128 * 1024 * 1024);
+	const headerLine = trusted.contents.toString("utf8", 0, Math.min(trusted.contents.length, 256 * 1024)).split(/\r?\n/, 1)[0];
+	let header: { type?: unknown; id?: unknown; parentSession?: unknown; rlmDepth?: unknown };
+	try { header = JSON.parse(headerLine ?? "") as typeof header; } catch { throw invalidFamilyTopology("session header is malformed"); }
+	const hasParent = header.parentSession !== undefined;
+	const hasDepth = Number.isSafeInteger(header.rlmDepth) && (header.rlmDepth as number) >= 0;
+	if (header.type !== "session" || typeof header.id !== "string" || header.id === "" || (hasParent && typeof header.parentSession !== "string") || (hasParent && header.parentSession === "") || (hasParent && !hasDepth) || (!hasParent && header.rlmDepth !== undefined && !hasDepth)) throw invalidFamilyTopology("session header lacks trustworthy topology claims");
+	const persistedDepth = hasDepth ? (header.rlmDepth as number) : 0;
+	const info = await readSessionInfoFromBuffer(path, trusted.contents, { mtimeMs: trusted.mtimeMs });
+	if (!info || info.id !== header.id) throw invalidFamilyTopology("session metadata does not match its header");
+	return { ...info, path, rlmDepth: persistedDepth, persistedDepth, ...(hasParent ? { persistedParentPath: header.parentSession as string } : {}) };
+}
+
+async function readLatestRegistry(path: string, roots: ManagedRoots): Promise<SavedRlmSubagentRegistryEntry[] | undefined> {
 	let contents: string;
 	try {
-		contents = await readFile(registryPath, "utf8");
+		contents = readTrustedFile(path, roots, MAX_RLM_REGISTRY_BYTES).contents.toString("utf8");
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [target];
+		if ((error as Error).message.includes("descriptor-relative artifact is absent")) return undefined;
 		throw error;
 	}
 	const latest = new Map<string, SavedRlmSubagentRegistryEntry>();
+	let records = 0;
 	for (const line of contents.split(/\r?\n/)) {
 		if (!line.trim()) continue;
+		if (++records > MAX_RLM_REGISTRY_RECORDS) throw invalidFamilyTopology("registry record limit exhausted");
+		let entry: SavedRlmSubagentRegistryEntry;
 		try {
-			const entry = JSON.parse(line) as SavedRlmSubagentRegistryEntry;
-			if (entry.type === "rlm_subagent" && typeof entry.childId === "string") latest.set(entry.childId, entry);
+			entry = JSON.parse(line) as SavedRlmSubagentRegistryEntry;
 		} catch {
-			// Ignore malformed registry history just like the owning worker does.
+			throw invalidFamilyTopology("registry contains malformed JSON");
 		}
+		if (
+			entry.type !== "rlm_subagent" ||
+			typeof entry.childId !== "string" ||
+			entry.childId === "" ||
+			typeof entry.sessionFile !== "string" ||
+			entry.sessionFile === "" ||
+			(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted")
+		) {
+			throw invalidFamilyTopology("registry contains an invalid edge");
+		}
+		latest.set(entry.childId, entry);
 	}
-	const siblingPaths = new Set<string>([resolve(target.path)]);
-	for (const entry of latest.values()) {
-		if (entry.status !== "deleted" && typeof entry.sessionFile === "string")
-			siblingPaths.add(resolve(entry.sessionFile));
+	return [...latest.values()];
+}
+
+export async function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
+	const roots = await SessionManager.listAll(undefined, sessionDir);
+	const authority = managedRoots(sessionDir);
+	try {
+		const sessions = new Map<string, TrustedSession>();
+		const ids = new Map<string, string>();
+		for (const root of roots) {
+			const trusted = await readTrustedSession(root.path, authority);
+			if (trusted.persistedDepth !== 0 || trusted.persistedParentPath !== undefined) {
+				throw invalidFamilyTopology("managed session seed claims a parent");
+			}
+			const existingPath = ids.get(trusted.id);
+			if (existingPath && existingPath !== trusted.path) throw invalidFamilyTopology("family contains a duplicate session id");
+			ids.set(trusted.id, trusted.path);
+			sessions.set(trusted.path, trusted);
+		}
+		let edges = 0;
+		const visited = new Set<string>();
+		const visit = async (parent: TrustedSession, depth: number, ancestors: ReadonlySet<string>): Promise<void> => {
+			if (depth > MAX_RLM_FAMILY_DEPTH) throw invalidFamilyTopology("family depth limit exhausted");
+			const parentPath = parent.path;
+			if (ancestors.has(parentPath)) throw invalidFamilyTopology("family contains a cycle");
+			if (visited.has(parentPath)) return;
+			visited.add(parentPath);
+			const registryPath = rlmSubagentRegistryPath(parent, authority);
+			const entries = await readLatestRegistry(registryPath, authority);
+			if (!entries) return;
+			const childAncestors = new Set(ancestors);
+			childAncestors.add(parentPath);
+			for (const entry of entries) {
+				if (entry.status === "deleted") continue;
+				if (++edges > MAX_RLM_FAMILY_EDGES) throw invalidFamilyTopology("family edge limit exhausted");
+				const childPath = entry.sessionFile as string;
+				if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
+				const child = await readTrustedSession(childPath, authority);
+				if (child.id !== entry.childId) throw invalidFamilyTopology("registry child id does not match session id");
+				if (child.persistedParentPath === undefined) throw invalidFamilyTopology("child lacks a persisted parent path");
+				const claimedParentPath = resolve(dirname(child.path), child.persistedParentPath);
+				readTrustedFile(claimedParentPath, authority, 128 * 1024 * 1024);
+				if (claimedParentPath !== parentPath) throw invalidFamilyTopology("child parent path does not match traversed parent");
+				if (child.persistedDepth !== parent.persistedDepth + 1) throw invalidFamilyTopology("child depth does not equal parent depth plus one");
+				const existingPath = ids.get(child.id);
+				if (existingPath && existingPath !== child.path) throw invalidFamilyTopology("family contains a duplicate session id");
+				const existing = sessions.get(child.path);
+				if (existing && (existing.id !== child.id || existing.persistedParentPath !== child.persistedParentPath || existing.persistedDepth !== child.persistedDepth)) {
+					throw invalidFamilyTopology("family contains a conflicting duplicate");
+				}
+				if (!existing && sessions.size >= MAX_RLM_FAMILY_NODES) throw invalidFamilyTopology("family node limit exhausted");
+				ids.set(child.id, child.path);
+				sessions.set(child.path, child);
+				await visit(child, depth + 1, childAncestors);
+			}
+		};
+		for (const root of [...sessions.values()]) await visit(root, 0, new Set());
+		return [...sessions.values()];
+	} finally {
+		closeManagedRoots(authority);
 	}
-	const siblings = await Promise.all([...siblingPaths].map((path) => readSessionInfo(path)));
-	return siblings.filter(
-		(info): info is SessionInfo =>
-			info !== null &&
-			info.parentSessionPath !== undefined &&
-			resolve(dirname(info.path), info.parentSessionPath) === parentPath,
+}
+export async function listSavedSessionSiblings(sessionPath: string, sessionDir?: string): Promise<SessionInfo[]> {
+	const family = await listCatalogFamilySessions(sessionDir);
+	const targetPath = resolve(sessionPath);
+	const target = family.find((session) => session.path === targetPath);
+	if (!target) throw new Error(`Session not found: ${sessionPath}`);
+	if (!target.parentSessionPath) return [target];
+	const parentPath = resolve(dirname(target.path), target.parentSessionPath);
+	return family.filter(
+		(session) =>
+			session.parentSessionPath !== undefined &&
+			resolve(dirname(session.path), session.parentSessionPath) === parentPath,
 	);
 }
 
@@ -141,6 +380,7 @@ function isCatalogRequest(value: unknown): value is CatalogRequest {
 		candidate.type === "request" &&
 		typeof candidate.id === "string" &&
 		(candidate.command === "list" ||
+			candidate.command === "family" ||
 			candidate.command === "resolve" ||
 			candidate.command === "siblings" ||
 			candidate.command === "rename" ||
@@ -194,6 +434,16 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				});
 				return;
 			}
+			case "family": {
+				const sessions = await listCatalogFamilySessions(request.sessionDir);
+				sendCatalogMessage({
+					type: "response",
+					id: request.id,
+					success: true,
+					data: { sessions: sessions.map(serializeSessionInfo) },
+				});
+				return;
+			}
 			case "resolve": {
 				const localMatch = resolveCatalogSessionMatch(
 					await SessionManager.list(request.cwd, request.sessionDir),
@@ -228,7 +478,7 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 					type: "response",
 					id: request.id,
 					success: true,
-					data: { sessions: (await listSavedSessionSiblings(request.sessionPath)).map(serializeSessionInfo) },
+					data: { sessions: (await listSavedSessionSiblings(request.sessionPath, request.sessionDir)).map(serializeSessionInfo) },
 				});
 				return;
 			case "rename":
@@ -328,12 +578,23 @@ export class DaemonCatalogClient {
 		return data.sessions.map(deserializeSessionInfo);
 	}
 
-	async siblings(sessionPath: string): Promise<SessionInfo[]> {
+	async family(sessionDir?: string): Promise<SessionInfo[]> {
+		const data = await this.request<{ sessions: SessionInfoWire[] }>({
+			type: "request",
+			id: randomUUID(),
+			command: "family",
+			sessionDir,
+		});
+		return data.sessions.map(deserializeSessionInfo);
+	}
+
+	async siblings(sessionPath: string, sessionDir?: string): Promise<SessionInfo[]> {
 		const data = await this.request<{ sessions: SessionInfoWire[] }>({
 			type: "request",
 			id: randomUUID(),
 			command: "siblings",
 			sessionPath,
+			sessionDir,
 		});
 		return data.sessions.map(deserializeSessionInfo);
 	}
