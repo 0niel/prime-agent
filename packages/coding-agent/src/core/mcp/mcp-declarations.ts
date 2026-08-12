@@ -67,7 +67,9 @@ function ownDataValue(record: Record<string, unknown>, key: string, message: str
 
 export function normalizeMcpDeclarationName(value: unknown): string {
 	if (typeof value !== "string" || !MCP_DECLARATION_NAME.test(value)) {
-		fail("MCP declaration names must start with a lowercase letter and contain lowercase letters, digits, or hyphens.");
+		fail(
+			"MCP declaration names must start with a lowercase letter and contain lowercase letters, digits, or hyphens.",
+		);
 	}
 	return value;
 }
@@ -100,13 +102,19 @@ function requireExactKeys(record: Record<string, unknown>, keys: readonly string
 export function parseMcpDeclaration(value: unknown, expectedName?: string): McpDeclaration {
 	if (!ownDataRecord(value)) fail("MCP declaration must be a plain object with own data fields.");
 	requireExactKeys(value, ["name", "url", "enabled"], "MCP declarations only permit name, url, and enabled fields.");
-	const name = normalizeMcpDeclarationName(ownDataValue(value, "name", "MCP declaration name must be an own data field."));
+	const name = normalizeMcpDeclarationName(
+		ownDataValue(value, "name", "MCP declaration name must be an own data field."),
+	);
 	if (expectedName !== undefined && name !== expectedName) {
 		fail("MCP declaration name must match its settings key.");
 	}
 	const enabled = ownDataValue(value, "enabled", "MCP declaration enabled must be an own data field.");
 	if (typeof enabled !== "boolean") fail("MCP declaration enabled must be a boolean.");
-	return { name, url: normalizeMcpDeclarationUrl(ownDataValue(value, "url", "MCP declaration URL must be an own data field.")), enabled };
+	return {
+		name,
+		url: normalizeMcpDeclarationUrl(ownDataValue(value, "url", "MCP declaration URL must be an own data field.")),
+		enabled,
+	};
 }
 
 export function emptyMcpDeclarationDocument(): McpDeclarationDocument {
@@ -117,7 +125,9 @@ export function parseMcpDeclarationDocument(value: unknown): McpDeclarationDocum
 	if (value === undefined) return emptyMcpDeclarationDocument();
 	if (!ownDataRecord(value)) fail("MCP declaration settings must be a plain object with own data fields.");
 	requireExactKeys(value, ["version", "servers"], "MCP declarations only permit version and servers fields.");
-	if (ownDataValue(value, "version", "MCP declaration version must be an own data field.") !== MCP_DECLARATION_VERSION) {
+	if (
+		ownDataValue(value, "version", "MCP declaration version must be an own data field.") !== MCP_DECLARATION_VERSION
+	) {
 		fail("MCP declaration settings use an unsupported format.");
 	}
 	const rawServers = ownDataValue(value, "servers", "MCP declaration servers must be an own data field.");
@@ -127,7 +137,10 @@ export function parseMcpDeclarationDocument(value: unknown): McpDeclarationDocum
 	const urls = new Set<string>();
 	for (const key of ownDataKeys(rawServers, "MCP declaration servers must be plain own data.")) {
 		const name = normalizeMcpDeclarationName(key);
-		const parsed = parseMcpDeclaration(ownDataValue(rawServers, key, "MCP declaration server must be an own data field."), name);
+		const parsed = parseMcpDeclaration(
+			ownDataValue(rawServers, key, "MCP declaration server must be an own data field."),
+			name,
+		);
 		if (urls.has(parsed.url)) fail("MCP declarations must not repeat an endpoint URL.");
 		urls.add(parsed.url);
 		Object.defineProperty(servers, name, { value: parsed, enumerable: true, configurable: true, writable: true });
