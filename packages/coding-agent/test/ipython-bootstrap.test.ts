@@ -32,6 +32,8 @@ describe("IPython RLM bootstrap", () => {
 		expect(code).toContain("except BaseException");
 		expect(code).toContain("bash() is unavailable on Windows");
 		expect(code).toContain("isinstance(max_output_bytes, bool)");
+		expect(code).toContain("captured {self.stdout_total_bytes} raw bytes; showing a bounded decoded tail");
+		expect(code).not.toContain("of {self.stdout_total_bytes} bytes");
 		expect(code).not.toContain("taskkill");
 	});
 

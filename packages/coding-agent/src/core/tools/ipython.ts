@@ -104,11 +104,11 @@ class _PrimeAgentBashResult:
         if self.stdout:
             parts.append(self.stdout)
         if self.stdout_truncated:
-            parts.append(f"[stdout truncated; showing final {len(self.stdout.encode('utf-8'))} of {self.stdout_total_bytes} bytes]")
+            parts.append(f"[stdout truncated; captured {self.stdout_total_bytes} raw bytes; showing a bounded decoded tail]")
         if self.stderr:
             parts.append(self.stderr)
         if self.stderr_truncated:
-            parts.append(f"[stderr truncated; showing final {len(self.stderr.encode('utf-8'))} of {self.stderr_total_bytes} bytes]")
+            parts.append(f"[stderr truncated; captured {self.stderr_total_bytes} raw bytes; showing a bounded decoded tail]")
         text = chr(10).join(parts)
         if self.returncode != 0:
             text += chr(10) + chr(10) + f"Command exited with code {self.returncode}"
