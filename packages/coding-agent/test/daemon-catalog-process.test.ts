@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
-import { listCatalogFamilySessions, listSavedSessionSiblings, resolveCatalogSessionMatch, setCatalogBeforeTrustedOpenForTest } from "../src/modes/daemon/daemon-catalog-process.js";
+import { listCatalogFamilySessions, listSavedSessionSiblings, getOpenCatalogAuthorityFdCountForTest, resolveCatalogSessionMatch, setCatalogBeforeTrustedOpenForTest } from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
 	return {
@@ -238,6 +238,43 @@ describe("daemon catalog selector resolution", () => {
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
 		setCatalogBeforeTrustedOpenForTest(undefined);
 		rmSync(root, { recursive: true, force: true });
+	});
+
+
+	it("closes authority descriptors after repeated hostile seed failures", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-fd-release-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		const hostile = SessionManager.create(root, sessionDir);
+		hostile.newSession({ id: "hostile", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		hostile.appendSessionInfo("hostile");
+		const baseline = getOpenCatalogAuthorityFdCountForTest();
+		for (let attempt = 0; attempt < 64; attempt++) {
+			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+			expect(getOpenCatalogAuthorityFdCountForTest()).toBe(baseline);
+		}
+	});
+
+	it("rejects an unregistered parent-claiming seed and conflicting duplicate identity", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-orphan-seed-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		const orphan = SessionManager.create(root, sessionDir);
+		orphan.newSession({ id: "evil", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		orphan.appendSessionInfo("evil");
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("managed session seed claims a parent");
+
+		const duplicateRoot = mkdtempSync(join(tmpdir(), "prime-catalog-duplicate-id-"));
+		const duplicateDir = join(duplicateRoot, "sessions");
+		const duplicate = SessionManager.create(duplicateRoot, duplicateDir);
+		duplicate.newSession({ id: "duplicate", rlmDepth: 0 });
+		duplicate.appendSessionInfo("one");
+		writeFileSync(join(duplicateDir, "alias.jsonl"), readFileSync(duplicate.getSessionFile()!));
+		await expect(listCatalogFamilySessions(duplicateDir)).rejects.toThrow("duplicate session id");
 	});
 
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {

@@ -114,10 +114,17 @@ function invalidFamilyTopology(reason: string): Error {
 	return new Error(`Invalid RLM artifact family topology: ${reason}`);
 }
 
+let openAuthorityFdCountForTest = 0;
+/** @internal */
+export function getOpenCatalogAuthorityFdCountForTest(): number {
+	return openAuthorityFdCountForTest;
+}
+
 function openAuthorityRoot(path: string, optional = false): ManagedRoot | undefined {
 	try {
 		// O_NOFOLLOW binds authority to the directory itself, never a pathname target.
 		const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+		openAuthorityFdCountForTest++;
 		return { lexical: path, fd };
 	} catch (error) {
 		if (optional && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -139,7 +146,11 @@ function managedRoots(sessionDir: string | undefined): ManagedRoots {
 
 function closeManagedRoots(roots: ManagedRoots): void {
 	closeSync(roots.session.fd);
-	if (roots.artifacts) closeSync(roots.artifacts.fd);
+	openAuthorityFdCountForTest--;
+	if (roots.artifacts) {
+		closeSync(roots.artifacts.fd);
+		openAuthorityFdCountForTest--;
+	}
 }
 
 const OPENAT_READ_HELPER = String.raw`import base64,json,os,stat,sys
@@ -260,63 +271,65 @@ async function readLatestRegistry(path: string, roots: ManagedRoots): Promise<Sa
 	return [...latest.values()];
 }
 
-/**
- * Produces an all-or-nothing durable topology. Missing registries are simply
- * absent; every other malformed, unreadable, cyclic, aliased, or exhausted
- * edge rejects the entire authorization snapshot instead of returning a
- * partial tree that could authorize a message.
- */
 export async function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
 	const roots = await SessionManager.listAll(undefined, sessionDir);
 	const authority = managedRoots(sessionDir);
-	const sessions = new Map<string, SessionInfo>();
-	for (const root of roots) {
-		const trusted = await readTrustedSession(root.path, authority);
-		sessions.set(trusted.path, trusted);
-	}
-	let edges = 0;
-	const visited = new Set<string>();
-	const visit = async (parent: TrustedSession, depth: number, ancestors: ReadonlySet<string>): Promise<void> => {
-		if (depth > MAX_RLM_FAMILY_DEPTH) throw invalidFamilyTopology("family depth limit exhausted");
-		const parentPath = parent.path;
-		if (ancestors.has(parentPath)) throw invalidFamilyTopology("family contains a cycle");
-		if (visited.has(parentPath)) return;
-		visited.add(parentPath);
-		const registryPath = rlmSubagentRegistryPath(parent, authority);
-		const entries = await readLatestRegistry(registryPath, authority);
-		if (!entries) return;
-		const childAncestors = new Set(ancestors);
-		childAncestors.add(parentPath);
-		for (const entry of entries) {
-			if (entry.status === "deleted") continue;
-			if (++edges > MAX_RLM_FAMILY_EDGES) throw invalidFamilyTopology("family edge limit exhausted");
-			const childPath = entry.sessionFile as string;
-			if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
-			const child = await readTrustedSession(childPath, authority);
-			if (child.id !== entry.childId) throw invalidFamilyTopology("registry child id does not match session id");
-			if (child.persistedParentPath === undefined) throw invalidFamilyTopology("child lacks a persisted parent path");
-			const claimedParentPath = resolve(dirname(child.path), child.persistedParentPath);
-			// Opening the claimed parent through the same authority rejects aliases and links.
-			readTrustedFile(claimedParentPath, authority, 128 * 1024 * 1024);
-			if (claimedParentPath !== parentPath) throw invalidFamilyTopology("child parent path does not match traversed parent");
-			if (child.persistedDepth !== parent.persistedDepth + 1) {
-				throw invalidFamilyTopology("child depth does not equal parent depth plus one");
-			}
-			if (!sessions.has(child.path) && sessions.size >= MAX_RLM_FAMILY_NODES) {
-				throw invalidFamilyTopology("family node limit exhausted");
-			}
-			sessions.set(child.path, child);
-			await visit(child, depth + 1, childAncestors);
-		}
-	};
 	try {
-		for (const root of [...sessions.values()] as TrustedSession[]) await visit(root, 0, new Set());
+		const sessions = new Map<string, TrustedSession>();
+		const ids = new Map<string, string>();
+		for (const root of roots) {
+			const trusted = await readTrustedSession(root.path, authority);
+			if (trusted.persistedDepth !== 0 || trusted.persistedParentPath !== undefined) {
+				throw invalidFamilyTopology("managed session seed claims a parent");
+			}
+			const existingPath = ids.get(trusted.id);
+			if (existingPath && existingPath !== trusted.path) throw invalidFamilyTopology("family contains a duplicate session id");
+			ids.set(trusted.id, trusted.path);
+			sessions.set(trusted.path, trusted);
+		}
+		let edges = 0;
+		const visited = new Set<string>();
+		const visit = async (parent: TrustedSession, depth: number, ancestors: ReadonlySet<string>): Promise<void> => {
+			if (depth > MAX_RLM_FAMILY_DEPTH) throw invalidFamilyTopology("family depth limit exhausted");
+			const parentPath = parent.path;
+			if (ancestors.has(parentPath)) throw invalidFamilyTopology("family contains a cycle");
+			if (visited.has(parentPath)) return;
+			visited.add(parentPath);
+			const registryPath = rlmSubagentRegistryPath(parent, authority);
+			const entries = await readLatestRegistry(registryPath, authority);
+			if (!entries) return;
+			const childAncestors = new Set(ancestors);
+			childAncestors.add(parentPath);
+			for (const entry of entries) {
+				if (entry.status === "deleted") continue;
+				if (++edges > MAX_RLM_FAMILY_EDGES) throw invalidFamilyTopology("family edge limit exhausted");
+				const childPath = entry.sessionFile as string;
+				if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
+				const child = await readTrustedSession(childPath, authority);
+				if (child.id !== entry.childId) throw invalidFamilyTopology("registry child id does not match session id");
+				if (child.persistedParentPath === undefined) throw invalidFamilyTopology("child lacks a persisted parent path");
+				const claimedParentPath = resolve(dirname(child.path), child.persistedParentPath);
+				readTrustedFile(claimedParentPath, authority, 128 * 1024 * 1024);
+				if (claimedParentPath !== parentPath) throw invalidFamilyTopology("child parent path does not match traversed parent");
+				if (child.persistedDepth !== parent.persistedDepth + 1) throw invalidFamilyTopology("child depth does not equal parent depth plus one");
+				const existingPath = ids.get(child.id);
+				if (existingPath && existingPath !== child.path) throw invalidFamilyTopology("family contains a duplicate session id");
+				const existing = sessions.get(child.path);
+				if (existing && (existing.id !== child.id || existing.persistedParentPath !== child.persistedParentPath || existing.persistedDepth !== child.persistedDepth)) {
+					throw invalidFamilyTopology("family contains a conflicting duplicate");
+				}
+				if (!existing && sessions.size >= MAX_RLM_FAMILY_NODES) throw invalidFamilyTopology("family node limit exhausted");
+				ids.set(child.id, child.path);
+				sessions.set(child.path, child);
+				await visit(child, depth + 1, childAncestors);
+			}
+		};
+		for (const root of [...sessions.values()]) await visit(root, 0, new Set());
 		return [...sessions.values()];
 	} finally {
 		closeManagedRoots(authority);
 	}
 }
-
 export async function listSavedSessionSiblings(sessionPath: string, sessionDir?: string): Promise<SessionInfo[]> {
 	const family = await listCatalogFamilySessions(sessionDir);
 	const targetPath = resolve(sessionPath);
