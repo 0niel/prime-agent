@@ -189,7 +189,7 @@ async def bash(
     the persistent kernel without bound. Truncation and total byte counts are
     reported on the result.
     """
-    if not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
+    if isinstance(max_output_bytes, bool) or not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
         raise ValueError("max_output_bytes must be a positive integer")
     if _prime_agent_bash_os.name == "nt":
         raise RuntimeError("bash() is unavailable on Windows because reliable process-tree cleanup is not supported")

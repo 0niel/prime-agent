@@ -31,6 +31,7 @@ describe("IPython RLM bootstrap", () => {
 		expect(code).toContain("killpg");
 		expect(code).toContain("except BaseException");
 		expect(code).toContain("bash() is unavailable on Windows");
+		expect(code).toContain("isinstance(max_output_bytes, bool)");
 		expect(code).not.toContain("taskkill");
 	});
 
