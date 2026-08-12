@@ -53,7 +53,7 @@ export async function renameDaemonSavedSession(
 	const command: Extract<DaemonCommand, { type: "rename_saved_session" }> =
 		"activeSessionId" in context
 			? { type: "rename_saved_session", activeSessionId: context.activeSessionId, sessionPath, name }
-			: { type: "rename_saved_session", sessionPath, name };
+			: { type: "rename_saved_session", sessionPath, name, sessionDir: context.sessionDir };
 	const response = await client.request(command);
 	if (!response.success) {
 		throw deserializeDaemonError(response);
