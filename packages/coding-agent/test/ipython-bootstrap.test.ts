@@ -169,6 +169,27 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 	);
 
 	it.skipIf(process.platform === "win32")(
+		"escalates when a descendant ignores SIGTERM and closes pipes",
+		async () => {
+			const manager = new KernelManager({ python: python as string, cwd: dir });
+			const marker = join(dir, "term-resistant-marker");
+			try {
+				await manager.start();
+				expect((await manager.execute(buildRlmBootstrapCode())).status).toBe("ok");
+				const result = await manager.execute(
+					`await bash("(trap '' TERM; exec 1>&- 2>&-; sleep 1; touch '${marker}') &")`,
+				);
+				expect(result.status).toBe("ok");
+				await new Promise((resolve) => setTimeout(resolve, 1300));
+				expect(existsSync(marker)).toBe(false);
+			} finally {
+				await manager.dispose();
+			}
+		},
+		60_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
 		"kills descendants on timeout and cancellation",
 		async () => {
 			const manager = new KernelManager({ python: python as string, cwd: dir });

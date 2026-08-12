@@ -130,14 +130,12 @@ async def _prime_agent_bash_collect(proc, stdout_task, stderr_task) -> None:
     # A successful shell may leave background descendants in its session. Stop
     # them before waiting for inherited pipe descriptors to close.
     _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGTERM)
-    drains = _prime_agent_asyncio.gather(stdout_task, stderr_task)
-    try:
-        await _prime_agent_asyncio.wait_for(
-            _prime_agent_asyncio.shield(drains), timeout=_PRIME_AGENT_BASH_STOP_GRACE
-        )
-    except _prime_agent_asyncio.TimeoutError:
+    deadline = _prime_agent_asyncio.get_running_loop().time() + _PRIME_AGENT_BASH_STOP_GRACE
+    while _prime_agent_bash_group_exists(proc) and _prime_agent_asyncio.get_running_loop().time() < deadline:
+        await _prime_agent_asyncio.sleep(0.01)
+    if _prime_agent_bash_group_exists(proc):
         _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGKILL)
-        await drains
+    await _prime_agent_asyncio.gather(stdout_task, stderr_task)
 
 
 def _prime_agent_bash_signal_group(proc, sig) -> None:
@@ -149,17 +147,25 @@ def _prime_agent_bash_signal_group(proc, sig) -> None:
         pass
 
 
+def _prime_agent_bash_group_exists(proc) -> bool:
+    try:
+        _prime_agent_bash_os.killpg(proc.pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 
 
 async def _prime_agent_bash_stop(proc, collector, stdout_task, stderr_task) -> None:
-    """Stop the command tree and finish or cancel every pipe-drain task."""
+    """Stop the command group and finish or cancel every pipe-drain task."""
     _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGTERM)
-    try:
-        await _prime_agent_asyncio.wait_for(
-            _prime_agent_asyncio.shield(collector), timeout=_PRIME_AGENT_BASH_STOP_GRACE
-        )
-        return
-    except _prime_agent_asyncio.TimeoutError:
+    deadline = _prime_agent_asyncio.get_running_loop().time() + _PRIME_AGENT_BASH_STOP_GRACE
+    while _prime_agent_bash_group_exists(proc) and _prime_agent_asyncio.get_running_loop().time() < deadline:
+        await _prime_agent_asyncio.sleep(0.01)
+    if _prime_agent_bash_group_exists(proc):
         _prime_agent_bash_signal_group(proc, _prime_agent_signal.SIGKILL)
 
     try:
