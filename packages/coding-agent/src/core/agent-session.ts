@@ -3787,24 +3787,36 @@ export class AgentSession {
 			return this._disposeAsyncPromise;
 		}
 		this._disposeAsyncPromise = (async () => {
-			// Capture the refinement drain before the first await: this preserves a
-			// final agent_end's serialized work while kernel disposal is pending.
+			// Capture both operations before the first await. allSettled observes either
+			// rejection immediately while allowing the independent operation to finish.
 			const drain = this._drainPendingRefinementForDisposal();
-			// Observe a concurrent drain failure immediately. Its original promise is
-			// still awaited below so disposal propagates the same failure after the
-			// kernel teardown ordering is preserved.
-			void drain.catch(() => {});
-			const kernelDispose = this._ipythonKernelProvisioner?.dispose();
-			if (kernelDispose) await kernelDispose;
-			// Drain before marking _disposing so a refine triggered at the final
-			// agent_end completes instead of being aborted by dispose().
-			await drain;
-			if (this._disposed) {
-				return this._disposeCallbacksPromise;
+			const kernelDispose = this._ipythonKernelProvisioner?.dispose() ?? Promise.resolve();
+			const failures: unknown[] = [];
+			for (const result of await Promise.allSettled([kernelDispose, drain])) {
+				if (result.status === "rejected") failures.push(result.reason);
 			}
-			this._disposing = true;
-			this._sessionActionCommitDisposeAbortController.abort();
-			await this._disposeAsyncOnce();
+
+			// Drain before marking _disposing so a refine triggered at the final
+			// agent_end completes instead of being aborted by dispose(). Cleanup remains
+			// authoritative even when the drain or kernel teardown failed.
+			if (this._disposed) {
+				await this._disposeCallbacksPromise;
+			} else {
+				this._disposing = true;
+				this._sessionActionCommitDisposeAbortController.abort();
+				try {
+					await this._disposeAsyncOnce();
+				} catch (error) {
+					failures.push(error);
+				} finally {
+					// _disposeAsyncOnce normally owns finalization. Keep the same authority
+					// boundary if an earlier best-effort child cleanup unexpectedly throws.
+					this.dispose();
+					await this._disposeCallbacksPromise;
+				}
+			}
+			if (failures.length === 1) throw failures[0];
+			if (failures.length > 1) throw new AggregateError(failures, "Session disposal failed.");
 		})();
 		return this._disposeAsyncPromise;
 	}
@@ -3958,11 +3970,6 @@ export class AgentSession {
 		this._rlmChildSessions.clear();
 		this._rlmChildCleanupFailures.clear();
 		this._deletedRlmChildIds.clear();
-		try {
-			await this._ipythonKernelProvisioner?.dispose();
-		} catch {
-			// a failed kernel startup already cleaned up after itself
-		}
 		this.dispose();
 		await this._disposeCallbacksPromise;
 	}
