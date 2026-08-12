@@ -219,6 +219,54 @@ describe("AgentSession concurrent prompt guard", () => {
 		await disposal;
 	});
 
+	it("observes a rejected refinement drain while kernel disposal is pending", async () => {
+		createSession();
+		const drainFailure = new Error("refinement drain failed");
+		const order: string[] = [];
+		let rejectDrain: (error: Error) => void = () => {};
+		const drainGate = new Promise<void>((_resolve, reject) => {
+			rejectDrain = reject;
+		});
+		let releaseKernelDispose: () => void = () => {};
+		const kernelDisposeGate = new Promise<void>((resolve) => {
+			releaseKernelDispose = resolve;
+		});
+		const internals = session as unknown as {
+			_drainPendingRefinementForDisposal: () => Promise<void>;
+			_ipythonKernelProvisioner?: { dispose(): Promise<void> };
+		};
+		vi.spyOn(internals, "_drainPendingRefinementForDisposal").mockImplementation(() => {
+			order.push("drain");
+			return drainGate;
+		});
+		internals._ipythonKernelProvisioner = {
+			dispose: vi.fn(async () => {
+				order.push("kernel-dispose");
+				await kernelDisposeGate;
+				order.push("kernel-dispose-finished");
+			}),
+		};
+		const unhandledRejections: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => {
+			unhandledRejections.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandledRejection);
+
+		try {
+			const disposal = session.disposeAsync();
+			expect(order).toEqual(["drain", "kernel-dispose"]);
+			rejectDrain(drainFailure);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(unhandledRejections).toEqual([]);
+
+			releaseKernelDispose();
+			await expect(disposal).rejects.toBe(drainFailure);
+			expect(order).toEqual(["drain", "kernel-dispose", "kernel-dispose-finished"]);
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+		}
+	});
+
 	it("should throw when prompt() called while streaming", async () => {
 		createSession();
 
