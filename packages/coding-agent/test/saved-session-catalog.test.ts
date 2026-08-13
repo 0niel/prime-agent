@@ -145,7 +145,12 @@ describe("saved session catalog", () => {
 		});
 
 		expect(fakeClient.commands).toEqual([
-			{ type: "rename_saved_session", sessionPath: "/tmp/sessions/one.jsonl", name: "One" },
+			{
+				type: "rename_saved_session",
+				sessionPath: "/tmp/sessions/one.jsonl",
+				sessionDir: "/tmp/sessions",
+				name: "One",
+			},
 			{ type: "delete_saved_session", sessionPath: "/tmp/sessions/one.jsonl" },
 		]);
 	});

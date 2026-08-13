@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SessionManager } from "../src/core/session-manager.js";
 import { success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
@@ -31,8 +32,17 @@ interface SupervisorInternals {
 	workers: Map<string, WorkerFixture>;
 	clients: Set<{ id: string; attachedActiveSessionIds: Set<string> }>;
 	idleEvictionFence?: Promise<void>;
-	catalog: { resolve: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> };
+	catalog: {
+		resolve: ReturnType<typeof vi.fn>;
+		stop: ReturnType<typeof vi.fn>;
+		list?: ReturnType<typeof vi.fn>;
+		family?: ReturnType<typeof vi.fn>;
+		siblings?: ReturnType<typeof vi.fn>;
+	};
 	createOrReuseWorker: ReturnType<typeof vi.fn>;
+	familyCatalogEntries(
+		sessionDir?: string,
+	): Promise<readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]>;
 	stopWorker: ReturnType<typeof vi.fn>;
 	log: ReturnType<typeof vi.fn>;
 	scheduleIdleEvictionSweep(): void;
@@ -304,6 +314,50 @@ describe("daemon supervisor whole-tree eviction", () => {
 		});
 	});
 
+	it("uses the merged custom session directory for named saved-session siblings", async () => {
+		const supervisor = makeSupervisor();
+		const sessionPath = "/tmp/custom-sessions/saved.jsonl";
+		const target = {
+			id: "saved",
+			path: sessionPath,
+			cwd: "/tmp/project",
+			parentSessionPath: "/tmp/custom-sessions/parent.jsonl",
+			rlmDepth: 1,
+			created: new Date("2026-08-01T12:00:00.000Z"),
+			modified: new Date("2026-08-01T12:00:00.000Z"),
+			messageCount: 0,
+			firstMessage: "",
+			allMessagesText: "",
+		};
+		supervisor.catalog.resolve = vi.fn(async () => sessionPath);
+		supervisor.catalog.siblings = vi.fn(async () => [target]);
+		const launched = makeWorker("launched", [makeSummary("launched-active", Date.now())]);
+		const launchWorker = vi.fn(async () => launched);
+		Object.assign(supervisor, { launchWorker });
+		const createOrReuseWorker = (
+			supervisor as unknown as {
+				createOrReuseWorker(clientId: string, command: object): Promise<WorkerFixture>;
+			}
+		).createOrReuseWorker.bind(supervisor);
+
+		await expect(
+			createOrReuseWorker("client", {
+				id: "named-custom",
+				type: "create",
+				sessionPath: "saved",
+				name: "renamed",
+				config: { sessionDir: "/tmp/custom-sessions" },
+			}),
+		).resolves.toBe(launched);
+		expect(supervisor.catalog.resolve).toHaveBeenCalledWith("saved", expect.any(String), "/tmp/custom-sessions");
+		expect(supervisor.catalog.siblings).toHaveBeenCalledWith(sessionPath, "/tmp/custom-sessions");
+		expect(launchWorker).toHaveBeenCalledWith(
+			expect.objectContaining({ sessionPath, config: { sessionDir: "/tmp/custom-sessions" } }),
+			undefined,
+			undefined,
+		);
+	});
+
 	it("resolves a saved target in the source worker's create-time session directory", async () => {
 		const now = Date.parse("2026-08-01T12:00:00.000Z");
 		const supervisor = makeSupervisor();
@@ -311,9 +365,19 @@ describe("daemon supervisor whole-tree eviction", () => {
 		const source = makeWorker("source", [sourceSummary]);
 		source.descriptor.createCommand.config = { sessionDir: "/tmp/custom-sessions" };
 		source.summaries = new Map([["source-active", sourceSummary]]);
+		// The wake path reads this row before authorizing it, so model an actual
+		// saved session rather than a summary whose sessionFile is not readable.
+		const targetDirectory = mkdtempSync(join(tmpdir(), "prime-supervisor-saved-target-"));
+		tempDirs.push(targetDirectory);
+		const targetManager = SessionManager.create(targetDirectory, join(targetDirectory, "sessions"));
+		targetManager.newSession();
+		targetManager.appendSessionInfo("saved target");
+		targetManager.flushNow();
+		const targetPath = targetManager.getSessionFile();
+		if (!targetPath) throw new Error("Missing saved target session path");
 		const targetSummary = makeSummary("target-active", now, {
-			sessionId: "target-session",
-			sessionFile: "/tmp/target.jsonl",
+			sessionId: targetManager.getSessionId(),
+			sessionFile: targetPath,
 		});
 		const target = makeWorker("target", [targetSummary]);
 		target.descriptor.rootActiveSessionId = "target-active";
@@ -324,7 +388,7 @@ describe("daemon supervisor whole-tree eviction", () => {
 			data: { deliveryStatus: "delivered" },
 		});
 		supervisor.workers.set("source", source);
-		supervisor.catalog.resolve = vi.fn(async () => "/tmp/target.jsonl");
+		supervisor.catalog.resolve = vi.fn(async () => targetPath);
 		supervisor.createOrReuseWorker = vi.fn(async () => target);
 		const client = { id: "sender", attachedActiveSessionIds: new Set<string>() };
 
@@ -339,7 +403,12 @@ describe("daemon supervisor whole-tree eviction", () => {
 		expect(supervisor.catalog.resolve).toHaveBeenCalledWith("target-session", "/tmp/project", "/tmp/custom-sessions");
 		expect(supervisor.createOrReuseWorker).toHaveBeenCalledWith(
 			"sender",
-			expect.objectContaining({ type: "create", sessionPath: "/tmp/target.jsonl", continueRecent: false }),
+			expect.objectContaining({
+				type: "create",
+				sessionPath: targetPath,
+				continueRecent: false,
+				config: { sessionDir: "/tmp/custom-sessions" },
+			}),
 		);
 		expect(target.client?.requestWorker).toHaveBeenCalledWith(
 			expect.objectContaining({
@@ -440,5 +509,324 @@ describe("daemon supervisor whole-tree eviction", () => {
 			}),
 		).rejects.toThrow('Ambiguous session selector "target"');
 		expect(supervisor.createOrReuseWorker).not.toHaveBeenCalled();
+	});
+
+	it("captures every inactive descendant for cross-worker sibling authorization", async () => {
+		const supervisor = makeSupervisor();
+		const timestamp = new Date("2026-08-01T12:00:00.000Z");
+		const catalog = [
+			{
+				id: "root",
+				path: "/tmp/root.jsonl",
+				cwd: "/tmp",
+				rlmDepth: 0,
+				created: timestamp,
+				modified: timestamp,
+				messageCount: 0,
+				firstMessage: "",
+			},
+			{
+				id: "middle",
+				path: "/tmp/middle.jsonl",
+				cwd: "/tmp",
+				parentSessionPath: "/tmp/root.jsonl",
+				rlmDepth: 1,
+				created: timestamp,
+				modified: timestamp,
+				messageCount: 0,
+				firstMessage: "",
+			},
+			{
+				id: "first",
+				path: "/tmp/first.jsonl",
+				cwd: "/tmp",
+				parentSessionPath: "/tmp/middle.jsonl",
+				rlmDepth: 2,
+				created: timestamp,
+				modified: timestamp,
+				messageCount: 0,
+				firstMessage: "",
+			},
+			{
+				id: "second",
+				path: "/tmp/second.jsonl",
+				cwd: "/tmp",
+				parentSessionPath: "/tmp/middle.jsonl",
+				rlmDepth: 2,
+				created: timestamp,
+				modified: timestamp,
+				messageCount: 0,
+				firstMessage: "",
+			},
+		];
+		supervisor.catalog.list = vi.fn(async () => catalog);
+		Object.assign(supervisor.catalog, { family: vi.fn(async () => catalog) });
+		const entries = await supervisor.familyCatalogEntries("/tmp/custom-sessions");
+		expect(supervisor.catalog.list).toHaveBeenCalledWith(undefined, "/tmp/custom-sessions");
+		expect(supervisor.catalog.family).toHaveBeenCalledWith("/tmp/custom-sessions");
+		expect(entries.map((entry) => entry.id)).toEqual(["root", "middle", "first", "second"]);
+		const { assertAgentFamilyReach } = await import("../src/core/agent-messages.js");
+		expect(
+			assertAgentFamilyReach(
+				entries.find((entry) => entry.id === "first")!,
+				entries.find((entry) => entry.id === "second")!,
+				entries,
+			),
+		).toBe("sibling");
+	});
+
+	it("uses the source worker session directory for agent-origin family snapshots", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const source = makeWorker("source", [makeSummary("source-active", now, { sessionId: "source" })]);
+		source.descriptor.createCommand.config = { sessionDir: "/tmp/custom-sessions" };
+		const target = makeWorker("target", [makeSummary("target-active", now, { sessionId: "target" })]);
+		target.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_deliver_message",
+			success: true,
+			data: { deliveryStatus: "delivered" },
+		});
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		const familyCatalogEntries = vi.fn(async () =>
+			Object.freeze([
+				{ id: "root", depth: 0, status: "inactive" as const },
+				{ id: "source", depth: 1, status: "running" as const, parentSessionId: "root" },
+				{ id: "target", depth: 1, status: "running" as const, parentSessionId: "root" },
+			]),
+		);
+		Object.assign(supervisor, { familyCatalogEntries });
+
+		await expect(
+			supervisor.handleCommand(
+				{ id: "sender" },
+				{
+					id: "custom-root",
+					type: "send_message",
+					agentOrigin: true,
+					fromActiveSessionId: "source-active",
+					targetActiveSessionId: "target-active",
+					message: "deliver",
+				},
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(familyCatalogEntries).toHaveBeenCalledWith("/tmp/custom-sessions");
+	});
+
+	it("rejects active topology that conflicts with the persisted row before remote delivery", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const sourceSummary = makeSummary("source-active", now, {
+			sessionId: "source",
+			rlmDepth: 1,
+			parentSessionPath: "/tmp/root.jsonl",
+		});
+		const targetSummary = makeSummary("target-active", now, {
+			sessionId: "target",
+			sessionFile: "/tmp/target.jsonl",
+			rlmDepth: 1,
+			parentSessionPath: "/tmp/forged-parent.jsonl",
+		});
+		const source = makeWorker("source", [sourceSummary]);
+		const target = makeWorker("target", [targetSummary]);
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		const timestamp = new Date(now);
+		const catalog = [
+			{
+				id: "root",
+				path: "/tmp/root.jsonl",
+				cwd: "/tmp",
+				rlmDepth: 0,
+				created: timestamp,
+				modified: timestamp,
+				messageCount: 0,
+				firstMessage: "",
+			},
+			{
+				id: "target",
+				path: "/tmp/target.jsonl",
+				cwd: "/tmp",
+				parentSessionPath: "/tmp/root.jsonl",
+				rlmDepth: 1,
+				created: timestamp,
+				modified: timestamp,
+				messageCount: 0,
+				firstMessage: "",
+			},
+		];
+		supervisor.catalog.list = vi.fn(async () => catalog);
+		Object.assign(supervisor.catalog, { family: vi.fn(async () => catalog) });
+
+		await expect(
+			supervisor.handleCommand(
+				{ id: "sender" },
+				{
+					id: "persisted-conflict",
+					type: "send_message",
+					agentOrigin: true,
+					fromActiveSessionId: "source-active",
+					targetActiveSessionId: "target-active",
+					message: "deny",
+				},
+			),
+		).rejects.toThrow("Agent reach is limited to parent, siblings, and children");
+		expect(target.client?.requestWorker).not.toHaveBeenCalled();
+	});
+
+	it("uses only the source custom directory when denying a conflicting family topology", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const sourceSummary = makeSummary("source-active", now, {
+			sessionId: "source",
+			rlmDepth: 1,
+			parentSessionPath: "/tmp/custom-sessions/root.jsonl",
+		});
+		const targetSummary = makeSummary("target-active", now, {
+			sessionId: "target",
+			sessionFile: "/tmp/custom-sessions/target.jsonl",
+			rlmDepth: 1,
+			parentSessionPath: "/tmp/custom-sessions/forged-parent.jsonl",
+		});
+		const source = makeWorker("source", [sourceSummary]);
+		source.descriptor.createCommand.config = { sessionDir: "/tmp/custom-sessions" };
+		const target = makeWorker("target", [targetSummary]);
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		const timestamp = new Date(now);
+		const catalog = [
+			{
+				id: "root",
+				path: "/tmp/custom-sessions/root.jsonl",
+				cwd: "/tmp",
+				rlmDepth: 0,
+				created: timestamp,
+				modified: timestamp,
+				messageCount: 0,
+				firstMessage: "",
+				allMessagesText: "",
+			},
+			{
+				id: "target",
+				path: "/tmp/custom-sessions/target.jsonl",
+				cwd: "/tmp",
+				parentSessionPath: "/tmp/custom-sessions/root.jsonl",
+				rlmDepth: 1,
+				created: timestamp,
+				modified: timestamp,
+				messageCount: 0,
+				firstMessage: "",
+				allMessagesText: "",
+			},
+		];
+		supervisor.catalog.list = vi.fn(async () => catalog);
+		supervisor.catalog.family = vi.fn(async () => catalog);
+
+		await expect(
+			supervisor.handleCommand(
+				{ id: "sender" },
+				{
+					id: "custom-persisted-conflict",
+					type: "send_message",
+					agentOrigin: true,
+					fromActiveSessionId: "source-active",
+					targetActiveSessionId: "target-active",
+					message: "deny",
+				},
+			),
+		).rejects.toThrow("Agent reach is limited to parent, siblings, and children");
+		expect(supervisor.catalog.list).toHaveBeenCalledWith(undefined, "/tmp/custom-sessions");
+		expect(supervisor.catalog.family).toHaveBeenCalledWith("/tmp/custom-sessions");
+		expect(target.client?.requestWorker).not.toHaveBeenCalled();
+	});
+
+	it("rejects duplicate snapshot identities before cross-worker delivery", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const sourceSummary = makeSummary("source-active", now, { sessionId: "source" });
+		const targetSummary = makeSummary("target-active", now, { sessionId: "target" });
+		const source = makeWorker("source", [sourceSummary]);
+		const target = makeWorker("target", [targetSummary]);
+		supervisor.workers.set("source", source);
+		supervisor.workers.set("target", target);
+		Object.assign(supervisor, {
+			familyCatalogEntries: vi.fn(async () =>
+				Object.freeze([
+					{ id: "root", depth: 0, status: "inactive" as const },
+					{ id: "source", depth: 1, status: "running" as const, parentSessionId: "root" },
+					{ id: "target", depth: 1, status: "running" as const, parentSessionId: "root" },
+					{ id: "target", depth: 1, status: "running" as const, parentSessionId: "forged" },
+				]),
+			),
+		});
+		await expect(
+			supervisor.handleCommand(
+				{ id: "sender" },
+				{
+					id: "duplicate",
+					type: "send_message",
+					agentOrigin: true,
+					fromActiveSessionId: "source-active",
+					targetActiveSessionId: "target-active",
+					message: "deny",
+				},
+			),
+		).rejects.toThrow("Agent reach is limited to parent, siblings, and children");
+		expect(target.client?.requestWorker).not.toHaveBeenCalled();
+	});
+
+	it("rejects a postwake session substitution without delivery", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-postwake-substitution-"));
+		tempDirs.push(directory);
+		const parentManager = SessionManager.create(directory, join(directory, "sessions"));
+		parentManager.newSession({ rlmDepth: 0 });
+		parentManager.flushNow();
+		const parentPath = parentManager.getSessionFile();
+		if (!parentPath) throw new Error("Missing parent session path");
+		const targetManager = SessionManager.create(directory, join(directory, "sessions"));
+		targetManager.newSession({ parentSession: parentPath, rlmDepth: 1 });
+		targetManager.flushNow();
+		const targetPath = targetManager.getSessionFile();
+		if (!targetPath) throw new Error("Missing target session path");
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const sourceSummary = makeSummary("source-active", now, { sessionId: "source" });
+		const source = makeWorker("source", [sourceSummary]);
+		const substituted = makeSummary("woken-active", now, { sessionId: "substitute", sessionFile: targetPath });
+		const woken = makeWorker("woken", [substituted]);
+		const supervisor = makeSupervisor();
+		supervisor.workers.set("source", source);
+		supervisor.catalog.resolve = vi.fn(async () => targetPath);
+		supervisor.createOrReuseWorker = vi.fn(async () => woken);
+		Object.assign(supervisor, {
+			familyCatalogEntries: vi.fn(async () =>
+				Object.freeze([
+					{ id: parentManager.getSessionId(), depth: 0, status: "inactive" as const, sessionPath: parentPath },
+					{ id: "source", depth: 1, status: "running" as const, parentSessionId: parentManager.getSessionId() },
+					{
+						id: targetManager.getSessionId(),
+						depth: 1,
+						status: "inactive" as const,
+						parentSessionPath: parentPath,
+						sessionPath: targetPath,
+					},
+				]),
+			),
+		});
+		await expect(
+			supervisor.handleCommand(
+				{ id: "sender" },
+				{
+					id: "substitution",
+					type: "send_message",
+					agentOrigin: true,
+					fromActiveSessionId: "source-active",
+					targetActiveSessionId: targetManager.getSessionId(),
+					message: "deny",
+				},
+			),
+		).rejects.toThrow("Agent reach is limited to parent, siblings, and children");
+		expect(supervisor.createOrReuseWorker).toHaveBeenCalledOnce();
+		expect(woken.client?.requestWorker).not.toHaveBeenCalled();
 	});
 });
