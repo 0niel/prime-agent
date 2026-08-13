@@ -110,6 +110,95 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
 }
 
+describe("Agent relay identity", () => {
+	it("generates a distinct protected relay ID per intercept completion and keeps it through downstream retries", async () => {
+		const seenRelayIds: string[] = [];
+		const retryRelayIds: string[] = [];
+		const eventPayloads: string[] = [];
+		const streamFn = vi.fn((_model: Model, _context, options) => {
+			const relayId = options?.headers?.["X-Prime-Agent-Relay-ID"];
+			if (!relayId) throw new Error("missing relay ID");
+			seenRelayIds.push(relayId);
+
+			// The provider SDK owns retries; it receives this one logical request's unchanged headers.
+			for (let attempt = 0; attempt < 2; attempt++) {
+				retryRelayIds.push(options?.headers?.["X-Prime-Agent-Relay-ID"] ?? "");
+			}
+
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "Response" }]),
+				});
+			});
+			return stream;
+		});
+		const config: AgentLoopConfig = {
+			model: { ...createModel(), provider: "intercept" },
+			convertToLlm: identityConverter,
+			headers: {
+				"X-Extra-Auth": "preserved",
+				"x-prime-agent-relay-id": "caller-must-not-control-this",
+			},
+		};
+		const run = async () => {
+			const events: AgentEvent[] = [];
+			await runAgentLoop(
+				[createUserMessage("Hello")],
+				{ systemPrompt: "You are helpful.", messages: [], tools: [] },
+				config,
+				(event) => {
+					events.push(event);
+				},
+				undefined,
+				streamFn,
+			);
+			eventPayloads.push(JSON.stringify(events));
+		};
+
+		await run();
+		await run();
+
+		expect(streamFn).toHaveBeenCalledTimes(2);
+		expect(seenRelayIds).toHaveLength(2);
+		expect(seenRelayIds[0]).toMatch(/^[0-9a-f]{32}$/);
+		expect(seenRelayIds[1]).toMatch(/^[0-9a-f]{32}$/);
+		expect(seenRelayIds[0]).not.toBe(seenRelayIds[1]);
+		expect(retryRelayIds).toEqual([seenRelayIds[0], seenRelayIds[0], seenRelayIds[1], seenRelayIds[1]]);
+		expect(eventPayloads.join("\n")).not.toContain(seenRelayIds[0]!);
+		expect(eventPayloads.join("\n")).not.toContain(seenRelayIds[1]!);
+	});
+
+	it("does not add a relay ID for non-intercept providers", async () => {
+		let headers: Record<string, string> | undefined;
+		const stream = new MockAssistantStream();
+		const streamFn = vi.fn((_model: Model, _context, options) => {
+			headers = options?.headers;
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "Response" }]),
+				});
+			});
+			return stream;
+		});
+
+		await runAgentLoop(
+			[createUserMessage("Hello")],
+			{ systemPrompt: "You are helpful.", messages: [], tools: [] },
+			{ model: createModel(), convertToLlm: identityConverter, headers: { "X-Extra-Auth": "preserved" } },
+			() => {},
+			undefined,
+			streamFn,
+		);
+
+		expect(headers).toEqual({ "X-Extra-Auth": "preserved" });
+	});
+});
+
 describe("agentLoop with AgentMessage", () => {
 	it("should preserve a terminal response when abort fires after done", async () => {
 		const context: AgentContext = {
