@@ -6,12 +6,7 @@ import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli
 import { getSessionsDir } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
-import {
-	readSessionInfo,
-	readSessionInfoFromBuffer,
-	type SessionInfo,
-	SessionManager,
-} from "../../core/session-manager.js";
+import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 
@@ -74,6 +69,7 @@ interface SavedRlmSubagentRegistryEntry {
 }
 
 const MAX_RLM_REGISTRY_BYTES = 1024 * 1024;
+const MAX_SESSION_HEADER_BYTES = 256 * 1024;
 const MAX_RLM_REGISTRY_RECORDS = 10_000;
 const MAX_RLM_FAMILY_EDGES = 10_000;
 const MAX_RLM_FAMILY_NODES = 10_000;
@@ -173,7 +169,8 @@ def flags(directory=False):
  return value
 def main():
  req=json.loads(sys.stdin.buffer.read(131073))
- parts=req.get("parts"); limit=req.get("limit")
+ parts=req.get("parts"); limit=req.get("limit"); mode=req.get("mode")
+ if mode not in ("read","header","stat"): reject()
  if not isinstance(parts,list) or not parts or not isinstance(limit,int) or limit<0 or limit>MAX: reject()
  if any(not isinstance(p,str) or not p or p in (".","..") or "/" in p or "\\" in p for p in parts): reject()
  current=os.dup(3)
@@ -183,16 +180,24 @@ def main():
   fd=os.open(parts[-1],flags(False),dir_fd=current)
   try:
    before=os.fstat(fd)
-   if not stat.S_ISREG(before.st_mode) or before.st_size>limit: reject()
-   chunks=[]; total=0
-   while True:
-    chunk=os.read(fd,min(65536,limit+1-total))
-    if not chunk: break
-    chunks.append(chunk); total+=len(chunk)
-    if total>limit: reject()
+   if not stat.S_ISREG(before.st_mode): reject()
+   if mode=="read" and before.st_size>limit: reject()
+   payload={}
+   if mode!="stat":
+    chunks=[]; total=0; done=False
+    while not done:
+     chunk=os.read(fd,min(65536,limit+1-total))
+     if not chunk: break
+     if mode=="header":
+      cut=chunk.find(b"\n")
+      if cut>=0: chunk=chunk[:cut+1]; done=True
+     chunks.append(chunk); total+=len(chunk)
+     if total>limit: reject()
+    payload["data"]=base64.b64encode(b"".join(chunks)).decode("ascii")
    after=os.fstat(fd)
    if (before.st_dev,before.st_ino,before.st_mode)!=(after.st_dev,after.st_ino,after.st_mode): reject()
-   print(json.dumps({"data":base64.b64encode(b"".join(chunks)).decode("ascii"),"mtimeMs":after.st_mtime_ns/1000000,"dev":str(after.st_dev),"ino":str(after.st_ino)},separators=(",",":")))
+   payload.update({"mtimeMs":after.st_mtime_ns/1000000,"dev":str(after.st_dev),"ino":str(after.st_ino)})
+   print(json.dumps(payload,separators=(",",":")))
   finally: os.close(fd)
  finally: os.close(current)
 try: main()
@@ -207,7 +212,9 @@ export function setCatalogBeforeTrustedOpenForTest(hook: ((path: string) => void
 	beforeTrustedOpenForTest = hook;
 }
 
-function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number): TrustedFile {
+type TrustedReadMode = "read" | "header" | "stat";
+
+function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number, mode: TrustedReadMode): TrustedFile {
 	if (!isAbsolute(rawPath) || rawPath !== resolve(rawPath))
 		throw invalidFamilyTopology("session path is not canonical");
 	const root = [roots.session, roots.artifacts].find((candidate) => candidate && isWithin(candidate.lexical, rawPath));
@@ -224,7 +231,7 @@ function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number)
 			: (process.env.PRIME_AGENT_KERNEL_PYTHON ?? "python3"),
 		["-I", "-c", OPENAT_READ_HELPER],
 		{
-			input: JSON.stringify({ parts, limit: maxBytes }),
+			input: JSON.stringify({ parts, limit: maxBytes, mode }),
 			encoding: "utf8",
 			timeout: 5_000,
 			maxBuffer: maxBytes * 2 + 64 * 1024,
@@ -239,7 +246,7 @@ function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number)
 	try {
 		const wire = JSON.parse(result.stdout) as { data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
 		if (
-			typeof wire.data !== "string" ||
+			(mode === "stat" ? wire.data !== undefined : typeof wire.data !== "string") ||
 			typeof wire.mtimeMs !== "number" ||
 			typeof wire.dev !== "string" ||
 			typeof wire.ino !== "string"
@@ -247,7 +254,7 @@ function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number)
 			throw new Error("invalid");
 		return {
 			path: rawPath,
-			contents: Buffer.from(wire.data, "base64"),
+			contents: typeof wire.data === "string" ? Buffer.from(wire.data, "base64") : Buffer.alloc(0),
 			mtimeMs: wire.mtimeMs,
 			dev: wire.dev,
 			ino: wire.ino,
@@ -257,11 +264,15 @@ function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number)
 	}
 }
 
-async function readTrustedSession(path: string, roots: ManagedRoots): Promise<TrustedSession> {
-	const trusted = readTrustedFile(path, roots, 128 * 1024 * 1024);
-	const headerLine = trusted.contents
-		.toString("utf8", 0, Math.min(trusted.contents.length, 256 * 1024))
-		.split(/\r?\n/, 1)[0];
+/**
+ * Topology claims (id, parent, depth) come from descriptor-bound header bytes.
+ * Display metadata (name, timestamps, previews) is not part of the trust
+ * decision: it comes from the caller's listing when available, otherwise from
+ * an ordinary cached read, and is bound to the header by the id cross-check.
+ */
+async function readTrustedSession(path: string, roots: ManagedRoots, listed?: SessionInfo): Promise<TrustedSession> {
+	const trusted = readTrustedFile(path, roots, MAX_SESSION_HEADER_BYTES, "header");
+	const headerLine = trusted.contents.toString("utf8").split(/\r?\n/, 1)[0];
 	let header: { type?: unknown; id?: unknown; parentSession?: unknown; rlmDepth?: unknown };
 	try {
 		header = JSON.parse(headerLine ?? "") as typeof header;
@@ -280,12 +291,15 @@ async function readTrustedSession(path: string, roots: ManagedRoots): Promise<Tr
 	)
 		throw invalidFamilyTopology("session header lacks trustworthy topology claims");
 	const persistedDepth = hasDepth ? (header.rlmDepth as number) : undefined;
-	const info = await readSessionInfoFromBuffer(path, trusted.contents, { mtimeMs: trusted.mtimeMs });
+	const info = listed?.path === path ? listed : await readSessionInfo(path);
 	if (!info || info.id !== header.id) throw invalidFamilyTopology("session metadata does not match its header");
+	// Topology fields are always the header's claims; the display read may not
+	// contradict them in the returned catalog row.
 	return {
 		...info,
 		path,
 		rlmDepth: persistedDepth ?? 0,
+		parentSessionPath: hasParent ? (header.parentSession as string) : undefined,
 		...(persistedDepth !== undefined ? { persistedDepth } : {}),
 		...(hasParent ? { persistedParentPath: header.parentSession as string } : {}),
 	};
@@ -318,7 +332,7 @@ async function readLatestRegistry(
 ): Promise<SavedRlmSubagentRegistryEntry[] | undefined> {
 	let contents: string;
 	try {
-		contents = readTrustedFile(path, roots, MAX_RLM_REGISTRY_BYTES).contents.toString("utf8");
+		contents = readTrustedFile(path, roots, MAX_RLM_REGISTRY_BYTES, "read").contents.toString("utf8");
 	} catch (error) {
 		if ((error as Error).message.includes("descriptor-relative artifact is absent")) return undefined;
 		throw error;
@@ -357,7 +371,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 		const sessions = new Map<string, FamilySession>();
 		const ids = new Map<string, string>();
 		for (const root of roots) {
-			const trusted = asTrustedFamilyRoot(await readTrustedSession(root.path, authority), authority);
+			const trusted = asTrustedFamilyRoot(await readTrustedSession(root.path, authority, root), authority);
 			const existingPath = ids.get(trusted.id);
 			if (existingPath && existingPath !== trusted.path)
 				throw invalidFamilyTopology("family contains a duplicate session id");
@@ -391,7 +405,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				if (trustedChild.persistedDepth === undefined) throw invalidFamilyTopology("child lacks a persisted depth");
 				const child: FamilySession = { ...trustedChild, persistedDepth: trustedChild.persistedDepth };
 				const claimedParentPath = resolve(dirname(child.path), trustedChild.persistedParentPath);
-				readTrustedFile(claimedParentPath, authority, 128 * 1024 * 1024);
+				readTrustedFile(claimedParentPath, authority, 0, "stat");
 				if (claimedParentPath !== parentPath)
 					throw invalidFamilyTopology("child parent path does not match traversed parent");
 				if (child.persistedDepth !== parent.persistedDepth + 1)

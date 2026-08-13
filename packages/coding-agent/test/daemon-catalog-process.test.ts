@@ -1,4 +1,13 @@
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -449,7 +458,7 @@ describe("daemon catalog selector resolution", () => {
 		setCatalogBeforeTrustedOpenForTest(undefined);
 	});
 
-	it("parses session metadata from the same descriptor-bound bytes without a pathname reopen", async () => {
+	it("rejects a session replaced between listing and the descriptor-bound header read", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-no-reopen-"));
 		const sessionDir = join(root, "sessions");
 		const parent = SessionManager.create(root, sessionDir);
@@ -463,8 +472,9 @@ describe("daemon catalog selector resolution", () => {
 			renameSync(path, original);
 			writeFileSync(path, "not a session\n");
 		});
-		// The helper opens after the hook, so it must reject the replacement instead of
-		// authorizing stale bytes. This pins the absence of a later readSessionInfo reopen.
+		// Topology claims come from the descriptor-bound header read, which opens
+		// after the hook and must reject the replacement instead of authorizing
+		// the stale listing.
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
 		setCatalogBeforeTrustedOpenForTest(undefined);
 		rmSync(root, { recursive: true, force: true });
@@ -597,6 +607,63 @@ describe("daemon catalog selector resolution", () => {
 		const baseline = getOpenCatalogAuthorityFdCountForTest();
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
 		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(baseline);
+	});
+
+	it("reads only the session header line even when the body is huge", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-header-only-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		// A body far beyond the old whole-file transfer budget must not slow or
+		// break the walk: only the first line participates in the trust decision.
+		appendFileSync(
+			parent.getSessionFile()!,
+			`${JSON.stringify({ type: "custom_message", body: "x".repeat(8 * 1024 * 1024) })}\n`,
+		);
+		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([
+			expect.objectContaining({ id: "parent", rlmDepth: 0 }),
+		]);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("rejects a session whose header line exceeds the header budget", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-header-overflow-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		const file = parent.getSessionFile()!;
+		const entries = readFileSync(file, "utf8").trimEnd().split(/\r?\n/);
+		const header = JSON.parse(entries[0]!) as Record<string, unknown>;
+		header.padding = "x".repeat(300 * 1024);
+		writeFileSync(file, `${[JSON.stringify(header), ...entries.slice(1)].join("\n")}\n`);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("still requires a registry child's claimed parent file to exist", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-absent-parent-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-child"));
+		child.newSession({ id: "child", parentSession: join(sessionDir, "gone.jsonl"), rlmDepth: 1 });
+		child.appendSessionInfo("child");
+		const registry = join(root, "session-artifacts", "parent", "rlm-subagents.jsonl");
+		mkdirSync(dirname(registry), { recursive: true });
+		writeFileSync(
+			registry,
+			JSON.stringify({
+				type: "rlm_subagent",
+				childId: "child",
+				sessionFile: child.getSessionFile(),
+				status: "completed",
+			}),
+		);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		rmSync(root, { recursive: true, force: true });
 	});
 
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {
