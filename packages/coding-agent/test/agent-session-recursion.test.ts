@@ -3037,7 +3037,16 @@ describe("AgentSession rlm recursion", () => {
 	});
 
 	it("cleans up a queued run when a subscriber revokes authority on the first child update", async () => {
-		const root = createSession();
+		const child = createSession();
+		const createRuntime = vi.fn(async () => ({ session: child }));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: createRuntime,
+				deleteRlmSubagentRuntime: async (_childId, session) => {
+					await session?.disposeAsync();
+				},
+			},
+		});
 		const controller = new AbortController();
 		root.subscribe((event) => {
 			if (event.type === "rlm_child_update" && event.child.status === "queued") {
@@ -3052,7 +3061,45 @@ describe("AgentSession rlm recursion", () => {
 		await expect(admission).rejects.toThrow("host request authority was revoked");
 		const internals = root as unknown as InspectableRlmSession;
 		await waitFor(() => internals._activeRlmChildRuns.size === 0);
+		expect(createRuntime.mock.calls.length).toBe(0);
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+		expect(root.messages.filter((message) => message.role === "custom")).toEqual([]);
+		const artifactDir = root.sessionManager.getSessionArtifactDir();
+		if (!artifactDir) throw new Error("Missing session artifact dir");
+		await waitFor(() => readdirSync(artifactDir).filter((name) => name.startsWith("sub-")).length === 0);
+		await child.disposeAsync();
+	});
+
+	it("disposes an already-created runtime for a spawn revoked before admission", async () => {
+		const controller = new AbortController();
+		const child = createSession();
+		const disposeChild = vi.spyOn(child, "disposeAsync");
+		const runtimeHost: SubagentRuntimeHost = {
+			createRlmSubagentRuntime: async (options) => {
+				// Revoke while the runtime is being created, then publish late.
+				controller.abort();
+				options.onSessionPublished?.(child);
+				return { session: child };
+			},
+			deleteRlmSubagentRuntime: async (_childId, session) => {
+				await session?.disposeAsync();
+			},
+		};
+		const root = createSession({ subagentRuntimeHost: runtimeHost });
+
+		const admission = root.runRlmChild("revoked during late publication", {}, undefined, {
+			signal: controller.signal,
+		});
+
+		await expect(admission).rejects.toThrow("host request authority was revoked");
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._activeRlmChildRuns.size === 0);
+		await waitFor(() => disposeChild.mock.calls.length > 0);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+		expect(root.messages.filter((message) => message.role === "custom")).toEqual([]);
+		const artifactDir = root.sessionManager.getSessionArtifactDir();
+		if (!artifactDir) throw new Error("Missing session artifact dir");
+		await waitFor(() => readdirSync(artifactDir).filter((name) => name.startsWith("sub-")).length === 0);
 	});
 
 	it("cleans up a run when authority is already revoked at registration", async () => {
