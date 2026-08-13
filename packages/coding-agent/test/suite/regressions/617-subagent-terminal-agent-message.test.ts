@@ -68,7 +68,7 @@ describe("#617 subagent terminal agent messages", () => {
 			rlmMaxDepth: 1,
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child!.session }),
-				deleteRlmSubagentRuntime: async () => {},
+				deleteRlmSubagentRuntime: async () => ({ deletionDurability: "absent" as const }),
 			},
 		});
 		child.setResponses([fauxAssistantMessage("child completed")]);
@@ -105,7 +105,7 @@ describe("#617 subagent terminal agent messages", () => {
 		parent = await createHarness({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child!.session }),
-				deleteRlmSubagentRuntime: async () => {},
+				deleteRlmSubagentRuntime: async () => ({ deletionDurability: "absent" as const }),
 			} as never,
 		});
 		child.setResponses([fauxAssistantMessage("done, no reply to parent")]);

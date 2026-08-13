@@ -10095,12 +10095,14 @@ export class AgentSession {
 		// retention, cancellation, and late-startup cleanup.
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
+			let runtimeCreationAttempted = false;
 			// A release hook is not itself proof that a cancelled, never-admitted
 			// child is durably unreachable. Preserve uncertainty rather than deleting
 			// an artifact whose durable owner cannot be proven.
-			let deletionDurability: RlmSubagentDeletionDurability = "unknown";
+			const deletionState: { durability: RlmSubagentDeletionDurability } = { durability: "unknown" };
 			try {
 				throwIfCancelled();
+				runtimeCreationAttempted = true;
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
 				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
@@ -10243,10 +10245,10 @@ export class AgentSession {
 									"error",
 									authority,
 								);
-								deletionDurability = outcome?.deletionDurability ?? "unknown";
+								deletionState.durability = outcome?.deletionDurability ?? "unknown";
 							} else {
 								await this._deleteResolvedRlmSubagent(completionSubagent, authority);
-								deletionDurability = "absent";
+								deletionState.durability = "absent";
 							}
 							return { subagent: completionSubagent };
 						},
@@ -10285,6 +10287,7 @@ export class AgentSession {
 					}
 				}
 				if (!run.detachedDeletion && childSession) {
+					const finalizerSession = childSession;
 					// Error/cancellation finalizers share the exact deletion owner with
 					// explicit deletion and the compaction reaper.
 					const inFlight = this._deletingRlmChildren.get(run.id);
@@ -10294,6 +10297,7 @@ export class AgentSession {
 							rlm_child_id: run.id,
 							active_session_id: null,
 							session_id: childSession.sessionId,
+							...(childSession.sessionFile ? { session_file: childSession.sessionFile } : {}),
 							session_name: childSession.sessionName ?? sessionName,
 							session_dir: childSessionDir,
 							status: "error",
@@ -10308,28 +10312,28 @@ export class AgentSession {
 								if (this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 									try {
 										const outcome = await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
-											childRuntime ?? { session: childSession },
+											childRuntime ?? { session: finalizerSession },
 											subagentOptions,
 											run.status === "cancelled" ? "cancelled" : "error",
 											authority,
 										);
-										deletionDurability = outcome?.deletionDurability ?? "unknown";
+										deletionState.durability = outcome?.deletionDurability ?? "unknown";
 									} catch (releaseError) {
 										if (!this._disposed && !this._disposing) {
 											if (this._isTombstonedRlmSubagentDeletionFailure(releaseError)) {
-												this._rlmChildSessions.set(run.id, childSession);
+												this._rlmChildSessions.set(run.id, finalizerSession);
 												this._rlmChildCleanupFailures.set(run.id, finalizerSubagent);
 											} else if (this._isPrecommitRlmSubagentDeletionFailure(releaseError)) {
 												// Keep the live host incarnation attached to the private unknown-
 												// durability lease so an exact-id retry can tombstone and close it.
-												this._rlmChildSessions.set(run.id, childSession);
+												this._rlmChildSessions.set(run.id, finalizerSession);
 											}
 										}
 										throw releaseError;
 									}
 									if (
 										run.status === "cancelled" &&
-										deletionDurability !== "unknown" &&
+										deletionState.durability !== "unknown" &&
 										!this._disposed &&
 										!this._disposing
 									) {
@@ -10339,7 +10343,7 @@ export class AgentSession {
 									return { subagent: finalizerSubagent };
 								}
 								const result = await this._deleteResolvedRlmSubagent(finalizerSubagent, authority);
-								deletionDurability = "absent";
+								deletionState.durability = "absent";
 								return result;
 							},
 						);
@@ -10354,9 +10358,12 @@ export class AgentSession {
 				// ambiguity is quarantined privately rather than being coerced into an
 				// active, idle, or inactive public child.
 				if (!admissionCommitted && run.status === "cancelled" && !run.detachedDeletion) {
-					if (deletionDurability === "absent") {
+					if (!runtimeCreationAttempted || deletionState.durability === "absent") {
+						// Before host creation begins, this exact reserved directory is still
+						// exclusively ours; no durability inference is required to remove it.
 						rmSync(childSessionDir, { recursive: true, force: true });
-					} else if (deletionDurability === "unknown" && !this._disposed && !this._disposing) {
+						deletionState.durability = "absent";
+					} else if (deletionState.durability === "unknown" && !this._disposed && !this._disposing) {
 						// Preserve a private cleanup lease through finalization. Unlike an
 						// explicit-delete failure, it is neither listed nor selector-addressable.
 						this._rlmChildDeletionQuarantines.set(run.id, {
@@ -10372,11 +10379,39 @@ export class AgentSession {
 				}
 			} finally {
 				if (run.detachedDeletion && childRuntime) {
-					// Startup may publish after deletion was requested. It must re-enter
-					// the same incarnation-fenced coordinator, never call the host directly.
-					await this._coordinateRlmSubagentDeletion(run.detachedDeletion, undefined, undefined, (authority) =>
-						this._deleteResolvedRlmSubagent(run.detachedDeletion!, authority),
-					).catch(() => undefined);
+					const publishedRuntime = childRuntime;
+					// The queued deletion may have completed before startup published an
+					// object. Join that exact owner, then release its settled single-flight
+					// slot before fencing and deleting the newly published incarnation.
+					const priorDeletion = this._deletingRlmChildren.get(run.id);
+					if (priorDeletion) {
+						await priorDeletion.promise.catch(() => undefined);
+						if (this._deletingRlmChildren.get(run.id) === priorDeletion) {
+							this._deletingRlmChildren.delete(run.id);
+						}
+					}
+					const publishedDeletion: RlmSubagentRegistryEntry = {
+						...run.detachedDeletion,
+						session_id: publishedRuntime.session.sessionId,
+						...(publishedRuntime.session.sessionFile
+							? { session_file: publishedRuntime.session.sessionFile }
+							: {}),
+					};
+					run.detachedDeletion = publishedDeletion;
+					await this._coordinateRlmSubagentDeletion(publishedDeletion, undefined, undefined, async (authority) => {
+						try {
+							await this._deleteRlmSubagentSession(run.id, publishedRuntime.session, authority);
+						} catch (error) {
+							if (!this._disposed && !this._disposing) {
+								this._rlmChildSessions.set(run.id, publishedRuntime.session);
+								this._rlmChildCleanupFailures.set(run.id, publishedDeletion);
+							}
+							throw error;
+						}
+						this._deletedRlmChildIds.add(run.id);
+						this._removeRlmSubagentTracking(run.id, run);
+						return { subagent: publishedDeletion };
+					}).catch(() => undefined);
 				}
 				if (this._activeRlmChildRuns.get(run.id) === run) {
 					if (this._rlmChildSessions.has(run.id)) {

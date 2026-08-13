@@ -699,7 +699,7 @@ describe("daemon mode helpers", () => {
 				{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
 				"cancelled",
 			);
-		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1");
+		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1", undefined, childState.runtime.session);
 		expect(recordDeletion.mock.invocationCallOrder[0]).toBeLessThan(closeSession.mock.invocationCallOrder[1]!);
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
@@ -1119,7 +1119,13 @@ describe("daemon mode helpers", () => {
 				recordRlmSubagentDeletion(
 					parentState: ActiveSessionState,
 					childId: string,
-					authority?: { assertCurrent(): void },
+					authority?: {
+						childId?: string;
+						sessionDir?: string;
+						sessionFile?: string;
+						sessionId?: string;
+						assertCurrent(): void;
+					},
 				): Promise<"absent" | "tombstoned" | "unknown">;
 			};
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
@@ -1267,12 +1273,18 @@ describe("daemon mode helpers", () => {
 					.deleteRlmSubagentRuntime(before.childId, beforeChild.runtime.session, {
 						childId: before.childId,
 						sessionDir: before.childSessionDir,
+						sessionFile: before.childSessionFile,
+						sessionId: beforeChild.runtime.session.sessionId,
 						generation: 1,
 						assertCurrent: () => {
 							if (++beforeBoundaryChecks === 2) throw revokedBeforeAppend;
 						},
 					}),
-			).rejects.toBe(revokedBeforeAppend);
+			).rejects.toMatchObject({
+				name: "RlmSubagentHostDeletionError",
+				phase: "precommit",
+				cause: revokedBeforeAppend,
+			});
 			expect(readFileSync(beforeRegistryPath, "utf8")).toBe(beforeRegistry);
 			expect(beforeInternals.sessions.get(beforeChild.activeSessionId)).toBe(beforeChild);
 
@@ -1301,6 +1313,8 @@ describe("daemon mode helpers", () => {
 					.deleteRlmSubagentRuntime(after.childId, afterChild.runtime.session, {
 						childId: after.childId,
 						sessionDir: after.childSessionDir,
+						sessionFile: after.childSessionFile,
+						sessionId: afterChild.runtime.session.sessionId,
 						generation: 1,
 						assertCurrent: () => {
 							if (afterAbort.signal.aborted) throw new Error("host request authority was revoked");
@@ -1627,7 +1641,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("closes the exact parent-scoped daemon runtime when a retained subagent is deleted", async () => {
+	it("rejects stale or missing daemon runtime objects without destructive authority", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -1637,9 +1651,7 @@ describe("daemon mode helpers", () => {
 		const parentState = makeState("parent");
 		parentState.runtime = {
 			...parentState.runtime,
-			session: {
-				sessionManager: { getSessionArtifactDir: () => undefined },
-			},
+			session: { sessionManager: { getSessionArtifactDir: () => undefined } },
 		} as ActiveSessionState["runtime"];
 		const childState = makeState("child", parentState.activeSessionId);
 		const foreignChildState = makeState("foreign-child", "other-parent");
@@ -1663,31 +1675,32 @@ describe("daemon mode helpers", () => {
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			closeSession: typeof closeSession;
-			createSubagentRuntimeHost(parent: ActiveSessionState): {
-				deleteRlmSubagentRuntime(childId: string, session: ActiveSessionState["runtime"]["session"]): Promise<void>;
-			};
+			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
 		};
 		internals.sessions.set(childState.activeSessionId, childState);
 		internals.sessions.set(foreignChildState.activeSessionId, foreignChildState);
 		internals.closeSession = closeSession;
-
+		const host = internals.createSubagentRuntimeHost(parentState);
 		const staleParentReference = {
 			disposeAsync: vi.fn(async () => {}),
 		} as unknown as ActiveSessionState["runtime"]["session"];
-		const host = internals.createSubagentRuntimeHost(parentState);
-		await host.deleteRlmSubagentRuntime("child-1", staleParentReference);
 
-		expect(closeSession).toHaveBeenCalledOnce();
-		expect(closeSession).toHaveBeenCalledWith(childState, "killed", false);
-		expect(closeSession).not.toHaveBeenCalledWith(foreignChildState, expect.anything());
+		await expect(host.deleteRlmSubagentRuntime("child-1", staleParentReference)).rejects.toMatchObject({
+			name: "RlmSubagentHostDeletionError",
+			phase: "precommit",
+		});
+		expect(closeSession).not.toHaveBeenCalled();
 		expect(childSession.disposeAsync).not.toHaveBeenCalled();
-		expect(staleParentReference.disposeAsync).toHaveBeenCalledOnce();
+		expect(staleParentReference.disposeAsync).not.toHaveBeenCalled();
 
 		const missingSession = {
 			disposeAsync: vi.fn(async () => {}),
 		} as unknown as ActiveSessionState["runtime"]["session"];
-		await host.deleteRlmSubagentRuntime("missing-child", missingSession);
-		expect(missingSession.disposeAsync).toHaveBeenCalledOnce();
+		await expect(host.deleteRlmSubagentRuntime("missing-child", missingSession)).rejects.toMatchObject({
+			name: "RlmSubagentHostDeletionError",
+			phase: "precommit",
+		});
+		expect(missingSession.disposeAsync).not.toHaveBeenCalled();
 	});
 
 	it("cancels child jobs when deletion joins an in-flight passivation close", async () => {
@@ -7826,13 +7839,23 @@ describe("daemon mode helpers", () => {
 			};
 			parentSession.deleteInactiveRlmSubagent = async (childId) => {
 				if (childId !== fixture.childId) return "not_found";
+				const persisted = JSON.parse(
+					readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8"),
+				) as { sessionId: string };
 				await (
 					fixture.daemon as unknown as {
 						createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
 					}
 				)
 					.createSubagentRuntimeHost(parentState)
-					.deleteRlmSubagentRuntime(childId);
+					.deleteRlmSubagentRuntime(childId, undefined, {
+						childId,
+						sessionDir: fixture.childSessionDir,
+						sessionFile: fixture.childSessionFile,
+						sessionId: persisted.sessionId,
+						generation: 1,
+						assertCurrent: () => {},
+					});
 				return "deleted";
 			};
 			const client = makeClient("client-1", parentState.activeSessionId);

@@ -433,6 +433,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			// newer map-resident incarnation intact.
 			if (
 				!authority ||
+				typeof session.sessionFile !== "string" ||
 				dirname(session.sessionFile) !== authority.sessionDir ||
 				session.sessionFile !== authority.sessionFile ||
 				session.sessionId !== authority.sessionId
