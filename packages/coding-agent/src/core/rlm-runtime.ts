@@ -308,6 +308,6 @@ export interface SubagentRuntimeHost {
 		childId: string,
 		session?: AgentSession,
 		authority?: RlmSubagentDeletionAuthority,
-	): Promise<RlmSubagentHostDeletionResult | void>;
+	): Promise<RlmSubagentHostDeletionResult | undefined>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
 }
