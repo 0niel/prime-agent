@@ -98,8 +98,6 @@ termux-camera-photo out.jpg   # Take photo
 - Use `pkg install termux-api` for the command-line tools
 - Storage permission needed for `/storage/emulated/0` access
 
-```bash
-
 ## Limitations
 
 - **No image clipboard**: Termux clipboard API only supports text
@@ -111,10 +109,12 @@ termux-camera-photo out.jpg   # Take photo
 ### Clipboard not working
 
 Ensure both apps are installed:
+
 1. Termux (from GitHub or F-Droid)
 2. Termux:API (from GitHub or F-Droid)
 
 Then install the CLI tools:
+
 ```bash
 pkg install termux-api
 ```
