@@ -1235,7 +1235,13 @@ describe("daemon mode helpers", () => {
 
 			const legacy = JSON.parse(modern) as Record<string, unknown>;
 			delete legacy.sessionId;
-			writeFileSync(registryPath, `${JSON.stringify(legacy)}\n`);
+			const legacyRegistry = `${JSON.stringify(legacy)}\n`;
+			writeFileSync(registryPath, legacyRegistry);
+			await expect(host.deleteRlmSubagentRuntime("missing-child")).rejects.toMatchObject({
+				name: "RlmSubagentHostDeletionError",
+				phase: "precommit",
+			});
+			expect(readFileSync(registryPath, "utf8")).toBe(legacyRegistry);
 			await expect(host.deleteRlmSubagentRuntime(fixture.childId)).rejects.toMatchObject({
 				name: "RlmSubagentHostDeletionError",
 				phase: "precommit",
@@ -1271,6 +1277,59 @@ describe("daemon mode helpers", () => {
 				status: "deleted",
 				sessionId: child.runtime.session.sessionId,
 			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rechecks authority after strict registry absence proof", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-absence-authority-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				readCompleteRlmSubagentRegistryForDeletion(parent: ActiveSessionState): Promise<unknown>;
+				closeSession: ReturnType<typeof vi.fn>;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const before = readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8");
+			const originalRead = internals.readCompleteRlmSubagentRegistryForDeletion.bind(internals);
+			let beginStrictRead!: () => void;
+			const strictReadStarted = new Promise<void>((resolve) => {
+				beginStrictRead = resolve;
+			});
+			let releaseStrictRead!: () => void;
+			const strictReadGate = new Promise<void>((resolve) => {
+				releaseStrictRead = resolve;
+			});
+			vi.spyOn(internals, "readCompleteRlmSubagentRegistryForDeletion").mockImplementation(async (state) => {
+				beginStrictRead();
+				await strictReadGate;
+				return originalRead(state);
+			});
+			const close = vi.spyOn(internals, "closeSession");
+			let revoked = false;
+			const deletion = internals
+				.createSubagentRuntimeHost(parent)
+				.deleteRlmSubagentRuntime("missing-child", undefined, {
+					childId: "missing-child",
+					sessionDir: join(tempDir, "missing-child"),
+					generation: 1,
+					assertCurrent: () => {
+						if (revoked) throw new Error("host request authority was revoked");
+					},
+				});
+
+			await strictReadStarted;
+			revoked = true;
+			releaseStrictRead();
+			await expect(deletion).rejects.toMatchObject({
+				name: "RlmSubagentHostDeletionError",
+				phase: "precommit",
+			});
+			expect(readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")).toBe(before);
+			expect(close).not.toHaveBeenCalled();
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -8233,6 +8292,33 @@ describe("daemon mode helpers", () => {
 			expect(result.data).toEqual({ deleted: false, reason: "running" });
 			expect(deleteSpy).not.toHaveBeenCalled();
 			expect(internals.sessions.get(nestedState.activeSessionId)).toBe(nestedState);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports stale when inactive cleanup preserves a newer child", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-stale-rlm-delete-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const parentSession = parent.runtime.session as unknown as {
+				deleteInactiveRlmSubagent: ReturnType<typeof vi.fn>;
+			};
+			parentSession.deleteInactiveRlmSubagent = vi.fn(async () => "preserved_newer" as const);
+
+			const result = (await internals.handleCommand(makeClient("client-1", parent.activeSessionId), {
+				type: "delete_rlm_subagent",
+				activeSessionId: parent.activeSessionId,
+				childId: fixture.childId,
+			})) as { data: { deleted: boolean; reason?: string } };
+
+			expect(result.data).toEqual({ deleted: false, reason: "stale" });
+			expect(parentSession.deleteInactiveRlmSubagent).toHaveBeenCalledOnce();
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

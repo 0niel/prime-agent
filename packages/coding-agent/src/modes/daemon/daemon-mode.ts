@@ -991,6 +991,7 @@ export class AgentDaemon {
 	 */
 	private async readCompleteRlmSubagentRegistryForDeletion(
 		parentState: ActiveSessionState,
+		allowLegacyRows = true,
 	): Promise<DeletionRlmSubagentRegistryEntry[] | undefined> {
 		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
 		if (!path) return undefined;
@@ -1027,6 +1028,7 @@ export class AgentDaemon {
 					typeof entry.sessionName !== "string" ||
 					typeof entry.sessionDir !== "string" ||
 					typeof entry.sessionFile !== "string" ||
+					(!allowLegacyRows && entry.sessionId === undefined) ||
 					(entry.sessionId !== undefined &&
 						(typeof entry.sessionId !== "string" || entry.sessionId.length === 0)) ||
 					typeof entry.parentSessionId !== "string" ||
@@ -2511,7 +2513,8 @@ export class AgentDaemon {
 					// A lenient listing may omit malformed historical rows. Absence authorizes
 					// cleanup, so require a complete registry read that also confirms no row.
 					if (state === undefined && persisted === undefined) {
-						const completeRegistry = await this.readCompleteRlmSubagentRegistryForDeletion(parentState);
+						const completeRegistry = await this.readCompleteRlmSubagentRegistryForDeletion(parentState, false);
+						authority?.assertCurrent();
 						if (!completeRegistry || completeRegistry.some((entry) => entry.childId === childId)) {
 							throw new Error("RLM subagent deletion registry cannot prove absence");
 						}
@@ -4365,6 +4368,7 @@ export class AgentDaemon {
 				return success(command.id, "delete_rlm_subagent", {
 					deleted: result === "deleted",
 					...(result === "running" ? { reason: "running" } : {}),
+					...(result === "preserved_newer" ? { reason: "stale" } : {}),
 				});
 			}
 

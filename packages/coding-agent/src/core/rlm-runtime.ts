@@ -39,7 +39,7 @@ export interface RlmListSubagentsResult {
 
 export interface RlmDeleteSubagentResult {
 	subagent: RlmSubagentRegistryEntry;
-	outcome?: "deleted" | "skipped_running";
+	outcome?: "deleted" | "skipped_running" | "preserved_newer";
 }
 
 export interface RlmModelMatch {

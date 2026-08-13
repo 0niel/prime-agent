@@ -358,6 +358,26 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("propagates preserved-newer deletion outcomes through the host handler", async () => {
+		const subagent = {
+			rlm_child_id: "recycled-child",
+			active_session_id: "new-session",
+			session_id: "new-session",
+			session_name: "recycled-worker",
+			session_dir: join(tempDir, "recycled-child"),
+			status: "running" as const,
+		};
+		const deleteHandler = createRlmDeleteSubagentHostHandler(async () => ({
+			subagent,
+			outcome: "preserved_newer",
+		}));
+
+		await expect(invokeHostRequestHandlerForTest(deleteHandler, { target: subagent.rlm_child_id })).resolves.toEqual({
+			subagent,
+			outcome: "preserved_newer",
+		});
+	});
+
 	it("persists RLM_DEPTH for a fresh session and reports the seeded depth", () => {
 		vi.stubEnv("RLM_DEPTH", "1");
 		try {
@@ -2528,7 +2548,10 @@ describe("AgentSession rlm recursion", () => {
 			status: "running" as const,
 		};
 
-		await expect(inspectable._deleteResolvedRlmSubagent(subagent)).resolves.toEqual({ subagent });
+		await expect(inspectable._deleteResolvedRlmSubagent(subagent)).resolves.toEqual({
+			subagent,
+			outcome: "preserved_newer",
+		});
 		expect(deleteRuntime).toHaveBeenCalledWith(childId, stale);
 		expect(inspectable._activeRlmChildRuns.get(childId)?.session).toBe(newer);
 		expect(inspectable._deletedRlmChildIds.has(childId)).toBe(false);
@@ -2574,11 +2597,45 @@ describe("AgentSession rlm recursion", () => {
 			status: "completed" as const,
 		};
 
-		await expect(inspectable._deleteResolvedRlmSubagent(subagent)).resolves.toEqual({ subagent });
+		await expect(inspectable._deleteResolvedRlmSubagent(subagent)).resolves.toEqual({
+			subagent,
+			outcome: "preserved_newer",
+		});
 		expect(deleteRuntime).toHaveBeenCalledWith(childId, stale);
 		expect(inspectable._rlmChildSessions.get(childId)).toBe(newer);
 		expect(inspectable._deletedRlmChildIds.has(childId)).toBe(false);
 		expect(childUpdates).toEqual([]);
+	});
+
+	it("reports preserved-newer when inactive cleanup finds a replacement", async () => {
+		const childId = "recycled-inactive-child";
+		const staleDir = join(tempDir, "stale-inactive");
+		const stale = { _rlmSessionDir: staleDir, sessionId: "stale" } as unknown as AgentSession;
+		const newer = {
+			_rlmSessionDir: join(tempDir, "new-inactive"),
+			sessionId: "new",
+			dispose: vi.fn(),
+		} as unknown as AgentSession;
+		let root!: AgentSession;
+		const deleteRuntime = vi.fn(async () => {
+			(root as unknown as InspectableRlmSession)._rlmChildSessions.set(childId, newer);
+			return { deletionDurability: "stale" as const };
+		});
+		root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		const inspectable = root as unknown as InspectableRlmSession;
+		inspectable._rlmChildSessions.set(childId, stale);
+
+		await expect(root.deleteInactiveRlmSubagent(childId)).resolves.toBe("preserved_newer");
+		expect(deleteRuntime).toHaveBeenCalledWith(childId, stale, expect.any(Object));
+		expect(inspectable._rlmChildSessions.get(childId)).toBe(newer);
+		expect(inspectable._deletedRlmChildIds.has(childId)).toBe(false);
 	});
 
 	it("deletes only inactive RLM children through the explicit inactive path", async () => {

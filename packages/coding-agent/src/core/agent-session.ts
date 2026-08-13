@@ -9377,7 +9377,7 @@ export class AgentSession {
 	async deleteInactiveRlmSubagent(
 		childId: string,
 		isExternallyRunning: () => boolean = () => false,
-	): Promise<"deleted" | "not_found" | "running"> {
+	): Promise<"deleted" | "not_found" | "running" | "preserved_newer"> {
 		const isRunning = (): boolean => {
 			const status = this._activeRlmChildRuns.get(childId)?.status;
 			return status === "queued" || status === "running" || isExternallyRunning();
@@ -9412,7 +9412,9 @@ export class AgentSession {
 			}
 			return this._deleteResolvedRlmSubagent(subagent, authority);
 		});
-		return result.outcome === "skipped_running" ? "running" : "deleted";
+		if (result.outcome === "skipped_running") return "running";
+		if (result.outcome === "preserved_newer") return "preserved_newer";
+		return "deleted";
 	}
 
 	/** Delete a running, retained, or passive direct child selected from this parent session's registry. */
@@ -9752,7 +9754,7 @@ export class AgentSession {
 						this._activeRlmChildRuns.get(childId) !== run ||
 						run.session !== liveSession
 					) {
-						return { subagent };
+						return { subagent, outcome: "preserved_newer" };
 					}
 				} catch (error) {
 					if (this._disposed || this._disposing) {
@@ -9807,7 +9809,7 @@ export class AgentSession {
 				this._activeRlmChildRuns.has(childId) ||
 				this._rlmChildSessions.get(childId) !== retained
 			) {
-				return { subagent };
+				return { subagent, outcome: "preserved_newer" };
 			}
 		} catch (error) {
 			if (this._disposed || this._disposing) {
