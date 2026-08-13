@@ -732,9 +732,11 @@ describe("daemon catalog selector resolution", () => {
 				`${[
 					JSON.stringify({ type: "message", message: { role: "user", content: payload } }),
 					JSON.stringify({ type: "session_info", name: payload }),
+					// Hostile taskState must be dropped rather than treated as a free-text
+					// field. The allowed wire enum is tested below.
 					JSON.stringify({
 						type: "agent_status",
-						status: { summary: payload, taskState: "completed", basedOnMessageCount: 1 },
+						status: { summary: payload, taskState: payload, basedOnMessageCount: 1 },
 					}),
 				].join("\n")}\n`,
 			);
@@ -752,11 +754,11 @@ describe("daemon catalog selector resolution", () => {
 					name: expect.any(String),
 					agentStatus: expect.objectContaining({
 						summary: expect.any(String),
-						taskState: "completed",
 						basedOnMessageCount: 1,
 					}),
 				}),
 			);
+			expect(session?.agentStatus?.taskState).toBeUndefined();
 			const serialized = JSON.stringify({
 				id: "metadata-response",
 				data: {
@@ -769,9 +771,41 @@ describe("daemon catalog selector resolution", () => {
 					agentStatus: session.agentStatus,
 				},
 			});
-			expect(Buffer.byteLength(serialized, "ascii")).toBeLessThanOrEqual(256 * 1024);
+			// The helper uses Python json.dumps(..., ensure_ascii=True), including
+			// surrogate-pair escaping for astral code points. Assert that exact
+			// envelope representation, not a UTF-8 or lossy Node "ascii" estimate.
+			const ensureAscii = serialized.replace(/[\u0080-\u{10ffff}]/gu, (character) => {
+				const codePoint = character.codePointAt(0)!;
+				if (codePoint <= 0xffff) return `\\u${codePoint.toString(16).padStart(4, "0")}`;
+				const offset = codePoint - 0x10000;
+				return `\\u${(0xd800 + (offset >> 10)).toString(16)}\\u${(0xdc00 + (offset & 0x3ff)).toString(16)}`;
+			});
+			expect(Buffer.byteLength(ensureAscii, "ascii")).toBeLessThanOrEqual(256 * 1024);
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("retains only allowed typed agent task states", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-agent-status-schema-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		appendFileSync(
+			parent.getSessionFile()!,
+			`${[
+				JSON.stringify({
+					type: "agent_status",
+					status: { summary: "valid", taskState: "completed", basedOnMessageCount: 1 },
+				}),
+			].join("\n")}\n`,
+		);
+		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([
+			expect.objectContaining({
+				agentStatus: { summary: "valid", taskState: "completed", basedOnMessageCount: 1 },
+			}),
+		]);
+		rmSync(root, { recursive: true, force: true });
 	});
 
 	it("skips junk root candidates but rejects identified malformed and duplicate roots", async () => {
@@ -783,7 +817,28 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(join(sessionDir, "blank.jsonl"), "\n");
 		writeFileSync(join(sessionDir, "junk.jsonl"), "not json\n");
 		writeFileSync(join(sessionDir, "event.jsonl"), '{"type":"message","id":"junk"}\n');
+		// An oversized root is skippable only when its bounded prefix is
+		// demonstrably unrelated, including incomplete unrelated junk. A purported
+		// session or identifier claim remains topology-relevant and fails closed.
+		writeFileSync(join(sessionDir, "oversized-junk.jsonl"), `not-json-${"x".repeat(300 * 1024)}`);
 		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([expect.objectContaining({ id: "parent" })]);
+		rmSync(join(sessionDir, "oversized-junk.jsonl"));
+		writeFileSync(join(sessionDir, "oversized-event.jsonl"), `{"type":"message","body":"${"x".repeat(300 * 1024)}`);
+		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([expect.objectContaining({ id: "parent" })]);
+		rmSync(join(sessionDir, "oversized-event.jsonl"));
+		writeFileSync(
+			join(sessionDir, "oversized-session.jsonl"),
+			`{"type":"session","id":"claimed","padding":"${"x".repeat(300 * 1024)}`,
+		);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(join(sessionDir, "oversized-session.jsonl"));
+		writeFileSync(join(sessionDir, "oversized-id.jsonl"), `{"id":"claimed","padding":"${"x".repeat(300 * 1024)}`);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(join(sessionDir, "oversized-id.jsonl"));
 		writeFileSync(join(sessionDir, "bad.jsonl"), '{"type":"session","id":"bad","rlmDepth":"oops"}\n');
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
 		rmSync(join(sessionDir, "bad.jsonl"));
