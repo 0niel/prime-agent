@@ -9863,6 +9863,7 @@ export class AgentSession {
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
 			try {
+				throwIfCancelled();
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
 				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
@@ -9995,7 +9996,9 @@ export class AgentSession {
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
-				if (!run.detachedDeletion) {
+				// A never-admitted spawn already surfaced this outcome to its caller as the
+				// admission exception; a parent notice would duplicate it into the transcript.
+				if (admissionCommitted && !run.detachedDeletion) {
 					if (run.status === "error") {
 						await deliverTerminalMessageToParent(
 							createRlmChildFailureMessage({
@@ -10043,6 +10046,11 @@ export class AgentSession {
 					} catch {
 						// A failed best-effort retry remains available through the retained cleanup maps.
 					}
+				}
+				// Nothing retains a never-admitted cancelled child, so its dir would be a
+				// permanent orphan. Removal happens after the dispose/release paths above.
+				if (!admissionCommitted && run.status === "cancelled" && !run.detachedDeletion) {
+					rmSync(childSessionDir, { recursive: true, force: true });
 				}
 			} finally {
 				if (run.detachedDeletion && childRuntime) {
