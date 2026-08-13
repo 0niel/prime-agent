@@ -259,6 +259,7 @@ describe("AgentSession rlm recursion", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		session?.dispose();
 		session = undefined;
 		rmSync(tempDir, { recursive: true, force: true });
@@ -3619,6 +3620,7 @@ describe("AgentSession RLM session dir", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		session?.dispose();
 		session = undefined;
 		rmSync(tempDir, { recursive: true, force: true });
