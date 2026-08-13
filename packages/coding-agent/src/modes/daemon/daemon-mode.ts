@@ -1103,10 +1103,12 @@ export class AgentDaemon {
 		const legacyResidentUpgrade = entry.sessionId === undefined && authority === undefined && residentMatchesHeader;
 		if (!authorityMatchesEntry && !(authority === undefined && residentMatchesHeader)) return "unknown";
 		if (entry.sessionId === undefined && !legacyResidentUpgrade) return "unknown";
-		if (entry.status === "deleted") {
+		if (entry.status === "deleted" && !legacyResidentUpgrade) {
 			authority?.assertCurrent();
 			return "tombstoned";
 		}
+		// A legacy deleted row also crosses the append boundary once to persist
+		// the exact resident identity; subsequent retries observe the modern row.
 		// The header and authority are both checked immediately before the
 		// synchronous append/fsync boundary. Once append starts, finish it.
 		authority?.assertCurrent();

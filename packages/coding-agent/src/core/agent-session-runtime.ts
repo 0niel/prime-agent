@@ -413,31 +413,51 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			// match alone cannot authorize disposing a supplied same-id incarnation.
 			throw new Error("RLM subagent runtime incarnation is no longer resident");
 		}
-		// A child id can be recycled after an older deletion attempt yields. The
-		// runtime metadata is assigned from CreateRlmSubagentRuntimeOptions before
-		// this map becomes addressable, so it is the authoritative incarnation
-		// fence for inline teardown; never treat absent metadata as a match.
+		// A child id can be recycled after an older deletion attempt yields. Any
+		// present coordinator authority must name a complete saved-session
+		// incarnation before it can destroy either the resident or a retained object.
 		if (
 			authority &&
 			(authority.childId !== childId ||
 				runtime.metadata.rlmChildId !== authority.childId ||
-				runtime.metadata.sessionDir !== authority.sessionDir)
+				typeof authority.sessionFile !== "string" ||
+				authority.sessionFile.length === 0 ||
+				typeof authority.sessionId !== "string" ||
+				authority.sessionId.length === 0)
+		) {
+			authority.assertCurrent();
+			throw new Error("RLM subagent deletion authority does not match runtime incarnation");
+		}
+		if (runtime.session !== session) {
+			// Dispose only the exact retained object named by the authority. Leave a
+			// newer map-resident incarnation intact.
+			if (
+				!authority ||
+				dirname(session.sessionFile) !== authority.sessionDir ||
+				session.sessionFile !== authority.sessionFile ||
+				session.sessionId !== authority.sessionId
+			) {
+				authority?.assertCurrent();
+				throw new Error("RLM subagent deletion does not match runtime incarnation");
+			}
+			authority.assertCurrent();
+			await session.disposeAsync();
+			return { deletionDurability: "absent" };
+		}
+		if (
+			authority &&
+			(runtime.metadata.sessionDir !== authority.sessionDir ||
+				runtime.session.sessionFile !== authority.sessionFile ||
+				runtime.session.sessionId !== authority.sessionId)
 		) {
 			authority.assertCurrent();
 			throw new Error("RLM subagent deletion authority does not match runtime incarnation");
 		}
 		authority?.assertCurrent();
-		if (runtime.session !== session) {
-			// The supplied object is the only stale incarnation we may touch. Leave
-			// the newer map resident intact.
-			if (!authority || dirname(session.sessionFile) !== authority.sessionDir) {
-				throw new Error("RLM subagent deletion does not match runtime incarnation");
-			}
-			await session.disposeAsync();
-			return { deletionDurability: "absent" };
-		}
-		this.subagentRuntimes.delete(childId);
 		await runtime.dispose();
+		// Disposal may yield while a newer runtime reuses the child id. Remove only
+		// the exact object this attempt fenced, and retain it for retry on failure.
+		if (this.subagentRuntimes.get(childId) === runtime) this.subagentRuntimes.delete(childId);
 		return { deletionDurability: "absent" };
 	}
 

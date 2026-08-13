@@ -38,6 +38,8 @@ type RuntimeSubagentMapAccess = {
 type StrictDeletionAuthority = {
 	childId: string;
 	sessionDir: string;
+	sessionFile: string;
+	sessionId: string;
 	generation: number;
 	assertCurrent: ReturnType<typeof vi.fn>;
 };
@@ -298,8 +300,8 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(secondDispose).toHaveBeenCalledTimes(1);
 	});
 
-	it("deletes exact and replaced in-process RLM child runtimes and retained sessions", async () => {
-		const { runtime } = await createRuntimeForTest(() => {});
+	it("deletes exact inline runtimes and fences stale or unowned retained sessions", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
 		const childSession = {} as AgentSession;
 		const disposeRuntime = vi.fn(async () => {});
 		const childRuntime = { session: childSession, dispose: disposeRuntime } as unknown as AgentSessionRuntime;
@@ -316,26 +318,51 @@ describe("AgentSessionRuntime characterization", () => {
 		const replacedRuntime = {
 			session: currentSession,
 			dispose: disposeReplacedRuntime,
+			metadata: { rlmChildId: "replaced-child", sessionDir: join(tempDir, "current-incarnation") },
 		} as unknown as AgentSessionRuntime;
 		const disposeStaleSession = vi.fn(async () => {});
-		const staleSession = { disposeAsync: disposeStaleSession } as unknown as AgentSession;
+		const staleSessionDir = join(tempDir, "stale-incarnation");
+		const staleSessionFile = join(staleSessionDir, "stale.jsonl");
+		const staleSession = {
+			sessionFile: staleSessionFile,
+			sessionId: "stale-session",
+			disposeAsync: disposeStaleSession,
+		} as unknown as AgentSession;
 		runtimeWithSubagents.subagentRuntimes.set("replaced-child", replacedRuntime);
 
-		await runtime.deleteRlmSubagentRuntime("replaced-child", staleSession);
-
-		expect(disposeReplacedRuntime).toHaveBeenCalledOnce();
+		await expect(runtime.deleteRlmSubagentRuntime("replaced-child", staleSession)).rejects.toThrow(
+			"RLM subagent deletion does not match runtime incarnation",
+		);
+		expect(disposeStaleSession).not.toHaveBeenCalled();
+		const staleAuthority: StrictDeletionAuthority = {
+			childId: "replaced-child",
+			sessionDir: staleSessionDir,
+			sessionFile: staleSessionFile,
+			sessionId: staleSession.sessionId,
+			generation: 1,
+			assertCurrent: vi.fn(),
+		};
+		await runtime.deleteRlmSubagentRuntime("replaced-child", staleSession, staleAuthority);
 		expect(disposeStaleSession).toHaveBeenCalledOnce();
-		expect(runtimeWithSubagents.subagentRuntimes.has("replaced-child")).toBe(false);
+		expect(disposeReplacedRuntime).not.toHaveBeenCalled();
+		expect(runtimeWithSubagents.subagentRuntimes.get("replaced-child")).toBe(replacedRuntime);
 
 		const disposeRetained = vi.fn(async () => {});
 		const retainedSession = { disposeAsync: disposeRetained } as unknown as AgentSession;
-		await runtime.deleteRlmSubagentRuntime("retained-child", retainedSession);
-		expect(disposeRetained).toHaveBeenCalledOnce();
+		await expect(runtime.deleteRlmSubagentRuntime("retained-child", retainedSession)).rejects.toThrow(
+			"RLM subagent runtime incarnation is no longer resident",
+		);
+		expect(disposeRetained).not.toHaveBeenCalled();
 	});
 
 	it("rejects stale inline deletion authority for a recycled child id without mutating the current runtime", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest(() => {});
-		const oldSession = { disposeAsync: vi.fn(async () => {}) } as unknown as AgentSession;
+		const oldSessionDir = join(tempDir, "old-incarnation");
+		const oldSession = {
+			sessionFile: join(oldSessionDir, "old.jsonl"),
+			sessionId: "old-session",
+			disposeAsync: vi.fn(async () => {}),
+		} as unknown as AgentSession;
 		const currentSession = {} as AgentSession;
 		const disposeCurrent = vi.fn(async () => {});
 		const currentRuntime = {
@@ -347,7 +374,9 @@ describe("AgentSessionRuntime characterization", () => {
 		runtimeWithSubagents.subagentRuntimes.set("recycled-child", currentRuntime);
 		const authority: StrictDeletionAuthority = {
 			childId: "recycled-child",
-			sessionDir: join(tempDir, "old-incarnation"),
+			sessionDir: oldSessionDir,
+			sessionFile: join(oldSessionDir, "wrong.jsonl"),
+			sessionId: oldSession.sessionId,
 			generation: 1,
 			assertCurrent: vi.fn(),
 		};
@@ -364,9 +393,15 @@ describe("AgentSessionRuntime characterization", () => {
 
 	it("deletes an inline runtime only when its authority matches the current incarnation", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest(() => {});
-		const childSession = {} as AgentSession;
-		const disposeChild = vi.fn(async () => {});
 		const sessionDir = join(tempDir, "matching-incarnation");
+		const childSession = {
+			sessionFile: join(sessionDir, "child.jsonl"),
+			sessionId: "matching-session",
+		} as AgentSession;
+		const disposeChild = vi
+			.fn<() => Promise<void>>()
+			.mockRejectedValueOnce(new Error("inline close failed once"))
+			.mockResolvedValueOnce(undefined);
 		const childRuntime = {
 			session: childSession,
 			dispose: disposeChild,
@@ -374,17 +409,35 @@ describe("AgentSessionRuntime characterization", () => {
 		} as unknown as AgentSessionRuntime;
 		const runtimeWithSubagents = runtime as unknown as RuntimeSubagentMapAccess;
 		runtimeWithSubagents.subagentRuntimes.set("matching-child", childRuntime);
+		const incompleteAuthority = {
+			childId: "matching-child",
+			sessionDir,
+			generation: 1,
+			assertCurrent: vi.fn(),
+		};
+		await expect(
+			runtime.deleteRlmSubagentRuntime("matching-child", childSession, incompleteAuthority),
+		).rejects.toThrow("RLM subagent deletion authority does not match runtime incarnation");
+		expect(disposeChild).not.toHaveBeenCalled();
+		expect(runtimeWithSubagents.subagentRuntimes.get("matching-child")).toBe(childRuntime);
+
 		const authority: StrictDeletionAuthority = {
 			childId: "matching-child",
 			sessionDir,
+			sessionFile: childSession.sessionFile,
+			sessionId: childSession.sessionId,
 			generation: 2,
 			assertCurrent: vi.fn(),
 		};
+		await expect(runtime.deleteRlmSubagentRuntime("matching-child", childSession, authority)).rejects.toThrow(
+			"inline close failed once",
+		);
+		expect(runtimeWithSubagents.subagentRuntimes.get("matching-child")).toBe(childRuntime);
 
 		await runtime.deleteRlmSubagentRuntime("matching-child", childSession, authority);
 
-		expect(authority.assertCurrent).toHaveBeenCalledTimes(2);
-		expect(disposeChild).toHaveBeenCalledOnce();
+		expect(authority.assertCurrent).toHaveBeenCalledTimes(4);
+		expect(disposeChild).toHaveBeenCalledTimes(2);
 		expect(runtimeWithSubagents.subagentRuntimes.has("matching-child")).toBe(false);
 	});
 

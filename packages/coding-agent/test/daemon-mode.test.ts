@@ -1202,6 +1202,23 @@ describe("daemon mode helpers", () => {
 				status: "deleted",
 				sessionId: child.runtime.session.sessionId,
 			});
+
+			// An already-deleted legacy row still needs one identity-upgrade append so
+			// retained cleanup retries can later prove the exact tombstoned incarnation.
+			writeFileSync(registryPath, `${JSON.stringify({ ...legacy, status: "deleted" })}\n`);
+			await expect(
+				internals.recordRlmSubagentDeletion(parent, fixture.childId, undefined, child.runtime.session),
+			).resolves.toBe("tombstoned");
+			const deletedEntries = readFileSync(registryPath, "utf8")
+				.trim()
+				.split(/\r?\n/u)
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			expect(deletedEntries).toHaveLength(2);
+			expect(deletedEntries[1]).toMatchObject({
+				childId: fixture.childId,
+				status: "deleted",
+				sessionId: child.runtime.session.sessionId,
+			});
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
