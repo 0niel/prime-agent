@@ -28,6 +28,9 @@ interface DirectoryIdentity {
 	readonly device: string;
 	readonly inode: string;
 }
+interface RetainedDirectory extends DirectoryIdentity {
+	readonly rootFd: number;
+}
 interface BindingRecord {
 	readonly authority: McpProjectTrustAuthority;
 	readonly revision: string;
@@ -43,13 +46,15 @@ const genuineAuthorities = new WeakSet<object>();
 const bindingRecords = new WeakMap<object, BindingRecord>();
 const releasedBindings = new WeakSet<object>();
 
-// A released binding unregisters before close so its finalizer can never close
-// a descriptor number subsequently reused by Node.
-const bindingFinalizer = new FinalizationRegistry<number>((rootFd) => {
-	try {
-		closeSync(rootFd);
-	} catch {
-		/* best effort only */
+// The authority owns its pinned policy descriptors. Binding records retain the
+// authority strongly, so these cannot close while a live binding can use one.
+const authorityFinalizer = new FinalizationRegistry<readonly number[]>((rootFds) => {
+	for (const rootFd of rootFds) {
+		try {
+			closeSync(rootFd);
+		} catch {
+			/* best effort only */
+		}
 	}
 });
 
@@ -78,6 +83,27 @@ function exactDirectoryIdentity(path: string): DirectoryIdentity | undefined {
 	}
 }
 
+function openRetainedDirectory(path: string): RetainedDirectory | undefined {
+	if (!isAbsolute(path) || resolve(path) !== path) return undefined;
+	let rootFd: number | undefined;
+	try {
+		rootFd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+		const opened = fstatSync(rootFd, { bigint: true });
+		if (!opened.isDirectory()) throw new Error("not a directory");
+		const identity = exactDirectoryIdentity(path);
+		if (!identity || opened.dev.toString() !== identity.device || opened.ino.toString() !== identity.inode)
+			throw new Error("directory changed during policy capture");
+		return { ...identity, rootFd };
+	} catch {
+		if (rootFd !== undefined)
+			try {
+				closeSync(rootFd);
+			} catch {
+				/* best effort only */
+			}
+		return undefined;
+	}
+}
 function digestSnapshot(revision: string, directories: readonly DirectoryIdentity[]): string {
 	return createHash("sha256")
 		.update(revision)
@@ -88,17 +114,20 @@ function digestSnapshot(revision: string, directories: readonly DirectoryIdentit
 function sameIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
 	return left.canonicalPath === right.canonicalPath && left.device === right.device && left.inode === right.inode;
 }
-function retainedDescriptorMatches(record: BindingRecord): boolean {
+function retainedDirectoryMatches(identity: DirectoryIdentity, rootFd: number): boolean {
 	try {
-		const current = fstatSync(record.rootFd, { bigint: true });
+		const current = fstatSync(rootFd, { bigint: true });
 		return (
 			current.isDirectory() &&
-			current.dev.toString() === record.identity.device &&
-			current.ino.toString() === record.identity.inode
+			current.dev.toString() === identity.device &&
+			current.ino.toString() === identity.inode
 		);
 	} catch {
 		return false;
 	}
+}
+function retainedDescriptorMatches(record: BindingRecord): boolean {
+	return retainedDirectoryMatches(record.identity, record.rootFd);
 }
 
 /**
@@ -126,12 +155,7 @@ export function releaseMcpProjectTrustBinding(binding: unknown): void {
 	const record = bindingRecords.get(binding);
 	if (!record) return;
 	releasedBindings.add(binding);
-	bindingFinalizer.unregister(binding);
-	try {
-		closeSync(record.rootFd);
-	} catch {
-		/* idempotent and redacted */
-	}
+	bindingRecords.delete(binding);
 }
 
 export function createMcpProjectTrustAuthority(input: McpProjectTrustAuthorityInput): McpProjectTrustAuthority {
@@ -139,71 +163,58 @@ export function createMcpProjectTrustAuthority(input: McpProjectTrustAuthorityIn
 	const requestedDirectories = Array.isArray(input.allowedProjectDirectories)
 		? [...input.allowedProjectDirectories]
 		: [];
-	const identities = requestedDirectories.map((directory) =>
-		typeof directory === "string" ? exactDirectoryIdentity(directory) : undefined,
-	);
+	const retained = supportsRetainedDirectoryFd()
+		? requestedDirectories.map((directory) =>
+				typeof directory === "string" ? openRetainedDirectory(directory) : undefined,
+			)
+		: [];
 	const valid =
 		supportsRetainedDirectoryFd() &&
 		revision.length > 0 &&
-		identities.every((identity): identity is DirectoryIdentity => identity !== undefined) &&
-		new Set(identities.map((identity) => identity.canonicalPath)).size === identities.length;
-	const snapshot = valid ? Object.freeze([...identities]) : Object.freeze([] as DirectoryIdentity[]);
+		retained.every((identity): identity is RetainedDirectory => identity !== undefined) &&
+		new Set(retained.map((identity) => identity.canonicalPath)).size === retained.length;
+	if (!valid) {
+		for (const identity of retained) {
+			if (identity)
+				try {
+					closeSync(identity.rootFd);
+				} catch {
+					/* best effort only */
+				}
+		}
+	}
+	const snapshot = valid
+		? Object.freeze([...retained] as RetainedDirectory[])
+		: Object.freeze([] as RetainedDirectory[]);
 	const snapshotDigest = digestSnapshot(revision, snapshot);
 	const bindings = new WeakSet<object>();
-	const localRecords = new WeakMap<object, BindingRecord>();
 	const authority: McpProjectTrustAuthority = Object.freeze({
 		authorizeProjectDirectory(projectDirectory: string): McpProjectTrustAuthorization {
 			const requested = typeof projectDirectory === "string" ? exactDirectoryIdentity(projectDirectory) : undefined;
-			if (!requested || !snapshot.some((approved) => sameIdentity(approved, requested))) return DENIED;
-			let rootFd: number | undefined;
-			try {
-				// This open is adjacent to the exact identity check. Its fstat must
-				// still be the authorized device/inode before a binding is minted.
-				rootFd = openSync(
-					requested.canonicalPath,
-					constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-				);
-				const opened = fstatSync(rootFd, { bigint: true });
-				if (
-					!opened.isDirectory() ||
-					opened.dev.toString() !== requested.device ||
-					opened.ino.toString() !== requested.inode
-				) {
-					closeSync(rootFd);
-					return DENIED;
-				}
-				const binding = Object.freeze(Object.create(null)) as McpProjectTrustBinding;
-				const record: BindingRecord = Object.freeze({
-					authority,
-					revision,
-					digest: snapshotDigest,
-					identity: requested,
-					rootFd,
-				});
-				bindings.add(binding);
-				localRecords.set(binding, record);
-				bindingRecords.set(binding, record);
-				bindingFinalizer.register(binding, rootFd, binding);
-				return Object.freeze({ kind: "granted", binding });
-			} catch {
-				if (rootFd !== undefined)
-					try {
-						closeSync(rootFd);
-					} catch {
-						/* redacted */
-					}
-				return DENIED;
-			}
+			const approved = requested ? snapshot.find((candidate) => sameIdentity(candidate, requested)) : undefined;
+			if (!requested || !approved || !retainedDirectoryMatches(approved, approved.rootFd)) return DENIED;
+			const binding = Object.freeze(Object.create(null)) as McpProjectTrustBinding;
+			const record: BindingRecord = Object.freeze({
+				authority,
+				revision,
+				digest: snapshotDigest,
+				identity: approved,
+				rootFd: approved.rootFd,
+			});
+			bindings.add(binding);
+			bindingRecords.set(binding, record);
+			return Object.freeze({ kind: "granted", binding });
 		},
 		validateBinding(binding: unknown): McpProjectTrustBindingValidation {
 			if (typeof binding !== "object" || binding === null || !bindings.has(binding) || releasedBindings.has(binding))
 				return BINDING_DENIED;
-			const record = localRecords.get(binding);
+			const record = bindingRecords.get(binding);
 			const currentSnapshot = snapshot.map(({ canonicalPath }) => exactDirectoryIdentity(canonicalPath));
 			if (currentSnapshot.some((identity) => identity === undefined)) return BINDING_DENIED;
 			const current = currentSnapshot as DirectoryIdentity[];
 			if (
 				!record ||
+				record.authority !== authority ||
 				!retainedDescriptorMatches(record) ||
 				record.revision !== revision ||
 				record.digest !== snapshotDigest ||
@@ -216,5 +227,6 @@ export function createMcpProjectTrustAuthority(input: McpProjectTrustAuthorityIn
 		},
 	});
 	genuineAuthorities.add(authority);
+	if (snapshot.length > 0) authorityFinalizer.register(authority, Object.freeze(snapshot.map(({ rootFd }) => rootFd)));
 	return authority;
 }
