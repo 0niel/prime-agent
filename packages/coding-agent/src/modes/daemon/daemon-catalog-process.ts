@@ -241,6 +241,13 @@ export function setCatalogAfterTrustedHeaderForTest(hook: ((path: string) => voi
 	afterTrustedHeaderForTest = hook;
 }
 
+/** Test-only helper launch override for terminal-path protocol tests. */
+let catalogHelperLaunchForTest: { command: string; args: string[] } | undefined;
+/** @internal */
+export function setCatalogHelperLaunchForTest(launch: { command: string; args: string[] } | undefined): void {
+	catalogHelperLaunchForTest = launch;
+}
+
 type TrustedReadMode = "read" | "header" | "stat";
 
 const TRUSTED_READ_TIMEOUT_MS = 5_000;
@@ -264,8 +271,10 @@ class TrustedReadSession {
 	private exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
 	private readonly stdoutFinished: Promise<void>;
 	private resolveStdoutFinished!: () => void;
-	private readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
-	private resolveExited!: (result: { code: number | null; signal: NodeJS.Signals | null }) => void;
+	/** Resolves for every terminal child-process path, including failed spawn. */
+	private readonly terminated: Promise<void>;
+	private resolveTerminated!: () => void;
+	private terminationSettled = false;
 
 	constructor(private readonly roots: ManagedRoots) {
 		const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "ignore", roots.session.fd];
@@ -273,16 +282,17 @@ class TrustedReadSession {
 		this.stdoutFinished = new Promise((resolveFinished) => {
 			this.resolveStdoutFinished = resolveFinished;
 		});
-		this.exited = new Promise((resolveExited) => {
-			this.resolveExited = resolveExited;
+		this.terminated = new Promise((resolveTerminated) => {
+			this.resolveTerminated = resolveTerminated;
 		});
-		this.child = spawn(
-			process.execPath === process.env.PRIME_AGENT_KERNEL_PYTHON
-				? process.execPath
-				: (process.env.PRIME_AGENT_KERNEL_PYTHON ?? "python3"),
-			["-I", "-c", OPENAT_READ_HELPER],
-			{ stdio, shell: false },
-		);
+		const launch = catalogHelperLaunchForTest ?? {
+			command:
+				process.execPath === process.env.PRIME_AGENT_KERNEL_PYTHON
+					? process.execPath
+					: (process.env.PRIME_AGENT_KERNEL_PYTHON ?? "python3"),
+			args: ["-I", "-c", OPENAT_READ_HELPER],
+		};
+		this.child = spawn(launch.command, launch.args, { stdio, shell: false });
 		helperSpawnCountForTest++;
 		this.child.stdin?.on("error", (error) =>
 			this.fail(new Error(`catalog openat helper write failed: ${String(error)}`)),
@@ -293,13 +303,25 @@ class TrustedReadSession {
 			this.resolveStdoutFinished();
 			if (this.stdoutBuffer !== "") this.fail(new Error("catalog openat helper left residual output"));
 		});
-		this.child.on("error", (error) => this.fail(new Error(`catalog openat helper failed: ${String(error)}`)));
+		this.child.on("error", (error) => {
+			// spawn() reports an invalid executable with error and close, but no exit.
+			// Settle cleanup here so failed spawn cannot strand authority FDs.
+			this.resolveStdoutFinished();
+			this.settleTermination();
+			this.fail(new Error(`catalog openat helper failed: ${String(error)}`));
+		});
 		this.child.on("exit", (code, signal) => {
 			this.exit = { code, signal };
-			this.resolveExited(this.exit);
+			this.settleTermination();
 			if (!this.stdinEnded || code !== 0 || signal !== null) {
 				this.fail(new Error(`catalog openat helper exited (${signal ?? code ?? "unknown"})`));
 			}
+		});
+		this.child.on("close", (code, signal) => {
+			this.exit ??= { code, signal };
+			// close is terminal for failed spawn and confirms stdio is complete.
+			this.resolveStdoutFinished();
+			this.settleTermination();
 		});
 	}
 
@@ -313,25 +335,36 @@ class TrustedReadSession {
 	async close(): Promise<void> {
 		await this.queue;
 		if (this.failure) {
-			// fail() sends SIGKILL only; wait before releasing the authority FDs.
-			await Promise.all([this.exited, this.stdoutFinished]);
-			return;
+			await this.awaitCleanup();
+			throw this.closeError(this.failure);
 		}
 		if (this.pending || this.stdoutBuffer !== "") {
 			this.fail(new Error("catalog openat helper has residual output"));
-			await Promise.all([this.exited, this.stdoutFinished]);
-			throw invalidFamilyTopology(
-				"descriptor-relative artifact read failed: catalog openat helper has residual output",
-			);
+			await this.awaitCleanup();
+			throw this.closeError(this.failure!);
 		}
 		this.stdinEnded = true;
 		this.child.stdin?.end();
-		const [exit] = await Promise.all([this.exited, this.stdoutFinished]);
-		if (this.failure || exit.code !== 0 || exit.signal !== null || this.stdoutBuffer !== "") {
+		await this.awaitCleanup();
+		if (this.failure || this.exit?.code !== 0 || this.exit?.signal !== null || this.stdoutBuffer !== "") {
 			const failure = this.failure ?? new Error("catalog openat helper did not exit cleanly");
 			if (!this.failure) this.fail(failure);
-			throw invalidFamilyTopology(`descriptor-relative artifact read failed: ${failure.message}`);
+			throw this.closeError(failure);
 		}
+	}
+
+	private settleTermination(): void {
+		if (this.terminationSettled) return;
+		this.terminationSettled = true;
+		this.resolveTerminated();
+	}
+
+	private async awaitCleanup(): Promise<void> {
+		await Promise.all([this.terminated, this.stdoutFinished]);
+	}
+
+	private closeError(failure: Error): Error {
+		return invalidFamilyTopology(`descriptor-relative artifact read failed: ${failure.message}`);
 	}
 
 	private async readSerialized(rawPath: string, maxBytes: number, mode: TrustedReadMode): Promise<TrustedFile> {
@@ -581,6 +614,8 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 	const roots = await SessionManager.listAll(undefined, effectiveSessionDir);
 	const authority = managedRoots(effectiveSessionDir);
 	const reader = new TrustedReadSession(authority);
+	let result: SessionInfo[] | undefined;
+	let traversalFailure: unknown;
 	try {
 		const sessions = new Map<string, FamilySession>();
 		const ids = new Map<string, string>();
@@ -632,16 +667,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 					childId.startsWith("sub-") &&
 					childId === basename(childSessionDir) &&
 					childSessionDir === join(writerChildrenRoot, childId);
-				// Versioned v2 registry records used the session id as their key but
-				// still allocated a direct sub-* writer directory. Require both facts;
-				// an equal-id synthetic record without that provenance is not trusted.
-				const legacyWriterPath =
-					trustedChild.persistedVersion !== undefined &&
-					trustedChild.persistedVersion < 3 &&
-					childId === trustedChild.id &&
-					basename(childSessionDir).startsWith("sub-") &&
-					dirname(childSessionDir) === writerChildrenRoot;
-				if (!modernWriterPath && !legacyWriterPath) {
+				if (!modernWriterPath) {
 					throw invalidFamilyTopology("registry child is outside the parent writer artifact layout");
 				}
 				if (trustedChild.persistedParentPath === undefined)
@@ -679,14 +705,25 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 			}
 		};
 		for (const root of [...sessions.values()]) await visit(root, 0, new Set());
-		return [...sessions.values()];
-	} finally {
-		try {
-			await reader.close();
-		} finally {
-			closeManagedRoots(authority);
-		}
+		result = [...sessions.values()];
+	} catch (error) {
+		traversalFailure = error;
 	}
+	let cleanupFailure: unknown;
+	try {
+		await reader.close();
+	} catch (error) {
+		cleanupFailure = error;
+	}
+	try {
+		closeManagedRoots(authority);
+	} catch (error) {
+		cleanupFailure ??= error;
+	}
+	// The traversal failure is authoritative; cleanup must not replace it.
+	if (traversalFailure !== undefined) throw traversalFailure;
+	if (cleanupFailure !== undefined) throw cleanupFailure;
+	return result!;
 }
 export async function listSavedSessionSiblings(sessionPath: string, sessionDir?: string): Promise<SessionInfo[]> {
 	const family = await listCatalogFamilySessions(sessionDir);
