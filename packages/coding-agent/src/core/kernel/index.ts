@@ -68,7 +68,6 @@ export interface HostRequestContext {
 	isCurrent(): boolean;
 }
 
-const hostRequestHandlerBrand = Symbol("hostRequestHandler");
 const factoryCreatedHostRequestHandlers = new WeakSet<object>();
 const dispatcherCreatedHostRequestContexts = new WeakSet<object>();
 
@@ -77,9 +76,6 @@ export type HostRequestHandler = (
 	payload: HostRequestPayload,
 	context: HostRequestContext,
 ) => Promise<Record<string, unknown>>;
-
-/** A factory-minted capability. Raw, copied-brand, and fabricated handlers are rejected. */
-type HostRequestHandlerCapability = HostRequestHandler & { readonly [hostRequestHandlerBrand]: true };
 
 function assertGenuineHostRequestContext(context: unknown): asserts context is HostRequestContext {
 	if (typeof context !== "object" || context === null || !dispatcherCreatedHostRequestContexts.has(context)) {
@@ -111,22 +107,18 @@ function mintHostRequestContext(controller: AbortController): HostRequestContext
  */
 export function createHostRequestHandler<
 	T extends (payload: HostRequestPayload, context: HostRequestContext) => Promise<Record<string, unknown>>,
->(implementation: T): HostRequestHandlerCapability {
+>(implementation: T): HostRequestHandler {
 	const handler = async (payload: HostRequestPayload, context: HostRequestContext) => {
 		assertGenuineHostRequestContext(context);
 		return implementation(payload, context);
 	};
 	factoryCreatedHostRequestHandlers.add(handler);
-	return Object.defineProperty(handler, hostRequestHandlerBrand, { value: true }) as HostRequestHandlerCapability;
+	return handler;
 }
 
-/** Reject copied-symbol and raw-function forgeries before they observe payload data. */
-export function assertHostRequestHandler(value: unknown): asserts value is HostRequestHandlerCapability {
-	if (
-		typeof value !== "function" ||
-		(value as Partial<HostRequestHandlerCapability>)[hostRequestHandlerBrand] !== true ||
-		!factoryCreatedHostRequestHandlers.has(value)
-	) {
+/** Reject raw-function forgeries before they observe payload data. */
+export function assertHostRequestHandler(value: unknown): asserts value is HostRequestHandler {
+	if (typeof value !== "function" || !factoryCreatedHostRequestHandlers.has(value)) {
 		throw new Error("host request handler is not a dispatcher-created capability");
 	}
 }
