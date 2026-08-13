@@ -10324,9 +10324,11 @@ export class AgentSession {
 												this._rlmChildSessions.set(run.id, finalizerSession);
 												this._rlmChildCleanupFailures.set(run.id, finalizerSubagent);
 											} else if (this._isPrecommitRlmSubagentDeletionFailure(releaseError)) {
-												// Keep the live host incarnation attached to the private unknown-
-												// durability lease so an exact-id retry can tombstone and close it.
+												// Keep the live host incarnation on an opaque retry lease. The
+												// completed-session map is public, so it must not project an
+												// uncommitted release as completed before an exact retry closes it.
 												this._rlmChildSessions.set(run.id, finalizerSession);
+												this._rlmChildDeletionQuarantines.set(run.id, finalizerSubagent);
 											}
 										}
 										throw releaseError;
