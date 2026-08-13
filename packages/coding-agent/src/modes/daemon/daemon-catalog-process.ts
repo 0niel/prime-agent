@@ -1072,12 +1072,17 @@ async function readLatestRegistry(
 	return [...latest.values()];
 }
 
-function listSessionCandidates(sessionDir: string, limit: number): Array<{ path: string; dev: string; ino: string }> {
+function listSessionCandidates(
+	sessionDir: string,
+	limit: number,
+): Array<{ path: string; dev: string; ino: string }> | undefined {
 	let directory: ReturnType<typeof opendirSync>;
 	try {
 		directory = opendirSync(sessionDir);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		// Preserve the catalog's missing-directory behavior without conflating an
+		// absent directory with unrelated enumeration failures.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
 	}
 
@@ -1123,6 +1128,7 @@ async function listCatalogFamilySessionsWithLimit(
 ): Promise<SessionInfo[]> {
 	const effectiveSessionDir = sessionDir ?? getSessionsDir();
 	const roots = listSessionCandidates(effectiveSessionDir, limit);
+	if (!roots) return [];
 	const authority = managedRoots(effectiveSessionDir);
 	const reader = new TrustedReadSession(authority);
 	let result: SessionInfo[] | undefined;
@@ -1159,6 +1165,11 @@ async function listCatalogFamilySessionsWithLimit(
 				if (++edges > MAX_RLM_FAMILY_EDGES) throw invalidFamilyTopology("family edge limit exhausted");
 				const childPath = entry.sessionFile as string;
 				if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
+				// Registry children share the same hard family-node budget. Fail before
+				// opening a new child descriptor when the exact limit is already full.
+				if (!sessions.has(childPath) && sessions.size >= limit) {
+					throw invalidFamilyTopology("family node limit exhausted");
+				}
 				const trustedChild = await readTrustedSession(childPath, reader);
 				if (basename(childPath, ".jsonl") !== trustedChild.id)
 					throw invalidFamilyTopology("registry child session file does not match its header id");
@@ -1210,7 +1221,6 @@ async function listCatalogFamilySessionsWithLimit(
 				) {
 					throw invalidFamilyTopology("family contains a conflicting duplicate");
 				}
-				if (!existing && sessions.size >= limit) throw invalidFamilyTopology("family node limit exhausted");
 				ids.set(child.id, child.path);
 				sessions.set(child.path, child);
 				await visit(child, depth + 1, childAncestors);

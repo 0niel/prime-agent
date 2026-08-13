@@ -884,6 +884,12 @@ describe("daemon catalog selector resolution", () => {
 			trustedOpens++;
 		});
 		try {
+			expect(() => listCatalogFamilySessionsWithLimitForTest(sessionDir, 0)).toThrow(
+				"Invalid catalog family node limit",
+			);
+			expect(() => listCatalogFamilySessionsWithLimitForTest(sessionDir, Number.MAX_SAFE_INTEGER)).toThrow(
+				"Invalid catalog family node limit",
+			);
 			// The per-call helper proves exact/over behavior without mutable global
 			// security state or creating 10,001 filesystem entries.
 			await expect(listCatalogFamilySessionsWithLimitForTest(sessionDir, 1)).resolves.toEqual([
@@ -898,6 +904,41 @@ describe("daemon catalog selector resolution", () => {
 			// No candidate descriptor may be opened, classified, or metadata-scanned
 			// after discovery proves the family is over the hard bound.
 			expect(trustedOpens).toBe(0);
+		} finally {
+			setCatalogBeforeTrustedOpenForTest(undefined);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("counts registry children in the exact family-node limit before descriptor reads", async () => {
+		const { root, sessionDir, parent } = createCatalogFamilyFixture();
+		try {
+			await expect(listCatalogFamilySessionsWithLimitForTest(sessionDir, 3)).resolves.toHaveLength(3);
+
+			const third = SessionManager.create(
+				root,
+				join(root, "session-artifacts", parent.getSessionId(), "sub-33333333"),
+			);
+			third.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
+			third.appendSessionInfo("third");
+			const registry = join(root, "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
+			appendFileSync(
+				registry,
+				`\n${JSON.stringify({
+					type: "rlm_subagent",
+					childId: "sub-33333333",
+					sessionFile: third.getSessionFile(),
+					status: "completed",
+				})}`,
+			);
+			let thirdOpened = false;
+			setCatalogBeforeTrustedOpenForTest((path) => {
+				if (path === third.getSessionFile()) thirdOpened = true;
+			});
+			await expect(listCatalogFamilySessionsWithLimitForTest(sessionDir, 3)).rejects.toThrow(
+				"family node limit exhausted",
+			);
+			expect(thirdOpened).toBe(false);
 		} finally {
 			setCatalogBeforeTrustedOpenForTest(undefined);
 			rmSync(root, { recursive: true, force: true });
@@ -943,13 +984,18 @@ describe("daemon catalog selector resolution", () => {
 		);
 		rmSync(boundaryType);
 
-		const boundaryId = join(sessionDir, "boundary-id-no-value.jsonl");
-		const idPrefix = `{"junk":0,"id"${" ".repeat(64 * 1024 - Buffer.byteLength('{"junk":0,"id"', "utf8"))}`;
-		writeFileSync(boundaryId, `${idPrefix}:"claimed","padding":"${"x".repeat(200 * 1024)}"}`);
-		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
-			"session header exceeds the trusted read limit",
-		);
-		rmSync(boundaryId);
+		for (const [name, beforeBoundary, suffix] of [
+			["boundary-id-no-colon", '{"junk":0,"id"', ':"claimed","padding":"'],
+			["boundary-id-colon-no-value", '{"junk":0,"id":', '"claimed","padding":"'],
+		] as const) {
+			const boundaryId = join(sessionDir, `${name}.jsonl`);
+			const idPrefix = `${beforeBoundary}${" ".repeat(64 * 1024 - Buffer.byteLength(beforeBoundary, "utf8"))}`;
+			writeFileSync(boundaryId, `${idPrefix}${suffix}${"x".repeat(200 * 1024)}"}`);
+			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+				"session header exceeds the trusted read limit",
+			);
+			rmSync(boundaryId);
+		}
 
 		// A complete demonstrably non-string type value remains unrelated; the
 		// following outer id is still scanned and cannot be hidden by that skip.
