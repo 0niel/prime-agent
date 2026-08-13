@@ -50,18 +50,19 @@ function createCatalogFamilyFixture() {
 	second.appendSessionInfo("second");
 	const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
 	mkdirSync(dirname(registry), { recursive: true });
+	// Registries key children by rlm child id ("sub-*"), never by session id.
 	writeFileSync(
 		registry,
 		[
 			{
 				type: "rlm_subagent",
-				childId: first.getSessionId(),
+				childId: "sub-first",
 				sessionFile: first.getSessionFile(),
 				status: "completed",
 			},
 			{
 				type: "rlm_subagent",
-				childId: second.getSessionId(),
+				childId: "sub-second",
 				sessionFile: second.getSessionFile(),
 				status: "completed",
 			},
@@ -98,6 +99,7 @@ describe("daemon catalog selector resolution", () => {
 		second.appendSessionInfo("second");
 		const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
 		mkdirSync(dirname(registry), { recursive: true });
+		// Legacy registry variant where childId happens to equal the session id.
 		writeFileSync(
 			registry,
 			[
@@ -179,13 +181,13 @@ describe("daemon catalog selector resolution", () => {
 			[
 				{
 					type: "rlm_subagent",
-					childId: first.getSessionId(),
+					childId: "sub-first",
 					sessionFile: first.getSessionFile(),
 					status: "completed",
 				},
 				{
 					type: "rlm_subagent",
-					childId: second.getSessionId(),
+					childId: "sub-second",
 					sessionFile: second.getSessionFile(),
 					status: "completed",
 				},
@@ -217,12 +219,14 @@ describe("daemon catalog selector resolution", () => {
 		const makeFixture = (name: string, omitRootDepth = false) => {
 			const root = mkdtempSync(join(tmpdir(), name));
 			const sessionDir = join(root, "sessions");
+			// The writer keeps a session's child registry beside its session dir:
+			// <dirname(sessionDir)>/session-artifacts/<session id>.
 			const registryPath = (parentId: string) => {
 				const parentFile = [rootSession, parent, first, second]
 					.find((manager) => manager.getSessionId() === parentId)
 					?.getSessionFile();
-				return parentFile && dirname(parentFile) !== sessionDir
-					? join(dirname(parentFile), "session-artifacts", parentId, "rlm-subagents.jsonl")
+				return parentFile
+					? join(dirname(dirname(parentFile)), "session-artifacts", parentId, "rlm-subagents.jsonl")
 					: join(root, "session-artifacts", parentId, "rlm-subagents.jsonl");
 			};
 			const writeRegistry = (parentId: string, entries: unknown[]) => {
@@ -255,22 +259,22 @@ describe("daemon catalog selector resolution", () => {
 			);
 			const first = create(
 				"first",
-				join(root, "session-artifacts", "parent", "sub-first"),
+				join(root, "session-artifacts", "root", "sub-parent", "sub-first"),
 				parent.getSessionFile(),
 				2,
 			);
 			const second = create(
 				"second",
-				join(root, "session-artifacts", "parent", "sub-second"),
+				join(root, "session-artifacts", "root", "sub-parent", "sub-second"),
 				parent.getSessionFile(),
 				2,
 			);
 			writeRegistry("root", [
-				{ type: "rlm_subagent", childId: "parent", sessionFile: parent.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: "sub-parent", sessionFile: parent.getSessionFile(), status: "completed" },
 			]);
 			writeRegistry("parent", [
-				{ type: "rlm_subagent", childId: "first", sessionFile: first.getSessionFile(), status: "completed" },
-				{ type: "rlm_subagent", childId: "second", sessionFile: second.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: "sub-first", sessionFile: first.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: "sub-second", sessionFile: second.getSessionFile(), status: "completed" },
 			]);
 			return { root, sessionDir, rootSession, parent, first, second, registryPath, writeRegistry };
 		};
@@ -289,16 +293,16 @@ describe("daemon catalog selector resolution", () => {
 
 		const cases: Array<[string, (fixture: ReturnType<typeof makeFixture>) => void]> = [
 			[
-				"id mismatch",
-				(fixture) =>
+				"basename mismatch",
+				(fixture) => {
+					// A session file whose name does not match its header id is not a
+					// writer-produced child and must not be authorized.
+					const alias = join(dirname(fixture.first.getSessionFile()!), "impostor.jsonl");
+					writeFileSync(alias, readFileSync(fixture.first.getSessionFile()!));
 					fixture.writeRegistry("parent", [
-						{
-							type: "rlm_subagent",
-							childId: "wrong",
-							sessionFile: fixture.first.getSessionFile(),
-							status: "completed",
-						},
-					]),
+						{ type: "rlm_subagent", childId: "sub-first", sessionFile: alias, status: "completed" },
+					]);
+				},
 			],
 			[
 				"parent mismatch",
@@ -415,7 +419,7 @@ describe("daemon catalog selector resolution", () => {
 				registry,
 				JSON.stringify({
 					type: "rlm_subagent",
-					childId: "child",
+					childId: "sub-child",
 					sessionFile: child.getSessionFile(),
 					status: "completed",
 				}),
@@ -554,17 +558,26 @@ describe("daemon catalog selector resolution", () => {
 			mkdirSync(dirname(registry), { recursive: true });
 			writeFileSync(
 				registry,
-				JSON.stringify({ type: "rlm_subagent", childId: "child", sessionFile: childFile, status: "completed" }),
+				JSON.stringify({ type: "rlm_subagent", childId: "sub-child", sessionFile: childFile, status: "completed" }),
 			);
 			return sessionDir;
 		};
+		// Old writers omitted child rlmDepth entirely: the edge supplies it.
 		await expect(
 			listCatalogFamilySessions(
 				make((header) => {
 					delete header.rlmDepth;
 				}),
 			),
-		).rejects.toThrow("child lacks a persisted depth");
+		).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ id: "child", rlmDepth: 1 })]));
+		// A present-but-contradicting depth claim is still corruption.
+		await expect(
+			listCatalogFamilySessions(
+				make((header) => {
+					header.rlmDepth = 7;
+				}),
+			),
+		).rejects.toThrow("child depth does not equal parent depth plus one");
 		await expect(
 			listCatalogFamilySessions(
 				make((header) => {
@@ -658,7 +671,7 @@ describe("daemon catalog selector resolution", () => {
 			registry,
 			JSON.stringify({
 				type: "rlm_subagent",
-				childId: "child",
+				childId: "sub-child",
 				sessionFile: child.getSessionFile(),
 				status: "completed",
 			}),
@@ -677,6 +690,66 @@ describe("daemon catalog selector resolution", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
+	});
+
+	it("walks a realistic profile: fork seeds, sub-* registry ids, two nested levels", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-realistic-"));
+		const sessionDir = join(root, "sessions");
+		const write = (path: string, header: Record<string, unknown>) => {
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(
+				path,
+				`${JSON.stringify({ type: "session", version: 10, timestamp: "2026-01-01T00:00:00.000Z", cwd: "/tmp/p", ...header })}\n`,
+			);
+		};
+		// The writer stores a session's child registry beside its session dir:
+		// flat roots use the profile's top-level session-artifacts; artifact-resident
+		// children get a nested session-artifacts dir beside their sub-* dir.
+		const writeRegistry = (parentFile: string, parentId: string, entries: Array<Record<string, unknown>>) => {
+			const path = join(dirname(dirname(parentFile)), "session-artifacts", parentId, "rlm-subagents.jsonl");
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, entries.map((entry) => JSON.stringify({ type: "rlm_subagent", ...entry })).join("\n"));
+		};
+		// Flat roots: a plain session plus forks in both real-world header shapes.
+		const rootFile = join(sessionDir, "root-uuid.jsonl");
+		write(rootFile, { id: "root-uuid", rlmDepth: 0 });
+		write(join(sessionDir, "fork-depth-uuid.jsonl"), { id: "fork-depth-uuid", parentSession: rootFile, rlmDepth: 0 });
+		write(join(sessionDir, "fork-nodepth-uuid.jsonl"), { id: "fork-nodepth-uuid", parentSession: rootFile });
+		// Depth-1 child in the root's artifact tree; its own registry lives at the
+		// top-level artifacts dir under its session id, as the writer stores it.
+		const childFile = join(root, "session-artifacts", "root-uuid", "sub-aaaa1111", "child-uuid.jsonl");
+		write(childFile, { id: "child-uuid", parentSession: rootFile, rlmDepth: 1 });
+		const grandFile = join(
+			root,
+			"session-artifacts",
+			"root-uuid",
+			"sub-aaaa1111",
+			"sub-bbbb2222",
+			"grand-uuid.jsonl",
+		);
+		write(grandFile, { id: "grand-uuid", parentSession: childFile, rlmDepth: 2 });
+		writeRegistry(rootFile, "root-uuid", [{ childId: "sub-aaaa1111", sessionFile: childFile, status: "running" }]);
+		writeRegistry(childFile, "child-uuid", [
+			{ childId: "sub-bbbb2222", sessionFile: grandFile, status: "completed" },
+		]);
+
+		const family = await listCatalogFamilySessions(sessionDir);
+		expect(family).toHaveLength(5);
+		expect(family).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "root-uuid", rlmDepth: 0 }),
+				expect.objectContaining({ id: "fork-depth-uuid", rlmDepth: 0 }),
+				expect.objectContaining({ id: "fork-nodepth-uuid", rlmDepth: 0 }),
+				expect.objectContaining({ id: "child-uuid", rlmDepth: 1 }),
+				expect.objectContaining({ id: "grand-uuid", rlmDepth: 2 }),
+			]),
+		);
+		// Fork ancestry must not surface as rlm parent edges on the seed rows.
+		for (const fork of ["fork-depth-uuid", "fork-nodepth-uuid"]) {
+			expect(family.find((info) => info.id === fork)?.parentSessionPath).toBeUndefined();
+		}
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
+		rmSync(root, { recursive: true, force: true });
 	});
 
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {
