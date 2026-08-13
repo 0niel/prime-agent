@@ -26,6 +26,53 @@ function session(id: string, name: string | undefined, path: string): SessionInf
 	};
 }
 
+function createCatalogFamilyFixture() {
+	const root = mkdtempSync(join(tmpdir(), "prime-catalog-default-session-dir-"));
+	const sessionDir = join(root, "sessions");
+	const parent = SessionManager.create(root, sessionDir);
+	parent.newSession({ rlmDepth: 0 });
+	parent.appendSessionInfo("parent");
+	const first = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-first"));
+	first.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
+	first.appendSessionInfo("first");
+	const second = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-second"));
+	second.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
+	second.appendSessionInfo("second");
+	const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
+	mkdirSync(dirname(registry), { recursive: true });
+	writeFileSync(
+		registry,
+		[
+			{
+				type: "rlm_subagent",
+				childId: first.getSessionId(),
+				sessionFile: first.getSessionFile(),
+				status: "completed",
+			},
+			{
+				type: "rlm_subagent",
+				childId: second.getSessionId(),
+				sessionFile: second.getSessionFile(),
+				status: "completed",
+			},
+		]
+			.map((entry) => JSON.stringify(entry))
+			.join("\n"),
+	);
+	return { root, sessionDir, parent, first, second };
+}
+
+async function withDefaultSessionDir<T>(sessionDir: string, callback: () => Promise<T>): Promise<T> {
+	const previousSessionDir = process.env.PRIME_AGENT_SESSION_DIR;
+	process.env.PRIME_AGENT_SESSION_DIR = sessionDir;
+	try {
+		return await callback();
+	} finally {
+		if (previousSessionDir === undefined) delete process.env.PRIME_AGENT_SESSION_DIR;
+		else process.env.PRIME_AGENT_SESSION_DIR = previousSessionDir;
+	}
+}
+
 describe("daemon catalog selector resolution", () => {
 	it("reads only a saved child's persisted sibling set", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-siblings-"));
@@ -65,6 +112,39 @@ describe("daemon catalog selector resolution", () => {
 			expect.objectContaining({ id: first.getSessionId(), name: "first" }),
 			expect.objectContaining({ id: second.getSessionId(), name: "second" }),
 		]);
+	});
+
+	it("uses the configured default session directory for family catalogs", async () => {
+		const { root, sessionDir, parent, first, second } = createCatalogFamilyFixture();
+		try {
+			await withDefaultSessionDir(sessionDir, async () => {
+				await expect(listCatalogFamilySessions()).resolves.toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({ id: parent.getSessionId(), name: "parent" }),
+						expect.objectContaining({ id: first.getSessionId(), name: "first" }),
+						expect.objectContaining({ id: second.getSessionId(), name: "second" }),
+					]),
+				);
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
+	});
+
+	it("uses the configured default session directory for saved siblings", async () => {
+		const { root, sessionDir, first, second } = createCatalogFamilyFixture();
+		try {
+			await withDefaultSessionDir(sessionDir, async () => {
+				await expect(listSavedSessionSiblings(first.getSessionFile()!)).resolves.toEqual([
+					expect.objectContaining({ id: first.getSessionId(), name: "first" }),
+					expect.objectContaining({ id: second.getSessionId(), name: "second" }),
+				]);
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
 	});
 
 	it("resolves relative parent headers from each child session directory", async () => {

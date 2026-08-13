@@ -449,6 +449,41 @@ describe("KernelManager abort handling", () => {
 		manager.disposeSync();
 	});
 
+	it("does not report handler failure or send an error reply when the ok reply fails", async () => {
+		const implementation = vi.fn(async () => ({ completed: true }));
+		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
+		const sendCommMessage = vi.fn(async () => {
+			throw new Error("reply send failed");
+		});
+		const internals = manager as unknown as {
+			state: "running";
+			connection: { key: string };
+			shell: { send: () => Promise<void>; close: () => void };
+			handleCommMessage: (message: { header: { msg_type: string }; content: Record<string, unknown> }) => void;
+			sendCommMessage: typeof sendCommMessage;
+			inFlightHostRequests: Set<Promise<void>>;
+			kernelStderr: string;
+		};
+		internals.state = "running";
+		internals.connection = { key: "test" };
+		internals.shell = { send: async () => {}, close: () => {} };
+		internals.sendCommMessage = sendCommMessage;
+		internals.handleCommMessage({
+			header: { msg_type: "comm_open" },
+			content: { comm_id: "ok-reply-fails", target_name: "host.request", data: { type: "test" } },
+		});
+		await Promise.allSettled([...internals.inFlightHostRequests]);
+		expect(implementation).toHaveBeenCalledTimes(1);
+		expect(sendCommMessage).toHaveBeenCalledTimes(1);
+		expect(sendCommMessage).toHaveBeenCalledWith("ok-reply-fails", { status: "ok", completed: true });
+		expect(internals.kernelStderr).toContain(
+			"failed to send host request ok reply for comm ok-reply-fails: reply send failed",
+		);
+		expect(internals.kernelStderr).not.toContain("host request failed for comm ok-reply-fails");
+		manager.disposeSync();
+	});
+
 	it("closes host-request admission before snapshot shutdown flushes", async () => {
 		let capturedContext: HostRequestContext | undefined;
 		let releaseHandler: (() => void) | undefined;
