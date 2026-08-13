@@ -2950,7 +2950,6 @@ describe("AgentSession rlm recursion", () => {
 
 		const admission = root.runRlmChild("revoked before admission", {}, undefined, {
 			signal: controller.signal,
-			isCurrent: () => !controller.signal.aborted,
 		});
 		await resolutionStartedGate;
 		controller.abort();
@@ -2983,7 +2982,6 @@ describe("AgentSession rlm recursion", () => {
 
 		const admission = root.runRlmChild("revoked during runtime admission", {}, undefined, {
 			signal: controller.signal,
-			isCurrent: () => !controller.signal.aborted,
 		});
 		await runtimeEnteredGate;
 		controller.abort();
@@ -3009,11 +3007,11 @@ describe("AgentSession rlm recursion", () => {
 		const manager = new KernelManager({
 			python: process.execPath,
 			hostHandlers: createTestHostHandlers({
-				"rlm.run": createRlmRunHostHandler(async ({ signal, isCurrent }) => {
+				"rlm.run": createRlmRunHostHandler(async ({ signal }) => {
 					handlerStarted();
 					await handlerGate;
-					sawAbortedSignal = signal.aborted && !isCurrent();
-					if (signal.aborted || !isCurrent()) throw new Error("host request authority was revoked");
+					sawAbortedSignal = signal.aborted;
+					if (signal.aborted) throw new Error("host request authority was revoked");
 					sideEffects++;
 					return { ok: true };
 				}),

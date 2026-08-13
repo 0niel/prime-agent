@@ -21,10 +21,7 @@ export async function invokeHostRequestHandlerForTest(
 		throw new Error("host request handler has no test-local raw implementation");
 	}
 	const controller = new AbortController();
-	const context: HostRequestContext = {
-		signal: controller.signal,
-		isCurrent: () => !controller.signal.aborted,
-	};
+	const context: HostRequestContext = { signal: controller.signal };
 	try {
 		return await implementation(payload, context);
 	} finally {
