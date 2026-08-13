@@ -3088,6 +3088,39 @@ describe("AgentSession rlm recursion", () => {
 		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toEqual([]);
 	});
 
+	it("does not return a spawn handle for a child cancelled between publication and admission", async () => {
+		const controller = new AbortController();
+		const child = createSession();
+		let root: AgentSession | undefined;
+		const runtimeHost: SubagentRuntimeHost = {
+			createRlmSubagentRuntime: async (options) => {
+				options.onSessionPublished?.(child);
+				// Cancel synchronously after publication resolves but before the awaiting
+				// admission continuation can run its checks.
+				const internals = root as unknown as InspectableRlmSession & {
+					_cancelRlmChildRun(run: InspectableRlmRun, reason: string): boolean;
+				};
+				const run = [...internals._activeRlmChildRuns.values()][0];
+				if (!run) throw new Error("Missing registered run");
+				internals._cancelRlmChildRun(run, "cancelled between publication and admission");
+				return { session: child };
+			},
+			deleteRlmSubagentRuntime: async (_childId, session) => {
+				await session?.disposeAsync();
+			},
+		};
+		root = createSession({ subagentRuntimeHost: runtimeHost });
+
+		const admission = root.runRlmChild("cancel during admission", {}, undefined, {
+			signal: controller.signal,
+		});
+
+		await expect(admission).rejects.toThrow("cancelled between publication and admission");
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._activeRlmChildRuns.size === 0);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+	});
+
 	it("does not delete a subagent after rlm.delete_subagent authority is revoked", async () => {
 		const childId = "revoked-delete-child";
 		const childDir = join(tempDir, childId);
