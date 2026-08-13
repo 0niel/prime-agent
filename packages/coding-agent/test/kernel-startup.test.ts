@@ -168,4 +168,39 @@ describe("KernelManager startup", () => {
 		expect(internals.hostRequestsClosed).toBe(true);
 		await expect(manager.start()).rejects.toThrow("Kernel was disposed");
 	});
+
+	it("rejects an external cell queued before terminal entry without dispatching it", async () => {
+		const manager = new KernelManager({ cwd: tempDir });
+		const firstEntered = vi.fn();
+		let releaseFirst = () => {};
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const executeInner = vi.fn(async (code: string) => {
+			if (code === "first") {
+				firstEntered();
+				await firstGate;
+			}
+			return { stdout: "", stderr: "", status: "ok" as const, durationMs: 0 };
+		});
+		const internals = manager as unknown as {
+			state: "idle" | "starting" | "running" | "shutdown";
+			start(): Promise<void>;
+			executeInner: typeof executeInner;
+		};
+		internals.state = "running";
+		internals.start = async () => {};
+		internals.executeInner = executeInner;
+
+		const first = manager.execute("first");
+		await vi.waitFor(() => expect(firstEntered).toHaveBeenCalledOnce());
+		const secondRejection = expect(manager.execute("second")).rejects.toThrow("Kernel was disposed");
+		const disposal = manager.dispose();
+		releaseFirst();
+
+		await expect(first).resolves.toMatchObject({ status: "ok" });
+		await secondRejection;
+		await disposal;
+		expect(executeInner).toHaveBeenCalledTimes(1);
+	});
 });

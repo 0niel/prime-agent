@@ -936,6 +936,9 @@ export class KernelManager {
 		if (opts.signal?.aborted) {
 			return { stdout: "", stderr: "", status: "aborted", durationMs: 0 };
 		}
+		if (this.terminal && !lifecycle?.allowTerminalRunning) {
+			throw new Error("Kernel was disposed");
+		}
 		if (lifecycle?.allowTerminalRunning) {
 			if (!this.terminal || !this.isRunning) throw new Error("Kernel is not running for terminal snapshot");
 		} else {
@@ -954,12 +957,18 @@ export class KernelManager {
 
 		const started = Date.now();
 		try {
+			if (this.terminal && !lifecycle?.allowTerminalRunning) {
+				throw new Error("Kernel was disposed");
+			}
 			await this.waitForActiveExecutionToClearForReuse(opts.signal);
 			if (opts.signal?.aborted) {
 				return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
 			}
 			if ((this.state as string) === "shutdown") {
 				throw new Error("Kernel has been shut down");
+			}
+			if (this.terminal && !lifecycle?.allowTerminalRunning) {
+				throw new Error("Kernel was disposed");
 			}
 			return await this.executeInner(code, opts, started);
 		} finally {

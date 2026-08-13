@@ -704,6 +704,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	private async disposeOnce(): Promise<void> {
+		this.session.beginClosing();
 		let disposeError: unknown;
 		try {
 			await emitSessionShutdownEvent(this.session.extensionRunner, {

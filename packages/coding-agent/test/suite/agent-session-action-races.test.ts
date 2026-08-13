@@ -14,6 +14,7 @@ interface CommitFenceInternals {
 	_scheduleSessionInputPump(): void;
 	_acquireDirectTurnAdmissionFence(signal?: AbortSignal): Promise<{ release(): void }>;
 	_acquireSessionActionCommitFence(signal?: AbortSignal): Promise<{ release(): void }>;
+	_drainPendingRefinementForDisposal(): Promise<void>;
 	_promptInjectedMessage(
 		text: string,
 		message: {
@@ -124,6 +125,31 @@ describe("AgentSession action commit-fence races", () => {
 		}
 		await Promise.resolve();
 		expect(settlementCount).toBe(1);
+	});
+
+	it("fences prompt admission synchronously while orderly async disposal drains", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("must not start")]);
+		const internals = harness.session as unknown as CommitFenceInternals;
+		const drainEntered = createDeferred();
+		const drainGate = createDeferred();
+		internals._drainPendingRefinementForDisposal = async () => {
+			drainEntered.resolve();
+			await drainGate.promise;
+		};
+
+		const disposal = harness.session.disposeAsync();
+		await drainEntered.promise;
+		await expect(harness.session.prompt("late prompt")).rejects.toThrow(
+			"Cannot admit a session action because the session is disposing or disposed.",
+		);
+		expect(internals._actionStore.unfinishedActions()).toEqual([]);
+		expect(getUserTexts(harness)).not.toContain("late prompt");
+		expect(harness.getPendingResponseCount()).toBe(1);
+
+		drainGate.resolve();
+		await disposal;
 	});
 
 	it("reports a queued commit-fence waiter while its predecessor releases", async () => {

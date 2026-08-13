@@ -2173,7 +2173,7 @@ export class AgentDaemon {
 		if (this.bindingSessions.has(state.activeSessionId)) {
 			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is still initializing`);
 		}
-		if (this.closingSessions.has(state.activeSessionId)) {
+		if (this.closingSessions.has(state.activeSessionId) || state.runtime.session.isClosing) {
 			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is closing`);
 		}
 		return state;
@@ -2697,7 +2697,7 @@ export class AgentDaemon {
 		if (this.sessions.get(state.activeSessionId) !== state || this.bindingSessions.has(state.activeSessionId)) {
 			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} did not finish initializing`);
 		}
-		if (this.closingSessions.has(state.activeSessionId)) {
+		if (this.closingSessions.has(state.activeSessionId) || state.runtime.session.isClosing) {
 			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is closing`);
 		}
 		return state;
@@ -6251,6 +6251,7 @@ export class AgentDaemon {
 		cascadeChildren = true,
 		descendantCollector?: Set<ActiveSessionState>,
 	): Promise<void> {
+		state.runtime.session.beginClosing();
 		this.abortWaitingPromptAdmissionsForSession(state.activeSessionId);
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);

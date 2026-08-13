@@ -1200,8 +1200,9 @@ export class AgentSession {
 	private _disposed = false;
 	private readonly _disposeCallbacks = new Set<() => void | Promise<void>>();
 	private _disposeCallbacksPromise?: Promise<void>;
-	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
-	// re-populate the retained map after it's been cleared.
+	/** Monotonic synchronous fence for external work while orderly async teardown drains. */
+	private _closing = false;
+	// Set after orderly async drains so final disposal cleanup cannot schedule more work.
 	private _disposing = false;
 	/** Set before async teardown awaits so runtime rebuilds cannot replace its owned kernel. */
 	private _asyncTeardownStarted = false;
@@ -3775,6 +3776,23 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	/**
+	 * Close external admission synchronously while leaving refinement and the final
+	 * kernel snapshot available to the orderly async teardown.
+	 */
+	private _beginClosing(): void {
+		if (this._closing || this._disposed) return;
+		this._closing = true;
+		this._sessionInputPumpRequested = false;
+		this._sessionInputPumpEpoch++;
+		this._sessionActionCommitDisposeAbortController.abort();
+		const error = new Error("Session closed before prompt delivery.");
+		this._rejectQueuedAgentMessageDeliveries(error, error);
+		this._cancelSessionActions(() => true, error);
+		this.agent.clearAllQueues();
+		this._notifySessionInputCheckpointChange();
+	}
+
+	/**
 	 * Async teardown for graceful quit/switch: await the IPython kernel's dispose
 	 * (which flushes a final namespace snapshot) before the synchronous dispose, so
 	 * the latest state reaches disk instead of racing process exit.
@@ -3789,6 +3807,7 @@ export class AgentSession {
 			return this._disposeCallbacksPromise;
 		}
 		this._asyncTeardownStarted = true;
+		this._beginClosing();
 		this._disposeAsyncPromise = (async () => {
 			// Capture both operations before the first await. allSettled observes either
 			// rejection immediately while allowing the independent operation to finish.
@@ -4001,6 +4020,7 @@ export class AgentSession {
 		if (this._disposed) {
 			return;
 		}
+		this._beginClosing();
 		this._disposed = true;
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
@@ -4047,6 +4067,15 @@ export class AgentSession {
 		} finally {
 			void this._startDisposeCallbacks();
 		}
+	}
+
+	/** Synchronously reject new external work before an owner begins async teardown. */
+	beginClosing(): void {
+		this._beginClosing();
+	}
+
+	get isClosing(): boolean {
+		return this._closing || this._disposing || this._disposed;
 	}
 
 	registerDisposeCallback(callback: () => void | Promise<void>): void {
@@ -5306,7 +5335,7 @@ export class AgentSession {
 	}
 
 	private _assertSessionActionAdmissionAvailable(): void {
-		if (this._disposed || this._disposing) {
+		if (this._closing || this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
@@ -5327,7 +5356,7 @@ export class AgentSession {
 		disposition: "starts_when_admitted" | "queued";
 		ticket?: ActionTicket;
 	} {
-		if (this._disposed || this._disposing) {
+		if (this._closing || this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
@@ -5401,7 +5430,7 @@ export class AgentSession {
 			refinementApply: this._refineInFlight !== undefined,
 			branchMutation: this._branchSummaryOperation !== undefined,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
-			disposing: this._disposed || this._disposing,
+			disposing: this._closing || this._disposed || this._disposing,
 		};
 	}
 
@@ -5434,7 +5463,13 @@ export class AgentSession {
 
 	private _scheduleSessionInputPump(): void {
 		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) return;
-		if (this._disposed || this._disposing || this._sessionInputPumpRequested || !this._hasSelectableSessionInput()) {
+		if (
+			this._closing ||
+			this._disposed ||
+			this._disposing ||
+			this._sessionInputPumpRequested ||
+			!this._hasSelectableSessionInput()
+		) {
 			return;
 		}
 		this._sessionInputPumpRequested = true;
@@ -5450,7 +5485,7 @@ export class AgentSession {
 	private async _pumpSessionInputs(epoch: number): Promise<void> {
 		let blocked = false;
 		try {
-			while (!this._disposed && !this._disposing && this._hasSelectableSessionInput()) {
+			while (!this._closing && !this._disposed && !this._disposing && this._hasSelectableSessionInput()) {
 				await this.agent.waitForIdle();
 				const preselected = this._actionStore
 					.activeActions()
@@ -5656,6 +5691,7 @@ export class AgentSession {
 		if (point === "pump") {
 			return (
 				externalBusy ||
+				this._closing ||
 				this._disposed ||
 				this._disposing ||
 				this._sessionInputPumpSuspended ||
