@@ -435,18 +435,6 @@ type AgentFamilyCatalogCandidate = AgentFamilyCatalogEntry & {
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
-type DaemonSessionCloseFailureStage = "dispose" | "persist" | "cascade";
-
-/** Daemon-private close diagnostics used only to authorize exact cleanup retry. */
-class DaemonSessionCloseError extends Error {
-	readonly stage: DaemonSessionCloseFailureStage;
-
-	constructor(stage: DaemonSessionCloseFailureStage, cause: unknown) {
-		super(cause instanceof Error ? cause.message : String(cause), { cause });
-		this.name = "DaemonSessionCloseError";
-		this.stage = stage;
-	}
-}
 class PrivateSessionUnavailableError extends BoundSessionUnavailableError {}
 
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
@@ -515,11 +503,6 @@ export class AgentDaemon {
 			descendants: Set<ActiveSessionState>;
 			reasonUpgrade?: Promise<void>;
 		}
-	>();
-	/** Exact removed incarnation retained only when its runtime dispose failed. */
-	private readonly failedSessionCloses = new Map<
-		string,
-		{ state: ActiveSessionState; error: DaemonSessionCloseError }
 	>();
 	private readonly failedTombstonedRlmCloses = new Map<string, FailedTombstonedRlmClose>();
 	private readonly closeDisposeErrors = new WeakMap<ActiveSessionState, unknown>();
