@@ -240,6 +240,14 @@ export interface RlmSubagentReleaseOutcome {
 	deletionDurability: RlmSubagentDeletionDurability;
 }
 
+/**
+ * Authority held by the exact host request that asked to reconcile a private
+ * deletion lease. This is a typed host contract, never child-controlled data.
+ */
+export interface RlmSubagentDeletionAuthority {
+	assertCurrent(): void;
+}
+
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
 	/** Persist host-owned completion before the child becomes passivation-eligible. */
@@ -251,7 +259,10 @@ export interface SubagentRuntimeHost {
 		status: "done" | "error" | "cancelled",
 	) => Promise<RlmSubagentReleaseOutcome>;
 	/** Re-check a release whose durability was unknown, without inventing a public child status. */
-	resolveRlmSubagentDeletion?(childId: string): Promise<RlmSubagentDeletionDurability>;
+	resolveRlmSubagentDeletion?(
+		childId: string,
+		authority: RlmSubagentDeletionAuthority,
+	): Promise<RlmSubagentDeletionDurability>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
 	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
