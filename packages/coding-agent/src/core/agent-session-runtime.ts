@@ -413,6 +413,19 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			await session.disposeAsync();
 			return;
 		}
+		// A child id can be recycled after an older deletion attempt yields. The
+		// runtime metadata is assigned from CreateRlmSubagentRuntimeOptions before
+		// this map becomes addressable, so it is the authoritative incarnation
+		// fence for inline teardown; never treat absent metadata as a match.
+		if (
+			authority &&
+			(authority.childId !== childId ||
+				runtime.metadata.rlmChildId !== authority.childId ||
+				runtime.metadata.sessionDir !== authority.sessionDir)
+		) {
+			authority.assertCurrent();
+			throw new Error("RLM subagent deletion authority does not match runtime incarnation");
+		}
 		authority?.assertCurrent();
 		this.subagentRuntimes.delete(childId);
 		const shouldDisposeStaleSession = runtime.session !== session;

@@ -1619,7 +1619,11 @@ describe("AgentSession rlm recursion", () => {
 
 		expect(await root.listRlmSubagents()).toEqual({ subagents: expected });
 		await expect(root.deleteRlmSubagent("finished-worker")).resolves.toEqual({ subagent: expected[1] });
-		expect(deleteRlmSubagentRuntime).toHaveBeenCalledWith("finished-child", undefined);
+		expect(deleteRlmSubagentRuntime).toHaveBeenCalledWith(
+			"finished-child",
+			undefined,
+			expect.objectContaining({ childId: "finished-child", sessionDir: expected[1].session_dir }),
+		);
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [expected[0]] });
 	});
 
@@ -2493,7 +2497,11 @@ describe("AgentSession rlm recursion", () => {
 			() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(childId)?.status !== "running",
 		);
 		await expect(root.deleteInactiveRlmSubagent(childId)).resolves.toBe("deleted");
-		expect(deleteRuntime).toHaveBeenCalledWith(childId, retainedChild);
+		expect(deleteRuntime).toHaveBeenCalledWith(
+			childId,
+			retainedChild,
+			expect.objectContaining({ childId, sessionDir: join(tempDir, "retained-child") }),
+		);
 		await expect(root.deleteInactiveRlmSubagent("unknown-child")).resolves.toBe("not_found");
 	});
 
@@ -3413,6 +3421,82 @@ describe("AgentSession rlm recursion", () => {
 			releaseListing();
 			await manager.dispose();
 		}
+	});
+
+	it("promotes a live deletion waiter after an aborted owner drains", async () => {
+		const childId = "promoted-delete-child";
+		const childDir = join(tempDir, childId);
+		mkdirSync(childDir, { recursive: true });
+		const child = createSession({ rlmSessionDir: childDir });
+		child.setSessionName("promoted-delete-worker");
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const authorities: Array<{ generation: number }> = [];
+		const deleteRuntime = vi.fn(async (_id: string, childSession: AgentSession | undefined, authority) => {
+			if (!authority) throw new Error("missing deletion authority");
+			authorities.push(authority);
+			authority.assertCurrent();
+			if (authorities.length === 1) await firstGate;
+			authority.assertCurrent();
+			await childSession?.disposeAsync();
+		});
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected child creation");
+				},
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		expect(root.registerRlmChildSession(childId, child)).toBe(true);
+		const ownerController = new AbortController();
+		const owner = root.deleteRlmSubagent("promoted-delete-worker", ownerController.signal);
+		await waitFor(() => deleteRuntime.mock.calls.length === 1);
+		const waiter = root.deleteRlmSubagent("promoted-delete-worker");
+		ownerController.abort();
+		await expect(owner).rejects.toThrow("host request authority was revoked");
+		releaseFirst();
+		await expect(waiter).resolves.toMatchObject({ subagent: { rlm_child_id: childId } });
+		expect(authorities).toHaveLength(2);
+		expect(authorities[1]?.generation).toBeGreaterThan(authorities[0]?.generation ?? Infinity);
+	});
+
+	it("keeps a live deletion owner authoritative when only its waiter aborts", async () => {
+		const childId = "caller-local-delete-child";
+		const childDir = join(tempDir, childId);
+		mkdirSync(childDir, { recursive: true });
+		const child = createSession({ rlmSessionDir: childDir });
+		child.setSessionName("caller-local-delete-worker");
+		let releaseDelete!: () => void;
+		const deleteGate = new Promise<void>((resolve) => {
+			releaseDelete = resolve;
+		});
+		const deleteRuntime = vi.fn(async (_id: string, childSession: AgentSession | undefined, authority) => {
+			authority?.assertCurrent();
+			await deleteGate;
+			authority?.assertCurrent();
+			await childSession?.disposeAsync();
+		});
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected child creation");
+				},
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		expect(root.registerRlmChildSession(childId, child)).toBe(true);
+		const owner = root.deleteRlmSubagent("caller-local-delete-worker");
+		await waitFor(() => deleteRuntime.mock.calls.length === 1);
+		const waiterController = new AbortController();
+		const waiter = root.deleteRlmSubagent("caller-local-delete-worker", waiterController.signal);
+		waiterController.abort();
+		await expect(waiter).rejects.toThrow("host request authority was revoked");
+		releaseDelete();
+		await expect(owner).resolves.toMatchObject({ subagent: { rlm_child_id: childId } });
+		expect(deleteRuntime).toHaveBeenCalledOnce();
 	});
 
 	it("runs parallel rlm comm requests independently", async () => {
