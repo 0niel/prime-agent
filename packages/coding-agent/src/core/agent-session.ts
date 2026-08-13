@@ -9286,6 +9286,9 @@ export class AgentSession {
 				rlm_child_id: run.id,
 				active_session_id: daemonChild?.activeSessionId ?? null,
 				session_id: daemonChild?.sessionId ?? run.session?.sessionId ?? null,
+				...((daemonChild?.sessionPath ?? run.session?.sessionFile)
+					? { session_file: daemonChild?.sessionPath ?? run.session?.sessionFile }
+					: {}),
 				session_name: daemonChild?.sessionName ?? run.session?.sessionName ?? run.sessionName,
 				session_dir: run.sessionDir,
 				status: run.status === "done" ? "completed" : run.status === "error" ? "error" : "running",
@@ -9310,6 +9313,9 @@ export class AgentSession {
 				rlm_child_id: childId,
 				active_session_id: daemonChild?.activeSessionId ?? null,
 				session_id: daemonChild?.sessionId ?? childSession.sessionId,
+				...((daemonChild?.sessionPath ?? childSession.sessionFile)
+					? { session_file: daemonChild?.sessionPath ?? childSession.sessionFile }
+					: {}),
 				session_name:
 					daemonChild?.sessionName ?? childSession.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: sessionDir,
@@ -9332,6 +9338,7 @@ export class AgentSession {
 				rlm_child_id: childId,
 				active_session_id: daemonChild.activeSessionId,
 				session_id: daemonChild.sessionId,
+				...(daemonChild.sessionPath ? { session_file: daemonChild.sessionPath } : {}),
 				session_name: daemonChild.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: daemonChild.sessionDir,
 				status: daemonChild.rlmChildRegistryStatus === "completed" ? "completed" : "error",
@@ -9481,6 +9488,7 @@ export class AgentSession {
 							...subagent,
 							active_session_id: daemonChild.activeSessionId,
 							session_id: daemonChild.sessionId,
+							...(daemonChild.sessionPath ? { session_file: daemonChild.sessionPath } : {}),
 							session_name: daemonChild.sessionName ?? subagent.session_name,
 						}
 					: subagent;
@@ -9565,6 +9573,8 @@ export class AgentSession {
 			authority = {
 				childId: subagent.rlm_child_id,
 				sessionDir: subagent.session_dir,
+				...(subagent.session_file ? { sessionFile: subagent.session_file } : {}),
+				...(subagent.session_id ? { sessionId: subagent.session_id } : {}),
 				generation,
 				assertCurrent: () => {
 					if (signal?.aborted) throw new Error("host request authority was revoked");
@@ -9618,6 +9628,7 @@ export class AgentSession {
 			authority ?? {
 				childId,
 				sessionDir: lease.session_dir,
+				...(lease.session_id ? { sessionId: lease.session_id } : {}),
 				generation: 0,
 				assertCurrent: () => {},
 			},
