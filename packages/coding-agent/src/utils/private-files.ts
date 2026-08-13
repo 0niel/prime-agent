@@ -173,23 +173,24 @@ export function readPrivateFile(path: string, encoding: BufferEncoding): string 
 	}
 }
 
+function ensureParentDirectory(path: string, privateParent: boolean): void {
+	const parent = dirname(path);
+	if (privateParent) {
+		ensurePrivateDirectory(parent);
+		return;
+	}
+	const parentExisted = pathExistsLexical(parent);
+	ensureNoSymlinkPath(parent, PRIVATE_DIRECTORY_MODE);
+	if (!lstatSync(parent).isDirectory()) throw new Error(`Refusing to use non-directory private path: ${parent}`);
+	if (!parentExisted) chmodSync(parent, PRIVATE_DIRECTORY_MODE);
+}
+
 export function writePrivateFileAtomic(
 	path: string,
 	content: string | Uint8Array,
 	options: { privateParent?: boolean } = {},
 ): void {
-	const parent = dirname(path);
-	if (options.privateParent === false) {
-		const parentExisted = pathExistsLexical(parent);
-		ensureNoSymlinkPath(parent, PRIVATE_DIRECTORY_MODE);
-		const parentStats = lstatSync(parent);
-		if (parentStats.isSymbolicLink() || !parentStats.isDirectory()) {
-			throw new Error(`Refusing to use non-directory private path: ${parent}`);
-		}
-		if (!parentExisted) chmodSync(parent, PRIVATE_DIRECTORY_MODE);
-	} else {
-		ensurePrivateDirectory(parent);
-	}
+	ensureParentDirectory(path, options.privateParent !== false);
 	if (pathExistsLexical(path)) {
 		assertRegularFileNoSymlink(path);
 	}
@@ -215,9 +216,9 @@ export function writePrivateFileAtomic(
 export function writePrivateFileAtomicLines(
 	path: string,
 	lines: Iterable<string>,
-	options: { preserveOwnership?: boolean } = {},
+	options: { preserveOwnership?: boolean; privateParent?: boolean } = {},
 ): void {
-	ensurePrivateDirectory(dirname(path));
+	ensureParentDirectory(path, options.privateParent !== false);
 	if (pathExistsLexical(path)) assertRegularFileNoSymlink(path);
 	const metadata = options.preserveOwnership && pathExistsLexical(path) ? statSync(path) : undefined;
 	const tempPath = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
@@ -240,8 +241,8 @@ export function writePrivateFileAtomicLines(
 	}
 }
 
-export function appendPrivateFile(path: string, content: string): void {
-	ensurePrivateDirectory(dirname(path));
+export function appendPrivateFile(path: string, content: string, options: { privateParent?: boolean } = {}): void {
+	ensureParentDirectory(path, options.privateParent !== false);
 	let flags = constants.O_WRONLY | constants.O_APPEND | requireNoFollow(constants.O_NOFOLLOW) | NONBLOCK_FLAG;
 	const exists = pathExistsLexical(path);
 	if (exists) {

@@ -298,9 +298,9 @@ export type ReadonlySessionManager = Pick<
 	| "getSessionName"
 >;
 
-export const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
-export function assertValidSessionId(sessionId: string): void {
+function assertValidSessionId(sessionId: string): void {
 	if (!SESSION_ID_PATTERN.test(sessionId)) {
 		throw new Error(
 			"Invalid session id: expected 1-128 ASCII letters, digits, dots, underscores, or hyphens, starting with a letter or digit",
@@ -1227,6 +1227,7 @@ export class SessionManager {
 	private sessionDir: string;
 	private cwd: string;
 	private persist: boolean;
+	private ownsSessionDir: boolean;
 	private flushed: boolean = false;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
@@ -1246,6 +1247,7 @@ export class SessionManager {
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
 		this.persist = persist;
+		this.ownsSessionDir = ownsSessionDir;
 		if (persist && sessionDir && ownsSessionDir) {
 			ensurePrivateDirectory(sessionDir);
 		}
@@ -1394,7 +1396,10 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		writePrivateFileAtomicLines(this.sessionFile, [content], { preserveOwnership: true });
+		writePrivateFileAtomicLines(this.sessionFile, [content], {
+			preserveOwnership: true,
+			privateParent: this.ownsSessionDir,
+		});
 		this._notifyPersistListeners();
 	}
 
@@ -1447,6 +1452,7 @@ export class SessionManager {
 		const previousHeader = this.getHeader();
 		const target = createUniqueSessionFileTarget(dir);
 		this.sessionDir = dir;
+		this.ownsSessionDir = true;
 		this.sessionId = target.sessionId;
 		this.sessionFile = target.sessionFile;
 		this.persist = true;
@@ -1501,7 +1507,7 @@ export class SessionManager {
 			this._rewriteFile();
 			this.flushed = true;
 		} else {
-			appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			appendPrivateFile(this.sessionFile, `${JSON.stringify(entry)}\n`, { privateParent: this.ownsSessionDir });
 			this._notifyPersistListeners();
 		}
 	}

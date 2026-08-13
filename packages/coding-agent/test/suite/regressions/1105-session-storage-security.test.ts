@@ -159,8 +159,11 @@ describe("issue #1105 session storage security", () => {
 `,
 			);
 
-			SessionManager.open(sessionFile);
+			const manager = SessionManager.open(sessionFile);
+			manager.appendSessionInfo("external");
+			manager.flushNow();
 			expect(statSync(sharedDir).mode & 0o777).toBe(0o755);
+			expect(statSync(sessionFile).mode & 0o777).toBe(0o600);
 		});
 	});
 });
