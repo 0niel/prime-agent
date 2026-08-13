@@ -10047,9 +10047,16 @@ export class AgentSession {
 						// A failed best-effort retry remains available through the retained cleanup maps.
 					}
 				}
-				// Nothing retains a never-admitted cancelled child, so its dir would be a
-				// permanent orphan. Removal happens after the dispose/release paths above.
-				if (!admissionCommitted && run.status === "cancelled" && !run.detachedDeletion) {
+				// A never-admitted cancelled child's dir is an orphan only when nothing
+				// durable references it. Once a runtime host produced a runtime or a
+				// session, its release/delete hooks own persistence (a daemon records a
+				// deleted registry entry that keeps the artifact tree on disk).
+				if (
+					!admissionCommitted &&
+					run.status === "cancelled" &&
+					!run.detachedDeletion &&
+					(!this._subagentRuntimeHost || (!childRuntime && !childSession))
+				) {
 					rmSync(childSessionDir, { recursive: true, force: true });
 				}
 			} finally {
