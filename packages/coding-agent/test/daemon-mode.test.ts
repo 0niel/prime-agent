@@ -854,6 +854,128 @@ describe("daemon mode helpers", () => {
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
 
+	it("fences stale same-id same-directory daemon release and delete by runtime identity", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-daemon-incarnation-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parentState = makeState("parent-incarnation");
+		const oldState = makeState("old-incarnation", parentState.activeSessionId);
+		const newState = makeState("new-incarnation", parentState.activeSessionId);
+		const sessionDir = "/tmp/recycled-child-directory";
+		const oldSession = {
+			sessionFile: `${sessionDir}/old.jsonl`,
+			disposeAsync: vi.fn(async () => {}),
+		};
+		const newSession = {
+			sessionFile: `${sessionDir}/new.jsonl`,
+			disposeAsync: vi.fn(async () => {}),
+		};
+		for (const [state, session] of [
+			[oldState, oldSession],
+			[newState, newSession],
+		] as const) {
+			state.runtime = {
+				...state.runtime,
+				metadata: {
+					kind: "subagent",
+					createdAt: 1,
+					parentActiveSessionId: parentState.activeSessionId,
+					rlmChildId: "recycled-child",
+					sessionDir,
+				},
+				session,
+			} as never;
+		}
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closeSession: ReturnType<typeof vi.fn>;
+			recordRlmSubagentDeletion: ReturnType<typeof vi.fn>;
+			readLatestRlmSubagentRegistry: ReturnType<typeof vi.fn>;
+			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+		};
+		internals.sessions.set(parentState.activeSessionId, parentState);
+		// Model recreation: the old object is no longer resident, while the new
+		// object has exactly the same child id and directory.
+		internals.sessions.set(newState.activeSessionId, newState);
+		internals.closeSession = vi.fn(async (state: ActiveSessionState) => {
+			internals.sessions.delete(state.activeSessionId);
+		});
+		internals.recordRlmSubagentDeletion = vi.fn(async () => "tombstoned" as const);
+		internals.readLatestRlmSubagentRegistry = vi.fn(async () => [
+			{ childId: "recycled-child", sessionDir, sessionFile: newSession.sessionFile },
+		]);
+		const host = internals.createSubagentRuntimeHost(parentState);
+		const options = { id: "recycled-child", sessionDir } as CreateRlmSubagentRuntimeOptions;
+
+		await expect(
+			host.releaseRlmSubagentRuntime?.({ session: oldSession } as never, options, "cancelled"),
+		).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
+		await expect(host.deleteRlmSubagentRuntime("recycled-child", oldSession as never)).rejects.toMatchObject({
+			name: "RlmSubagentHostDeletionError",
+			phase: "precommit",
+		});
+		expect(internals.recordRlmSubagentDeletion).not.toHaveBeenCalled();
+		expect(internals.closeSession).not.toHaveBeenCalled();
+		expect(oldSession.disposeAsync).not.toHaveBeenCalled();
+		expect(newSession.disposeAsync).not.toHaveBeenCalled();
+		expect(internals.sessions.get(newState.activeSessionId)).toBe(newState);
+
+		await expect(
+			host.releaseRlmSubagentRuntime?.({ session: newSession } as never, options, "cancelled"),
+		).resolves.toEqual({ deletionDurability: "tombstoned" });
+		expect(internals.recordRlmSubagentDeletion).toHaveBeenCalledOnce();
+		expect(internals.closeSession).toHaveBeenCalledOnce();
+		expect(internals.closeSession).toHaveBeenCalledWith(newState, "killed");
+	});
+
+	it("classifies scheduler failure after a daemon tombstone as postcommit", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-daemon-postcommit-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parentState = makeState("parent-postcommit");
+		const childState = makeState("child-postcommit", parentState.activeSessionId);
+		const sessionDir = "/tmp/postcommit-child";
+		const session = { sessionFile: `${sessionDir}/child.jsonl` };
+		childState.runtime = {
+			...childState.runtime,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: parentState.activeSessionId,
+				rlmChildId: "postcommit-child",
+				sessionDir,
+			},
+			session,
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closeSession: ReturnType<typeof vi.fn>;
+			recordRlmSubagentDeletion: ReturnType<typeof vi.fn>;
+			readLatestRlmSubagentRegistry: ReturnType<typeof vi.fn>;
+			cancelScheduledJobsForSessionFile: ReturnType<typeof vi.fn>;
+			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+		};
+		internals.sessions.set(childState.activeSessionId, childState);
+		internals.closeSession = vi.fn(async () => {});
+		internals.recordRlmSubagentDeletion = vi.fn(async () => "tombstoned" as const);
+		internals.readLatestRlmSubagentRegistry = vi.fn(async () => [
+			{ childId: "postcommit-child", sessionDir, sessionFile: session.sessionFile },
+		]);
+		internals.cancelScheduledJobsForSessionFile = vi.fn(() => {
+			throw new Error("scheduler cleanup failed");
+		});
+
+		await expect(
+			internals
+				.createSubagentRuntimeHost(parentState)
+				.deleteRlmSubagentRuntime("postcommit-child", session as never),
+		).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "tombstoned" });
+		expect(internals.recordRlmSubagentDeletion).toHaveBeenCalledOnce();
+		expect(internals.closeSession).toHaveBeenCalledOnce();
+	});
+
 	it("reports durable retention only for actual daemon deletion tombstones", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-release-ownership-"));
 		try {
@@ -950,9 +1072,13 @@ describe("daemon mode helpers", () => {
 						...patch,
 					})}\n`,
 				);
-				await expect(host.releaseRlmSubagentRuntime?.(runtime, options, "cancelled")).resolves.toEqual({
-					deletionDurability: "unknown",
+				await expect(host.releaseRlmSubagentRuntime?.(runtime, options, "cancelled")).rejects.toMatchObject({
+					name: "RlmSubagentHostDeletionError",
+					phase: "precommit",
 				});
+				expect([...internals.sessions.values()].some((state) => state.runtime.session === runtime.session)).toBe(
+					true,
+				);
 				expect(existsSync(options.sessionDir)).toBe(true);
 			}
 
@@ -964,12 +1090,15 @@ describe("daemon mode helpers", () => {
 			const failedOptions = optionsFor("release-write-failed");
 			const failedRuntime = await internals.createRlmSubagentRuntime(parentState, failedOptions);
 			const append = vi.spyOn(internals, "appendRlmSubagentRegistryEntry").mockReturnValue(false);
-			await expect(host.releaseRlmSubagentRuntime?.(failedRuntime, failedOptions, "cancelled")).resolves.toEqual({
-				deletionDurability: "unknown",
+			await expect(
+				host.releaseRlmSubagentRuntime?.(failedRuntime, failedOptions, "cancelled"),
+			).rejects.toMatchObject({
+				name: "RlmSubagentHostDeletionError",
+				phase: "precommit",
 			});
 			expect(append).toHaveBeenCalledWith(parentState, expect.objectContaining({ status: "deleted" }));
 			expect([...internals.sessions.values()].some((state) => state.runtime.session === failedRuntime.session)).toBe(
-				false,
+				true,
 			);
 
 			// A malformed registry history cannot prove that a child is absent.
@@ -978,7 +1107,10 @@ describe("daemon mode helpers", () => {
 			writeFileSync(registryPath, `${readFileSync(registryPath, "utf8")}not-json\n`);
 			await expect(
 				host.releaseRlmSubagentRuntime?.(malformedRuntime, malformedOptions, "cancelled"),
-			).resolves.toEqual({ deletionDurability: "unknown" });
+			).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
+			expect(
+				[...internals.sessions.values()].some((state) => state.runtime.session === malformedRuntime.session),
+			).toBe(true);
 
 			// An unreadable registry has the same fail-closed result, rather than
 			// treating the missing child row as authority to remove artifacts.
@@ -989,7 +1121,10 @@ describe("daemon mode helpers", () => {
 			mkdirSync(registryPath);
 			await expect(
 				host.releaseRlmSubagentRuntime?.(readFaultRuntime, readFaultOptions, "cancelled"),
-			).resolves.toEqual({ deletionDurability: "unknown" });
+			).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
+			expect(
+				[...internals.sessions.values()].some((state) => state.runtime.session === readFaultRuntime.session),
+			).toBe(true);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

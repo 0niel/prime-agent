@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { AgentSession } from "./agent-session.js";
 import type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
 import type {
@@ -409,9 +409,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		authority?.assertCurrent();
 		const runtime = this.subagentRuntimes.get(childId);
 		if (!runtime) {
-			authority?.assertCurrent();
-			await session.disposeAsync();
-			return { deletionDurability: "absent" };
+			// With no resident object there is no exact-object fence. A directory
+			// match alone cannot authorize disposing a supplied same-id incarnation.
+			throw new Error("RLM subagent runtime incarnation is no longer resident");
 		}
 		// A child id can be recycled after an older deletion attempt yields. The
 		// runtime metadata is assigned from CreateRlmSubagentRuntimeOptions before
@@ -427,15 +427,17 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			throw new Error("RLM subagent deletion authority does not match runtime incarnation");
 		}
 		authority?.assertCurrent();
-		this.subagentRuntimes.delete(childId);
-		const shouldDisposeStaleSession = runtime.session !== session;
-		try {
-			await runtime.dispose();
-		} finally {
-			if (shouldDisposeStaleSession) {
-				await session.disposeAsync();
+		if (runtime.session !== session) {
+			// The supplied object is the only stale incarnation we may touch. Leave
+			// the newer map resident intact.
+			if (!authority || dirname(session.sessionFile) !== authority.sessionDir) {
+				throw new Error("RLM subagent deletion does not match runtime incarnation");
 			}
+			await session.disposeAsync();
+			return { deletionDurability: "absent" };
 		}
+		this.subagentRuntimes.delete(childId);
+		await runtime.dispose();
 		return { deletionDurability: "absent" };
 	}
 
