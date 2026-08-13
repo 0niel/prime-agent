@@ -1081,6 +1081,11 @@ describe("daemon mode helpers", () => {
 			const original = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
 			const oldSessionId = original.sessionId as string;
 			const replacementSessionId = "replacement-session-id";
+			const replacementEntries = readFileSync(fixture.childSessionFile, "utf8").split(/\r?\n/u);
+			const replacementHeader = JSON.parse(replacementEntries[0]!) as Record<string, unknown>;
+			replacementHeader.id = replacementSessionId;
+			replacementEntries[0] = JSON.stringify(replacementHeader);
+			writeFileSync(fixture.childSessionFile, replacementEntries.join("\n"));
 			writeFileSync(
 				registryPath,
 				`${JSON.stringify(original)}\n${JSON.stringify({
