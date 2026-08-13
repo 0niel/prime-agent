@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, openSync } from "node:fs";
+import { closeSync, constants, openSync, readdirSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import { getSessionsDir } from "../../config.js";
@@ -99,6 +99,20 @@ interface TrustedFile {
 	ino: string;
 }
 
+interface TrustedSessionMetadata {
+	messageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+	modifiedMs: number;
+	name?: string;
+	state?: SessionInfo["state"];
+	agentStatus?: SessionInfo["agentStatus"];
+}
+
+interface TrustedMetadataFile extends TrustedFile {
+	metadata: TrustedSessionMetadata;
+}
+
 interface TrustedSession extends SessionInfo {
 	/** The header claims are intentionally separate from SessionInfo's legacy fallback. */
 	persistedDepth?: number;
@@ -176,15 +190,116 @@ function closeManagedRoots(roots: ManagedRoots): void {
 
 const OPENAT_READ_HELPER = String.raw`import base64,json,os,stat,sys
 MAX=134217728
+SEARCH_MAX=65536
+PARSE_MAX=1048576
+PREVIEW_MAX=256
 def reject(): raise ValueError("invalid")
 def flags(directory=False):
  value=os.O_RDONLY|os.O_NOFOLLOW
  if directory: value|=os.O_DIRECTORY
  return value
+def message_text(message):
+ content=message.get("content") if isinstance(message,dict) else None
+ if isinstance(content,str): return content
+ if isinstance(content,list): return " ".join(block.get("text","") for block in content if isinstance(block,dict) and block.get("type")=="text" and isinstance(block.get("text"),str))
+ return ""
+def append_search(current,text):
+ if not text or len(current)>=SEARCH_MAX: return current
+ next_text=(current+" " if current else "")+text
+ return current+next_text[len(current):len(current)+(SEARCH_MAX-len(current))]
+def parse_time(value):
+ if not isinstance(value,str): return None
+ try:
+  text=value.replace("Z","+00:00")
+  return __import__("datetime").datetime.fromisoformat(text).timestamp()*1000
+ except Exception: return None
+def string_prefix(text,key,limit,start=0):
+ index=text.find('"'+key+'"',start)
+ if index<0: return None
+ index+=len(key)+2
+ while index<len(text) and text[index].isspace(): index+=1
+ if index>=len(text) or text[index] != ":": return None
+ index+=1
+ while index<len(text) and text[index].isspace(): index+=1
+ if index>=len(text) or text[index] != '"': return None
+ index+=1; result=[]; escaped=False
+ while index<len(text) and len(result)<limit:
+  char=text[index]
+  if escaped: result.append(char); escaped=False
+  elif char=="\\": escaped=True
+  elif char=='"': break
+  else: result.append(char)
+  index+=1
+ return "".join(result)
+def scan_metadata(fd,mtime_ms):
+ os.lseek(fd,0,os.SEEK_SET)
+ stream=os.fdopen(os.dup(fd),"rb")
+ try:
+  header=None; count=0; first=""; search=""; name=None; state=None; agent_status=None; activity=None
+  while True:
+   # readline's limit prevents one hostile JSONL record from being materialized
+   # in the helper. Parse normal records; for oversize records inspect only their
+   # bounded prefix, then drain their remaining chunks before the next record.
+   raw=stream.readline(PARSE_MAX+1)
+   if not raw: break
+   oversized=len(raw)>PARSE_MAX and not raw.endswith(b"\n")
+   line=raw.decode("utf-8","replace").rstrip("\n")
+   if oversized:
+    if '"type":"message"' in line or '"type": "message"' in line:
+     count+=1
+     timestamp=parse_time(string_prefix(line,"timestamp",64) or "")
+     message_index=line.find('"message"')
+     role=string_prefix(line,"role",64,message_index if message_index>=0 else 0)
+     preview=string_prefix(line,"content",PREVIEW_MAX,message_index) if message_index>=0 else None
+     if preview is None and message_index>=0: preview=string_prefix(line,"text",PREVIEW_MAX,message_index)
+     if timestamp is not None and role in ("user","assistant"): activity=max(activity or 0,timestamp)
+     if role=="user" and not first: first=preview or "(large message)"
+    while raw and not raw.endswith(b"\n"):
+     raw=stream.readline(65536)
+    continue
+   if not line.strip(): continue
+   try: entry=json.loads(line)
+   except Exception: continue
+   if not isinstance(entry,dict): continue
+   kind=entry.get("type")
+   if kind=="session_info":
+    value=entry.get("name"); name=value.strip() if isinstance(value,str) and value.strip() else None
+   elif kind=="session_state":
+    value=entry.get("state"); status=value.get("status") if isinstance(value,dict) else None
+    if status in ("active","archived","crash"): state={"status":status}
+    elif status in ("hidden","sleep"): state={"status":"archived"}
+   elif kind=="agent_status":
+    value=entry.get("status")
+    if isinstance(value,dict):
+     agent_status={key:value[key] for key in ("summary","taskState","basedOnMessageCount") if key in value}
+   if header is None:
+    if kind!="session": return {"valid":False}
+    header=entry
+   if kind!="message": continue
+   count+=1
+   message=entry.get("message")
+   if not isinstance(message,dict) or not isinstance(message.get("role"),str) or "content" not in message: continue
+   role=message["role"]
+   if role not in ("user","assistant"): continue
+   timestamp=message.get("timestamp") if isinstance(message.get("timestamp"), (int,float)) and not isinstance(message.get("timestamp"),bool) else parse_time(entry.get("timestamp"))
+   if timestamp is not None: activity=max(activity or 0,timestamp)
+   text=message_text(message)
+   if not text: continue
+   search=append_search(search,text)
+   if role=="user" and not first: first=text
+  if header is None: return {"valid":False}
+  header_time=parse_time(header.get("timestamp"))
+  modified=activity if activity is not None and activity>0 else (header_time if header_time is not None else mtime_ms)
+  data={"valid":True,"messageCount":count,"firstMessage":first or "(no messages)","allMessagesText":search,"modifiedMs":modified}
+  if name is not None: data["name"]=name
+  if state is not None: data["state"]=state
+  if agent_status is not None: data["agentStatus"]=agent_status
+  return data
+ finally: stream.close()
 def serve(req):
  request_id=req.get("id"); parts=req.get("parts"); limit=req.get("limit"); mode=req.get("mode"); root=req.get("root")
  if not isinstance(request_id,str) or not request_id or len(request_id)>128: reject()
- if mode not in ("read","header","stat") or root not in (3,4): reject()
+ if mode not in ("read","header","stat","metadata") or root not in (3,4): reject()
  if not isinstance(parts,list) or not parts or not isinstance(limit,int) or limit<0 or limit>MAX: reject()
  if any(not isinstance(p,str) or not p or p in (".","..") or "/" in p or "\\" in p for p in parts): reject()
  current=os.dup(root)
@@ -197,7 +312,7 @@ def serve(req):
    if not stat.S_ISREG(before.st_mode): reject()
    if mode=="read" and before.st_size>limit: reject()
    payload={}
-   if mode!="stat":
+   if mode in ("read","header"):
     chunks=[]; total=0; done=False
     while not done:
      chunk=os.read(fd,min(65536,limit+1-total))
@@ -208,6 +323,7 @@ def serve(req):
      chunks.append(chunk); total+=len(chunk)
      if total>limit: reject()
     payload["data"]=base64.b64encode(b"".join(chunks)).decode("ascii")
+   elif mode=="metadata": payload["data"]=scan_metadata(fd,before.st_mtime_ns/1000000)
    after=os.fstat(fd)
    if (before.st_dev,before.st_ino,before.st_mode)!=(after.st_dev,after.st_ino,after.st_mode): reject()
    payload.update({"mtimeMs":after.st_mtime_ns/1000000,"dev":str(after.st_dev),"ino":str(after.st_ino)})
@@ -248,9 +364,38 @@ export function setCatalogHelperLaunchForTest(launch: { command: string; args: s
 	catalogHelperLaunchForTest = launch;
 }
 
-type TrustedReadMode = "read" | "header" | "stat";
+type TrustedReadMode = "read" | "header" | "stat" | "metadata";
 
 const TRUSTED_READ_TIMEOUT_MS = 5_000;
+const MAX_METADATA_RESPONSE_BYTES = 256 * 1024;
+
+function isTrustedSessionMetadata(value: unknown): value is TrustedSessionMetadata {
+	if (!value || typeof value !== "object") return false;
+	const metadata = value as Record<string, unknown>;
+	if (
+		metadata.valid !== true ||
+		typeof metadata.messageCount !== "number" ||
+		!Number.isSafeInteger(metadata.messageCount) ||
+		metadata.messageCount < 0 ||
+		typeof metadata.firstMessage !== "string" ||
+		typeof metadata.allMessagesText !== "string" ||
+		typeof metadata.modifiedMs !== "number" ||
+		!Number.isFinite(metadata.modifiedMs) ||
+		(metadata.name !== undefined && typeof metadata.name !== "string") ||
+		(metadata.state !== undefined &&
+			(!metadata.state ||
+				typeof metadata.state !== "object" ||
+				typeof (metadata.state as { status?: unknown }).status !== "string")) ||
+		(metadata.agentStatus !== undefined &&
+			(!metadata.agentStatus ||
+				typeof metadata.agentStatus !== "object" ||
+				typeof (metadata.agentStatus as { summary?: unknown }).summary !== "string" ||
+				typeof (metadata.agentStatus as { basedOnMessageCount?: unknown }).basedOnMessageCount !== "number"))
+	) {
+		return false;
+	}
+	return true;
+}
 
 /**
  * One helper process serves every descriptor-relative read of a family walk.
@@ -325,8 +470,14 @@ class TrustedReadSession {
 		});
 	}
 
-	async read(rawPath: string, maxBytes: number, mode: TrustedReadMode): Promise<TrustedFile> {
+	async read(rawPath: string, maxBytes: number, mode: Exclude<TrustedReadMode, "metadata">): Promise<TrustedFile> {
 		const run = this.queue.then(() => this.readSerialized(rawPath, maxBytes, mode));
+		this.queue = run.catch(() => undefined);
+		return run;
+	}
+
+	async metadata(rawPath: string): Promise<TrustedMetadataFile> {
+		const run = this.queue.then(() => this.readMetadataSerialized(rawPath));
 		this.queue = run.catch(() => undefined);
 		return run;
 	}
@@ -367,7 +518,17 @@ class TrustedReadSession {
 		return invalidFamilyTopology(`descriptor-relative artifact read failed: ${failure.message}`);
 	}
 
-	private async readSerialized(rawPath: string, maxBytes: number, mode: TrustedReadMode): Promise<TrustedFile> {
+	private async readMetadataSerialized(rawPath: string): Promise<TrustedMetadataFile> {
+		const file = await this.readSerialized(rawPath, 0, "metadata");
+		if (!file.metadata) throw invalidFamilyTopology("descriptor-relative artifact metadata is invalid");
+		return { ...file, metadata: file.metadata };
+	}
+
+	private async readSerialized(
+		rawPath: string,
+		maxBytes: number,
+		mode: TrustedReadMode,
+	): Promise<TrustedFile & { metadata?: TrustedSessionMetadata }> {
 		if (!isAbsolute(rawPath) || rawPath !== resolve(rawPath))
 			throw invalidFamilyTopology("session path is not canonical");
 		const root = [this.roots.session, this.roots.artifacts].find(
@@ -384,7 +545,7 @@ class TrustedReadSession {
 		const requestId = randomUUID();
 		const line = await this.exchange(
 			JSON.stringify({ id: requestId, parts, limit: maxBytes, mode, root: rootFd }),
-			maxBytes * 2 + 64 * 1024,
+			mode === "metadata" ? MAX_METADATA_RESPONSE_BYTES : maxBytes * 2 + 64 * 1024,
 		);
 		let wire: { id?: unknown; error?: unknown; data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
 		try {
@@ -400,7 +561,11 @@ class TrustedReadSession {
 		if (wire.error === "absent") throw invalidFamilyTopology("descriptor-relative artifact is absent");
 		if (
 			wire.error !== undefined ||
-			(mode === "stat" ? wire.data !== undefined : typeof wire.data !== "string") ||
+			(mode === "stat"
+				? wire.data !== undefined
+				: mode === "metadata"
+					? !isTrustedSessionMetadata(wire.data)
+					: typeof wire.data !== "string") ||
 			typeof wire.mtimeMs !== "number" ||
 			typeof wire.dev !== "string" ||
 			typeof wire.ino !== "string"
@@ -413,6 +578,7 @@ class TrustedReadSession {
 			mtimeMs: wire.mtimeMs,
 			dev: wire.dev,
 			ino: wire.ino,
+			...(mode === "metadata" ? { metadata: wire.data as TrustedSessionMetadata } : {}),
 		};
 	}
 
@@ -488,14 +654,10 @@ class TrustedReadSession {
 /**
  * Topology claims (id, parent, depth) come from descriptor-bound header bytes.
  * Display metadata (name, timestamps, previews) is not part of the trust
- * decision: it comes from the caller's listing when available, otherwise from
- * an ordinary cached read, and is bound to the header by the id cross-check.
+ * decision. It is scanned inside the descriptor-bound helper and is bound to
+ * the trusted header by the identity check below.
  */
-async function readTrustedSession(
-	path: string,
-	reader: TrustedReadSession,
-	listed?: SessionInfo,
-): Promise<TrustedSession> {
+async function readTrustedSession(path: string, reader: TrustedReadSession): Promise<TrustedSession> {
 	const trusted = await reader.read(path, MAX_SESSION_HEADER_BYTES, "header");
 	const headerLine = trusted.contents.toString("utf8").split(/\r?\n/, 1)[0];
 	let header: {
@@ -527,19 +689,25 @@ async function readTrustedSession(
 		throw invalidFamilyTopology("session header lacks trustworthy topology claims");
 	const persistedDepth = hasDepth ? (header.rlmDepth as number) : undefined;
 	afterTrustedHeaderForTest?.(path);
-	// Detect a post-header swap without reading a body or reopening through the
-	// legacy scanner. The descriptor-relative stat is a second identity binding.
-	const bound = await reader.read(path, 0, "stat");
+	// The metadata scan is bound to one descriptor, so it can skip giant entries
+	// without transferring a session body or reopening the pathname in Node.
+	const bound = await reader.metadata(path);
 	if (bound.dev !== trusted.dev || bound.ino !== trusted.ino)
 		throw invalidFamilyTopology("session changed after its trusted header read");
-	// An unlisted registry child must never reach the legacy pathname scanner:
-	// it may recursively read parent paths and can observe a replacement after
-	// this descriptor-bound open. Header metadata is intentionally shallow.
-	const info =
-		listed?.path === path
-			? listed
-			: readSessionHeaderInfoFromBuffer(path, trusted.contents, { mtimeMs: trusted.mtimeMs });
-	if (!info || info.id !== header.id) throw invalidFamilyTopology("session metadata does not match its header");
+	const headerInfo = readSessionHeaderInfoFromBuffer(path, trusted.contents, { mtimeMs: trusted.mtimeMs });
+	if (!headerInfo || headerInfo.id !== header.id)
+		throw invalidFamilyTopology("session metadata does not match its header");
+	const { metadata } = bound;
+	const info: SessionInfo = {
+		...headerInfo,
+		modified: new Date(metadata.modifiedMs),
+		messageCount: metadata.messageCount,
+		firstMessage: metadata.firstMessage,
+		allMessagesText: metadata.allMessagesText,
+		...(metadata.name !== undefined ? { name: metadata.name } : {}),
+		...(metadata.state !== undefined ? { state: metadata.state } : {}),
+		...(metadata.agentStatus !== undefined ? { agentStatus: metadata.agentStatus } : {}),
+	};
 	return {
 		...info,
 		path,
@@ -597,7 +765,7 @@ async function readLatestRegistry(
 		if (
 			entry.type !== "rlm_subagent" ||
 			typeof entry.childId !== "string" ||
-			entry.childId === "" ||
+			!/^sub-[0-9a-f]{8}$/.test(entry.childId) ||
 			typeof entry.sessionFile !== "string" ||
 			entry.sessionFile === "" ||
 			(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted")
@@ -609,9 +777,19 @@ async function readLatestRegistry(
 	return [...latest.values()];
 }
 
+function listSessionCandidates(sessionDir: string): string[] {
+	try {
+		return readdirSync(sessionDir)
+			.filter((entry) => entry.endsWith(".jsonl"))
+			.map((entry) => join(resolve(sessionDir), entry));
+	} catch {
+		return [];
+	}
+}
+
 export async function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
 	const effectiveSessionDir = sessionDir ?? getSessionsDir();
-	const roots = await SessionManager.listAll(undefined, effectiveSessionDir);
+	const roots = listSessionCandidates(effectiveSessionDir);
 	const authority = managedRoots(effectiveSessionDir);
 	const reader = new TrustedReadSession(authority);
 	let result: SessionInfo[] | undefined;
@@ -619,8 +797,8 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 	try {
 		const sessions = new Map<string, FamilySession>();
 		const ids = new Map<string, string>();
-		for (const root of roots) {
-			const trusted = asTrustedFamilyRoot(await readTrustedSession(root.path, reader, root), authority);
+		for (const rootPath of roots) {
+			const trusted = asTrustedFamilyRoot(await readTrustedSession(rootPath, reader), authority);
 			const existingPath = ids.get(trusted.id);
 			if (existingPath && existingPath !== trusted.path)
 				throw invalidFamilyTopology("family contains a duplicate session id");
@@ -664,7 +842,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				// Registry keys name that immediate child directory, so neither a
 				// nested sessions root nor a re-keyed sibling is reachable.
 				const modernWriterPath =
-					childId.startsWith("sub-") &&
+					/^sub-[0-9a-f]{8}$/.test(childId) &&
 					childId === basename(childSessionDir) &&
 					childSessionDir === join(writerChildrenRoot, childId);
 				if (!modernWriterPath) {

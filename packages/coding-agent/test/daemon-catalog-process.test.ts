@@ -44,10 +44,10 @@ function createCatalogFamilyFixture() {
 	const parent = SessionManager.create(root, sessionDir);
 	parent.newSession({ rlmDepth: 0 });
 	parent.appendSessionInfo("parent");
-	const first = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-first"));
+	const first = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-11111111"));
 	first.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
 	first.appendSessionInfo("first");
-	const second = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-second"));
+	const second = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-22222222"));
 	second.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
 	second.appendSessionInfo("second");
 	const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
@@ -58,13 +58,13 @@ function createCatalogFamilyFixture() {
 		[
 			{
 				type: "rlm_subagent",
-				childId: "sub-first",
+				childId: "sub-11111111",
 				sessionFile: first.getSessionFile(),
 				status: "completed",
 			},
 			{
 				type: "rlm_subagent",
-				childId: "sub-second",
+				childId: "sub-22222222",
 				sessionFile: second.getSessionFile(),
 				status: "completed",
 			},
@@ -93,12 +93,17 @@ describe("daemon catalog selector resolution", () => {
 		const parent = SessionManager.create(root, sessionDir);
 		parent.newSession({ rlmDepth: 0 });
 		parent.appendSessionInfo("parent");
-		const first = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-first"));
+		const first = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-11111111"));
 		first.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
 		first.appendSessionInfo("first");
-		const second = SessionManager.create(root, join(root, "session-artifacts", parent.getSessionId(), "sub-second"));
+		first.appendSessionState({ status: "archived" });
+		const second = SessionManager.create(
+			root,
+			join(root, "session-artifacts", parent.getSessionId(), "sub-22222222"),
+		);
 		second.newSession({ parentSession: parent.getSessionFile(), rlmDepth: 1 });
 		second.appendSessionInfo("second");
+		second.appendSessionState({ status: "active" });
 		const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
 		mkdirSync(dirname(registry), { recursive: true });
 		// Reader compatibility for v2 headers does not relax registry provenance:
@@ -113,13 +118,13 @@ describe("daemon catalog selector resolution", () => {
 			[
 				{
 					type: "rlm_subagent",
-					childId: "sub-first",
+					childId: "sub-11111111",
 					sessionFile: first.getSessionFile(),
 					status: "completed",
 				},
 				{
 					type: "rlm_subagent",
-					childId: "sub-second",
+					childId: "sub-22222222",
 					sessionFile: second.getSessionFile(),
 					status: "completed",
 				},
@@ -129,8 +134,8 @@ describe("daemon catalog selector resolution", () => {
 		);
 
 		await expect(listSavedSessionSiblings(first.getSessionFile()!, sessionDir)).resolves.toEqual([
-			expect.objectContaining({ id: first.getSessionId() }),
-			expect.objectContaining({ id: second.getSessionId() }),
+			expect.objectContaining({ id: first.getSessionId(), name: "first", state: { status: "archived" } }),
+			expect.objectContaining({ id: second.getSessionId(), name: "second", state: { status: "active" } }),
 		]);
 	});
 
@@ -140,9 +145,9 @@ describe("daemon catalog selector resolution", () => {
 			await withDefaultSessionDir(sessionDir, async () => {
 				await expect(listCatalogFamilySessions()).resolves.toEqual(
 					expect.arrayContaining([
-						expect.objectContaining({ id: parent.getSessionId() }),
-						expect.objectContaining({ id: first.getSessionId() }),
-						expect.objectContaining({ id: second.getSessionId() }),
+						expect.objectContaining({ id: parent.getSessionId(), name: "parent" }),
+						expect.objectContaining({ id: first.getSessionId(), name: "first" }),
+						expect.objectContaining({ id: second.getSessionId(), name: "second" }),
 					]),
 				);
 			});
@@ -174,11 +179,11 @@ describe("daemon catalog selector resolution", () => {
 		parent.newSession({ rlmDepth: 0 });
 		parent.appendSessionInfo("parent");
 		const parentFile = parent.getSessionFile()!;
-		const firstDir = join(root, "session-artifacts", parent.getSessionId(), "sub-first");
+		const firstDir = join(root, "session-artifacts", parent.getSessionId(), "sub-11111111");
 		const first = SessionManager.create(root, firstDir);
 		first.newSession({ parentSession: relative(firstDir, parentFile), rlmDepth: 1 });
 		first.appendSessionInfo("first");
-		const secondDir = join(root, "session-artifacts", parent.getSessionId(), "sub-second");
+		const secondDir = join(root, "session-artifacts", parent.getSessionId(), "sub-22222222");
 		const second = SessionManager.create(root, secondDir);
 		second.newSession({ parentSession: relative(secondDir, parentFile), rlmDepth: 1 });
 		second.appendSessionInfo("second");
@@ -189,13 +194,13 @@ describe("daemon catalog selector resolution", () => {
 			[
 				{
 					type: "rlm_subagent",
-					childId: "sub-first",
+					childId: "sub-11111111",
 					sessionFile: first.getSessionFile(),
 					status: "completed",
 				},
 				{
 					type: "rlm_subagent",
-					childId: "sub-second",
+					childId: "sub-22222222",
 					sessionFile: second.getSessionFile(),
 					status: "completed",
 				},
@@ -261,28 +266,38 @@ describe("daemon catalog selector resolution", () => {
 			}
 			const parent = create(
 				"parent",
-				join(root, "session-artifacts", "root", "sub-parent"),
+				join(root, "session-artifacts", "root", "sub-33333333"),
 				rootSession.getSessionFile(),
 				1,
 			);
 			const first = create(
 				"first",
-				join(root, "session-artifacts", "root", "sub-parent", "sub-first"),
+				join(root, "session-artifacts", "root", "sub-33333333", "sub-11111111"),
 				parent.getSessionFile(),
 				2,
 			);
 			const second = create(
 				"second",
-				join(root, "session-artifacts", "root", "sub-parent", "sub-second"),
+				join(root, "session-artifacts", "root", "sub-33333333", "sub-22222222"),
 				parent.getSessionFile(),
 				2,
 			);
 			writeRegistry("root", [
-				{ type: "rlm_subagent", childId: "sub-parent", sessionFile: parent.getSessionFile(), status: "completed" },
+				{
+					type: "rlm_subagent",
+					childId: "sub-33333333",
+					sessionFile: parent.getSessionFile(),
+					status: "completed",
+				},
 			]);
 			writeRegistry("parent", [
-				{ type: "rlm_subagent", childId: "sub-first", sessionFile: first.getSessionFile(), status: "completed" },
-				{ type: "rlm_subagent", childId: "sub-second", sessionFile: second.getSessionFile(), status: "completed" },
+				{ type: "rlm_subagent", childId: "sub-11111111", sessionFile: first.getSessionFile(), status: "completed" },
+				{
+					type: "rlm_subagent",
+					childId: "sub-22222222",
+					sessionFile: second.getSessionFile(),
+					status: "completed",
+				},
 			]);
 			return { root, sessionDir, rootSession, parent, first, second, registryPath, writeRegistry };
 		};
@@ -308,7 +323,7 @@ describe("daemon catalog selector resolution", () => {
 					const alias = join(dirname(fixture.first.getSessionFile()!), "impostor.jsonl");
 					writeFileSync(alias, readFileSync(fixture.first.getSessionFile()!));
 					fixture.writeRegistry("parent", [
-						{ type: "rlm_subagent", childId: "sub-first", sessionFile: alias, status: "completed" },
+						{ type: "rlm_subagent", childId: "sub-11111111", sessionFile: alias, status: "completed" },
 					]);
 				},
 			],
@@ -317,12 +332,17 @@ describe("daemon catalog selector resolution", () => {
 				(fixture) => {
 					const evil = SessionManager.create(
 						fixture.root,
-						join(fixture.root, "session-artifacts", "parent", "sub-evil"),
+						join(fixture.root, "session-artifacts", "parent", "sub-66666666"),
 					);
 					evil.newSession({ id: "evil", parentSession: fixture.rootSession.getSessionFile(), rlmDepth: 2 });
 					evil.appendSessionInfo("evil");
 					fixture.writeRegistry("parent", [
-						{ type: "rlm_subagent", childId: "evil", sessionFile: evil.getSessionFile(), status: "completed" },
+						{
+							type: "rlm_subagent",
+							childId: "sub-66666666",
+							sessionFile: evil.getSessionFile(),
+							status: "completed",
+						},
 					]);
 				},
 			],
@@ -331,12 +351,17 @@ describe("daemon catalog selector resolution", () => {
 				(fixture) => {
 					const evil = SessionManager.create(
 						fixture.root,
-						join(fixture.root, "session-artifacts", "parent", "sub-evil"),
+						join(fixture.root, "session-artifacts", "parent", "sub-66666666"),
 					);
 					evil.newSession({ id: "evil", parentSession: fixture.parent.getSessionFile(), rlmDepth: 7 });
 					evil.appendSessionInfo("evil");
 					fixture.writeRegistry("parent", [
-						{ type: "rlm_subagent", childId: "evil", sessionFile: evil.getSessionFile(), status: "completed" },
+						{
+							type: "rlm_subagent",
+							childId: "sub-66666666",
+							sessionFile: evil.getSessionFile(),
+							status: "completed",
+						},
 					]);
 				},
 			],
@@ -346,7 +371,7 @@ describe("daemon catalog selector resolution", () => {
 					fixture.writeRegistry("parent", [
 						{
 							type: "rlm_subagent",
-							childId: "evil",
+							childId: "sub-66666666",
 							sessionFile: join(tmpdir(), "outside.jsonl"),
 							status: "completed",
 						},
@@ -358,8 +383,8 @@ describe("daemon catalog selector resolution", () => {
 					fixture.writeRegistry("parent", [
 						{
 							type: "rlm_subagent",
-							childId: "first",
-							sessionFile: `${dirname(fixture.first.getSessionFile()!)}/../sub-first/first.jsonl`,
+							childId: "sub-11111111",
+							sessionFile: `${dirname(fixture.first.getSessionFile()!)}/../sub-11111111/first.jsonl`,
 							status: "completed",
 						},
 					]),
@@ -370,7 +395,7 @@ describe("daemon catalog selector resolution", () => {
 					fixture.writeRegistry("parent", [
 						{
 							type: "rlm_subagent",
-							childId: "root",
+							childId: "sub-33333333",
 							sessionFile: fixture.rootSession.getSessionFile(),
 							status: "completed",
 						},
@@ -378,13 +403,25 @@ describe("daemon catalog selector resolution", () => {
 			],
 			["malformed", (fixture) => fixture.writeRegistry("parent", ["{not json"])],
 			[
+				"malformed child id",
+				(fixture) =>
+					fixture.writeRegistry("parent", [
+						{
+							type: "rlm_subagent",
+							childId: "sub-ABCDEF12",
+							sessionFile: fixture.first.getSessionFile(),
+							status: "completed",
+						},
+					]),
+			],
+			[
 				"record limit",
 				(fixture) =>
 					fixture.writeRegistry(
 						"parent",
 						Array.from({ length: 10_001 }, (_, index) => ({
 							type: "rlm_subagent",
-							childId: `bad-${index}`,
+							childId: `sub-${index.toString(16).padStart(8, "0")}`,
 							sessionFile: fixture.first.getSessionFile(),
 							status: "completed",
 						})),
@@ -399,11 +436,11 @@ describe("daemon catalog selector resolution", () => {
 			);
 		}
 		const symlink = makeFixture("prime-catalog-family-symlink-");
-		const alias = join(symlink.root, "session-artifacts", "parent", "sub-alias", "first.jsonl");
+		const alias = join(symlink.root, "session-artifacts", "parent", "sub-77777777", "first.jsonl");
 		mkdirSync(dirname(alias), { recursive: true });
 		symlinkSync(symlink.first.getSessionFile()!, alias);
 		symlink.writeRegistry("parent", [
-			{ type: "rlm_subagent", childId: "first", sessionFile: alias, status: "completed" },
+			{ type: "rlm_subagent", childId: "sub-11111111", sessionFile: alias, status: "completed" },
 		]);
 		await expect(listCatalogFamilySessions(symlink.sessionDir)).rejects.toThrow(
 			"Invalid RLM artifact family topology",
@@ -417,7 +454,7 @@ describe("daemon catalog selector resolution", () => {
 			const parent = SessionManager.create(root, sessionDir);
 			parent.newSession({ id: "parent", rlmDepth: 0 });
 			parent.appendSessionInfo("parent");
-			const childDir = join(root, "session-artifacts", "parent", "sub-child");
+			const childDir = join(root, "session-artifacts", "parent", "sub-44444444");
 			const child = SessionManager.create(root, childDir);
 			child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 1 });
 			child.appendSessionInfo("child");
@@ -427,7 +464,7 @@ describe("daemon catalog selector resolution", () => {
 				registry,
 				JSON.stringify({
 					type: "rlm_subagent",
-					childId: "sub-child",
+					childId: "sub-44444444",
 					sessionFile: child.getSessionFile(),
 					status: "completed",
 				}),
@@ -554,7 +591,7 @@ describe("daemon catalog selector resolution", () => {
 			const parent = SessionManager.create(root, sessionDir);
 			parent.newSession({ id: "parent", rlmDepth: 0 });
 			parent.appendSessionInfo("parent");
-			const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-child"));
+			const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-44444444"));
 			child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 1 });
 			child.appendSessionInfo("child");
 			const childFile = child.getSessionFile()!;
@@ -566,7 +603,12 @@ describe("daemon catalog selector resolution", () => {
 			mkdirSync(dirname(registry), { recursive: true });
 			writeFileSync(
 				registry,
-				JSON.stringify({ type: "rlm_subagent", childId: "sub-child", sessionFile: childFile, status: "completed" }),
+				JSON.stringify({
+					type: "rlm_subagent",
+					childId: "sub-44444444",
+					sessionFile: childFile,
+					status: "completed",
+				}),
 			);
 			return sessionDir;
 		};
@@ -631,6 +673,50 @@ describe("daemon catalog selector resolution", () => {
 		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(baseline);
 	});
 
+	it("returns descriptor-bound metadata after a multi-megabyte entry without reopening the pathname", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-compact-metadata-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("initial name");
+		const file = parent.getSessionFile()!;
+		appendFileSync(
+			file,
+			`${[
+				JSON.stringify({
+					type: "message",
+					id: "first-message",
+					parentId: null,
+					timestamp: "2026-01-02T03:04:05.000Z",
+					message: {
+						role: "user",
+						content: "first searchable prompt",
+						timestamp: Date.parse("2026-01-02T03:04:05.000Z"),
+					},
+				}),
+				JSON.stringify({ type: "custom_message", body: "x".repeat(3 * 1024 * 1024) }),
+				JSON.stringify({ type: "session_info", name: "trailing name" }),
+				JSON.stringify({ type: "session_state", state: { status: "archived" } }),
+				JSON.stringify({
+					type: "agent_status",
+					status: { summary: "trailing recap", taskState: "completed", basedOnMessageCount: 1 },
+				}),
+			].join("\n")}\n`,
+		);
+		const [info] = await listCatalogFamilySessions(sessionDir);
+		expect(info).toMatchObject({
+			id: "parent",
+			name: "trailing name",
+			state: { status: "archived" },
+			messageCount: 1,
+			firstMessage: "first searchable prompt",
+			allMessagesText: "first searchable prompt",
+			agentStatus: { summary: "trailing recap", taskState: "completed", basedOnMessageCount: 1 },
+		});
+		expect(info?.modified.toISOString()).toBe("2026-01-02T03:04:05.000Z");
+		rmSync(root, { recursive: true, force: true });
+	});
+
 	it("reads only the session header line even when the body is huge", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-header-only-"));
 		const sessionDir = join(root, "sessions");
@@ -670,7 +756,7 @@ describe("daemon catalog selector resolution", () => {
 		const parent = SessionManager.create(root, sessionDir);
 		parent.newSession({ id: "parent", rlmDepth: 0 });
 		parent.appendSessionInfo("parent");
-		const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-child"));
+		const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-44444444"));
 		child.newSession({ id: "child", parentSession: join(sessionDir, "gone.jsonl"), rlmDepth: 1 });
 		child.appendSessionInfo("child");
 		const registry = join(root, "session-artifacts", "parent", "rlm-subagents.jsonl");
@@ -679,7 +765,7 @@ describe("daemon catalog selector resolution", () => {
 			registry,
 			JSON.stringify({
 				type: "rlm_subagent",
-				childId: "sub-child",
+				childId: "sub-44444444",
 				sessionFile: child.getSessionFile(),
 				status: "completed",
 			}),
@@ -736,9 +822,9 @@ process.stdin.on("data", chunk => {
  while (true) {
   const end=input.indexOf("\n"); if (end<0) break;
   const request=JSON.parse(input.slice(0,end)); input=input.slice(end+1);
-  const payload=request.mode === "header" ? { id:request.id, data:${JSON.stringify(Buffer.from(header).toString("base64"))}, mtimeMs:0, dev:"1", ino:"1" } : { id:request.id, mtimeMs:0, dev:"1", ino:"1" };
+  const payload=request.mode === "header" ? { id:request.id, data:${JSON.stringify(Buffer.from(header).toString("base64"))}, mtimeMs:0, dev:"1", ino:"1" } : request.mode === "metadata" ? { id:request.id, data:{valid:true,messageCount:0,firstMessage:"(no messages)",allMessagesText:"",modifiedMs:0}, mtimeMs:0, dev:"1", ino:"1" } : { id:request.id, mtimeMs:0, dev:"1", ino:"1" };
   process.stdout.write(JSON.stringify(payload)+"\n");
-  if (request.mode === "stat") setTimeout(() => process.stdout.write("{\"unsolicited\":true}\n"), 25);
+  if (request.mode === "metadata") setTimeout(() => process.stdout.write("{\"unsolicited\":true}\n"), 25);
  }
 });`;
 		const baseline = getOpenCatalogAuthorityFdCountForTest();
@@ -758,7 +844,7 @@ process.stdin.on("data", chunk => {
 		const parent = SessionManager.create(root, sessionDir);
 		parent.newSession({ id: "parent", rlmDepth: 0 });
 		parent.appendSessionInfo("parent");
-		const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-real"));
+		const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-55555555"));
 		child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 1 });
 		child.appendSessionInfo("child");
 		const childFile = child.getSessionFile()!;
@@ -768,7 +854,7 @@ process.stdin.on("data", chunk => {
 		mkdirSync(dirname(registry), { recursive: true });
 		writeFileSync(
 			registry,
-			JSON.stringify({ type: "rlm_subagent", childId: "child", sessionFile: childFile, status: "completed" }),
+			JSON.stringify({ type: "rlm_subagent", childId: "sub-66666666", sessionFile: childFile, status: "completed" }),
 		);
 		try {
 			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("writer artifact layout");
@@ -844,7 +930,7 @@ process.stdin.on("data", chunk => {
 			const parent = SessionManager.create(root, sessionDir);
 			parent.newSession({ id: "parent", rlmDepth: 0 });
 			parent.appendSessionInfo("parent");
-			const childDir = join(root, "session-artifacts", "parent", "sub-real");
+			const childDir = join(root, "session-artifacts", "parent", "sub-55555555");
 			const child = SessionManager.create(root, childDir);
 			child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 1 });
 			child.appendSessionInfo("child");
@@ -855,19 +941,19 @@ process.stdin.on("data", chunk => {
 					registry,
 					JSON.stringify({ type: "rlm_subagent", childId, sessionFile, status: "completed" }),
 				);
-			writeRegistry("sub-real");
+			writeRegistry("sub-55555555");
 			return { root, sessionDir, child, childDir, writeRegistry };
 		};
 		const spoofed = make();
-		spoofed.writeRegistry("sub-spoofed");
+		spoofed.writeRegistry("sub-66666666");
 		await expect(listCatalogFamilySessions(spoofed.sessionDir)).rejects.toThrow("writer artifact layout");
 		rmSync(spoofed.root, { recursive: true, force: true });
 
 		const nested = make();
-		const nestedPath = join(nested.sessionDir, "sub-real", "child.jsonl");
+		const nestedPath = join(nested.sessionDir, "sub-55555555", "child.jsonl");
 		mkdirSync(dirname(nestedPath), { recursive: true });
 		writeFileSync(nestedPath, readFileSync(nested.child.getSessionFile()!));
-		nested.writeRegistry("sub-real", nestedPath);
+		nested.writeRegistry("sub-55555555", nestedPath);
 		await expect(listCatalogFamilySessions(nested.sessionDir)).rejects.toThrow("writer artifact layout");
 		rmSync(nested.root, { recursive: true, force: true });
 
