@@ -10115,6 +10115,13 @@ export class AgentSession {
 			return false;
 		}
 
+		// The intercept provider adds an idempotency key at the logical request boundary.
+		// Retrying here would call agent.continue() and mint a new key; provider retries
+		// remain below that boundary and retain the original key.
+		if (message.provider === "intercept") {
+			return false;
+		}
+
 		if (this._isAgentLifecycleFailure(message)) {
 			return false;
 		}

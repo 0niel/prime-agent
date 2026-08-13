@@ -1,7 +1,7 @@
 import type { AgentEvent, AgentTool } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "./harness.js";
 
 function normalizeEventOrder(events: Harness["events"]): string[] {
@@ -249,7 +249,26 @@ describe("AgentSession retry and event characterization", () => {
 		});
 	}
 
-	it("retries generic provider errors", async () => {
+	it("does not outer-retry intercept provider errors", async () => {
+		const harness = await createHarness({
+			provider: "intercept",
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "unknown after provider" }),
+			fauxAssistantMessage("must not make a second logical request"),
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
+	it("retries generic errors from non-intercept providers", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);
 		harness.setResponses([
