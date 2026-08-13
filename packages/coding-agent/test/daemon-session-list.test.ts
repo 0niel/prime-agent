@@ -589,20 +589,29 @@ describe("buildRlmChildSnapshots", () => {
 		expect(snapshots.map((snapshot) => [snapshot.id, snapshot.status])).toEqual([["sub-aaa", "running"]]);
 	});
 
-	it("omits a precommit-quarantined resident child from attach snapshots", () => {
+	it("omits a quarantined child subtree without hiding an unrelated sibling", () => {
 		const parent = makeState({ activeSessionId: "parent", quarantinedRlmChildren: ["sub-private"] });
 		const privateChild = makeState({
 			activeSessionId: "private-child",
 			metadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "sub-private" },
+		});
+		const privateGrandchild = makeState({
+			activeSessionId: "private-grandchild",
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: "private-child",
+				rlmChildId: "sub-private-grandchild",
+			},
 		});
 		const visibleChild = makeState({
 			activeSessionId: "visible-child",
 			metadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "sub-visible" },
 		});
 
-		expect(buildRlmChildSnapshots("parent", [parent, privateChild, visibleChild])).toMatchObject([
-			{ id: "sub-visible" },
-		]);
+		expect(
+			buildRlmChildSnapshots("parent", [parent, privateChild, privateGrandchild, visibleChild]).map(({ id }) => id),
+		).toEqual(["sub-visible"]);
 	});
 
 	it("keeps terminal run status while projecting a retained child's active follow-up", () => {
