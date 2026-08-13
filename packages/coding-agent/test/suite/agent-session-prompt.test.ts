@@ -414,9 +414,9 @@ describe("AgentSession prompt characterization", () => {
 			await expect(harness.session.prompt("/testcmd must-not-run")).rejects.toThrow(
 				"Cannot admit a session action because the session is disposing or disposed.",
 			);
-			await expect(harness.session.prompt("must-not-reach-input-handler", { streamingBehavior: "followUp" })).rejects.toThrow(
-				"Cannot admit a session action because the session is disposing or disposed.",
-			);
+			await expect(
+				harness.session.prompt("must-not-reach-input-handler", { streamingBehavior: "followUp" }),
+			).rejects.toThrow("Cannot admit a session action because the session is disposing or disposed.");
 			expect(commandRuns).toEqual([]);
 			expect(inputRuns).toEqual([]);
 
