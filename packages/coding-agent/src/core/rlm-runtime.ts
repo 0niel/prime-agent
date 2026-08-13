@@ -240,6 +240,35 @@ export interface RlmSubagentReleaseOutcome {
 	deletionDurability: RlmSubagentDeletionDurability;
 }
 
+/** The durable phase reached by a host-owned deletion attempt. */
+export type RlmSubagentDeletionPhase = "precommit" | "tombstoned";
+
+/** A successful host deletion always proves a concrete durable outcome. */
+export interface RlmSubagentHostDeletionResult {
+	deletionDurability: Exclude<RlmSubagentDeletionDurability, "unknown">;
+}
+
+/**
+ * A typed host deletion failure. `precommit` guarantees that no durable
+ * tombstone was appended, so the caller must leave its live child tracking
+ * untouched. `tombstoned` means the registry commit is authoritative and only
+ * runtime cleanup remains retryable.
+ */
+export class RlmSubagentHostDeletionError extends Error {
+	readonly phase: RlmSubagentDeletionPhase;
+
+	constructor(phase: RlmSubagentDeletionPhase, cause: unknown) {
+		super(
+			phase === "precommit"
+				? "RLM subagent deletion did not commit"
+				: "RLM subagent tombstone committed but runtime close failed",
+			{ cause },
+		);
+		this.name = "RlmSubagentHostDeletionError";
+		this.phase = phase;
+	}
+}
+
 /**
  * Authority held by the exact host request that asked to reconcile a private
  * deletion lease. This is a typed host contract, never child-controlled data.
@@ -267,6 +296,7 @@ export interface SubagentRuntimeHost {
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,
 		status: "done" | "error" | "cancelled",
+		authority?: RlmSubagentDeletionAuthority,
 	) => Promise<RlmSubagentReleaseOutcome>;
 	/** Re-check a release whose durability was unknown, without inventing a public child status. */
 	resolveRlmSubagentDeletion?(
@@ -278,6 +308,6 @@ export interface SubagentRuntimeHost {
 		childId: string,
 		session?: AgentSession,
 		authority?: RlmSubagentDeletionAuthority,
-	): Promise<void>;
+	): Promise<RlmSubagentHostDeletionResult | undefined>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
 }
