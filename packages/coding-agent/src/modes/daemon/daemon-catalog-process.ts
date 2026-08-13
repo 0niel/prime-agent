@@ -1095,9 +1095,9 @@ function listSessionCandidates(
 				if (!entry) break;
 				if (!entry.name.endsWith(".jsonl")) continue;
 				const path = join(resolve(sessionDir), entry.name);
-				let stat: ReturnType<typeof lstatSync>;
 				try {
-					stat = lstatSync(path);
+					const stat = lstatSync(path, { bigint: true });
+					candidates.push({ path, dev: stat.dev.toString(), ino: stat.ino.toString() });
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 						// Removed during enumeration: it was never a stable root candidate.
@@ -1105,7 +1105,6 @@ function listSessionCandidates(
 					}
 					throw error;
 				}
-				candidates.push({ path, dev: String(stat.dev), ino: String(stat.ino) });
 				// Stop immediately at limit + 1. No further directory entries are read,
 				// and no candidate descriptor is opened from an incomplete root set.
 				if (candidates.length > limit) throw limitExceeded;
