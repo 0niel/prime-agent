@@ -285,6 +285,8 @@ export { type ParsedSkillBlock, parseSkillBlock } from "./skill-blocks.js";
 
 export type RlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
 
+type RlmChildDeletionQuarantineResolution = "deleted" | "preserved_newer" | "unknown";
+
 export interface RlmChildAgentActivity {
 	kind: "waiting" | "writing" | "executing";
 	toolName?: string;
@@ -7333,10 +7335,11 @@ export class AgentSession {
 		await Promise.allSettled(
 			[...this._rlmChildDeletionQuarantines.entries()].map(([childId, lease]) =>
 				this._coordinateRlmSubagentDeletion(lease, undefined, lease, async (authority) => {
-					if (!(await this._resolveRlmChildDeletionQuarantine(childId, authority))) {
+					const resolution = await this._resolveRlmChildDeletionQuarantine(childId, authority);
+					if (resolution === "unknown") {
 						throw new Error("RLM subagent deletion durability is still unknown");
 					}
-					return { subagent: lease };
+					return { subagent: lease, ...(resolution === "preserved_newer" ? { outcome: resolution } : {}) };
 				}),
 			),
 		);
@@ -9450,14 +9453,17 @@ export class AgentSession {
 			// promise: if an aborted owner fails before commit, this live waiter can
 			// promote a fresh generation after it drains.
 			const joined = inFlight[0];
-			return this._coordinateRlmSubagentDeletion(joined.subagent, signal, joined.lease, (authority) => {
+			return this._coordinateRlmSubagentDeletion(joined.subagent, signal, joined.lease, async (authority) => {
 				if (joined.lease) {
-					return this._resolveRlmChildDeletionQuarantine(joined.subagent.rlm_child_id, authority).then(
-						(resolved) => {
-							if (!resolved) throw new Error("RLM subagent deletion durability is still unknown");
-							return { subagent: joined.subagent };
-						},
+					const resolution = await this._resolveRlmChildDeletionQuarantine(
+						joined.subagent.rlm_child_id,
+						authority,
 					);
+					if (resolution === "unknown") throw new Error("RLM subagent deletion durability is still unknown");
+					return {
+						subagent: joined.subagent,
+						...(resolution === "preserved_newer" ? { outcome: resolution } : {}),
+					};
 				}
 				return this._deleteResolvedRlmSubagent(joined.subagent, authority);
 			});
@@ -9468,10 +9474,9 @@ export class AgentSession {
 		const quarantined = this._rlmChildDeletionQuarantines.get(target);
 		if (quarantined) {
 			return this._coordinateRlmSubagentDeletion(quarantined, signal, quarantined, async (authority) => {
-				if (!(await this._resolveRlmChildDeletionQuarantine(target, authority))) {
-					throw new Error("RLM subagent deletion durability is still unknown");
-				}
-				return { subagent: quarantined };
+				const resolution = await this._resolveRlmChildDeletionQuarantine(target, authority);
+				if (resolution === "unknown") throw new Error("RLM subagent deletion durability is still unknown");
+				return { subagent: quarantined, ...(resolution === "preserved_newer" ? { outcome: resolution } : {}) };
 			});
 		}
 		if (localMatches[0]) {
@@ -9619,16 +9624,13 @@ export class AgentSession {
 		}
 	}
 
-	/**
-	 * Reconcile a private cancelled-spawn cleanup lease. `false` deliberately
-	 * means that durability is still unknown, never that deletion succeeded.
-	 */
+	/** Reconcile a private cancelled-spawn cleanup lease without touching a replacement. */
 	private async _resolveRlmChildDeletionQuarantine(
 		childId: string,
 		authority?: RlmSubagentDeletionAuthority,
-	): Promise<boolean> {
+	): Promise<RlmChildDeletionQuarantineResolution> {
 		const lease = this._rlmChildDeletionQuarantines.get(childId);
-		if (!lease || this._disposed || this._disposing) return false;
+		if (!lease || this._disposed || this._disposing) return "unknown";
 		authority?.assertCurrent();
 		const durability = await this._subagentRuntimeHost?.resolveRlmSubagentDeletion?.(
 			childId,
@@ -9641,18 +9643,16 @@ export class AgentSession {
 				assertCurrent: () => {},
 			},
 		);
-		if (durability !== "absent" && durability !== "tombstoned") return false;
-		// The host await is a revocation boundary. Do not mutate the artifact or
-		// private deletion bookkeeping after its caller has lost authority.
+		if (durability !== "absent" && durability !== "tombstoned") return "unknown";
+		// The host await is a revocation boundary. It may only discharge the exact
+		// lease it resolved, never a lease or runtime republished under this id.
 		authority?.assertCurrent();
-		// A retry/reaper can yield while the host reads. It may only discharge the
-		// exact lease it resolved, never a newer lease reusing this child id.
-		if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return false;
+		if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return "unknown";
 		const retained = this._rlmChildSessions.get(childId);
+		if (!retained && this._activeRlmChildRuns.has(childId)) {
+			return this._preserveNewerRlmChild(childId, lease) ? "preserved_newer" : "unknown";
+		}
 		if (retained) {
-			// A precommit release failure left the host runtime live. Durability alone
-			// cannot discharge that lease: retry the typed host deletion so the exact
-			// resident incarnation is closed before local tracking is cleared.
 			const deletion = await this._deleteRlmSubagentSession(childId, retained, authority);
 			authority?.assertCurrent();
 			if (
@@ -9660,9 +9660,12 @@ export class AgentSession {
 				this._activeRlmChildRuns.has(childId) ||
 				this._rlmChildSessions.get(childId) !== retained
 			) {
-				return false;
+				// The old host lease is settled, but its id now belongs to a newer
+				// runtime. Discharge only this private lease: no artifact removal,
+				// tracking removal, deleted marker, or deletion-success result.
+				return this._preserveNewerRlmChild(childId, lease) ? "preserved_newer" : "unknown";
 			}
-			if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return false;
+			if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return "unknown";
 			this._removeRlmSubagentTracking(childId);
 		}
 		if (durability === "absent") {
@@ -9673,6 +9676,18 @@ export class AgentSession {
 		// directory is removable. Either conclusion discharges the private lease.
 		this._rlmChildDeletionQuarantines.delete(childId);
 		this._deletedRlmChildIds.add(childId);
+		return "deleted";
+	}
+
+	/** Discharge an obsolete private lease without mutating the replacement's tracking. */
+	private _preserveNewerRlmChild(childId: string, lease?: RlmSubagentRegistryEntry): boolean {
+		if (lease) {
+			if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return false;
+			this._rlmChildDeletionQuarantines.delete(childId);
+		}
+		// A queued old delete may have hidden this id before its host later confirms
+		// that the incarnation was replaced. The marker is not owned by that newer child.
+		this._deletedRlmChildIds.delete(childId);
 		return true;
 	}
 
@@ -10080,6 +10095,7 @@ export class AgentSession {
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
 		let childSession: AgentSession | undefined;
+		let preservesNewerChild = false;
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -10488,11 +10504,14 @@ export class AgentSession {
 					await this._coordinateRlmSubagentDeletion(publishedDeletion, undefined, undefined, async (authority) => {
 						try {
 							const deletion = await this._deleteRlmSubagentSession(run.id, publishedRuntime.session, authority);
+							authority.assertCurrent();
 							if (
 								deletion.deletionDurability === "stale" ||
 								this._activeRlmChildRuns.get(run.id) !== run ||
-								run.session !== publishedRuntime.session
+								(run.session !== undefined && run.session !== publishedRuntime.session)
 							) {
+								preservesNewerChild = this._preserveNewerRlmChild(run.id);
+								if (preservesNewerChild) run.detachedDeletion = undefined;
 								return { subagent: publishedDeletion, outcome: "preserved_newer" };
 							}
 						} catch (error) {
@@ -10507,7 +10526,7 @@ export class AgentSession {
 						return { subagent: publishedDeletion };
 					}).catch(() => undefined);
 				}
-				if (this._activeRlmChildRuns.get(run.id) === run) {
+				if (this._activeRlmChildRuns.get(run.id) === run && !preservesNewerChild) {
 					if (this._rlmChildSessions.has(run.id)) {
 						this._activeRlmChildRuns.delete(run.id);
 						if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);

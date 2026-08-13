@@ -3068,11 +3068,13 @@ describe("AgentSession rlm recursion", () => {
 		const stale = createSession({ rlmSessionDir: join(tempDir, "stale-startup") });
 		const newer = createSession({ rlmSessionDir: join(tempDir, "new-startup") });
 		let root!: AgentSession;
-		const deleteRuntime = vi.fn(async (childId: string) => {
-			const internals = root as unknown as InspectableRlmSession;
-			const original = internals._activeRlmChildRuns.get(childId);
+		const deleteRuntime = vi.fn(async (childId: string, session?: AgentSession) => {
+			if (session !== stale) return { deletionDurability: "absent" as const };
+			const original = (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(childId);
 			if (!original) throw new Error("Missing delayed startup run");
-			internals._activeRlmChildRuns.set(childId, { ...original, session: newer });
+			// Same run, newer active session: finalization must not clear this replacement.
+			original.session = newer;
+			original.status = "running";
 			return { deletionDurability: "stale" as const };
 		});
 		root = createSession({
@@ -3096,8 +3098,58 @@ describe("AgentSession rlm recursion", () => {
 		await waitFor(() => internals._activeRlmChildRuns.get(childId)?.session === newer);
 		expect(internals._deletedRlmChildIds.has(childId)).toBe(false);
 		expect(internals._activeRlmChildRuns.get(childId)?.session).toBe(newer);
+		await expect(root.listRlmSubagents()).resolves.toEqual({
+			subagents: [expect.objectContaining({ rlm_child_id: childId, session_id: newer.sessionId })],
+		});
+		await expect(root.deleteRlmSubagent(childId)).resolves.toMatchObject({ subagent: { rlm_child_id: childId } });
+		expect(deleteRuntime).toHaveBeenLastCalledWith(childId, newer, expect.any(Object));
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 		await stale.disposeAsync();
 		await newer.disposeAsync();
+	});
+
+	it("discharges a quarantined old lease when a queued replacement reuses its id", async () => {
+		const childId = "queued-quarantine-replacement";
+		const staleDir = join(tempDir, "queued-stale-quarantine");
+		const lease = {
+			rlm_child_id: childId,
+			active_session_id: null,
+			session_id: "stale",
+			status: "error" as const,
+			session_name: "stale-quarantine",
+			session_dir: staleDir,
+		};
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				resolveRlmSubagentDeletion: async () => "tombstoned",
+				deleteRlmSubagentRuntime: async () => {
+					throw new Error("queued replacement has no old retained session to delete");
+				},
+			},
+		});
+		const internals = root as unknown as InspectableRlmSession;
+		internals._rlmChildDeletionQuarantines.set(childId, lease);
+		internals._deletedRlmChildIds.add(childId);
+		internals._activeRlmChildRuns.set(childId, {
+			id: childId,
+			sessionDir: join(tempDir, "queued-new-quarantine"),
+			status: "queued",
+			settled: false,
+			abort: () => {},
+			publication: { promise: Promise.resolve(), resolve: () => {}, reject: () => {} },
+		} as unknown as InspectableRlmRun);
+
+		await expect(root.deleteRlmSubagent(childId)).resolves.toMatchObject({ outcome: "preserved_newer" });
+		expect(internals._rlmChildDeletionQuarantines.has(childId)).toBe(false);
+		expect(internals._deletedRlmChildIds.has(childId)).toBe(false);
+		await expect(root.listRlmSubagents()).resolves.toEqual({
+			subagents: [
+				expect.objectContaining({ rlm_child_id: childId, session_dir: join(tempDir, "queued-new-quarantine") }),
+			],
+		});
 	});
 
 	it("keeps late startup cleanup retryable when release and fallback delete fail", async () => {
@@ -3555,7 +3607,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(internals._rlmChildSessions).toHaveLength(0);
 	});
 
-	it("preserves a replacement retained child when quarantined deletion settles stale", async () => {
+	it("discharges only a stale quarantine lease when its child id is replaced", async () => {
 		const childId = "recycled-quarantine-child";
 		const staleDir = join(tempDir, "stale-quarantine");
 		const stale = { _rlmSessionDir: staleDir, sessionId: "stale" } as unknown as AgentSession;
@@ -3569,9 +3621,12 @@ describe("AgentSession rlm recursion", () => {
 			session_name: "stale-quarantine",
 			session_dir: staleDir,
 		};
-		const deleteRuntime = vi.fn(async () => {
-			(root as unknown as InspectableRlmSession)._rlmChildSessions.set(childId, newer);
-			return { deletionDurability: "stale" as const };
+		const deleteRuntime = vi.fn(async (_childId: string, session?: AgentSession) => {
+			if (session === stale) {
+				(root as unknown as InspectableRlmSession)._rlmChildSessions.set(childId, newer);
+				return { deletionDurability: "stale" as const };
+			}
+			return { deletionDurability: "absent" as const };
 		});
 		root = createSession({
 			subagentRuntimeHost: {
@@ -3586,13 +3641,27 @@ describe("AgentSession rlm recursion", () => {
 		internals._rlmChildDeletionQuarantines.set(childId, rootEntry);
 		internals._rlmChildSessions.set(childId, stale);
 
-		await expect(root.deleteRlmSubagent(childId)).rejects.toThrow(
-			"RLM subagent deletion durability is still unknown",
-		);
+		await expect(root.deleteRlmSubagent(childId)).resolves.toMatchObject({ outcome: "preserved_newer" });
 		expect(deleteRuntime).toHaveBeenCalledWith(childId, stale, expect.any(Object));
 		expect(internals._rlmChildSessions.get(childId)).toBe(newer);
-		expect(internals._rlmChildDeletionQuarantines.get(childId)).toBe(rootEntry);
+		expect(internals._rlmChildDeletionQuarantines.has(childId)).toBe(false);
 		expect(internals._deletedRlmChildIds.has(childId)).toBe(false);
+		await expect(root.listRlmSubagents()).resolves.toEqual({
+			subagents: [
+				expect.objectContaining({
+					rlm_child_id: childId,
+					session_id: "new",
+					session_dir: join(tempDir, "new-quarantine"),
+				}),
+			],
+		});
+
+		await expect(root.deleteRlmSubagent(childId)).resolves.toEqual({
+			subagent: expect.objectContaining({ rlm_child_id: childId, session_id: "new" }),
+		});
+		expect(deleteRuntime).toHaveBeenLastCalledWith(childId, newer, expect.any(Object));
+		expect(internals._rlmChildSessions.has(childId)).toBe(false);
+		expect(internals._deletedRlmChildIds.has(childId)).toBe(true);
 	});
 
 	it("rejects a quarantine retry revoked after host durability resolves without mutating", async () => {
