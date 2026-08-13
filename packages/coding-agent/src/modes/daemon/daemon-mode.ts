@@ -2347,42 +2347,48 @@ export class AgentDaemon {
 				});
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status, authority) => {
-				authority?.assertCurrent();
-				// Preserve the three-way durability proof through release. The finalizer
-				// receives the same incarnation authority as explicit deletion, so it
-				// cannot close a same-id runtime recreated during delayed startup.
-				let deletionDurability: RlmSubagentDeletionDurability = "unknown";
-				if (status === "cancelled") {
-					try {
-						deletionDurability = await this.recordRlmSubagentDeletion(parentState, options.id, authority);
-					} catch (error) {
-						throw new RlmSubagentHostDeletionError("precommit", error);
-					}
-				}
-				const state = [...this.sessions.values()].find(
-					(candidate) =>
-						candidate.runtime.metadata.kind === "subagent" &&
-						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
-						candidate.runtime.metadata.rlmChildId === options.id &&
-						candidate.runtime.session === runtime.session,
-				);
-				if (authority && state?.runtime.metadata.sessionDir !== authority.sessionDir) {
-					throw new RlmSubagentHostDeletionError(
-						"precommit",
-						new Error("RLM subagent release authority does not match runtime incarnation"),
-					);
-				}
 				try {
-					if (deletionDurability === "absent") authority?.assertCurrent();
-					if (state) await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
-					else await runtime.session.disposeAsync();
-				} catch (error) {
-					if (deletionDurability === "tombstoned") {
-						throw new RlmSubagentHostDeletionError("tombstoned", error);
+					authority?.assertCurrent();
+					// Resolve the exact resident incarnation before any tombstone append. An
+					// older finalizer can share both child id and directory with its
+					// replacement, so neither field is an object-identity fence.
+					const state = [...this.sessions.values()].find(
+						(candidate) =>
+							candidate.runtime.metadata.kind === "subagent" &&
+							candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+							candidate.runtime.metadata.rlmChildId === options.id,
+					);
+					if (
+						!state ||
+						state.runtime.session !== runtime.session ||
+						state.runtime.metadata.sessionDir !== options.sessionDir ||
+						(authority !== undefined && state.runtime.metadata.sessionDir !== authority.sessionDir)
+					) {
+						throw new Error("RLM subagent release does not match the resident runtime incarnation");
 					}
+
+					let deletionDurability: RlmSubagentDeletionDurability = "unknown";
+					if (status === "cancelled") {
+						deletionDurability = await this.recordRlmSubagentDeletion(parentState, options.id, authority);
+						if (deletionDurability === "unknown") {
+							throw new Error("RLM subagent deletion durability is still unknown");
+						}
+					}
+
+					try {
+						if (deletionDurability === "absent") authority?.assertCurrent();
+						await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
+					} catch (error) {
+						if (deletionDurability === "tombstoned") {
+							throw new RlmSubagentHostDeletionError("tombstoned", error);
+						}
+						throw error;
+					}
+					return { deletionDurability };
+				} catch (error) {
+					if (error instanceof RlmSubagentHostDeletionError) throw error;
 					throw new RlmSubagentHostDeletionError("precommit", error);
 				}
-				return { deletionDurability };
 			},
 			resolveRlmSubagentDeletion: (childId, authority) =>
 				this.recordRlmSubagentDeletion(parentState, childId, authority),
@@ -2398,33 +2404,34 @@ export class AgentDaemon {
 					const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
 						(entry) => entry.childId === childId,
 					);
+					// Concrete deletion requires exact object identity. Passive deletion has no
+					// object fence, so bind it to the complete persisted identity instead.
 					if (
-						authority &&
-						state?.runtime.metadata.sessionDir !== undefined &&
-						state.runtime.metadata.sessionDir !== authority.sessionDir
+						(state !== undefined && session !== undefined && state.runtime.session !== session) ||
+						(state !== undefined && session === undefined) ||
+						(state === undefined && session !== undefined) ||
+						(authority !== undefined &&
+							(state !== undefined
+								? state.runtime.metadata.sessionDir !== authority.sessionDir
+								: persisted === undefined || persisted.sessionDir !== authority.sessionDir))
 					) {
-						authority.assertCurrent();
-						throw new Error("RLM subagent deletion authority does not match runtime incarnation");
+						throw new Error("RLM subagent deletion does not match the resident runtime incarnation");
 					}
 					const childSessionFile = persisted?.sessionFile ?? state?.runtime.session.sessionFile;
 					const deletionDurability = await this.recordRlmSubagentDeletion(parentState, childId, authority);
 					if (deletionDurability === "unknown") {
 						throw new Error("RLM subagent deletion durability is still unknown");
 					}
-					if (deletionDurability === "absent") authority?.assertCurrent();
-					const staleSession = state && session && state.runtime.session !== session ? session : undefined;
 					try {
 						if (deletionDurability === "absent") authority?.assertCurrent();
 						if (state) await this.closeSession(state, "killed", false);
-						else await session?.disposeAsync();
-						await staleSession?.disposeAsync();
+						if (childSessionFile) this.cancelScheduledJobsForSessionFile(childSessionFile);
 					} catch (error) {
 						if (deletionDurability === "tombstoned") {
 							throw new RlmSubagentHostDeletionError("tombstoned", error);
 						}
 						throw error;
 					}
-					if (childSessionFile) this.cancelScheduledJobsForSessionFile(childSessionFile);
 					return { deletionDurability };
 				} catch (error) {
 					if (error instanceof RlmSubagentHostDeletionError) throw error;
