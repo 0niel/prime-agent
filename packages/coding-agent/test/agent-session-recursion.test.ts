@@ -2169,6 +2169,43 @@ describe("AgentSession rlm recursion", () => {
 		);
 	});
 
+	it("removes an unadmitted child directory when host cancellation wins name validation", async () => {
+		let releaseNameCheck: () => void = () => {};
+		const nameCheckGate = new Promise<void>((resolve) => {
+			releaseNameCheck = resolve;
+		});
+		let nameCheckStarted = false;
+		const controller = new AbortController();
+		const root = createSession({
+			agentMessageController: {
+				assertSessionNameAvailable: async () => {
+					nameCheckStarted = true;
+					await nameCheckGate;
+				},
+				listAgents: async () => ({
+					current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+					agents: [],
+				}),
+				sendAgentMessage: async () => {
+					throw new Error("unexpected send");
+				},
+			},
+		});
+
+		const run = root.runRlmChild("cancel during default name validation", {}, undefined, controller.signal);
+		await waitFor(() => nameCheckStarted);
+		const childDirs = readdirSync(tempDir, { recursive: true, encoding: "utf8" }).filter((path) =>
+			basename(path).startsWith("sub-"),
+		);
+		expect(childDirs).toHaveLength(1);
+
+		controller.abort(new Error("host disposed"));
+		releaseNameCheck();
+
+		await expect(run).rejects.toThrow("host disposed");
+		expect(existsSync(join(tempDir, childDirs[0] ?? ""))).toBe(false);
+	});
+
 	it("cancels active rlm children when the parent session is disposed", async () => {
 		let releaseChild: () => void = () => {};
 		const release = new Promise<void>((resolve) => {
