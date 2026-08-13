@@ -8,7 +8,7 @@ description: Create, validate, and install Prime Agent skills - both markdown sk
 A skill is a directory with a `SKILL.md` file (YAML frontmatter + markdown instructions). At startup Prime Agent reads only each skill's name and description into the system prompt; the full file loads on demand when a task matches. Prime Agent follows the [Agent Skills standard](https://agentskills.io/specification) and extends it with Python-backed skills.
 
 | Kind | What it is | When to use |
-|---|---|---|
+| --- | --- | --- |
 | markdown | `SKILL.md` plus optional scripts, references, and assets | Workflows, CLI recipes, domain knowledge, multi-step instructions |
 | python | A markdown skill that also ships a Python package installed into the agent's persistent IPython kernel | Capabilities that are naturally one Python call: API wrappers, fetchers, converters, computations |
 
@@ -28,7 +28,7 @@ On a name collision the first skill found wins. Precedence: explicit `--skill` p
 
 ## Layout
 
-```
+```text
 my-skill/
 ├── SKILL.md              # Required: frontmatter + instructions
 ├── scripts/              # Optional helper scripts the instructions reference
@@ -48,7 +48,7 @@ description: What this skill does and when to use it. Be specific.
 ```
 
 | Field | Required | Rules |
-|---|---|---|
+| --- | --- | --- |
 | `name` | Yes | Max 64 chars. Lowercase a-z, 0-9, hyphens. No leading/trailing/consecutive hyphens. Must match the parent directory name. |
 | `description` | Yes | Max 1024 chars. A skill with a missing or empty description is **silently not loaded**. |
 | `disable-model-invocation` | No | `true` hides the skill from the system prompt; only explicit `/skill:<name>` invokes it. |

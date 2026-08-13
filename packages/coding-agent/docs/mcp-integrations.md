@@ -98,7 +98,7 @@ Currently only remote `"http"` servers are supported by `McpIntegration`. HTTP
 server fields:
 
 | Field | Meaning |
-|-------|---------|
+| ------- | --------- |
 | `type` | Must be `"http"` |
 | `url` | The MCP endpoint |
 | `oauth` | `true` to use the browser OAuth flow (requires the server to support dynamic client registration) |
@@ -114,7 +114,7 @@ server fields:
 Create a skill directory (any [skills location](skills.md#locations), e.g.
 `~/.prime/agent/skills/acme/`) with the standard Python-skill layout:
 
-```
+```text
 acme/
   SKILL.md
   pyproject.toml

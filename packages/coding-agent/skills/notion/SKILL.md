@@ -39,6 +39,7 @@ Tools whose names *are* valid identifiers can also be called as
 `list_tools()` has run.
 
 Notes:
+
 - Every call is `async` — always `await`.
 - Results are already-parsed Python (a `dict` for structured output, otherwise a
   string). No need to `json.loads` them.

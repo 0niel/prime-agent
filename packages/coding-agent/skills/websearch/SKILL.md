@@ -9,7 +9,7 @@ Search the web via the Serper Google Search API.
 
 ## Setup
 
-Get a free API key at https://serper.dev, then run `/login` in Prime Agent,
+Get a free API key at <https://serper.dev>, then run `/login` in Prime Agent,
 switch to **MCP Connections**, and choose **Serper (web search)** to paste it.
 The key is stored in Prime Agent and made available to this skill automatically.
 

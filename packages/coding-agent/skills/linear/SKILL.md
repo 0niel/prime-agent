@@ -35,6 +35,7 @@ print(result)
 ```
 
 Notes:
+
 - Every tool is an `async` method — always `await`.
 - Results are already-parsed Python (a `dict` for structured output, otherwise a
   string). No need to `json.loads` them.

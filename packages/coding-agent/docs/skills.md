@@ -38,6 +38,7 @@ Prime Agent loads skills from:
 - Built-in: `skills/` shipped with the prime-agent package (lowest precedence)
 
 Discovery rules:
+
 - In `~/.prime/agent/skills/` and `.prime/agent/skills/`, direct root `.md` files are discovered as individual skills
 - In all skill locations, directories containing `SKILL.md` are discovered recursively
 - In `~/.agents/skills/` and project `.agents/skills/`, root `.md` files are ignored
@@ -142,7 +143,7 @@ Skills with `disable-model-invocation: true` are hidden from the startup skill l
 
 A Python-backed skill uses the same `SKILL.md` metadata and invocation behavior as a markdown skill, but also provides a Python package for the IPython kernel.
 
-```
+```text
 web-search/
 ├── SKILL.md
 ├── pyproject.toml
@@ -152,6 +153,7 @@ web-search/
 ```
 
 Detection rules:
+
 - `SKILL.md` is still required
 - `pyproject.toml` marks the skill as Python-backed
 - the import name is the skill name with hyphens converted to underscores
@@ -253,7 +255,7 @@ Toggle skill commands via `/settings` in interactive mode or in `settings.json`:
 
 A skill is a directory with a `SKILL.md` file. Everything else is freeform.
 
-```
+```text
 my-skill/
 ├── SKILL.md              # Required: frontmatter + instructions
 ├── scripts/              # Helper scripts
@@ -299,7 +301,7 @@ See [the reference guide](references/REFERENCE.md) for details.
 Per the [Agent Skills specification](https://agentskills.io/specification#frontmatter-required):
 
 | Field | Required | Description |
-|-------|----------|-------------|
+| ------- | ---------- | ------------- |
 | `name` | Yes | Max 64 chars. Lowercase a-z, 0-9, hyphens. Must match parent directory. |
 | `description` | Yes | Max 1024 chars. What the skill does and when to use it. |
 | `license` | No | License name or reference to bundled file. |
@@ -324,11 +326,13 @@ Invalid: `PDF-Processing`, `-pdf`, `pdf--processing`
 The description determines when the agent loads the skill. Be specific.
 
 Good:
+
 ```yaml
 description: Extracts text and tables from PDF files, fills PDF forms, and merges multiple PDFs. Use when working with PDF documents.
 ```
 
 Poor:
+
 ```yaml
 description: Helps with PDFs.
 ```
@@ -350,7 +354,7 @@ Name collisions (same name from different locations) warn and keep the first ski
 
 ## Example
 
-```
+```text
 brave-search/
 ├── SKILL.md
 ├── search.js
@@ -358,6 +362,7 @@ brave-search/
 ```
 
 **SKILL.md:**
+
 ````markdown
 ---
 name: brave-search

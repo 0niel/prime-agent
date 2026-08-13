@@ -11,7 +11,7 @@ The runtime example shows how to build a recreate function that closes over proc
 ## Examples
 
 | File | Description |
-|------|-------------|
+| ------ | ------------- |
 | `01-minimal.ts` | Simplest usage with all defaults |
 | `02-custom-model.ts` | Select model and thinking level |
 | `03-custom-prompt.ts` | Replace or modify system prompt |
@@ -111,7 +111,7 @@ await session.prompt("Hello");
 ## Options
 
 | Option | Default | Description |
-|--------|---------|-------------|
+| -------- | --------- | ------------- |
 | `authStorage` | `AuthStorage.create()` | Credential storage |
 | `modelRegistry` | `ModelRegistry.create(authStorage)` | Model registry |
 | `cwd` | `process.cwd()` | Working directory |
