@@ -822,21 +822,28 @@ interface JsonStringPrefix {
 	end: number;
 	terminated: boolean;
 	partialEscape: boolean;
+	invalidEscape: boolean;
 }
 
-/** Read a JSON string without treating malformed input as executable JSON. */
+/**
+ * Read a JSON string without treating malformed input as executable JSON.
+ *
+ * Even after an invalid escape, retain string framing: a malformed unrelated
+ * value must not hide subsequent outer-object claims behind its closing quote.
+ */
 function readJsonStringPrefix(text: string, start: number): JsonStringPrefix | undefined {
 	if (text[start] !== '"') return undefined;
 	let value = "";
 	let index = start + 1;
+	let invalidEscape = false;
 	while (index < text.length) {
 		const char = text[index++];
-		if (char === '"') return { value, end: index, terminated: true, partialEscape: false };
+		if (char === '"') return { value, end: index, terminated: true, partialEscape: false, invalidEscape };
 		if (char !== "\\") {
 			value += char;
 			continue;
 		}
-		if (index === text.length) return { value, end: index, terminated: false, partialEscape: true };
+		if (index === text.length) return { value, end: index, terminated: false, partialEscape: true, invalidEscape };
 		const escapedChar = text[index++];
 		const simpleEscape =
 			escapedChar === '"'
@@ -860,14 +867,26 @@ function readJsonStringPrefix(text: string, start: number): JsonStringPrefix | u
 			value += simpleEscape;
 			continue;
 		}
-		if (escapedChar !== "u") return { value, end: index, terminated: false, partialEscape: false };
-		if (index + 4 > text.length) return { value, end: text.length, terminated: false, partialEscape: true };
-		const hex = text.slice(index, index + 4);
-		if (!/^[0-9a-f]{4}$/iu.test(hex)) return { value, end: index + 4, terminated: false, partialEscape: false };
-		value += String.fromCharCode(Number.parseInt(hex, 16));
-		index += 4;
+		if (escapedChar !== "u") {
+			invalidEscape = true;
+			continue;
+		}
+		const unicodeStart = index;
+		let hex = "";
+		while (hex.length < 4 && index < text.length && /[0-9a-f]/iu.test(text[index] ?? "")) {
+			hex += text[index++];
+		}
+		if (hex.length === 4) {
+			value += String.fromCharCode(Number.parseInt(hex, 16));
+			continue;
+		}
+		invalidEscape = true;
+		// A truncated sequence is ambiguous. Otherwise leave the first invalid
+		// byte for normal framing, notably a terminating quote.
+		if (index === text.length) return { value, end: index, terminated: false, partialEscape: true, invalidEscape };
+		index = unicodeStart + hex.length;
 	}
-	return { value, end: index, terminated: false, partialEscape: false };
+	return { value, end: index, terminated: false, partialEscape: false, invalidEscape };
 }
 
 function skipJsonValuePrefix(text: string, start: number): number {
@@ -913,17 +932,19 @@ function hasApparentSessionTopologyClaimPrefix(text: string): boolean {
 		if (text[index] === "}") return false;
 		const key = readJsonStringPrefix(text, index);
 		if (!key) return false;
-		if (!key.terminated) return key.partialEscape;
+		// A malformed or partial outer key could itself be a topology key.
+		if (!key.terminated || key.invalidEscape) return true;
 		index = key.end;
 		while (/\s/u.test(text[index] ?? "")) index++;
 		if (text[index] !== ":") return false;
 		index++;
 		while (/\s/u.test(text[index] ?? "")) index++;
 		if (key.value === "id") return true;
-		if (key.value === "type") {
-			const value = readJsonStringPrefix(text, index);
-			if (!value) return false;
-			if (!value.terminated) return value.partialEscape || "session".startsWith(value.value);
+		if (key.value === "type" && text[index] === '"') {
+			const value = readJsonStringPrefix(text, index)!;
+			// Type's string value is itself a session claim surface; do not
+			// downgrade malformed or partial values to unrelated junk.
+			if (!value.terminated || value.invalidEscape) return true;
 			if (value.value === "session") return true;
 		}
 		index = skipJsonValuePrefix(text, index);
