@@ -5840,6 +5840,12 @@ export class AgentDaemon {
 		return manifest;
 	}
 
+	private removeMemoryRestartCheckpoints(manifest: DaemonUpdateRestartManifest | undefined): void {
+		for (const session of manifest?.sessions ?? []) {
+			if (session.persistence === "memory") rmSync(session.sessionFile, { force: true });
+		}
+	}
+
 	private cancelPreparedUpdateRestart(transactionId?: symbol): void {
 		const transaction = this.updateRestart;
 		if (!transaction || (transactionId && transaction.id !== transactionId)) return;
@@ -5847,6 +5853,7 @@ export class AgentDaemon {
 		transaction.deadline = undefined;
 		transaction.abort.abort();
 		if (transaction.phase === "publishing") return;
+		this.removeMemoryRestartCheckpoints(transaction.manifest);
 		this.updateRestart = undefined;
 		for (const deferred of transaction.deferredClientEnv) {
 			if (

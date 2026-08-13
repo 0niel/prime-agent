@@ -1426,7 +1426,7 @@ export class SessionManager {
 		const checkpointHeader: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
-			id: target.sessionId,
+			id: this.sessionId,
 			timestamp: new Date().toISOString(),
 			cwd: this.cwd,
 			parentSession: header?.parentSession,

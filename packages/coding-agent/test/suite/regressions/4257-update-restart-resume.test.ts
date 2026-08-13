@@ -910,7 +910,8 @@ describe("issue #4257 update restart resume", () => {
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
 		);
 
-		const manifest = await internals.prepareUpdateRestart();
+		const transaction = internals.beginUpdateRestartTransaction();
+		const manifest = await internals.runUpdateRestartPreparation(transaction);
 
 		expect(manifest.sessions).toHaveLength(1);
 		expect(manifest.sessions[0]).toMatchObject({
@@ -924,7 +925,11 @@ describe("issue #4257 update restart resume", () => {
 		});
 		expect(harness.session.sessionFile).toBeUndefined();
 		expect(harness.sessionManager.allowsPersistence()).toBe(false);
-		expect(readFileSync(manifest.sessions[0]!.sessionFile, "utf8")).toContain('"type":"session"');
+		const checkpoint = manifest.sessions[0]!.sessionFile;
+		const checkpointHeader = JSON.parse(readFileSync(checkpoint, "utf8").split("\n")[0]!) as { id: string };
+		expect(checkpointHeader.id).toBe(harness.session.sessionId);
+		internals.cancelPreparedUpdateRestart();
+		expect(() => readFileSync(checkpoint, "utf8")).toThrow();
 	});
 
 	it("restores queued actions through the public recovery API with stable ids and FIFO", async () => {
