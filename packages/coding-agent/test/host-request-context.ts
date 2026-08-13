@@ -5,7 +5,7 @@ import {
 	KernelManager,
 } from "../src/core/kernel/index.js";
 
-/** Raw implementations are retained only for test-created business-unit fixtures. */
+/** Raw implementations retained per fixture so tests can call them without dispatcher authority. */
 const testHostHandlerImplementations = new WeakMap<HostRequestHandler, HostRequestHandler>();
 
 /**
