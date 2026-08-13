@@ -10245,16 +10245,39 @@ export class AgentSession {
 					);
 				}
 				if (!this.registerRlmChildSession(run.id, child)) {
-					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
-						await this._subagentRuntimeHost
-							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
-							.then((outcome) => {
+					// Registration can lose a race to delete-before-publication. Join that
+					// exact owner rather than releasing the newly published runtime directly.
+					const inFlight = this._deletingRlmChildren.get(run.id);
+					const finalizerSubagent =
+						inFlight?.subagent ??
+						({
+							rlm_child_id: run.id,
+							active_session_id: null,
+							session_id: child.sessionId,
+							session_name: child.sessionName ?? sessionName,
+							session_dir: childSessionDir,
+							status: "error",
+						} satisfies RlmSubagentRegistryEntry);
+					await this._coordinateRlmSubagentDeletion(
+						finalizerSubagent,
+						undefined,
+						inFlight?.lease,
+						async (authority) => {
+							if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
+								const outcome = await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
+									childRuntime,
+									subagentOptions,
+									"error",
+									authority,
+								);
 								deletionDurability = outcome?.deletionDurability ?? "unknown";
-							})
-							.catch(() => void child.disposeAsync().catch(() => undefined));
-					} else {
-						await child.disposeAsync().catch(() => undefined);
-					}
+							} else {
+								authority.assertCurrent();
+								await child.disposeAsync();
+							}
+							return { subagent: finalizerSubagent };
+						},
+					).catch(() => undefined);
 				}
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
@@ -10335,12 +10358,33 @@ export class AgentSession {
 						}
 					}
 				} else if (!run.detachedDeletion) {
+					const finalizerSubagent: RlmSubagentRegistryEntry = {
+						rlm_child_id: run.id,
+						active_session_id: null,
+						session_id: childSession?.sessionId ?? null,
+						session_name: childSession?.sessionName ?? sessionName,
+						session_dir: childSessionDir,
+						status: "error",
+					};
 					try {
-						if (childRuntime && this._subagentRuntimeHost) {
-							await this._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
-						} else if (childSession) {
-							await childSession.disposeAsync();
-						}
+						await this._coordinateRlmSubagentDeletion(
+							finalizerSubagent,
+							undefined,
+							undefined,
+							async (authority) => {
+								if (childRuntime && this._subagentRuntimeHost) {
+									await this._subagentRuntimeHost.deleteRlmSubagentRuntime(
+										run.id,
+										childRuntime.session,
+										authority,
+									);
+								} else if (childSession) {
+									authority.assertCurrent();
+									await childSession.disposeAsync();
+								}
+								return { subagent: finalizerSubagent };
+							},
+						);
 						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
 							// The known dispose-only host owns no durable registry, so a successful
 							// fallback delete is affirmative absence rather than an I/O guess.
