@@ -26,6 +26,8 @@ export interface RlmSubagentRegistryEntry {
 	rlm_child_id: string;
 	active_session_id: string | null;
 	session_id: string | null;
+	/** Persisted session path, when daemon discovery can identify this incarnation. */
+	session_file?: string;
 	session_name: string;
 	session_dir: string;
 	status: RlmSubagentRegistryStatus;
@@ -277,6 +279,12 @@ export interface RlmSubagentDeletionAuthority {
 	/** Exact child incarnation this attempt is allowed to reconcile. */
 	childId: string;
 	sessionDir: string;
+	/**
+	 * Persisted/runtime incarnation fences. Passive deletion has no object
+	 * reference, so it must carry at least one of these when discovery has it.
+	 */
+	sessionFile?: string;
+	sessionId?: string;
 	/** Monotonic per-parent attempt token; never reused after an aborted owner. */
 	generation: number;
 	/**

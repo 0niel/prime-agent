@@ -1057,6 +1057,70 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("fences passive deletion by its persisted incarnation and retries only post-tombstone cleanup", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-delete-incarnation-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				cancelScheduledJobsForSessionFile(sessionFile: string): void;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const original = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
+			const replacementFile = join(fixture.childSessionDir, "replacement.jsonl");
+			writeFileSync(replacementFile, "replacement");
+			writeFileSync(
+				registryPath,
+				`${JSON.stringify({
+					...original,
+					sessionFile: replacementFile,
+					updatedAt: "2026-01-01T00:00:02.000Z",
+				})}\n`,
+			);
+			const host = internals.createSubagentRuntimeHost(parent);
+			const oldAuthority = {
+				childId: fixture.childId,
+				sessionDir: fixture.childSessionDir,
+				sessionFile: fixture.childSessionFile,
+				sessionId: "old-session-id",
+				generation: 1,
+				assertCurrent: () => {},
+			};
+			await expect(host.deleteRlmSubagentRuntime(fixture.childId, undefined, oldAuthority)).rejects.toMatchObject({
+				name: "RlmSubagentHostDeletionError",
+				phase: "precommit",
+			});
+			expect(readFileSync(registryPath, "utf8")).not.toContain('"status":"deleted"');
+
+			let cleanupAttempts = 0;
+			const cleanup = vi.spyOn(internals, "cancelScheduledJobsForSessionFile").mockImplementation(() => {
+				if (++cleanupAttempts === 1) throw new Error("scheduler cleanup failed once");
+			});
+			const currentAuthority = {
+				...oldAuthority,
+				sessionFile: replacementFile,
+				sessionId: "replacement-session-id",
+				generation: 2,
+			};
+			await expect(
+				host.deleteRlmSubagentRuntime(fixture.childId, undefined, currentAuthority),
+			).rejects.toMatchObject({
+				name: "RlmSubagentHostDeletionError",
+				phase: "tombstoned",
+			});
+			expect(readFileSync(registryPath, "utf8").match(/"status":"deleted"/g)).toHaveLength(1);
+			await expect(host.deleteRlmSubagentRuntime(fixture.childId, undefined, currentAuthority)).resolves.toEqual({
+				deletionDurability: "tombstoned",
+			});
+			expect(cleanup).toHaveBeenCalledTimes(2);
+			expect(readFileSync(registryPath, "utf8").match(/"status":"deleted"/g)).toHaveLength(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("honors daemon deletion authority on both sides of the append boundary", async () => {
 		const beforeTempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-before-append-"));
 		const afterTempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-after-append-"));
@@ -1124,7 +1188,7 @@ describe("daemon mode helpers", () => {
 							if (afterAbort.signal.aborted) throw new Error("host request authority was revoked");
 						},
 					}),
-			).resolves.toBeUndefined();
+			).resolves.toEqual({ deletionDurability: "tombstoned" });
 			expect(readFileSync(join(after.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")).toContain(
 				'"status":"deleted"',
 			);
