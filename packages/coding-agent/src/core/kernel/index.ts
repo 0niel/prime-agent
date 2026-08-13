@@ -1362,10 +1362,10 @@ export class KernelManager {
 		this.activeHostRequestControllers.set(commId, controller);
 		const context = mintHostRequestContext(uuid(), ++this.hostRequestGeneration, controller);
 		const task = (async () => {
+			let result: Record<string, unknown>;
 			try {
-				const result = await this.handleHostRequest(data, context);
+				result = await this.handleHostRequest(data, context);
 				if (context.signal.aborted) throw new Error("host request authority was revoked");
-				await this.sendCommMessage(commId, { status: "ok", ...result });
 			} catch (error) {
 				this.appendKernelDiagnostic(`host request failed for comm ${commId}: ${errorMessage(error)}`);
 				// A closed or replaced comm must not receive a stale error from its former request.
@@ -1377,6 +1377,14 @@ export class KernelManager {
 						`failed to send host request error reply for comm ${commId}: ${errorMessage(replyError)}`,
 					);
 				}
+				return;
+			}
+			try {
+				await this.sendCommMessage(commId, { status: "ok", ...result });
+			} catch (replyError) {
+				this.appendKernelDiagnostic(
+					`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,
+				);
 			}
 		})();
 		this.inFlightHostRequests.add(task);
