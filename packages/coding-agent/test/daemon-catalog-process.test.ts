@@ -18,6 +18,7 @@ import {
 	listCatalogFamilySessions,
 	listSavedSessionSiblings,
 	resolveCatalogSessionMatch,
+	setCatalogAfterHelperResponseForTest,
 	setCatalogAfterTrustedHeaderForTest,
 	setCatalogBeforeTrustedOpenForTest,
 	setCatalogHelperLaunchForTest,
@@ -717,11 +718,20 @@ describe("daemon catalog selector resolution", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
-	it("caps the exact escaped metadata response while preserving a usable family", async () => {
+	it("caps exact escaped metadata envelopes without changing request ids", async () => {
 		// Keep each JSONL record below the parser's 1 MiB record bound while its
 		// combined escaped metadata response still greatly exceeds 256 KiB.
-		const payloads = ["a".repeat(500_000), "漢😀".repeat(50_000), '"\\\b\f\n\r\t\u0000'.repeat(25_000)];
+		const payloads = [
+			"a".repeat(500_000),
+			"漢".repeat(100_000),
+			"😀".repeat(75_000),
+			'"\\\b\f\n\r\t\u0000'.repeat(25_000),
+		];
 		for (const [index, payload] of payloads.entries()) {
+			const responses: Array<{ id: string; line: string }> = [];
+			setCatalogAfterHelperResponseForTest((mode, id, line) => {
+				if (mode === "metadata") responses.push({ id, line });
+			});
 			const root = mkdtempSync(join(tmpdir(), `prime-catalog-escaped-cap-${index}-`));
 			const sessionDir = join(root, "sessions");
 			const parent = SessionManager.create(root, sessionDir);
@@ -732,59 +742,36 @@ describe("daemon catalog selector resolution", () => {
 				`${[
 					JSON.stringify({ type: "message", message: { role: "user", content: payload } }),
 					JSON.stringify({ type: "session_info", name: payload }),
-					// Hostile taskState must be dropped rather than treated as a free-text
-					// field. The allowed wire enum is tested below.
 					JSON.stringify({
 						type: "agent_status",
 						status: { summary: payload, taskState: payload, basedOnMessageCount: 1 },
 					}),
 				].join("\n")}\n`,
 			);
-			const family = await listCatalogFamilySessions(sessionDir);
-			expect(family).toHaveLength(1);
-			const [session] = family;
-			// A successful descriptor helper exchange proves the exact ASCII-escaped
-			// response stayed inside its 256 KiB wire cap. The compact response still
-			// has every catalog field consumers require.
-			expect(session).toEqual(
-				expect.objectContaining({
-					id: `parent-${index}`,
-					firstMessage: expect.any(String),
-					allMessagesText: expect.any(String),
-					name: expect.any(String),
-					agentStatus: expect.objectContaining({
-						summary: expect.any(String),
-						basedOnMessageCount: 1,
+			try {
+				const family = await listCatalogFamilySessions(sessionDir);
+				expect(family).toHaveLength(1);
+				const [session] = family;
+				expect(session).toEqual(
+					expect.objectContaining({
+						id: `parent-${index}`,
+						firstMessage: expect.any(String),
+						allMessagesText: expect.any(String),
+						name: expect.any(String),
+						agentStatus: expect.objectContaining({ summary: expect.any(String), basedOnMessageCount: 1 }),
 					}),
-				}),
-			);
-			expect(session?.agentStatus?.taskState).toBeUndefined();
-			const serialized = JSON.stringify({
-				id: "metadata-response",
-				data: {
-					valid: true,
-					messageCount: session.messageCount,
-					firstMessage: session.firstMessage,
-					allMessagesText: session.allMessagesText,
-					modifiedMs: session.modified.getTime(),
-					name: session.name,
-					agentStatus: session.agentStatus,
-				},
-			});
-			// The helper uses Python json.dumps(..., ensure_ascii=True), including
-			// surrogate-pair escaping for astral code points. Assert that exact
-			// envelope representation, not a UTF-8 or lossy Node "ascii" estimate.
-			const ensureAscii = serialized.replace(/[\u0080-\u{10ffff}]/gu, (character) => {
-				const codePoint = character.codePointAt(0)!;
-				if (codePoint <= 0xffff) return `\\u${codePoint.toString(16).padStart(4, "0")}`;
-				const offset = codePoint - 0x10000;
-				return `\\u${(0xd800 + (offset >> 10)).toString(16)}\\u${(0xdc00 + (offset & 0x3ff)).toString(16)}`;
-			});
-			expect(Buffer.byteLength(ensureAscii, "ascii")).toBeLessThanOrEqual(256 * 1024);
-			rmSync(root, { recursive: true, force: true });
+				);
+				expect(session?.agentStatus?.taskState).toBeUndefined();
+				expect(responses).toHaveLength(1);
+				const response = responses[0]!;
+				expect(JSON.parse(response.line).id).toBe(response.id);
+				expect(Buffer.byteLength(response.line, "ascii")).toBeLessThanOrEqual(256 * 1024);
+			} finally {
+				setCatalogAfterHelperResponseForTest(undefined);
+				rmSync(root, { recursive: true, force: true });
+			}
 		}
 	});
-
 	it("retains only allowed typed agent task states", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-agent-status-schema-"));
 		const sessionDir = join(root, "sessions");
@@ -817,24 +804,33 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(join(sessionDir, "blank.jsonl"), "\n");
 		writeFileSync(join(sessionDir, "junk.jsonl"), "not json\n");
 		writeFileSync(join(sessionDir, "event.jsonl"), '{"type":"message","id":"junk"}\n');
+		writeFileSync(join(sessionDir, "session-no-id.jsonl"), '{"type":"session","cwd":"/tmp"}\n');
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("trustworthy topology claims");
+		rmSync(join(sessionDir, "session-no-id.jsonl"));
 		// An oversized root is skippable only when its bounded prefix is
 		// demonstrably unrelated, including incomplete unrelated junk. A purported
 		// session or identifier claim remains topology-relevant and fails closed.
-		writeFileSync(join(sessionDir, "oversized-junk.jsonl"), `not-json-${"x".repeat(300 * 1024)}`);
+		const classificationResponses: string[] = [];
+		setCatalogAfterHelperResponseForTest((mode, _id, line) => {
+			if (mode === "classify") classificationResponses.push(line);
+		});
+		writeFileSync(join(sessionDir, "oversized-junk.jsonl"), `not-json-${"x".repeat(200 * 1024)}`);
 		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([expect.objectContaining({ id: "parent" })]);
+		expect(classificationResponses.every((line) => Buffer.byteLength(line, "ascii") <= 256 * 1024)).toBe(true);
+		setCatalogAfterHelperResponseForTest(undefined);
 		rmSync(join(sessionDir, "oversized-junk.jsonl"));
-		writeFileSync(join(sessionDir, "oversized-event.jsonl"), `{"type":"message","body":"${"x".repeat(300 * 1024)}`);
+		writeFileSync(join(sessionDir, "oversized-event.jsonl"), `{"type":"message","body":"${"x".repeat(200 * 1024)}`);
 		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([expect.objectContaining({ id: "parent" })]);
 		rmSync(join(sessionDir, "oversized-event.jsonl"));
 		writeFileSync(
 			join(sessionDir, "oversized-session.jsonl"),
-			`{"type":"session","id":"claimed","padding":"${"x".repeat(300 * 1024)}`,
+			`{"type":"session","id":"claimed","padding":"${"x".repeat(200 * 1024)}`,
 		);
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
 			"session header exceeds the trusted read limit",
 		);
 		rmSync(join(sessionDir, "oversized-session.jsonl"));
-		writeFileSync(join(sessionDir, "oversized-id.jsonl"), `{"id":"claimed","padding":"${"x".repeat(300 * 1024)}`);
+		writeFileSync(join(sessionDir, "oversized-id.jsonl"), `{"id":"claimed","padding":"${"x".repeat(200 * 1024)}`);
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
 			"session header exceeds the trusted read limit",
 		);
@@ -845,6 +841,20 @@ describe("daemon catalog selector resolution", () => {
 		writeFileSync(join(sessionDir, "duplicate.jsonl"), readFileSync(parent.getSessionFile()!));
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("duplicate session id");
 		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("keeps registry-reached child headers strict when classification would truncate", async () => {
+		const { root, sessionDir, first } = createCatalogFamilyFixture();
+		try {
+			const file = first.getSessionFile()!;
+			const entries = readFileSync(file, "utf8").trimEnd().split(/\r?\n/);
+			const header = JSON.parse(entries[0]!) as Record<string, unknown>;
+			header.padding = "x".repeat(200 * 1024);
+			writeFileSync(file, `${[JSON.stringify(header), ...entries.slice(1)].join("\n")}\n`);
+			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("reads only the session header line even when the body is huge", async () => {
