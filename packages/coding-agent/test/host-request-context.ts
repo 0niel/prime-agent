@@ -3,22 +3,19 @@ import {
 	contextAwareHostRequestHandler,
 	createHostRequestHandler,
 	type HostRequestContext,
-	type HostRequestHandlerImplementation,
+	type HostRequestHandler,
 	KernelManager,
 } from "../src/core/kernel/index.js";
 
 /** Raw implementations are retained only for test-created business-unit fixtures. */
-const testHostHandlerImplementations = new WeakMap<
-	HostRequestHandlerImplementation,
-	HostRequestHandlerImplementation
->();
+const testHostHandlerImplementations = new WeakMap<HostRequestHandler, HostRequestHandler>();
 
 /**
  * Calls a raw test fixture with synthetic context. This deliberately bypasses the
  * production wrapper and never registers context identity with production authority.
  */
 export async function invokeHostRequestHandlerForTest(
-	handler: HostRequestHandlerImplementation,
+	handler: HostRequestHandler,
 	payload: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
 	const implementation = testHostHandlerImplementations.get(handler);
@@ -44,7 +41,7 @@ export async function invokeHostRequestHandlerForTest(
  * dispatcher, preserving its authority and revocation boundary in integration tests.
  */
 export async function invokeHostRequestThroughKernelForTest(
-	handler: HostRequestHandlerImplementation,
+	handler: HostRequestHandler,
 	payload: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
 	const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
@@ -72,12 +69,12 @@ export function createTestHostHandlers<
 		string,
 		(payload: Record<string, unknown>, context: HostRequestContext) => Promise<Record<string, unknown>>
 	>,
->(handlers: T): Record<keyof T, HostRequestHandlerImplementation> {
+>(handlers: T): Record<keyof T, HostRequestHandler> {
 	return Object.fromEntries(
 		Object.entries(handlers).map(([type, implementation]) => {
 			const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
 			testHostHandlerImplementations.set(handler, implementation);
 			return [type, handler];
 		}),
-	) as unknown as Record<keyof T, HostRequestHandlerImplementation>;
+	) as unknown as Record<keyof T, HostRequestHandler>;
 }
