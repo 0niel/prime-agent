@@ -768,6 +768,7 @@ describe("daemon mode helpers", () => {
 			});
 			const host = internals.createSubagentRuntimeHost(parentState);
 			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const validHistoryEntry = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
 
 			// A real resident child with its row removed has no durable owner. The host
 			// still closes it, and explicitly proves the artifact is absent.
@@ -798,6 +799,34 @@ describe("daemon mode helpers", () => {
 			);
 			expect(readFileSync(registryPath, "utf8")).toContain('"childId":"release-tombstoned"');
 			expect(readFileSync(registryPath, "utf8")).toContain('"status":"deleted"');
+
+			// Every historical line is authority-sensitive: an unrelated syntactically
+			// valid but schema-truncated row makes release durability unknown rather
+			// than authorizing artifact removal as if the child were absent.
+			for (const [label, patch] of [
+				["missing-parent-session-id", { parentSessionId: undefined }],
+				["missing-created-at", { createdAt: undefined }],
+				["missing-updated-at", { updatedAt: undefined }],
+				["malformed-model", { model: { provider: "test" } }],
+			] as const) {
+				const options = optionsFor(`release-${label}`);
+				const runtime = await internals.createRlmSubagentRuntime(parentState, options);
+				writeFileSync(
+					registryPath,
+					`${JSON.stringify(validHistoryEntry)}\n${JSON.stringify({
+						...validHistoryEntry,
+						childId: `unrelated-${label}`,
+						...patch,
+					})}\n`,
+				);
+				await expect(host.releaseRlmSubagentRuntime?.(runtime, options, "cancelled")).resolves.toEqual({
+					deletionDurability: "unknown",
+				});
+				expect(existsSync(options.sessionDir)).toBe(true);
+			}
+
+			// Restore complete history so this control reaches the append boundary.
+			writeFileSync(registryPath, `${JSON.stringify(validHistoryEntry)}\n`);
 
 			// A deterministic append/fsync failure likewise closes the real resident
 			// runtime but leaves durable ownership unknown, so the caller retains it.
