@@ -10137,6 +10137,7 @@ export class AgentSession {
 		try {
 			if (requestAuthority) await run.publication.promise;
 			assertRequestCurrent();
+			throwIfCancelled();
 			admissionCommitted = true;
 			if (requestAuthority) requestAuthority.signal.removeEventListener("abort", revokeAdmission);
 		} catch (error) {
