@@ -9862,6 +9862,10 @@ export class AgentSession {
 		// retention, cancellation, and late-startup cleanup.
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
+			// A release hook is not itself proof that a cancelled, never-admitted
+			// child is durably unreachable. Only its verified retention outcome may
+			// preserve the artifact directory.
+			let releaseRetained = false;
 			try {
 				throwIfCancelled();
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
@@ -9981,6 +9985,9 @@ export class AgentSession {
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
+							.then((outcome) => {
+								releaseRetained = outcome.retained;
+							})
 							.catch(() => void child.disposeAsync().catch(() => undefined));
 					} else {
 						await child.disposeAsync().catch(() => undefined);
@@ -10020,11 +10027,12 @@ export class AgentSession {
 				}
 				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 					try {
-						await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
+						const outcome = await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
 							childRuntime ?? { session: childSession },
 							subagentOptions,
 							run.status === "cancelled" ? "cancelled" : "error",
 						);
+						releaseRetained = outcome.retained;
 						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
 							this._deletedRlmChildIds.add(run.id);
 							this._removeRlmSubagentTracking(run.id);
@@ -10047,17 +10055,10 @@ export class AgentSession {
 						// A failed best-effort retry remains available through the retained cleanup maps.
 					}
 				}
-				// A never-admitted cancelled child's dir is an orphan only when nothing
-				// durable references it. A host with a release hook records deletion
-				// durably (a daemon keeps the artifact tree for its deleted registry
-				// entry); a dispose-only host, like the default in-process runtime,
-				// persists nothing, so its dir is still an orphan to remove.
-				if (
-					!admissionCommitted &&
-					run.status === "cancelled" &&
-					!run.detachedDeletion &&
-					(!this._subagentRuntimeHost?.releaseRlmSubagentRuntime || (!childRuntime && !childSession))
-				) {
+				// A never-admitted cancelled child's dir is an orphan unless the release
+				// path verified durable ownership (for example, a daemon tombstone). A
+				// hook's presence alone does not make its artifact tree recoverable.
+				if (!admissionCommitted && run.status === "cancelled" && !run.detachedDeletion && !releaseRetained) {
 					rmSync(childSessionDir, { recursive: true, force: true });
 				}
 			} finally {

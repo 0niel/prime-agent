@@ -952,12 +952,16 @@ export class AgentDaemon {
 		});
 	}
 
-	private async recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<void> {
+	/** Write (or verify) the deletion tombstone and report whether durable ownership exists. */
+	private async recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<boolean> {
 		const latest = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
 			(entry) => entry.childId === childId,
 		);
-		if (!latest || latest.status === "deleted") {
-			return;
+		if (!latest) {
+			return false;
+		}
+		if (latest.status === "deleted") {
+			return true;
 		}
 		if (
 			!this.appendRlmSubagentRegistryEntry(parentState, {
@@ -968,6 +972,7 @@ export class AgentDaemon {
 		) {
 			throw new Error(`Failed to persist deletion for RLM subagent ${childId}`);
 		}
+		return true;
 	}
 
 	private readLatestRlmSubagentRegistry(
@@ -2239,14 +2244,16 @@ export class AgentDaemon {
 				});
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
-				// Persist the deletion boundary first, but never let a registry failure
-				// strand the cancelled child as a stale resident session.
-				let deletionError: unknown;
+				// A caller may only retain a never-admitted cancelled child when the
+				// deletion tombstone is durably written. Close it on any write failure,
+				// then explicitly return that the caller still owns its artifact dir.
+				let retained = false;
 				if (status === "cancelled") {
 					try {
-						await this.recordRlmSubagentDeletion(parentState, options.id);
-					} catch (error) {
-						deletionError = error;
+						retained = await this.recordRlmSubagentDeletion(parentState, options.id);
+					} catch {
+						// The close below prevents a stale resident runtime; the caller removes
+						// its exact never-admitted child dir because no durable row exists.
 					}
 				}
 				const state = [...this.sessions.values()].find(
@@ -2261,7 +2268,7 @@ export class AgentDaemon {
 				} else {
 					await runtime.session.disposeAsync();
 				}
-				if (deletionError !== undefined) throw deletionError;
+				return { retained };
 			},
 			deleteRlmSubagentRuntime: async (childId, session) => {
 				const state = [...this.sessions.values()].find(

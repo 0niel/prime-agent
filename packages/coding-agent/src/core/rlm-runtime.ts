@@ -238,7 +238,7 @@ export interface SubagentRuntimeHost {
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,
 		status: "done" | "error" | "cancelled",
-	) => Promise<void>;
+	) => Promise<{ retained: boolean }>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
 	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
