@@ -1444,10 +1444,10 @@ export class KernelManager {
 		}
 		// Best-effort final flush (bounded) before teardown — used by signal handlers
 		// so a SIGINT/SIGTERM exit doesn't lose work the debounced snapshot hasn't saved.
+		this.abortHostRequests("IPython kernel shut down");
 		if (opts.snapshot) {
 			await this.flushSnapshotForDispose();
 		}
-		this.abortHostRequests("IPython kernel shut down");
 		this.state = "shutdown";
 		liveKernels.delete(this);
 
@@ -1592,9 +1592,9 @@ export class KernelManager {
 	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
 	dispose(): Promise<void> {
 		return (async () => {
+			this.abortHostRequests("IPython kernel disposed");
 			// Final namespace flush while the kernel is still live (session end / reload).
 			await this.flushSnapshotForDispose();
-			this.abortHostRequests("IPython kernel disposed");
 			this.state = "shutdown";
 			liveKernels.delete(this);
 			const inFlightHostRequests = [...this.inFlightHostRequests];

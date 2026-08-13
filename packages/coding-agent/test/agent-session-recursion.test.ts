@@ -144,6 +144,7 @@ interface KernelExecuteTestApi {
 	start: () => Promise<void>;
 	state: "idle" | "starting" | "running" | "shutdown";
 	activeExecution?: unknown;
+	snapshotState?: () => Promise<null>;
 	shell?: {
 		send(frames: Buffer[]): Promise<void>;
 		close(): void;
@@ -3172,6 +3173,42 @@ print(_result.name)
 			await manager.dispose();
 		}
 	});
+
+	it.each(["dispose", "shutdown"] as const)(
+		"aborts host work before the final snapshot during %s",
+		async (teardown) => {
+			let hostSignal: AbortSignal | undefined;
+			const manager = new KernelManager({
+				python: process.execPath,
+				snapshot: { path: "/tmp/unused.dill", manifestPath: "/tmp/unused.json" },
+				hostHandlers: {
+					"rlm.run": createRlmRunHostHandler(async (_request, signal) => {
+						hostSignal = signal;
+						await new Promise<void>((resolve) => {
+							if (signal?.aborted) resolve();
+							else signal?.addEventListener("abort", () => resolve(), { once: true });
+						});
+						return {};
+					}),
+				},
+			});
+			const kernel = manager as unknown as KernelCommTestApi & KernelExecuteTestApi;
+			kernel.state = "running";
+			kernel.sendCommMessage = async () => {};
+			kernel.snapshotState = async () => {
+				expect(hostSignal?.aborted).toBe(true);
+				return null;
+			};
+
+			kernel.handleCommMessage(rlmCommOpen(`comm-${teardown}`, "slow child"));
+			await waitFor(() => hostSignal !== undefined);
+
+			if (teardown === "dispose") await manager.dispose();
+			else await manager.shutdown({ snapshot: true });
+
+			expect(hostSignal?.aborted).toBe(true);
+		},
+	);
 
 	it("aborts in-flight rlm comm work during dispose and buffers failures", async () => {
 		let started = false;
