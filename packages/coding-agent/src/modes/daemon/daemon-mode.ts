@@ -1438,7 +1438,9 @@ export class AgentDaemon {
 		try {
 			sessionLease = acquireSessionLease(sessionPath, agentDir);
 			sessionManager = sessionPath
-				? await SessionManager.openAsync(sessionPath, config.sessionDir, cwdOverride)
+				? command.noSession
+					? await SessionManager.openInMemoryAsync(sessionPath, config.sessionDir, cwdOverride)
+					: await SessionManager.openAsync(sessionPath, config.sessionDir, cwdOverride)
 				: command.noSession
 					? SessionManager.inMemory(cwd)
 					: command.continueRecent
@@ -2219,7 +2221,9 @@ export class AgentDaemon {
 						candidate.runtime.metadata.rlmChildId === childId &&
 						candidate.runtime.session === session,
 				);
-				if (!state?.runtime.session.sessionFile) return false;
+				if (!state) return false;
+				if (!state.runtime.session.sessionManager.allowsPersistence()) return true;
+				if (!state.runtime.session.sessionFile) return false;
 				if (state.runtime.metadata.rehydratedCompleted) return true;
 				const metadata = state.runtime.metadata;
 				const model = session.model;
@@ -2306,11 +2310,9 @@ export class AgentDaemon {
 		options: CreateRlmSubagentRuntimeOptions,
 	): Promise<AgentSessionRuntime> {
 		const childCwd = options.parentSession.sessionManager.getCwd();
-		const sessionManager = options.parentSession.sessionManager.isPersisted()
+		const sessionManager = options.parentSession.sessionManager.allowsPersistence()
 			? SessionManager.create(childCwd, options.sessionDir)
 			: SessionManager.inMemory(childCwd, options.sessionDir);
-		// Explicit depth is required for in-memory children too: their initial manager
-		// header otherwise defaults to root depth when there is no parent session file.
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
 			rlmDepth: options.rlmDepth,
@@ -5649,7 +5651,7 @@ export class AgentDaemon {
 		const sessionFile =
 			session.sessionFile ??
 			(hasQueuedMessages || shouldResume
-				? session.sessionManager.materializeSessionFile(
+				? session.sessionManager.writeCheckpointFile(
 						state.runtime.runtimeConfig?.sessionDir ?? this.options.defaultSessionConfig.sessionDir,
 					)
 				: undefined);
@@ -5660,6 +5662,7 @@ export class AgentDaemon {
 			activeSessionId: state.activeSessionId,
 			sessionId: session.sessionId,
 			sessionFile,
+			...(session.sessionManager.allowsPersistence() ? {} : { persistence: "memory" as const }),
 			cwd: session.sessionManager.getCwd(),
 			config: {
 				...state.runtime.runtimeConfig,

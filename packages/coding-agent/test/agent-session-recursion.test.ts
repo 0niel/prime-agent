@@ -430,10 +430,10 @@ describe("AgentSession rlm recursion", () => {
 		const grandchild = child.getRlmChildSession(grandchildHandle.rlm_child_id);
 		if (!grandchild) throw new Error("Missing admitted grandchild session");
 
-		expect(child.sessionManager.isPersisted()).toBe(false);
+		expect(child.sessionManager.allowsPersistence()).toBe(false);
 		expect(child.sessionFile).toBeUndefined();
 		expect(child.sessionManager.getHeader()).toMatchObject({ rlmDepth: 1, parentSession: undefined });
-		expect(grandchild.sessionManager.isPersisted()).toBe(false);
+		expect(grandchild.sessionManager.allowsPersistence()).toBe(false);
 		expect(grandchild.sessionFile).toBeUndefined();
 		expect(grandchild.sessionManager.getHeader()).toMatchObject({ rlmDepth: 2, parentSession: undefined });
 		expect(readdirSync(childHandle.session_dir).some((name) => name.endsWith(".jsonl"))).toBe(false);

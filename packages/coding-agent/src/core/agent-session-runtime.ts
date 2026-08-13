@@ -334,11 +334,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
 		const childCwd = options.parentSession.sessionManager.getCwd();
-		const sessionManager = options.parentSession.sessionManager.isPersisted()
+		const sessionManager = options.parentSession.sessionManager.allowsPersistence()
 			? SessionManager.create(childCwd, options.sessionDir)
 			: SessionManager.inMemory(childCwd, options.sessionDir);
-		// Explicit depth is required for in-memory children too: their initial manager
-		// header otherwise defaults to root depth when there is no parent session file.
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
 			rlmDepth: options.rlmDepth,
@@ -548,7 +546,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		if (this.session.sessionManager.isPersisted()) {
+		if (this.session.sessionManager.allowsPersistence()) {
 			const currentSessionFile = this.session.sessionFile;
 			if (!currentSessionFile) {
 				throw new Error("Persisted session is missing a session file");

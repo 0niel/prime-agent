@@ -360,7 +360,7 @@ describe("AgentSessionRuntime characterization", () => {
 		});
 		createResolved = true;
 		expect(onSessionPublished).toHaveBeenCalledOnce();
-		expect(childRuntime.session.sessionManager.isPersisted()).toBe(false);
+		expect(childRuntime.session.sessionManager.allowsPersistence()).toBe(false);
 		expect(childRuntime.session.sessionManager.getHeader()).toMatchObject({
 			rlmDepth: 1,
 			parentSession: undefined,

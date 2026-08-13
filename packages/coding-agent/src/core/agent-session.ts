@@ -9046,11 +9046,9 @@ export class AgentSession {
 	}
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
-		const childSessionManager = options.parentSession.sessionManager.isPersisted()
+		const childSessionManager = options.parentSession.sessionManager.allowsPersistence()
 			? SessionManager.create(this._cwd, options.sessionDir)
 			: SessionManager.inMemory(this._cwd, options.sessionDir);
-		// Explicit depth is required for in-memory children too: their initial manager
-		// header otherwise defaults to root depth when there is no parent session file.
 		childSessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
 			rlmDepth: options.rlmDepth,
