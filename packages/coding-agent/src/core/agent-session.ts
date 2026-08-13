@@ -9416,6 +9416,16 @@ export class AgentSession {
 		if (inFlight[0]) {
 			return inFlight[0].promise;
 		}
+		// Quarantine is deliberately absent from public list/roster/hydration, but
+		// the caller holding the exact opaque child id may explicitly retry its
+		// durability check. Names and session ids cannot address private leases.
+		const quarantined = this._rlmChildDeletionQuarantines.get(target);
+		if (quarantined) {
+			return this._trackRlmSubagentDeletion(quarantined, async () => {
+				await this._resolveRlmChildDeletionQuarantine(target);
+				return { subagent: quarantined };
+			});
+		}
 		if (localMatches[0]) {
 			const subagent = localMatches[0];
 			return this._trackRlmSubagentDeletion(subagent, async () => {
