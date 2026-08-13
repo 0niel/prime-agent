@@ -274,13 +274,13 @@ describe("daemon catalog selector resolution", () => {
 			);
 			const first = create(
 				"first",
-				join(root, "session-artifacts", "root", "sub-33333333", "sub-11111111"),
+				join(root, "session-artifacts", "root", "session-artifacts", "parent", "sub-11111111"),
 				parent.getSessionFile(),
 				2,
 			);
 			const second = create(
 				"second",
-				join(root, "session-artifacts", "root", "sub-33333333", "sub-22222222"),
+				join(root, "session-artifacts", "root", "session-artifacts", "parent", "sub-22222222"),
 				parent.getSessionFile(),
 				2,
 			);
@@ -1248,15 +1248,16 @@ process.stdin.on("data", chunk => {
 		write(rootFile, { id: "root-uuid", rlmDepth: 0 });
 		write(join(sessionDir, "fork-depth-uuid.jsonl"), { id: "fork-depth-uuid", parentSession: rootFile, rlmDepth: 0 });
 		write(join(sessionDir, "fork-nodepth-uuid.jsonl"), { id: "fork-nodepth-uuid", parentSession: rootFile });
-		// Depth-1 child in the root's artifact tree; its own registry lives at the
-		// top-level artifacts dir under its session id, as the writer stores it.
+		// Depth-1 child in the root's artifact tree. SessionManager gives that
+		// artifact-resident session its own artifact root beside its sub-* dir.
 		const childFile = join(root, "session-artifacts", "root-uuid", "sub-aaaa1111", "child-uuid.jsonl");
 		write(childFile, { id: "child-uuid", parentSession: rootFile, rlmDepth: 1 });
 		const grandFile = join(
 			root,
 			"session-artifacts",
 			"root-uuid",
-			"sub-aaaa1111",
+			"session-artifacts",
+			"child-uuid",
 			"sub-bbbb2222",
 			"grand-uuid.jsonl",
 		);

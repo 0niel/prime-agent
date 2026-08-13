@@ -1180,10 +1180,12 @@ async function listCatalogFamilySessionsWithLimit(
 				const childId = entry.childId as string;
 				const childSessionDir = dirname(childPath);
 				const parentSessionDir = dirname(parent.path);
-				const writerChildrenRoot =
-					parentSessionDir === authority.session.lexical
-						? join(authority.artifacts?.lexical ?? "", parent.id)
-						: parentSessionDir;
+				// SessionManager derives every session's artifact dir from that session's
+				// own session dir, including artifact-resident parents. Its children
+				// therefore live in <dirname(parent session dir)>/session-artifacts/
+				// <parent session id>/sub-*, rather than directly below the parent
+				// session dir.
+				const writerChildrenRoot = join(dirname(parentSessionDir), "session-artifacts", parent.id);
 				// The actual writer uses <parent artifact dir>/sub-*/<session-id>.jsonl.
 				// Registry keys name that immediate child directory, so neither a
 				// nested sessions root nor a re-keyed sibling is reachable.
