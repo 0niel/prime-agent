@@ -340,7 +340,6 @@ function throwIfAdmissionCancelled(admission: SupervisorPromptAdmission | undefi
 	if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
 }
 
-/** Match catalog sibling topology: relative parents are rooted at each child session file. */
 /**
  * Normalize the structural namespace occupied by a session name. Every
  * reservation, availability check, and family-catalog entry must derive this
@@ -2121,7 +2120,7 @@ export class DaemonSupervisor {
 			);
 			const targetSummary = target ? summaryForInactiveSession(target) : { sessionId: "new-root", rlmDepth: 0 };
 			const reservation = target
-				? this.savedSiblingNameReservationInput(target, savedSiblings, createCommand.name)
+				? this.savedSiblingNameReservationInput(target, createCommand.name)
 				: this.summaryNameReservationInput(targetSummary, createCommand.name);
 			return this.withSessionNameReservation(reservation, async () => {
 				if (target) {
@@ -3234,12 +3233,11 @@ export class DaemonSupervisor {
 		const siblings = await this.catalog.siblings(sessionPath, sessionDir ?? this.defaultSessionConfig.sessionDir);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
-		return this.savedSiblingNameReservationInput(saved, siblings, name);
+		return this.savedSiblingNameReservationInput(saved, name);
 	}
 
 	private savedSiblingNameReservationInput(
 		saved: SessionInfo,
-		_siblings: readonly SessionInfo[],
 		name: string,
 	): { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string } {
 		return { name, ...summarySiblingScope(summaryForInactiveSession(saved)) };
