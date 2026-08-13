@@ -2532,6 +2532,99 @@ describe("AgentSession rlm recursion", () => {
 		expect(root.getRlmChildSession(spawned.rlm_child_id)).toBeUndefined();
 	});
 
+	it("routes completion-rejection finalization through the active deletion coordinator exactly once", async () => {
+		let finishChild!: () => void;
+		const finishGate = new Promise<void>((resolve) => {
+			finishChild = resolve;
+		});
+		const child = createSession({
+			rlmSessionDir: join(tempDir, "completion-race-child"),
+			streamFn: (_model, context) => {
+				const stream = createAssistantMessageEventStream();
+				void finishGate.then(() =>
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${userText(context)}`) }),
+				);
+				return stream;
+			},
+		});
+		let releaseDelete!: () => void;
+		const deleteGate = new Promise<void>((resolve) => {
+			releaseDelete = resolve;
+		});
+		const deleteRuntime = vi.fn(async (_id: string, childSession: AgentSession | undefined, authority) => {
+			if (!authority) throw new Error("missing deletion authority");
+			authority.assertCurrent();
+			await deleteGate;
+			authority.assertCurrent();
+			await childSession?.disposeAsync();
+		});
+		const releaseRuntime = vi.fn(async () => ({ deletionDurability: "unknown" as const }));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				completeRlmSubagentRuntime: () => false,
+				releaseRlmSubagentRuntime: releaseRuntime,
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		const spawned = await root.runRlmChild("completion race", { name: "completion-race" });
+		const deletion = root.deleteRlmSubagent(spawned.rlm_child_id);
+		await waitFor(() => deleteRuntime.mock.calls.length === 1);
+		finishChild();
+		await Promise.resolve();
+		releaseDelete();
+		await expect(deletion).resolves.toMatchObject({ subagent: { rlm_child_id: spawned.rlm_child_id } });
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._activeRlmChildRuns.size === 0);
+		expect(deleteRuntime).toHaveBeenCalledOnce();
+		expect(releaseRuntime).not.toHaveBeenCalled();
+	});
+
+	it("joins a close-failure finalizer to the explicit deletion coordinator exactly once", async () => {
+		let failChild!: () => void;
+		const failGate = new Promise<void>((resolve) => {
+			failChild = resolve;
+		});
+		const child = createSession({
+			rlmSessionDir: join(tempDir, "error-finalizer-race-child"),
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				void failGate.then(() => stream.push({ type: "error", reason: "error", error: { ...assistantMessage("child failure"), stopReason: "error" } }));
+				return stream;
+			},
+		});
+		let releaseDelete!: () => void;
+		const deleteGate = new Promise<void>((resolve) => {
+			releaseDelete = resolve;
+		});
+		const deleteRuntime = vi.fn(async (_id: string, childSession: AgentSession | undefined, authority) => {
+			if (!authority) throw new Error("missing deletion authority");
+			authority.assertCurrent();
+			await deleteGate;
+			authority.assertCurrent();
+			await childSession?.disposeAsync();
+		});
+		const releaseRuntime = vi.fn(async () => ({ deletionDurability: "unknown" as const }));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				releaseRlmSubagentRuntime: releaseRuntime,
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		const spawned = await root.runRlmChild("error finalizer race", { name: "error-finalizer-race" });
+		const deletion = root.deleteRlmSubagent(spawned.rlm_child_id);
+		await waitFor(() => deleteRuntime.mock.calls.length === 1);
+		failChild();
+		await Promise.resolve();
+		releaseDelete();
+		await expect(deletion).resolves.toMatchObject({ subagent: { rlm_child_id: spawned.rlm_child_id } });
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._activeRlmChildRuns.size === 0);
+		expect(deleteRuntime).toHaveBeenCalledOnce();
+		expect(releaseRuntime).not.toHaveBeenCalled();
+	});
+
 	it("does not let completion retention resurrect a child being deleted", async () => {
 		const root = createSession();
 		const spawned = await root.runRlmChild("fast child", { name: "fast-worker" });
