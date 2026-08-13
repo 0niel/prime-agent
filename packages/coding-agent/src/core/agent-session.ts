@@ -8760,8 +8760,8 @@ export class AgentSession {
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
 	private _createKernelHostHandlers(): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
-			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode, signal, isCurrent }) => ({
-				...(await this.runRlmChild(prompt, kwargs, cellSourceCode, { signal, isCurrent })),
+			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode, signal }) => ({
+				...(await this.runRlmChild(prompt, kwargs, cellSourceCode, { signal })),
 			})),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
@@ -9693,10 +9693,10 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
-		requestAuthority?: { signal: AbortSignal; isCurrent(): boolean },
+		requestAuthority?: { signal: AbortSignal },
 	): Promise<RlmSpawnHandle> {
 		const assertRequestCurrent = () => {
-			if (requestAuthority && (requestAuthority.signal.aborted || !requestAuthority.isCurrent())) {
+			if (requestAuthority?.signal.aborted) {
 				throw new Error("host request authority was revoked");
 			}
 		};
@@ -10076,7 +10076,7 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
-		requestAuthority?: { signal: AbortSignal; isCurrent(): boolean },
+		requestAuthority?: { signal: AbortSignal },
 	): Promise<RlmSpawnHandle> {
 		return this._startRlmChildRun(prompt, kwargs, spawnCode, requestAuthority);
 	}

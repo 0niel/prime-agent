@@ -59,13 +59,12 @@ export const HOST_COMM_TARGET = "host.request";
 export type HostRequestPayload = Record<string, unknown>;
 
 /**
- * Per-call authority minted by this dispatcher.  Although its TypeScript shape is
+ * Per-call authority minted by this dispatcher. Although its TypeScript shape is
  * exported for handler implementations, a value is accepted only when this module
- * has registered its object identity for the active request.
+ * has registered its object identity. Revocation is observable via the signal.
  */
 export interface HostRequestContext {
 	readonly signal: AbortSignal;
-	isCurrent(): boolean;
 }
 
 const factoryCreatedHostRequestHandlers = new WeakSet<object>();
@@ -84,20 +83,8 @@ function assertGenuineHostRequestContext(context: unknown): asserts context is H
 }
 
 function mintHostRequestContext(controller: AbortController): HostRequestContext {
-	let current = true;
-	const context: HostRequestContext = Object.freeze({
-		signal: controller.signal,
-		isCurrent: () => current && !controller.signal.aborted,
-	});
+	const context: HostRequestContext = Object.freeze({ signal: controller.signal });
 	dispatcherCreatedHostRequestContexts.add(context);
-	controller.signal.addEventListener(
-		"abort",
-		() => {
-			current = false;
-			dispatcherCreatedHostRequestContexts.delete(context);
-		},
-		{ once: true },
-	);
 	return context;
 }
 
@@ -110,6 +97,7 @@ export function createHostRequestHandler<
 >(implementation: T): HostRequestHandler {
 	const handler = async (payload: HostRequestPayload, context: HostRequestContext) => {
 		assertGenuineHostRequestContext(context);
+		if (context.signal.aborted) throw new Error("host request authority was revoked");
 		return implementation(payload, context);
 	};
 	factoryCreatedHostRequestHandlers.add(handler);

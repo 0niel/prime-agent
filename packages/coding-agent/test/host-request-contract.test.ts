@@ -55,10 +55,7 @@ describe("staged host-request handler authority", () => {
 			calls += 1;
 			return {};
 		});
-		const fabricated = {
-			signal: new AbortController().signal,
-			isCurrent: () => true,
-		};
+		const fabricated = { signal: new AbortController().signal };
 		await expect(handler({ context: fabricated }, fabricated)).rejects.toThrow("host request context is invalid");
 		expect(calls).toBe(0);
 	});

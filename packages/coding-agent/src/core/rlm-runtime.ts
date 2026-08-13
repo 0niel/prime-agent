@@ -11,7 +11,6 @@ export interface RlmRunRequest {
 	cellSourceCode?: string;
 	/** Dispatcher authority for this admission; revoked requests must not spawn. */
 	signal: AbortSignal;
-	isCurrent(): boolean;
 }
 
 export interface RlmSpawnHandle {
@@ -159,13 +158,11 @@ export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHand
 		}
 		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
 		const cellSourceCode = typeof payload.cellSourceCode === "string" ? payload.cellSourceCode : undefined;
-		if (context.signal.aborted || !context.isCurrent()) throw new Error("host request authority was revoked");
 		const result = await handler({
 			prompt: payload.prompt,
 			kwargs,
 			cellSourceCode,
 			signal: context.signal,
-			isCurrent: () => context.isCurrent(),
 		});
 		return result as unknown as Record<string, unknown>;
 	});

@@ -284,7 +284,7 @@ describe("KernelManager abort handling", () => {
 		await Promise.allSettled([...internals.inFlightHostRequests]);
 		expect(capturedContext?.signal.aborted).toBe(true);
 		if (!capturedContext) throw new Error("Expected genuine host request context");
-		await expect(handler({ type: "test" }, capturedContext)).rejects.toThrow("host request context is invalid");
+		await expect(handler({ type: "test" }, capturedContext)).rejects.toThrow("host request authority was revoked");
 		expect(implementation).toHaveBeenCalledTimes(1);
 		manager.disposeSync();
 	});
@@ -321,7 +321,7 @@ describe("KernelManager abort handling", () => {
 		internals.handleCommMessage({ header: { msg_type: "comm_close" }, content: { comm_id: "request" } });
 		expect(capturedContext?.signal.aborted).toBe(true);
 		if (!capturedContext) throw new Error("Expected genuine host request context");
-		await expect(handler({ type: "test" }, capturedContext)).rejects.toThrow("host request context is invalid");
+		await expect(handler({ type: "test" }, capturedContext)).rejects.toThrow("host request authority was revoked");
 		expect(implementation).toHaveBeenCalledTimes(1);
 		resolveHandler?.();
 		await Promise.allSettled([...internals.inFlightHostRequests]);
@@ -336,7 +336,7 @@ describe("KernelManager abort handling", () => {
 			await new Promise<void>((resolve) => {
 				resolveHandler = resolve;
 			});
-			return { current: context.isCurrent() };
+			return { current: !context.signal.aborted };
 		});
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const sent: Record<string, unknown>[] = [];
