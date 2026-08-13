@@ -6,7 +6,7 @@ import {
 } from "../src/core/kernel/index.js";
 import { invokeHostRequestThroughKernelForTest as invokeHostRequestHandlerForTest } from "./host-request-context.js";
 
-describe("staged host-request handler authority", () => {
+describe("host-request handler authority", () => {
 	it("rejects missing or invalid context before a genuine handler runs", async () => {
 		let calls = 0;
 		const handler = createHostRequestHandler(async (_payload, _context) => {
