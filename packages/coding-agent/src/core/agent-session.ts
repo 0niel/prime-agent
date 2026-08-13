@@ -9547,38 +9547,44 @@ export class AgentSession {
 	getRlmChildSnapshots(): RlmChildAgentSnapshot[] {
 		const snapshots: RlmChildAgentSnapshot[] = [];
 		const recorded = new Set<string>();
+		const traversed = new Set<string>();
 		for (const run of this._activeRlmChildRuns.values()) {
-			if (run.detachedDeletion || this._deletingRlmChildren.has(run.id) || this._deletedRlmChildIds.has(run.id)) {
-				continue;
-			}
+			const hidden =
+				run.detachedDeletion || this._deletingRlmChildren.has(run.id) || this._deletedRlmChildIds.has(run.id);
 			const child = run.session;
-			snapshots.push({
-				id: run.id,
-				parentId: this._rlmParentNodeId,
-				sessionName: child?.sessionName ?? run.sessionName,
-				model: `${(child?.model ?? run.model).provider}/${(child?.model ?? run.model).id}`,
-				label: rlmChildLabel(run.prompt),
-				status: run.status,
-				sessionDir: run.sessionDir,
-			});
-			recorded.add(run.id);
-			if (child) snapshots.push(...child.getRlmChildSnapshots());
+			if (!hidden) {
+				snapshots.push({
+					id: run.id,
+					parentId: this._rlmParentNodeId,
+					sessionName: child?.sessionName ?? run.sessionName,
+					model: `${(child?.model ?? run.model).provider}/${(child?.model ?? run.model).id}`,
+					label: rlmChildLabel(run.prompt),
+					status: run.status,
+					sessionDir: run.sessionDir,
+				});
+				recorded.add(run.id);
+			}
+			if (child) {
+				traversed.add(run.id);
+				snapshots.push(...child.getRlmChildSnapshots());
+			}
 		}
 		for (const [childId, child] of this._rlmChildSessions) {
-			if (recorded.has(childId) || this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) {
-				continue;
+			if (recorded.has(childId) || traversed.has(childId)) continue;
+			const hidden = this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId);
+			if (!hidden) {
+				snapshots.push({
+					id: childId,
+					parentId: this._rlmParentNodeId,
+					sessionName: child.sessionName,
+					model: child.model ? `${child.model.provider}/${child.model.id}` : undefined,
+					label: child.sessionName ?? "child agent",
+					// A failed delete retains the session solely for cleanup retry. Preserve
+					// its cancellation truth in snapshots rather than reviving it as done.
+					status: this._rlmChildCleanupFailures.has(childId) ? "cancelled" : "done",
+					sessionDir: child._rlmSessionDir ?? child.sessionManager.getSessionDir(),
+				});
 			}
-			snapshots.push({
-				id: childId,
-				parentId: this._rlmParentNodeId,
-				sessionName: child.sessionName,
-				model: child.model ? `${child.model.provider}/${child.model.id}` : undefined,
-				label: child.sessionName ?? "child agent",
-				// A failed delete retains the session solely for cleanup retry. Preserve
-				// its cancellation truth in snapshots rather than reviving it as done.
-				status: this._rlmChildCleanupFailures.has(childId) ? "cancelled" : "done",
-				sessionDir: child._rlmSessionDir ?? child.sessionManager.getSessionDir(),
-			});
 			snapshots.push(...child.getRlmChildSnapshots());
 		}
 		return snapshots;
