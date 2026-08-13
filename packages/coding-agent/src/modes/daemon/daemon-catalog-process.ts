@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, openSync, readdirSync } from "node:fs";
+import { closeSync, constants, openSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import { getSessionsDir } from "../../config.js";
@@ -97,6 +97,8 @@ interface TrustedFile {
 	mtimeMs: number;
 	dev: string;
 	ino: string;
+	/** A header exceeded the bounded descriptor read; only untrusted roots may skip it. */
+	truncated?: boolean;
 }
 
 interface TrustedSessionMetadata {
@@ -193,7 +195,45 @@ MAX=134217728
 SEARCH_MAX=65536
 PARSE_MAX=1048576
 PREVIEW_MAX=256
+MAX_METADATA_RESPONSE_BYTES=256*1024
+TRUNCATION_MARKER="... [truncated]"
 def reject(): raise ValueError("invalid")
+def compact_metadata_response(response):
+ # json.dumps defaults to ensure_ascii=True. Keep the complete wire response,
+ # rather than just metadata, inside the TypeScript-side response cap.
+ def encoded_size(): return len(json.dumps(response,separators=(",",":")).encode("ascii"))
+ if encoded_size()<=MAX_METADATA_RESPONSE_BYTES: return
+ data=response.get("data")
+ if not isinstance(data,dict): reject()
+ targets=[]
+ def add_target(container,key):
+  if isinstance(container.get(key),str):
+   targets.append((container,key,container[key]))
+ add_target(data,"firstMessage"); add_target(data,"allMessagesText"); add_target(data,"name")
+ status=data.get("agentStatus")
+ if isinstance(status,dict):
+  add_target(status,"summary"); add_target(status,"taskState")
+ # Clear every unbounded display field before allocating the remaining escaped-byte
+ # budget in a stable priority order. Fields remain present and string typed.
+ for container,key,_ in targets: container[key]=""
+ if encoded_size()>MAX_METADATA_RESPONSE_BYTES: reject()
+ for container,key,original in targets:
+  length=len(original)
+  def candidate(prefix):
+   return original if prefix==length else original[:prefix]+TRUNCATION_MARKER
+  # A marker is useful when it fits; otherwise preserve the greatest raw
+  # prefix. Either search uses the exact ensure_ascii serialized byte count.
+  use_marker=encoded_size()+len(json.dumps(TRUNCATION_MARKER))<=MAX_METADATA_RESPONSE_BYTES
+  def fits(prefix):
+   container[key]=candidate(prefix) if use_marker else original[:prefix]
+   return encoded_size()<=MAX_METADATA_RESPONSE_BYTES
+  low=0; high=length
+  while low<high:
+   middle=(low+high+1)//2
+   if fits(middle): low=middle
+   else: high=middle-1
+  container[key]=candidate(low) if use_marker else original[:low]
+ if encoded_size()>MAX_METADATA_RESPONSE_BYTES: reject()
 def flags(directory=False):
  value=os.O_RDONLY|os.O_NOFOLLOW
  if directory: value|=os.O_DIRECTORY
@@ -321,8 +361,13 @@ def serve(req):
       cut=chunk.find(b"\n")
       if cut>=0: chunk=chunk[:cut+1]; done=True
      chunks.append(chunk); total+=len(chunk)
-     if total>limit: reject()
-    payload["data"]=base64.b64encode(b"".join(chunks)).decode("ascii")
+     if total>limit:
+      # An oversized first record can be an incomplete concurrent write. It is
+      # distinguishable from an I/O/protocol failure so root classification can
+      # ignore it, while registry-reached sessions remain strict.
+      if mode=="header": payload["truncated"]=True; chunks=[]; break
+      reject()
+    if not payload.get("truncated"): payload["data"]=base64.b64encode(b"".join(chunks)).decode("ascii")
    elif mode=="metadata": payload["data"]=scan_metadata(fd,before.st_mtime_ns/1000000)
    after=os.fstat(fd)
    if (before.st_dev,before.st_ino,before.st_mode)!=(after.st_dev,after.st_ino,after.st_mode): reject()
@@ -340,7 +385,12 @@ while True:
  except FileNotFoundError: response={"error":"absent"}
  except Exception: response={"error":"failed"}
  response["id"]=request.get("id") if isinstance(request,dict) else None
- sys.stdout.write(json.dumps(response,separators=(",",":"))+"\n"); sys.stdout.flush()
+ if isinstance(request,dict) and request.get("mode")=="metadata" and "data" in response:
+  try: compact_metadata_response(response)
+  except Exception: response={"error":"failed","id":response.get("id")}
+ serialized=json.dumps(response,separators=(",",":"))
+ if len(serialized.encode("ascii"))>MAX_METADATA_RESPONSE_BYTES: sys.exit(1)
+ sys.stdout.write(serialized+"\n"); sys.stdout.flush()
 `;
 
 /** Test-only seam runs after authority selection but before descriptor-relative traversal. */
@@ -547,7 +597,15 @@ class TrustedReadSession {
 			JSON.stringify({ id: requestId, parts, limit: maxBytes, mode, root: rootFd }),
 			mode === "metadata" ? MAX_METADATA_RESPONSE_BYTES : maxBytes * 2 + 64 * 1024,
 		);
-		let wire: { id?: unknown; error?: unknown; data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
+		let wire: {
+			id?: unknown;
+			error?: unknown;
+			data?: unknown;
+			truncated?: unknown;
+			mtimeMs?: unknown;
+			dev?: unknown;
+			ino?: unknown;
+		};
 		try {
 			wire = JSON.parse(line) as typeof wire;
 		} catch {
@@ -559,13 +617,16 @@ class TrustedReadSession {
 			throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
 		}
 		if (wire.error === "absent") throw invalidFamilyTopology("descriptor-relative artifact is absent");
+		const truncatedHeader = mode === "header" && wire.truncated === true;
 		if (
 			wire.error !== undefined ||
-			(mode === "stat"
-				? wire.data !== undefined
-				: mode === "metadata"
-					? !isTrustedSessionMetadata(wire.data)
-					: typeof wire.data !== "string") ||
+			(wire.truncated !== undefined && !truncatedHeader) ||
+			(!truncatedHeader &&
+				(mode === "stat"
+					? wire.data !== undefined
+					: mode === "metadata"
+						? !isTrustedSessionMetadata(wire.data)
+						: typeof wire.data !== "string")) ||
 			typeof wire.mtimeMs !== "number" ||
 			typeof wire.dev !== "string" ||
 			typeof wire.ino !== "string"
@@ -578,6 +639,7 @@ class TrustedReadSession {
 			mtimeMs: wire.mtimeMs,
 			dev: wire.dev,
 			ino: wire.ino,
+			...(truncatedHeader ? { truncated: true } : {}),
 			...(mode === "metadata" ? { metadata: wire.data as TrustedSessionMetadata } : {}),
 		};
 	}
@@ -659,6 +721,7 @@ class TrustedReadSession {
  */
 async function readTrustedSession(path: string, reader: TrustedReadSession): Promise<TrustedSession> {
 	const trusted = await reader.read(path, MAX_SESSION_HEADER_BYTES, "header");
+	if (trusted.truncated) throw invalidFamilyTopology("session header exceeds the trusted read limit");
 	const headerLine = trusted.contents.toString("utf8").split(/\r?\n/, 1)[0];
 	let header: {
 		type?: unknown;
@@ -777,19 +840,13 @@ async function readLatestRegistry(
 	return [...latest.values()];
 }
 
-function listSessionCandidates(sessionDir: string): string[] {
-	try {
-		return readdirSync(sessionDir)
-			.filter((entry) => entry.endsWith(".jsonl"))
-			.map((entry) => join(resolve(sessionDir), entry));
-	} catch {
-		return [];
-	}
-}
-
 export async function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
 	const effectiveSessionDir = sessionDir ?? getSessionsDir();
-	const roots = listSessionCandidates(effectiveSessionDir);
+	// SessionManager performs the non-authoritative flat-directory classification:
+	// interrupted, blank, and unrelated jsonl files are not roots. Topology is
+	// still re-read descriptor-relatively below and any identified candidate
+	// that fails validation is fatal.
+	const roots = await SessionManager.listAll(undefined, effectiveSessionDir);
 	const authority = managedRoots(effectiveSessionDir);
 	const reader = new TrustedReadSession(authority);
 	let result: SessionInfo[] | undefined;
@@ -797,8 +854,8 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 	try {
 		const sessions = new Map<string, FamilySession>();
 		const ids = new Map<string, string>();
-		for (const rootPath of roots) {
-			const trusted = asTrustedFamilyRoot(await readTrustedSession(rootPath, reader), authority);
+		for (const root of roots) {
+			const trusted = asTrustedFamilyRoot(await readTrustedSession(root.path, reader), authority);
 			const existingPath = ids.get(trusted.id);
 			if (existingPath && existingPath !== trusted.path)
 				throw invalidFamilyTopology("family contains a duplicate session id");

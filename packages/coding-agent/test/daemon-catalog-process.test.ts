@@ -717,6 +717,49 @@ describe("daemon catalog selector resolution", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	it("caps the exact escaped metadata response while preserving a usable family", async () => {
+		const payloads = ["a".repeat(1_048_000), "漢😀".repeat(65_536), '"\\\b\f\n\r\t\u0000'.repeat(80_000)];
+		for (const [index, payload] of payloads.entries()) {
+			const root = mkdtempSync(join(tmpdir(), `prime-catalog-escaped-cap-${index}-`));
+			const sessionDir = join(root, "sessions");
+			const parent = SessionManager.create(root, sessionDir);
+			parent.newSession({ id: `parent-${index}`, rlmDepth: 0 });
+			parent.appendSessionInfo("compact");
+			appendFileSync(
+				parent.getSessionFile()!,
+				`${[
+					JSON.stringify({ type: "message", message: { role: "user", content: payload } }),
+					JSON.stringify({ type: "session_info", name: payload }),
+					JSON.stringify({
+						type: "agent_status",
+						status: { summary: payload, taskState: "completed", basedOnMessageCount: 1 },
+					}),
+				].join("\n")}\n`,
+			);
+			const family = await listCatalogFamilySessions(sessionDir);
+			expect(family).toHaveLength(1);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("skips junk root candidates but rejects identified malformed and duplicate roots", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-root-classification-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		writeFileSync(join(sessionDir, "blank.jsonl"), "\n");
+		writeFileSync(join(sessionDir, "junk.jsonl"), "not json\n");
+		writeFileSync(join(sessionDir, "event.jsonl"), '{"type":"message","id":"junk"}\n');
+		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([expect.objectContaining({ id: "parent" })]);
+		writeFileSync(join(sessionDir, "bad.jsonl"), '{"type":"session","id":"bad","rlmDepth":"oops"}\n');
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		rmSync(join(sessionDir, "bad.jsonl"));
+		writeFileSync(join(sessionDir, "duplicate.jsonl"), readFileSync(parent.getSessionFile()!));
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("duplicate session id");
+		rmSync(root, { recursive: true, force: true });
+	});
+
 	it("reads only the session header line even when the body is huge", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-header-only-"));
 		const sessionDir = join(root, "sessions");
