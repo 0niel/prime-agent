@@ -720,6 +720,99 @@ describe("daemon mode helpers", () => {
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
 
+	it("reports durable retention only for actual daemon deletion tombstones", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-release-ownership-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createRlmSubagentRuntime(
+					parentState: ActiveSessionState,
+					options: CreateRlmSubagentRuntimeOptions,
+				): Promise<ActiveSessionState["runtime"]>;
+				createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
+				appendRlmSubagentRegistryEntry(parentState: ActiveSessionState, entry: { status: string }): boolean;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			Object.assign(parentState.runtime.session, {
+				isSessionActive: false,
+				isStreaming: false,
+				isCompacting: false,
+				isBashRunning: false,
+				state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+				thinkingLevel: "off",
+				hasRunningRlmChildren: () => false,
+				getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+			});
+			const optionsFor = (id: string): CreateRlmSubagentRuntimeOptions => ({
+				parentSession: parentState.runtime.session,
+				id,
+				prompt: `release ${id}`,
+				sessionName: id,
+				sessionDir: join(fixture.parentArtifactDir, id),
+				model: { provider: "test", id: "model" } as Model<Api>,
+				thinkingLevel: "off",
+				serviceTier: null,
+				scopedModels: [],
+				activeToolNames: [],
+				customTools: [],
+				includeGoals: false,
+				includeCompactSkill: false,
+				rlmDepth: 1,
+				rlmMaxDepth: 4,
+				rlmParentNodeId: id,
+			});
+			const host = internals.createSubagentRuntimeHost(parentState);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+
+			// A real resident child with its row removed has no durable owner. The host
+			// still closes it, and explicitly returns retained:false.
+			const noRowOptions = optionsFor("release-no-row");
+			const noRowRuntime = await internals.createRlmSubagentRuntime(parentState, noRowOptions);
+			writeFileSync(
+				registryPath,
+				`${readFileSync(registryPath, "utf8")
+					.split("\n")
+					.filter((line) => !line.includes('"childId":"release-no-row"'))
+					.filter(Boolean)
+					.join("\n")}\n`,
+			);
+			await expect(host.releaseRlmSubagentRuntime?.(noRowRuntime, noRowOptions, "cancelled")).resolves.toEqual({
+				retained: false,
+			});
+			expect([...internals.sessions.values()].some((state) => state.runtime.session === noRowRuntime.session)).toBe(
+				false,
+			);
+
+			// The ordinary daemon append/fsync path records the tombstone before close.
+			const retainedOptions = optionsFor("release-tombstoned");
+			const retainedRuntime = await internals.createRlmSubagentRuntime(parentState, retainedOptions);
+			await expect(host.releaseRlmSubagentRuntime?.(retainedRuntime, retainedOptions, "cancelled")).resolves.toEqual(
+				{
+					retained: true,
+				},
+			);
+			expect(readFileSync(registryPath, "utf8")).toContain('"childId":"release-tombstoned"');
+			expect(readFileSync(registryPath, "utf8")).toContain('"status":"deleted"');
+
+			// A deterministic append/fsync failure likewise closes the real resident
+			// runtime but cannot claim durable ownership of its artifact directory.
+			const failedOptions = optionsFor("release-write-failed");
+			const failedRuntime = await internals.createRlmSubagentRuntime(parentState, failedOptions);
+			const append = vi.spyOn(internals, "appendRlmSubagentRegistryEntry").mockReturnValue(false);
+			await expect(host.releaseRlmSubagentRuntime?.(failedRuntime, failedOptions, "cancelled")).resolves.toEqual({
+				retained: false,
+			});
+			expect(append).toHaveBeenCalledWith(parentState, expect.objectContaining({ status: "deleted" }));
+			expect([...internals.sessions.values()].some((state) => state.runtime.session === failedRuntime.session)).toBe(
+				false,
+			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-real-completion-"));
 		try {
