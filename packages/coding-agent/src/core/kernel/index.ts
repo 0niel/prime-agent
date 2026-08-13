@@ -64,8 +64,6 @@ export type HostRequestPayload = Record<string, unknown>;
  * has registered its object identity for the active request.
  */
 export interface HostRequestContext {
-	readonly requestId: string;
-	readonly generation: number;
 	readonly signal: AbortSignal;
 	isCurrent(): boolean;
 }
@@ -89,15 +87,9 @@ function assertGenuineHostRequestContext(context: unknown): asserts context is H
 	}
 }
 
-function mintHostRequestContext(
-	requestId: string,
-	generation: number,
-	controller: AbortController,
-): HostRequestContext {
+function mintHostRequestContext(controller: AbortController): HostRequestContext {
 	let current = true;
 	const context: HostRequestContext = Object.freeze({
-		requestId,
-		generation,
 		signal: controller.signal,
 		isCurrent: () => current && !controller.signal.aborted,
 	});
@@ -626,7 +618,6 @@ export class KernelManager {
 	private terminalRevision = 0;
 	/** Once terminal, this manager can never reopen host-request admission. */
 	private terminal = false;
-	private hostRequestGeneration = 0;
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Memoized so concurrent callers all await the same in-flight startup. */
 	private startPromise?: Promise<void>;
@@ -1349,7 +1340,7 @@ export class KernelManager {
 		this.handledHostRequestCommIds.add(commId);
 		const controller = new AbortController();
 		this.activeHostRequestControllers.set(commId, controller);
-		const context = mintHostRequestContext(uuid(), ++this.hostRequestGeneration, controller);
+		const context = mintHostRequestContext(controller);
 		const task = (async () => {
 			let result: Record<string, unknown>;
 			try {

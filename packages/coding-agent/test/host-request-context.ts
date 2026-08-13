@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
 	createHostRequestHandler,
 	type HostRequestContext,
@@ -23,8 +22,6 @@ export async function invokeHostRequestHandlerForTest(
 	}
 	const controller = new AbortController();
 	const context: HostRequestContext = {
-		requestId: randomUUID(),
-		generation: 0,
 		signal: controller.signal,
 		isCurrent: () => !controller.signal.aborted,
 	};
