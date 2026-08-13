@@ -41,7 +41,7 @@ type StrictDeletionAuthority = {
 	sessionFile: string;
 	sessionId: string;
 	generation: number;
-	assertCurrent: ReturnType<typeof vi.fn>;
+	assertCurrent: () => void;
 };
 
 describe("AgentSessionRuntime characterization", () => {
@@ -382,7 +382,7 @@ describe("AgentSessionRuntime characterization", () => {
 		};
 
 		await expect(runtime.deleteRlmSubagentRuntime("recycled-child", oldSession, authority)).rejects.toThrow(
-			"RLM subagent deletion authority does not match runtime incarnation",
+			"RLM subagent deletion does not match runtime incarnation",
 		);
 
 		expect(authority.assertCurrent).toHaveBeenCalledTimes(2);
@@ -424,7 +424,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const authority: StrictDeletionAuthority = {
 			childId: "matching-child",
 			sessionDir,
-			sessionFile: childSession.sessionFile,
+			sessionFile: childSession.sessionFile!,
 			sessionId: childSession.sessionId,
 			generation: 2,
 			assertCurrent: vi.fn(),
@@ -502,7 +502,7 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.session.runRlmChild("fail after startup");
 
 		await vi.waitFor(() => expect(deleteRlmSubagentRuntime).toHaveBeenCalledOnce());
-		expect(runtime.listSubagentRuntimes()).toEqual([]);
+		await vi.waitFor(() => expect(runtime.listSubagentRuntimes()).toEqual([]));
 	});
 
 	it("plumbs the parent agent identity into runtime-created child prompts", async () => {
@@ -537,7 +537,7 @@ describe("AgentSessionRuntime characterization", () => {
 			createRlmSubagentRuntime: async () => {
 				throw new Error("unexpected child creation");
 			},
-			deleteRlmSubagentRuntime: async () => {},
+			deleteRlmSubagentRuntime: async () => ({ deletionDurability: "absent" as const }),
 			disposeRlmSubagentRuntimes,
 		};
 		const { runtime } = await createRuntimeForTest(() => {});
