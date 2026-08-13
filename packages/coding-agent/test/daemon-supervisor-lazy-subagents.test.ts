@@ -546,6 +546,48 @@ describe("daemon supervisor passive subagent topology", () => {
 		await expect(activeRename).resolves.toMatchObject({ success: true });
 	});
 
+	it("blocks a saved-child launch when an active sibling occupies its canonical scope", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-active-saved-create-availability-"));
+		tempDirs.push(directory);
+		const activePath = join(directory, "children", "active.jsonl");
+		const savedPath = join(directory, "children", "nested", "saved.jsonl");
+		const active = summary({
+			id: "active-id",
+			sessionId: "active-id",
+			sessionName: "shared",
+			sessionFile: activePath,
+			parentSessionPath: "../parent.jsonl",
+			rlmDepth: 1,
+		});
+		const saved = {
+			id: "saved-id",
+			path: savedPath,
+			cwd: directory,
+			created: new Date(0),
+			modified: new Date(0),
+			messageCount: 0,
+			firstMessage: "",
+			allMessagesText: "",
+			rlmDepth: 1,
+			parentSessionPath: "../../parent.jsonl",
+		};
+		const launchWorker = vi.fn();
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		Object.assign(supervisor, {
+			workers: new Map([["active", worker("active", [active])]]),
+			catalog: { siblings: vi.fn(async () => [saved]), list: vi.fn(async () => [saved]) },
+			launchWorker,
+		});
+
+		await expect(
+			supervisor.createOrReuseWorker("client", { type: "create", name: "shared", sessionPath: savedPath }),
+		).rejects.toThrow("an agent of that name already exists at depth 1 under this parent");
+		expect(launchWorker).not.toHaveBeenCalled();
+	});
+
 	it("fails closed before mutation for an active nonroot relative parent without a session file", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-unanchored-active-parent-"));
 		tempDirs.push(directory);
