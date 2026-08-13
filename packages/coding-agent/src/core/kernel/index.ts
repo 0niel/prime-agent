@@ -1394,7 +1394,8 @@ export class KernelManager {
 				return;
 			}
 			try {
-				await this.sendCommMessage(commId, { status: "ok", ...result });
+				// status goes last so handler payloads cannot override the protocol discriminator.
+				await this.sendCommMessage(commId, { ...result, status: "ok" });
 			} catch (replyError) {
 				this.appendKernelDiagnostic(
 					`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,

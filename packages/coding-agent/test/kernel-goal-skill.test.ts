@@ -127,22 +127,30 @@ except RuntimeError as error:
 		expect(reroute.stdout.trim()).toBe('RuntimeError: host request type "goal.get" is not available in this session');
 	});
 
-	it("rejects replies with an unexpected status instead of hanging", async () => {
+	it("keeps the protocol status authoritative over handler payload keys", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [bundledGoalSkill()],
 			hostHandlers: createTestHostHandlers({
-				"goal.get": async () => ({ status: "partial" }),
+				"goal.get": async () => ({
+					status: "partial",
+					value: "kept",
+					error: "payload error",
+					id: "payload-id",
+				}),
 			}),
 		});
 
 		const manager = await provisioner.ensure();
 		const result = await manager.execute(`
-try:
-    await goal.get()
-except RuntimeError as error:
-    print(f"RuntimeError: {error}")
+import json
+_reply = await goal.get()
+print(json.dumps(_reply, sort_keys=True))
 `);
 		expect(result.status).toBe("ok");
-		expect(result.stdout.trim()).toBe("RuntimeError: host request goal.get returned unexpected status: 'partial'");
+		expect(JSON.parse(result.stdout.trim())).toEqual({
+			error: "payload error",
+			id: "payload-id",
+			value: "kept",
+		});
 	});
 });
