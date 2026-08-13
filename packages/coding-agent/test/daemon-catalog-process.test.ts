@@ -20,6 +20,7 @@ import {
 	resolveCatalogSessionMatch,
 	setCatalogAfterTrustedHeaderForTest,
 	setCatalogBeforeTrustedOpenForTest,
+	setCatalogHelperLaunchForTest,
 } from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
@@ -100,9 +101,8 @@ describe("daemon catalog selector resolution", () => {
 		second.appendSessionInfo("second");
 		const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
 		mkdirSync(dirname(registry), { recursive: true });
-		// Version-2 session headers prove the old registry key shape, where a
-		// record was keyed by the persisted session id while its directory retained
-		// a sub-* run id.
+		// Reader compatibility for v2 headers does not relax registry provenance:
+		// childId remains the writer's direct sub-* directory name.
 		for (const child of [first, second]) {
 			const file = child.getSessionFile()!;
 			const [header, ...entries] = readFileSync(file, "utf8").trimEnd().split(/\r?\n/);
@@ -113,13 +113,13 @@ describe("daemon catalog selector resolution", () => {
 			[
 				{
 					type: "rlm_subagent",
-					childId: first.getSessionId(),
+					childId: "sub-first",
 					sessionFile: first.getSessionFile(),
 					status: "completed",
 				},
 				{
 					type: "rlm_subagent",
-					childId: second.getSessionId(),
+					childId: "sub-second",
 					sessionFile: second.getSessionFile(),
 					status: "completed",
 				},
@@ -698,6 +698,83 @@ describe("daemon catalog selector resolution", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
+	});
+
+	it("rejects promptly and releases authority FDs when the helper executable cannot spawn", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-helper-spawn-error-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		const baseline = getOpenCatalogAuthorityFdCountForTest();
+		setCatalogHelperLaunchForTest({ command: join(root, "does-not-exist"), args: [] });
+		try {
+			await expect(
+				Promise.race([
+					listCatalogFamilySessions(sessionDir),
+					new Promise<never>((_, reject) => setTimeout(() => reject(new Error("helper spawn hung")), 1_000)),
+				]),
+			).rejects.toThrow("Invalid RLM artifact family topology");
+		} finally {
+			setCatalogHelperLaunchForTest(undefined);
+			rmSync(root, { recursive: true, force: true });
+		}
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(baseline);
+	});
+
+	it("rejects the family when the helper writes delayed unsolicited stdout after its final response", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-helper-delayed-stdout-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		const header = readFileSync(parent.getSessionFile()!, "utf8").split(/\r?\n/, 1)[0]!;
+		const helper = String.raw`let input="";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => {
+ input += chunk;
+ while (true) {
+  const end=input.indexOf("\n"); if (end<0) break;
+  const request=JSON.parse(input.slice(0,end)); input=input.slice(end+1);
+  const payload=request.mode === "header" ? { id:request.id, data:${JSON.stringify(Buffer.from(header).toString("base64"))}, mtimeMs:0, dev:"1", ino:"1" } : { id:request.id, mtimeMs:0, dev:"1", ino:"1" };
+  process.stdout.write(JSON.stringify(payload)+"\n");
+  if (request.mode === "stat") setTimeout(() => process.stdout.write("{\"unsolicited\":true}\n"), 25);
+ }
+});`;
+		const baseline = getOpenCatalogAuthorityFdCountForTest();
+		setCatalogHelperLaunchForTest({ command: process.execPath, args: ["-e", helper] });
+		try {
+			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		} finally {
+			setCatalogHelperLaunchForTest(undefined);
+			rmSync(root, { recursive: true, force: true });
+		}
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(baseline);
+	});
+
+	it("rejects a v2 header whose registry rekeys the child by session id", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-v2-rekey-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-real"));
+		child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		child.appendSessionInfo("child");
+		const childFile = child.getSessionFile()!;
+		const [header, ...entries] = readFileSync(childFile, "utf8").trimEnd().split(/\r?\n/);
+		writeFileSync(childFile, `${JSON.stringify({ ...JSON.parse(header!), version: 2 })}\n${entries.join("\n")}\n`);
+		const registry = join(root, "session-artifacts", "parent", "rlm-subagents.jsonl");
+		mkdirSync(dirname(registry), { recursive: true });
+		writeFileSync(
+			registry,
+			JSON.stringify({ type: "rlm_subagent", childId: "child", sessionFile: childFile, status: "completed" }),
+		);
+		try {
+			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("writer artifact layout");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("walks a realistic profile: fork seeds, sub-* registry ids, two nested levels", async () => {
