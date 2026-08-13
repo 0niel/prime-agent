@@ -403,7 +403,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		childId: string,
 		session: AgentSession,
 		authority?: RlmSubagentDeletionAuthority,
-	): Promise<void> {
+	): Promise<import("./rlm-runtime.js").RlmSubagentHostDeletionResult> {
 		// Inline teardown has no daemon append, so the exact coordinator token is
 		// its sole pre-destruction fence.
 		authority?.assertCurrent();
@@ -411,7 +411,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (!runtime) {
 			authority?.assertCurrent();
 			await session.disposeAsync();
-			return;
+			return { deletionDurability: "absent" };
 		}
 		// A child id can be recycled after an older deletion attempt yields. The
 		// runtime metadata is assigned from CreateRlmSubagentRuntimeOptions before
@@ -436,6 +436,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				await session.disposeAsync();
 			}
 		}
+		return { deletionDurability: "absent" };
 	}
 
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
