@@ -3196,6 +3196,43 @@ describe("AgentSession rlm recursion", () => {
 		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-")).length).toBe(0);
 	});
 
+	it("discharges a quarantined tombstone without removing its retained artifact", async () => {
+		const admissionController = new AbortController();
+		const child = createSession();
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async (options) => {
+					admissionController.abort();
+					options.onSessionPublished?.(child);
+					return { session: child };
+				},
+				releaseRlmSubagentRuntime: async (runtime) => {
+					await runtime.session.disposeAsync();
+					return { deletionDurability: "unknown" };
+				},
+				resolveRlmSubagentDeletion: async () => "tombstoned",
+				deleteRlmSubagentRuntime: async (_childId, session) => session?.disposeAsync(),
+			},
+		});
+
+		await expect(
+			root.runRlmChild("tombstone quarantine retry", {}, undefined, { signal: admissionController.signal }),
+		).rejects.toThrow("host request authority was revoked");
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._rlmChildDeletionQuarantines.size === 1);
+		const childId = [...internals._rlmChildDeletionQuarantines.keys()][0];
+		if (!childId) throw new Error("Missing deletion quarantine");
+		const artifactDir = root.sessionManager.getSessionArtifactDir();
+		if (!artifactDir) throw new Error("Missing session artifact dir");
+
+		await expect(root.deleteRlmSubagent(childId)).resolves.toMatchObject({
+			subagent: { rlm_child_id: childId },
+		});
+		expect(internals._rlmChildDeletionQuarantines.has(childId)).toBe(false);
+		expect(internals._deletedRlmChildIds.has(childId)).toBe(true);
+		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-")).length).toBe(1);
+	});
+
 	it("retains a host-owned runtime dir when revoked-spawn release is tombstoned", async () => {
 		const controller = new AbortController();
 		const child = createSession();
