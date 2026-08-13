@@ -2484,6 +2484,59 @@ describe("AgentSession rlm recursion", () => {
 		expect(deleteRuntime).not.toHaveBeenCalled();
 	});
 
+	it("keeps a newer active child tracked when stale inline cleanup settles", async () => {
+		const childId = "recycled-active-child";
+		const staleDir = join(tempDir, "stale-active");
+		const stale = { _rlmSessionDir: staleDir, sessionId: "stale" } as unknown as AgentSession;
+		const newer = { _rlmSessionDir: join(tempDir, "new-active"), sessionId: "new" } as unknown as AgentSession;
+		const run = {
+			id: childId,
+			sessionDir: staleDir,
+			abort: vi.fn(),
+			status: "running",
+			settled: false,
+			session: stale,
+		};
+		let root!: AgentSession;
+		const deleteRuntime = vi.fn(async () => {
+			(root as unknown as InspectableRlmSession)._activeRlmChildRuns.set(childId, {
+				...run,
+				session: newer,
+			});
+			return { deletionDurability: "stale" as const };
+		});
+		root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		const inspectable = root as unknown as InspectableRlmSession;
+		const childUpdates: string[] = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") childUpdates.push(event.child.status);
+		});
+		inspectable._activeRlmChildRuns.set(childId, run);
+		const subagent = {
+			rlm_child_id: childId,
+			active_session_id: "stale",
+			session_id: "stale",
+			session_name: "stale-active",
+			session_dir: staleDir,
+			status: "running" as const,
+		};
+
+		await expect(inspectable._deleteResolvedRlmSubagent(subagent)).resolves.toEqual({ subagent });
+		expect(deleteRuntime).toHaveBeenCalledWith(childId, stale);
+		expect(inspectable._activeRlmChildRuns.get(childId)?.session).toBe(newer);
+		expect(inspectable._deletedRlmChildIds.has(childId)).toBe(false);
+		expect(run.abort).not.toHaveBeenCalled();
+		expect(childUpdates).toEqual([]);
+		inspectable._activeRlmChildRuns.delete(childId);
+	});
+
 	it("keeps a newer retained child tracked when stale inline cleanup settles", async () => {
 		const childId = "recycled-retained-child";
 		const staleDir = join(tempDir, "stale-retained");

@@ -1236,6 +1236,11 @@ describe("daemon mode helpers", () => {
 			const legacy = JSON.parse(modern) as Record<string, unknown>;
 			delete legacy.sessionId;
 			writeFileSync(registryPath, `${JSON.stringify(legacy)}\n`);
+			await expect(host.deleteRlmSubagentRuntime(fixture.childId)).rejects.toMatchObject({
+				name: "RlmSubagentHostDeletionError",
+				phase: "precommit",
+			});
+			expect(close).not.toHaveBeenCalled();
 			await expect(
 				internals.recordRlmSubagentDeletion(parent, fixture.childId, undefined, child.runtime.session),
 			).resolves.toBe("tombstoned");

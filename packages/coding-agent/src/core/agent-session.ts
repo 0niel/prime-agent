@@ -9746,7 +9746,14 @@ export class AgentSession {
 			if (liveSession) {
 				authority?.assertCurrent();
 				try {
-					await this._deleteRlmSubagentSession(childId, liveSession, authority);
+					const deletion = await this._deleteRlmSubagentSession(childId, liveSession, authority);
+					if (
+						deletion.deletionDurability === "stale" ||
+						this._activeRlmChildRuns.get(childId) !== run ||
+						run.session !== liveSession
+					) {
+						return { subagent };
+					}
 				} catch (error) {
 					if (this._disposed || this._disposing) {
 						this._removeRlmSubagentTracking(childId, run);
