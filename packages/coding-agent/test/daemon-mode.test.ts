@@ -134,9 +134,13 @@ describe("daemon mode helpers", () => {
 		expect(setSessionName).toHaveBeenCalledOnce();
 	});
 
-	it("treats a depth-zero fork as a sibling of another root", () => {
+	it("treats a depth-zero fork as a sibling of another root", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-fork-family.sock", {
-			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: vi.fn(),
 		});
 		const fork = makeState("fork");
@@ -152,7 +156,10 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-fork",
 				sessionFile: "/tmp/fork.jsonl",
 				rlmDepth: 0,
-				sessionManager: { getHeader: () => ({ parentSession: "/tmp/fork-origin.jsonl" }) },
+				sessionManager: {
+					getHeader: () => ({ parentSession: "/tmp/fork-origin.jsonl" }),
+					getSessionArtifactDir: () => undefined,
+				},
 			},
 		} as never;
 		const root = makeState("root");
@@ -163,20 +170,33 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-root",
 				sessionFile: "/tmp/root.jsonl",
 				rlmDepth: 0,
+				sessionManager: { getSessionArtifactDir: () => undefined },
 			},
 		} as never;
 		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
 			agentFamilyEntry(state: ActiveSessionState): {
 				parentSessionId?: string;
 				parentSessionPath?: string;
 			};
+			agentFamilyCatalogEntries(): Promise<
+				readonly import("../src/core/agent-messages.js").AgentFamilyCatalogEntry[]
+			>;
 			isAgentFamilyReachable(current: ActiveSessionState, target: ActiveSessionState): boolean;
 		};
+		internals.sessions.set(fork.activeSessionId, fork);
+		internals.sessions.set(root.activeSessionId, root);
 
 		expect(internals.agentFamilyEntry(fork)).not.toHaveProperty("parentSessionId");
 		expect(internals.agentFamilyEntry(fork)).not.toHaveProperty("parentSessionPath");
 		expect(internals.isAgentFamilyReachable(root, fork)).toBe(true);
 		expect(internals.isAgentFamilyReachable(fork, root)).toBe(true);
+		const catalog = await internals.agentFamilyCatalogEntries();
+		const forkEntry = catalog.find((entry) => entry.id === "session-fork");
+		const rootEntry = catalog.find((entry) => entry.id === "session-root");
+		expect(forkEntry).toEqual(expect.objectContaining({ depth: 0 }));
+		expect(forkEntry).not.toHaveProperty("parentSessionPath");
+		expect(assertAgentFamilyReach(rootEntry!, forkEntry!, catalog)).toBe("sibling");
 	});
 
 	it("finds only direct child active sessions", () => {

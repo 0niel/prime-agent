@@ -5540,8 +5540,10 @@ export class AgentDaemon {
 				typeof header.rlmDepth === "number" && Number.isSafeInteger(header.rlmDepth) && header.rlmDepth >= 0
 					? header.rlmDepth
 					: undefined;
+			// Session forks also persist parentSession as provenance while retaining
+			// depth zero. Only positive/unknown-depth headers may claim a family edge.
 			const parentSessionPath =
-				typeof header.parentSession === "string" && header.parentSession
+				depth !== 0 && typeof header.parentSession === "string" && header.parentSession
 					? canonicalSessionPath(
 							isAbsolute(header.parentSession)
 								? header.parentSession
@@ -5610,12 +5612,13 @@ export class AgentDaemon {
 		const entry = this.agentFamilyEntry(state);
 		const session = state.runtime.session;
 		const metadata = state.runtime.metadata;
-		const headerParent = this.resolveHeaderParentSessionPath(state);
-		const parentSessionPath = headerParent ?? metadata.parentSessionFile;
-		// A root has no parent claim. Do not let a stale runtime rlmDepth turn it
-		// into a depth-N orphan when its durable/root metadata still says root.
+		const headerParent = entry.depth > 0 ? this.resolveHeaderParentSessionPath(state) : undefined;
+		const parentSessionId = entry.depth > 0 ? metadata.parentSessionId : undefined;
+		const parentSessionPath = entry.depth > 0 ? (headerParent ?? metadata.parentSessionFile) : undefined;
+		// A root has no family parent claim. Depth-zero fork provenance in
+		// parentSession/metadata must not turn the fork into an RLM child.
 		const isUnparentedTopLevel =
-			metadata.kind === "top-level" && !headerParent && !metadata.parentSessionId && !metadata.parentSessionFile;
+			metadata.kind === "top-level" && !headerParent && !parentSessionId && !parentSessionPath;
 		const depthClaim =
 			!isUnparentedTopLevel &&
 			typeof session.rlmDepth === "number" &&
@@ -5628,9 +5631,7 @@ export class AgentDaemon {
 			...(isUnparentedTopLevel ? { depth: 0 } : {}),
 			source: "resident",
 			...(depthClaim !== undefined ? { depthClaim } : {}),
-			...(metadata.parentSessionId
-				? { parentSessionId: metadata.parentSessionId, parentSessionIdClaim: metadata.parentSessionId }
-				: {}),
+			...(parentSessionId ? { parentSessionId, parentSessionIdClaim: parentSessionId } : {}),
 			...(parentSessionPath
 				? {
 						parentSessionPath: canonicalSessionPath(parentSessionPath),
