@@ -9719,6 +9719,14 @@ export class AgentSession {
 					this._rlmChildCleanupFailures.set(childId, subagent);
 					if (run.unsubscribe) this._rlmChildUnsubscribes.set(childId, run.unsubscribe);
 					this._activeRlmChildRuns.delete(childId);
+					// A generic close failure may follow a durable daemon tombstone. Keep
+					// this task on its cancelled terminal path so its finalizer retries the
+					// retained cleanup record rather than completing and losing that route.
+					// A revoked owner is different: a live waiter may promote a fresh
+					// generation, so it must not mutate the run before that commit.
+					if (!(error instanceof Error) || error.message !== "host request authority was revoked") {
+						this._cancelRlmChildRun(run, "Deleted by parent orchestrator");
+					}
 					run.abort = noopRlmChildAbort;
 					run.unsubscribe = undefined;
 					run.session = undefined;

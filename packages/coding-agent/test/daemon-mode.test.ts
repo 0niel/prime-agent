@@ -1019,6 +1019,84 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("honors daemon deletion authority on both sides of the append boundary", async () => {
+		const beforeTempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-before-append-"));
+		const afterTempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-after-append-"));
+		try {
+			const before = makePersistedRlmDaemonFixture(beforeTempDir);
+			const beforeInternals = before.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				sessions: Map<string, ActiveSessionState>;
+			};
+			const beforeParent = await beforeInternals.createRuntime({
+				type: "create",
+				sessionPath: before.parentSessionFile,
+			});
+			const beforeChild = await beforeInternals.createRuntime({
+				type: "create",
+				sessionPath: before.childSessionFile,
+			});
+			const beforeRegistryPath = join(before.parentArtifactDir, "rlm-subagents.jsonl");
+			const beforeRegistry = readFileSync(beforeRegistryPath, "utf8");
+			const revokedBeforeAppend = new Error("host request authority was revoked");
+			let beforeBoundaryChecks = 0;
+			await expect(
+				beforeInternals
+					.createSubagentRuntimeHost(beforeParent)
+					.deleteRlmSubagentRuntime(before.childId, beforeChild.runtime.session, {
+						childId: before.childId,
+						sessionDir: before.childSessionDir,
+						generation: 1,
+						assertCurrent: () => {
+							if (++beforeBoundaryChecks === 2) throw revokedBeforeAppend;
+						},
+					}),
+			).rejects.toBe(revokedBeforeAppend);
+			expect(readFileSync(beforeRegistryPath, "utf8")).toBe(beforeRegistry);
+			expect(beforeInternals.sessions.get(beforeChild.activeSessionId)).toBe(beforeChild);
+
+			const after = makePersistedRlmDaemonFixture(afterTempDir);
+			const afterInternals = after.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				appendRlmSubagentRegistryEntry(parent: ActiveSessionState, entry: { status: string }): boolean;
+				sessions: Map<string, ActiveSessionState>;
+			};
+			const afterParent = await afterInternals.createRuntime({
+				type: "create",
+				sessionPath: after.parentSessionFile,
+			});
+			const afterChild = await afterInternals.createRuntime({ type: "create", sessionPath: after.childSessionFile });
+			const afterAbort = new AbortController();
+			const appendEntry = afterInternals.appendRlmSubagentRegistryEntry;
+			vi.spyOn(afterInternals, "appendRlmSubagentRegistryEntry").mockImplementation((parentState, entry) => {
+				const result = appendEntry.call(afterInternals, parentState, entry);
+				afterAbort.abort();
+				return result;
+			});
+			await expect(
+				afterInternals
+					.createSubagentRuntimeHost(afterParent)
+					.deleteRlmSubagentRuntime(after.childId, afterChild.runtime.session, {
+						childId: after.childId,
+						sessionDir: after.childSessionDir,
+						generation: 1,
+						assertCurrent: () => {
+							if (afterAbort.signal.aborted) throw new Error("host request authority was revoked");
+						},
+					}),
+			).resolves.toBeUndefined();
+			expect(readFileSync(join(after.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")).toContain(
+				'"status":"deleted"',
+			);
+			expect(afterInternals.sessions.has(afterChild.activeSessionId)).toBe(false);
+		} finally {
+			rmSync(beforeTempDir, { recursive: true, force: true });
+			rmSync(afterTempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-real-completion-"));
 		try {
