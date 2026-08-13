@@ -9629,6 +9629,17 @@ export class AgentSession {
 		// A retry/reaper can yield while the host reads. It may only discharge the
 		// exact lease it resolved, never a newer lease reusing this child id.
 		if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return false;
+		const retained = this._rlmChildSessions.get(childId);
+		if (retained) {
+			// A precommit release failure left the host runtime live. Durability alone
+			// cannot discharge that lease: retry the typed host deletion so the exact
+			// resident incarnation is closed before local tracking is cleared.
+			await this._deleteRlmSubagentSession(childId, retained, authority);
+			authority?.assertCurrent();
+			if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return false;
+			if (this._rlmChildSessions.get(childId) !== retained) return false;
+			this._removeRlmSubagentTracking(childId);
+		}
 		if (durability === "absent") {
 			// This is the sole path which removes the exact quarantined directory.
 			rmSync(lease.session_dir, { recursive: true, force: true });
@@ -9652,6 +9663,10 @@ export class AgentSession {
 			return deletion.then((result) => result ?? { deletionDurability: "absent" });
 		}
 		return (session?.disposeAsync() ?? Promise.resolve()).then(() => ({ deletionDurability: "absent" }));
+	}
+
+	private _isPrecommitRlmSubagentDeletionFailure(error: unknown): boolean {
+		return error instanceof RlmSubagentHostDeletionError && error.phase === "precommit";
 	}
 
 	private _isTombstonedRlmSubagentDeletionFailure(error: unknown): boolean {
@@ -10345,13 +10360,15 @@ export class AgentSession {
 										);
 										deletionDurability = outcome?.deletionDurability ?? "unknown";
 									} catch (releaseError) {
-										if (
-											this._isTombstonedRlmSubagentDeletionFailure(releaseError) &&
-											!this._disposed &&
-											!this._disposing
-										) {
-											this._rlmChildSessions.set(run.id, childSession);
-											this._rlmChildCleanupFailures.set(run.id, finalizerSubagent);
+										if (!this._disposed && !this._disposing) {
+											if (this._isTombstonedRlmSubagentDeletionFailure(releaseError)) {
+												this._rlmChildSessions.set(run.id, childSession);
+												this._rlmChildCleanupFailures.set(run.id, finalizerSubagent);
+											} else if (this._isPrecommitRlmSubagentDeletionFailure(releaseError)) {
+												// Keep the live host incarnation attached to the private unknown-
+												// durability lease so an exact-id retry can tombstone and close it.
+												this._rlmChildSessions.set(run.id, childSession);
+											}
 										}
 										throw releaseError;
 									}

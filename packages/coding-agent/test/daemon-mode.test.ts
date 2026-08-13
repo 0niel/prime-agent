@@ -818,9 +818,10 @@ describe("daemon mode helpers", () => {
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 
-		// A registry failure must not strand the cancelled child as a stale resident session,
-		// but must retain the artifact because durability is unknown.
+		// A registry failure is precommit: keep the live incarnation resident and
+		// addressable so a later owner can retry the durable tombstone and close once.
 		internals.sessions.set(childState.activeSessionId, childState);
+		const closeCountBeforeFailure = closeSession.mock.calls.length;
 		internals.recordRlmSubagentDeletion = vi.fn(async () => {
 			throw new Error("registry write failed");
 		});
@@ -832,7 +833,23 @@ describe("daemon mode helpers", () => {
 					{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
 					"cancelled",
 				),
-		).resolves.toEqual({ deletionDurability: "unknown" });
+		).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
+		expect(closeSession).toHaveBeenCalledTimes(closeCountBeforeFailure);
+		expect(internals.sessions.get(childState.activeSessionId)).toBe(childState);
+
+		const retryDeletion = vi.fn(async () => "tombstoned" as const);
+		internals.recordRlmSubagentDeletion = retryDeletion;
+		await expect(
+			internals
+				.createSubagentRuntimeHost(parentState)
+				.releaseRlmSubagentRuntime?.(
+					{ session: childState.runtime.session },
+					{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
+					"cancelled",
+				),
+		).resolves.toEqual({ deletionDurability: "tombstoned" });
+		expect(retryDeletion).toHaveBeenCalledOnce();
+		expect(closeSession).toHaveBeenCalledTimes(closeCountBeforeFailure + 1);
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
