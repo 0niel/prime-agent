@@ -2508,11 +2508,13 @@ export class AgentDaemon {
 					) {
 						throw new Error("RLM subagent deletion does not match the resident runtime incarnation");
 					}
-					// `readLatestRlmSubagentRegistry(..., true)` completed successfully.
-					// When it proves this child has no current row and no resident object
-					// exists, deletion is already benign regardless of a stale or partial
-					// coordinator token. Existing rows above still require exact authority.
+					// A lenient listing may omit malformed historical rows. Absence authorizes
+					// cleanup, so require a complete registry read that also confirms no row.
 					if (state === undefined && persisted === undefined) {
+						const completeRegistry = await this.readCompleteRlmSubagentRegistryForDeletion(parentState);
+						if (!completeRegistry || completeRegistry.some((entry) => entry.childId === childId)) {
+							throw new Error("RLM subagent deletion registry cannot prove absence");
+						}
 						return { deletionDurability: "absent" };
 					}
 					const childSessionFile = persisted?.sessionFile ?? state?.runtime.session.sessionFile;

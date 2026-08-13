@@ -1223,6 +1223,16 @@ describe("daemon mode helpers", () => {
 			).resolves.toEqual({ deletionDurability: "absent" });
 			expect(readFileSync(registryPath, "utf8")).toBe(modern);
 
+			// The lenient lookup above skips malformed lines. It must not turn that
+			// omission into absence proof for a passive no-row deletion request.
+			writeFileSync(registryPath, `${modern}not-json\n`);
+			await expect(host.deleteRlmSubagentRuntime("missing-child")).rejects.toMatchObject({
+				name: "RlmSubagentHostDeletionError",
+				phase: "precommit",
+			});
+			expect(readFileSync(registryPath, "utf8")).toBe(`${modern}not-json\n`);
+			writeFileSync(registryPath, modern);
+
 			const legacy = JSON.parse(modern) as Record<string, unknown>;
 			delete legacy.sessionId;
 			writeFileSync(registryPath, `${JSON.stringify(legacy)}\n`);
