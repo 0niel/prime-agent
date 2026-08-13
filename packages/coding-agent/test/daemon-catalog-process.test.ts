@@ -18,6 +18,7 @@ import {
 	listCatalogFamilySessions,
 	listSavedSessionSiblings,
 	resolveCatalogSessionMatch,
+	setCatalogAfterTrustedHeaderForTest,
 	setCatalogBeforeTrustedOpenForTest,
 } from "../src/modes/daemon/daemon-catalog-process.js";
 
@@ -99,7 +100,14 @@ describe("daemon catalog selector resolution", () => {
 		second.appendSessionInfo("second");
 		const registry = join(dirname(sessionDir), "session-artifacts", parent.getSessionId(), "rlm-subagents.jsonl");
 		mkdirSync(dirname(registry), { recursive: true });
-		// Legacy registry variant where childId happens to equal the session id.
+		// Version-2 session headers prove the old registry key shape, where a
+		// record was keyed by the persisted session id while its directory retained
+		// a sub-* run id.
+		for (const child of [first, second]) {
+			const file = child.getSessionFile()!;
+			const [header, ...entries] = readFileSync(file, "utf8").trimEnd().split(/\r?\n/);
+			writeFileSync(file, `${JSON.stringify({ ...JSON.parse(header!), version: 2 })}\n${entries.join("\n")}\n`);
+		}
 		writeFileSync(
 			registry,
 			[
@@ -121,8 +129,8 @@ describe("daemon catalog selector resolution", () => {
 		);
 
 		await expect(listSavedSessionSiblings(first.getSessionFile()!, sessionDir)).resolves.toEqual([
-			expect.objectContaining({ id: first.getSessionId(), name: "first" }),
-			expect.objectContaining({ id: second.getSessionId(), name: "second" }),
+			expect.objectContaining({ id: first.getSessionId() }),
+			expect.objectContaining({ id: second.getSessionId() }),
 		]);
 	});
 
@@ -132,9 +140,9 @@ describe("daemon catalog selector resolution", () => {
 			await withDefaultSessionDir(sessionDir, async () => {
 				await expect(listCatalogFamilySessions()).resolves.toEqual(
 					expect.arrayContaining([
-						expect.objectContaining({ id: parent.getSessionId(), name: "parent" }),
-						expect.objectContaining({ id: first.getSessionId(), name: "first" }),
-						expect.objectContaining({ id: second.getSessionId(), name: "second" }),
+						expect.objectContaining({ id: parent.getSessionId() }),
+						expect.objectContaining({ id: first.getSessionId() }),
+						expect.objectContaining({ id: second.getSessionId() }),
 					]),
 				);
 			});
@@ -149,8 +157,8 @@ describe("daemon catalog selector resolution", () => {
 		try {
 			await withDefaultSessionDir(sessionDir, async () => {
 				await expect(listSavedSessionSiblings(first.getSessionFile()!)).resolves.toEqual([
-					expect.objectContaining({ id: first.getSessionId(), name: "first" }),
-					expect.objectContaining({ id: second.getSessionId(), name: "second" }),
+					expect.objectContaining({ id: first.getSessionId() }),
+					expect.objectContaining({ id: second.getSessionId() }),
 				]);
 			});
 		} finally {
@@ -197,8 +205,8 @@ describe("daemon catalog selector resolution", () => {
 		);
 
 		await expect(listSavedSessionSiblings(first.getSessionFile()!, sessionDir)).resolves.toEqual([
-			expect.objectContaining({ id: first.getSessionId(), name: "first" }),
-			expect.objectContaining({ id: second.getSessionId(), name: "second" }),
+			expect.objectContaining({ id: first.getSessionId() }),
+			expect.objectContaining({ id: second.getSessionId() }),
 		]);
 	});
 
@@ -750,6 +758,57 @@ describe("daemon catalog selector resolution", () => {
 		}
 		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
 		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("binds registry child ids to direct writer directories and detects post-header replacement", async () => {
+		const make = () => {
+			const root = mkdtempSync(join(tmpdir(), "prime-catalog-identity-binding-"));
+			const sessionDir = join(root, "sessions");
+			const parent = SessionManager.create(root, sessionDir);
+			parent.newSession({ id: "parent", rlmDepth: 0 });
+			parent.appendSessionInfo("parent");
+			const childDir = join(root, "session-artifacts", "parent", "sub-real");
+			const child = SessionManager.create(root, childDir);
+			child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+			child.appendSessionInfo("child");
+			const registry = join(root, "session-artifacts", "parent", "rlm-subagents.jsonl");
+			mkdirSync(dirname(registry), { recursive: true });
+			const writeRegistry = (childId: string, sessionFile = child.getSessionFile()!) =>
+				writeFileSync(
+					registry,
+					JSON.stringify({ type: "rlm_subagent", childId, sessionFile, status: "completed" }),
+				);
+			writeRegistry("sub-real");
+			return { root, sessionDir, child, childDir, writeRegistry };
+		};
+		const spoofed = make();
+		spoofed.writeRegistry("sub-spoofed");
+		await expect(listCatalogFamilySessions(spoofed.sessionDir)).rejects.toThrow("writer artifact layout");
+		rmSync(spoofed.root, { recursive: true, force: true });
+
+		const nested = make();
+		const nestedPath = join(nested.sessionDir, "sub-real", "child.jsonl");
+		mkdirSync(dirname(nestedPath), { recursive: true });
+		writeFileSync(nestedPath, readFileSync(nested.child.getSessionFile()!));
+		nested.writeRegistry("sub-real", nestedPath);
+		await expect(listCatalogFamilySessions(nested.sessionDir)).rejects.toThrow("writer artifact layout");
+		rmSync(nested.root, { recursive: true, force: true });
+
+		const replacement = make();
+		let swapped = false;
+		setCatalogAfterTrustedHeaderForTest((path) => {
+			if (swapped || path !== replacement.child.getSessionFile()) return;
+			swapped = true;
+			const moved = `${path}.old`;
+			renameSync(path, moved);
+			writeFileSync(path, `${readFileSync(moved, "utf8").split(/\r?\n/, 1)[0]}\n${"x".repeat(2 * 1024 * 1024)}\n`);
+		});
+		await expect(listCatalogFamilySessions(replacement.sessionDir)).rejects.toThrow(
+			"session changed after its trusted header read",
+		);
+		setCatalogAfterTrustedHeaderForTest(undefined);
+		rmSync(replacement.root, { recursive: true, force: true });
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
 	});
 
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {

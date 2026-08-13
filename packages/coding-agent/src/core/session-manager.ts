@@ -1018,6 +1018,49 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 	return info;
 }
 
+/**
+ * Parse only descriptor-authorized session-header bytes. Unlike readSessionInfo,
+ * this deliberately never follows a legacy parent path or scans the body.
+ */
+export function readSessionHeaderInfoFromBuffer(
+	filePath: string,
+	contents: Buffer,
+	metadata: { mtimeMs: number },
+): SessionInfo | null {
+	try {
+		const newline = contents.indexOf(0x0a);
+		const line = contents
+			.subarray(0, newline === -1 ? contents.length : newline)
+			.toString("utf8")
+			.trim();
+		const header = JSON.parse(line) as Partial<SessionHeader>;
+		if (
+			header.type !== "session" ||
+			typeof header.id !== "string" ||
+			header.id === "" ||
+			(typeof header.cwd !== "string" && header.cwd !== undefined) ||
+			(typeof header.parentSession !== "string" && header.parentSession !== undefined) ||
+			(header.rlmDepth !== undefined && !isValidRlmDepth(header.rlmDepth))
+		) {
+			return null;
+		}
+		return {
+			path: filePath,
+			id: header.id,
+			cwd: header.cwd ?? "",
+			...(header.parentSession !== undefined ? { parentSessionPath: header.parentSession } : {}),
+			rlmDepth: header.rlmDepth ?? 0,
+			created: new Date(typeof header.timestamp === "string" ? header.timestamp : 0),
+			modified: new Date(metadata.mtimeMs),
+			messageCount: 0,
+			firstMessage: "(no messages)",
+			allMessagesText: "",
+		};
+	} catch {
+		return null;
+	}
+}
+
 /** Parse catalog-authorized bytes without reopening their pathname. */
 export async function readSessionInfoFromBuffer(
 	filePath: string,

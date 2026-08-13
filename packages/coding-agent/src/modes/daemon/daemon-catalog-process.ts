@@ -6,7 +6,12 @@ import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli
 import { getSessionsDir } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
-import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import {
+	readSessionHeaderInfoFromBuffer,
+	readSessionInfo,
+	type SessionInfo,
+	SessionManager,
+} from "../../core/session-manager.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 
@@ -98,6 +103,7 @@ interface TrustedSession extends SessionInfo {
 	/** The header claims are intentionally separate from SessionInfo's legacy fallback. */
 	persistedDepth?: number;
 	persistedParentPath?: string;
+	persistedVersion?: number;
 }
 
 /** A family member whose depth has been verified against the walk. */
@@ -224,6 +230,13 @@ export function setCatalogBeforeTrustedOpenForTest(hook: ((path: string) => void
 	beforeTrustedOpenForTest = hook;
 }
 
+/** Test-only seam runs after a descriptor-bound header read, before metadata. */
+let afterTrustedHeaderForTest: ((path: string) => void) | undefined;
+/** @internal */
+export function setCatalogAfterTrustedHeaderForTest(hook: ((path: string) => void) | undefined): void {
+	afterTrustedHeaderForTest = hook;
+}
+
 type TrustedReadMode = "read" | "header" | "stat";
 
 const TRUSTED_READ_TIMEOUT_MS = 5_000;
@@ -243,10 +256,22 @@ class TrustedReadSession {
 		| { resolve: (line: string) => void; reject: (error: Error) => void; timeout: NodeJS.Timeout; cap: number }
 		| undefined;
 	private queue: Promise<unknown> = Promise.resolve();
+	private stdinEnded = false;
+	private exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+	private readonly stdoutFinished: Promise<void>;
+	private resolveStdoutFinished!: () => void;
+	private readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+	private resolveExited!: (result: { code: number | null; signal: NodeJS.Signals | null }) => void;
 
 	constructor(private readonly roots: ManagedRoots) {
 		const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "ignore", roots.session.fd];
 		if (roots.artifacts) stdio.push(roots.artifacts.fd);
+		this.stdoutFinished = new Promise((resolveFinished) => {
+			this.resolveStdoutFinished = resolveFinished;
+		});
+		this.exited = new Promise((resolveExited) => {
+			this.resolveExited = resolveExited;
+		});
 		this.child = spawn(
 			process.execPath === process.env.PRIME_AGENT_KERNEL_PYTHON
 				? process.execPath
@@ -260,8 +285,18 @@ class TrustedReadSession {
 		);
 		this.child.stdout?.setEncoding("utf8");
 		this.child.stdout?.on("data", (chunk: string) => this.handleStdout(chunk));
+		this.child.stdout?.on("end", () => {
+			this.resolveStdoutFinished();
+			if (this.stdoutBuffer !== "") this.fail(new Error("catalog openat helper left residual output"));
+		});
 		this.child.on("error", (error) => this.fail(new Error(`catalog openat helper failed: ${String(error)}`)));
-		this.child.on("exit", () => this.fail(new Error("catalog openat helper exited")));
+		this.child.on("exit", (code, signal) => {
+			this.exit = { code, signal };
+			this.resolveExited(this.exit);
+			if (!this.stdinEnded || code !== 0 || signal !== null) {
+				this.fail(new Error(`catalog openat helper exited (${signal ?? code ?? "unknown"})`));
+			}
+		});
 	}
 
 	async read(rawPath: string, maxBytes: number, mode: TrustedReadMode): Promise<TrustedFile> {
@@ -270,10 +305,22 @@ class TrustedReadSession {
 		return run;
 	}
 
-	close(): void {
-		this.fail(new Error("catalog openat helper closed"));
+	/** End input and require the helper to finish silently and successfully. */
+	async close(): Promise<void> {
+		await this.queue;
+		if (this.failure) return;
+		if (this.pending || this.stdoutBuffer !== "") {
+			this.fail(new Error("catalog openat helper has residual output"));
+			return;
+		}
+		this.stdinEnded = true;
 		this.child.stdin?.end();
-		this.child.kill("SIGKILL");
+		const [exit] = await Promise.all([this.exited, this.stdoutFinished]);
+		if (this.failure || exit.code !== 0 || exit.signal !== null || this.stdoutBuffer !== "") {
+			const failure = this.failure ?? new Error("catalog openat helper did not exit cleanly");
+			if (!this.failure) this.fail(failure);
+			throw invalidFamilyTopology(`descriptor-relative artifact read failed: ${failure.message}`);
+		}
 	}
 
 	private async readSerialized(rawPath: string, maxBytes: number, mode: TrustedReadMode): Promise<TrustedFile> {
@@ -321,14 +368,17 @@ class TrustedReadSession {
 	}
 
 	private exchange(request: string, responseCap: number): Promise<string> {
-		if (this.failure)
+		if (this.failure || this.stdinEnded)
 			return Promise.reject(
-				invalidFamilyTopology(`descriptor-relative artifact read failed: ${this.failure.message}`),
+				invalidFamilyTopology(
+					`descriptor-relative artifact read failed: ${this.failure?.message ?? "helper closed"}`,
+				),
 			);
 		return new Promise<string>((resolvePending, rejectPending) => {
-			const timeout = setTimeout(() => {
-				this.fail(new Error("catalog openat helper timed out"));
-			}, TRUSTED_READ_TIMEOUT_MS);
+			const timeout = setTimeout(
+				() => this.fail(new Error("catalog openat helper timed out")),
+				TRUSTED_READ_TIMEOUT_MS,
+			);
 			this.pending = { resolve: resolvePending, reject: rejectPending, timeout, cap: responseCap };
 			this.child.stdin?.write(`${request}\n`, (error) => {
 				if (error) this.fail(new Error(`catalog openat helper write failed: ${String(error)}`));
@@ -354,11 +404,18 @@ class TrustedReadSession {
 			return;
 		}
 		const line = this.stdoutBuffer.slice(0, end);
-		this.stdoutBuffer = this.stdoutBuffer.slice(end + 1);
+		const suffix = this.stdoutBuffer.slice(end + 1);
+		this.stdoutBuffer = "";
 		this.pending = undefined;
 		clearTimeout(pending.timeout);
-		if (line.length > pending.cap) {
-			this.fail(new Error("catalog openat helper response overflow"));
+		if (line.length > pending.cap || suffix !== "") {
+			this.fail(
+				new Error(
+					line.length > pending.cap
+						? "catalog openat helper response overflow"
+						: "catalog openat helper sent a shifted response",
+				),
+			);
 			pending.reject(invalidFamilyTopology("descriptor-relative artifact response is invalid"));
 			return;
 		}
@@ -368,6 +425,7 @@ class TrustedReadSession {
 	private fail(error: Error): void {
 		if (this.failure) return;
 		this.failure = error;
+		// Failure is deliberately terminal. Clean shutdown is handled only by close().
 		this.child.kill("SIGKILL");
 		const pending = this.pending;
 		this.pending = undefined;
@@ -391,7 +449,15 @@ async function readTrustedSession(
 ): Promise<TrustedSession> {
 	const trusted = await reader.read(path, MAX_SESSION_HEADER_BYTES, "header");
 	const headerLine = trusted.contents.toString("utf8").split(/\r?\n/, 1)[0];
-	let header: { type?: unknown; id?: unknown; parentSession?: unknown; rlmDepth?: unknown };
+	let header: {
+		type?: unknown;
+		id?: unknown;
+		parentSession?: unknown;
+		rlmDepth?: unknown;
+		version?: unknown;
+		cwd?: unknown;
+		timestamp?: unknown;
+	};
 	try {
 		header = JSON.parse(headerLine ?? "") as typeof header;
 	} catch {
@@ -399,20 +465,32 @@ async function readTrustedSession(
 	}
 	const hasParent = header.parentSession !== undefined;
 	const hasDepth = Number.isSafeInteger(header.rlmDepth) && (header.rlmDepth as number) >= 0;
+	const hasVersion = Number.isSafeInteger(header.version) && (header.version as number) >= 1;
 	if (
 		header.type !== "session" ||
 		typeof header.id !== "string" ||
 		header.id === "" ||
 		(hasParent && typeof header.parentSession !== "string") ||
 		(hasParent && header.parentSession === "") ||
-		(header.rlmDepth !== undefined && !hasDepth)
+		(header.rlmDepth !== undefined && !hasDepth) ||
+		(header.version !== undefined && !hasVersion)
 	)
 		throw invalidFamilyTopology("session header lacks trustworthy topology claims");
 	const persistedDepth = hasDepth ? (header.rlmDepth as number) : undefined;
-	const info = listed?.path === path ? listed : await readSessionInfo(path);
+	afterTrustedHeaderForTest?.(path);
+	// Detect a post-header swap without reading a body or reopening through the
+	// legacy scanner. The descriptor-relative stat is a second identity binding.
+	const bound = await reader.read(path, 0, "stat");
+	if (bound.dev !== trusted.dev || bound.ino !== trusted.ino)
+		throw invalidFamilyTopology("session changed after its trusted header read");
+	// An unlisted registry child must never reach the legacy pathname scanner:
+	// it may recursively read parent paths and can observe a replacement after
+	// this descriptor-bound open. Header metadata is intentionally shallow.
+	const info =
+		listed?.path === path
+			? listed
+			: readSessionHeaderInfoFromBuffer(path, trusted.contents, { mtimeMs: trusted.mtimeMs });
 	if (!info || info.id !== header.id) throw invalidFamilyTopology("session metadata does not match its header");
-	// Topology fields are always the header's claims; the display read may not
-	// contradict them in the returned catalog row.
 	return {
 		...info,
 		path,
@@ -420,6 +498,7 @@ async function readTrustedSession(
 		parentSessionPath: hasParent ? (header.parentSession as string) : undefined,
 		...(persistedDepth !== undefined ? { persistedDepth } : {}),
 		...(hasParent ? { persistedParentPath: header.parentSession as string } : {}),
+		...(hasVersion ? { persistedVersion: header.version as number } : {}),
 	};
 }
 
@@ -517,11 +596,38 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				const childPath = entry.sessionFile as string;
 				if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
 				const trustedChild = await readTrustedSession(childPath, reader);
-				// Registry childId is the rlm child id (e.g. "sub-1a2b3c4d"), not the
-				// session id. The child's identity anchor is its filename: the session
-				// writer names every child file after its header id.
 				if (basename(childPath, ".jsonl") !== trustedChild.id)
 					throw invalidFamilyTopology("registry child session file does not match its header id");
+				// Registry reachability is not enough: bind the registry key to the
+				// directory the writer allocates directly below this parent's managed
+				// artifact root. This rejects arbitrary sessions-root descendants and
+				// prevents rekeying a real child under another sub-* id.
+				const childId = entry.childId as string;
+				const childSessionDir = dirname(childPath);
+				const parentSessionDir = dirname(parent.path);
+				const writerChildrenRoot =
+					parentSessionDir === authority.session.lexical
+						? join(authority.artifacts?.lexical ?? "", parent.id)
+						: parentSessionDir;
+				// The actual writer uses <parent artifact dir>/sub-*/<session-id>.jsonl.
+				// Registry keys name that immediate child directory, so neither a
+				// nested sessions root nor a re-keyed sibling is reachable.
+				const modernWriterPath =
+					childId.startsWith("sub-") &&
+					childId === basename(childSessionDir) &&
+					childSessionDir === join(writerChildrenRoot, childId);
+				// Versioned v2 registry records used the session id as their key but
+				// still allocated a direct sub-* writer directory. Require both facts;
+				// an equal-id synthetic record without that provenance is not trusted.
+				const legacyWriterPath =
+					trustedChild.persistedVersion !== undefined &&
+					trustedChild.persistedVersion < 3 &&
+					childId === trustedChild.id &&
+					basename(childSessionDir).startsWith("sub-") &&
+					dirname(childSessionDir) === writerChildrenRoot;
+				if (!modernWriterPath && !legacyWriterPath) {
+					throw invalidFamilyTopology("registry child is outside the parent writer artifact layout");
+				}
 				if (trustedChild.persistedParentPath === undefined)
 					throw invalidFamilyTopology("child lacks a persisted parent path");
 				// Old writers persisted no rlmDepth on children: an absent claim is
@@ -559,8 +665,11 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 		for (const root of [...sessions.values()]) await visit(root, 0, new Set());
 		return [...sessions.values()];
 	} finally {
-		reader.close();
-		closeManagedRoots(authority);
+		try {
+			await reader.close();
+		} finally {
+			closeManagedRoots(authority);
+		}
 	}
 }
 export async function listSavedSessionSiblings(sessionPath: string, sessionDir?: string): Promise<SessionInfo[]> {
