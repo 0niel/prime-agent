@@ -3110,29 +3110,33 @@ describe("AgentSession rlm recursion", () => {
 		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toHaveLength(1);
 	});
 
-	it("removes an in-process child's dir when a spawn is revoked before admission", async () => {
+	it("removes a dispose-only host child's dir when a spawn is revoked before admission", async () => {
 		const controller = new AbortController();
-		const root = createSession();
-		const internals = root as unknown as InspectableRlmSession & {
-			_createRlmSubagentRuntime(options: unknown): Promise<{ session: AgentSession }>;
+		const child = createSession();
+		const disposeChild = vi.spyOn(child, "disposeAsync");
+		// The default in-process AgentSessionRuntime self-host shape: no release
+		// hook, dispose-only deletion, no durable registry.
+		const runtimeHost: SubagentRuntimeHost = {
+			createRlmSubagentRuntime: async (options) => {
+				// Revoke while the runtime is being created, then publish late.
+				controller.abort();
+				options.onSessionPublished?.(child);
+				return { session: child };
+			},
+			deleteRlmSubagentRuntime: async (_childId, session) => {
+				await session?.disposeAsync();
+			},
 		};
-		const originalCreateRuntime = internals._createRlmSubagentRuntime.bind(root);
-		let disposeChild: ReturnType<typeof vi.spyOn> | undefined;
-		vi.spyOn(internals, "_createRlmSubagentRuntime").mockImplementation(async (options) => {
-			// Revoke while the inline runtime is being created, then publish late.
-			controller.abort();
-			const runtime = await originalCreateRuntime(options);
-			disposeChild = vi.spyOn(runtime.session, "disposeAsync");
-			return runtime;
-		});
+		const root = createSession({ subagentRuntimeHost: runtimeHost });
 
-		const admission = root.runRlmChild("revoked during inline creation", {}, undefined, {
+		const admission = root.runRlmChild("revoked under dispose-only host", {}, undefined, {
 			signal: controller.signal,
 		});
 
 		await expect(admission).rejects.toThrow("host request authority was revoked");
+		const internals = root as unknown as InspectableRlmSession;
 		await waitFor(() => internals._activeRlmChildRuns.size === 0);
-		await waitFor(() => (disposeChild?.mock.calls.length ?? 0) > 0);
+		await waitFor(() => disposeChild.mock.calls.length > 0);
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 		expect(root.messages.filter((message) => message.role === "custom")).toEqual([]);
 		const artifactDir = root.sessionManager.getSessionArtifactDir();
