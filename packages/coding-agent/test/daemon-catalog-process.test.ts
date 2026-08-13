@@ -22,6 +22,7 @@ import {
 	setCatalogAfterTrustedHeaderForTest,
 	setCatalogBeforeTrustedOpenForTest,
 	setCatalogHelperLaunchForTest,
+	setCatalogMaxRlmFamilyNodesForTest,
 } from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
@@ -872,6 +873,37 @@ describe("daemon catalog selector resolution", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	it("bounds stable root discovery before descriptor reads and admits the exact limit", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-root-discovery-bound-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		let trustedOpens = 0;
+		setCatalogBeforeTrustedOpenForTest(() => {
+			trustedOpens++;
+		});
+		try {
+			// The narrow limit hook proves both the exact-limit success case and
+			// over-limit failure without creating 10,001 filesystem entries.
+			setCatalogMaxRlmFamilyNodesForTest(1);
+			await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([
+				expect.objectContaining({ id: "parent" }),
+			]);
+			expect(trustedOpens).toBeGreaterThan(0);
+			trustedOpens = 0;
+			writeFileSync(join(sessionDir, "unrelated.jsonl"), "not json\n");
+			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("family node limit exhausted");
+			// No candidate descriptor may be opened, classified, or metadata-scanned
+			// after discovery proves the family is over the hard bound.
+			expect(trustedOpens).toBe(0);
+		} finally {
+			setCatalogMaxRlmFamilyNodesForTest(undefined);
+			setCatalogBeforeTrustedOpenForTest(undefined);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("classifies escaped and boundary-truncated root claims with the real helper", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-catalog-escaped-root-classification-"));
 		const sessionDir = join(root, "sessions");
@@ -899,6 +931,34 @@ describe("daemon catalog selector resolution", () => {
 			"session header exceeds the trusted read limit",
 		);
 		rmSync(partialEscape);
+
+		// These cross the actual 64 KiB classifier read boundary. A fully decoded
+		// outer type whose colon/value is still beyond that boundary, and a fully
+		// decoded outer id with its delimiter/value beyond it, are topology claims.
+		const boundaryType = join(sessionDir, "boundary-type-whitespace.jsonl");
+		const typePrefix = `{"type"${" ".repeat(64 * 1024 - Buffer.byteLength('{"type"', "utf8"))}`;
+		writeFileSync(boundaryType, `${typePrefix}:"session","id":"claimed","padding":"${"x".repeat(200 * 1024)}"}`);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(boundaryType);
+
+		const boundaryId = join(sessionDir, "boundary-id-no-value.jsonl");
+		const idPrefix = `{"junk":0,"id"${" ".repeat(64 * 1024 - Buffer.byteLength('{"junk":0,"id"', "utf8"))}`;
+		writeFileSync(boundaryId, `${idPrefix}:"claimed","padding":"${"x".repeat(200 * 1024)}"}`);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(boundaryId);
+
+		// A complete demonstrably non-string type value remains unrelated; the
+		// following outer id is still scanned and cannot be hidden by that skip.
+		const nonStringThenId = join(sessionDir, "non-string-type-then-id.jsonl");
+		writeFileSync(nonStringThenId, `{"type":null,"id":"claimed","padding":"${"x".repeat(200 * 1024)}"}`);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(nonStringThenId);
 
 		// Invalid escapes in a terminated unrelated value must not conceal later
 		// outer claims in the bounded helper prefix.

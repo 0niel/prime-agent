@@ -81,6 +81,18 @@ const MAX_RLM_FAMILY_EDGES = 10_000;
 const MAX_RLM_FAMILY_NODES = 10_000;
 const MAX_RLM_FAMILY_DEPTH = 64;
 
+// A narrow test seam avoids creating ten thousand filesystem entries merely to
+// verify that root enumeration fails before opening any candidate descriptor.
+let maxRlmFamilyNodesForTest: number | undefined;
+/** @internal */
+export function setCatalogMaxRlmFamilyNodesForTest(limit: number | undefined): void {
+	maxRlmFamilyNodesForTest = limit;
+}
+
+function maxRlmFamilyNodes(): number {
+	return maxRlmFamilyNodesForTest ?? MAX_RLM_FAMILY_NODES;
+}
+
 interface ManagedRoot {
 	lexical: string;
 	fd: number;
@@ -934,12 +946,18 @@ function hasApparentSessionTopologyClaimPrefix(text: string): boolean {
 		if (!key) return false;
 		// A malformed or partial outer key could itself be a topology key.
 		if (!key.terminated || key.invalidEscape) return true;
+		// A decoded id is topology-relevant before its delimiter or value can
+		// arrive. In particular, a 64 KiB cut immediately after `"id"` must
+		// not turn an identified root into harmless junk.
+		if (key.value === "id") return true;
 		index = key.end;
 		while (/\s/u.test(text[index] ?? "")) index++;
-		if (text[index] !== ":") return false;
+		// Likewise a decoded outer type cannot safely be downgraded while its
+		// colon/value is absent or only whitespace has reached the prefix end.
+		if (text[index] !== ":") return key.value === "type";
 		index++;
 		while (/\s/u.test(text[index] ?? "")) index++;
-		if (key.value === "id") return true;
+		if (key.value === "type" && index === text.length) return true;
 		if (key.value === "type" && text[index] === '"') {
 			const value = readJsonStringPrefix(text, index)!;
 			// Type's string value is itself a session claim surface; do not
@@ -947,7 +965,18 @@ function hasApparentSessionTopologyClaimPrefix(text: string): boolean {
 			if (!value.terminated || value.invalidEscape) return true;
 			if (value.value === "session") return true;
 		}
+		const valueStart = index;
 		index = skipJsonValuePrefix(text, index);
+		if (key.value === "type" && text[valueStart] !== '"') {
+			// A non-string type is harmless only after its complete JSON value is
+			// demonstrable. A cut through `nul`, `{`, or any nested value remains
+			// ambiguous rather than becoming a skip at the read boundary.
+			try {
+				JSON.parse(text.slice(valueStart, index).trim());
+			} catch {
+				return true;
+			}
+		}
 		while (/\s/u.test(text[index] ?? "")) index++;
 		if (text[index] !== ",") return false;
 		index++;
@@ -1051,19 +1080,26 @@ async function readLatestRegistry(
 
 function listSessionCandidates(sessionDir: string): Array<{ path: string; dev: string; ino: string }> {
 	try {
-		return readdirSync(sessionDir)
-			.filter((entry) => entry.endsWith(".jsonl"))
-			.flatMap((entry) => {
-				const path = join(resolve(sessionDir), entry);
-				try {
-					const stat = lstatSync(path);
-					return [{ path, dev: String(stat.dev), ino: String(stat.ino) }];
-				} catch {
-					// Removed during enumeration: it was never a stable root candidate.
-					return [];
-				}
-			});
-	} catch {
+		const candidates: Array<{ path: string; dev: string; ino: string }> = [];
+		const limit = maxRlmFamilyNodes();
+		for (const entry of readdirSync(sessionDir)) {
+			if (!entry.endsWith(".jsonl")) continue;
+			const path = join(resolve(sessionDir), entry);
+			try {
+				const stat = lstatSync(path);
+				// Count every stable root candidate, including junk and duplicate ids,
+				// before opening a descriptor or scanning metadata. Removed entries
+				// retain their historical behavior and never become candidates.
+				candidates.push({ path, dev: String(stat.dev), ino: String(stat.ino) });
+				if (candidates.length > limit) throw invalidFamilyTopology("family node limit exhausted");
+			} catch (error) {
+				if ((error as Error).message.includes("family node limit exhausted")) throw error;
+				// Removed during enumeration: it was never a stable root candidate.
+			}
+		}
+		return candidates;
+	} catch (error) {
+		if ((error as Error).message.includes("family node limit exhausted")) throw error;
 		return [];
 	}
 }
@@ -1158,7 +1194,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				) {
 					throw invalidFamilyTopology("family contains a conflicting duplicate");
 				}
-				if (!existing && sessions.size >= MAX_RLM_FAMILY_NODES)
+				if (!existing && sessions.size >= maxRlmFamilyNodes())
 					throw invalidFamilyTopology("family node limit exhausted");
 				ids.set(child.id, child.path);
 				sessions.set(child.path, child);
