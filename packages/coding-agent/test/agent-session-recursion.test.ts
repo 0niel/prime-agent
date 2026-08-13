@@ -29,6 +29,7 @@ import {
 	createDefaultRlmSubagentSessionName,
 	createRlmDeleteSubagentHostHandler,
 	createRlmRunHostHandler,
+	RlmSubagentHostDeletionError,
 	type SubagentRuntimeHost,
 } from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
@@ -626,7 +627,7 @@ describe("AgentSession rlm recursion", () => {
 		const deleteRuntime = vi.fn(async (_childId: string, session: AgentSession) => {
 			deleteAttempts++;
 			if (deleteAttempts === 1) {
-				throw new Error("retained close failed");
+				throw new RlmSubagentHostDeletionError("tombstoned", new Error("retained close failed"));
 			}
 			await session.disposeAsync();
 		});
@@ -2569,7 +2570,7 @@ describe("AgentSession rlm recursion", () => {
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
 				deleteRlmSubagentRuntime: async (_id, session) => {
-					if (++deleteAttempts === 1) throw new Error("first close failed");
+					if (++deleteAttempts === 1) throw new RlmSubagentHostDeletionError("tombstoned", new Error("first close failed"));
 					await session?.disposeAsync();
 				},
 			},
@@ -2599,7 +2600,7 @@ describe("AgentSession rlm recursion", () => {
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
 				deleteRlmSubagentRuntime: async (_id, session) => {
-					if (++attempts === 1) throw new Error("close failed");
+					if (++attempts === 1) throw new RlmSubagentHostDeletionError("tombstoned", new Error("close failed"));
 					await session?.disposeAsync();
 				},
 			},
@@ -2752,7 +2753,7 @@ describe("AgentSession rlm recursion", () => {
 		const deleteRuntime = vi.fn(async () => {
 			deleteAttempts++;
 			if (deleteAttempts === 1) {
-				throw new Error("fallback delete failed");
+				throw new RlmSubagentHostDeletionError("tombstoned", new Error("fallback delete failed"));
 			}
 			await hostedChild.disposeAsync();
 		});
