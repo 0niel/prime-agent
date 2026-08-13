@@ -47,6 +47,7 @@ import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js"
 import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon mode helpers", () => {
+	const emptySavedSessionsDir = join(tmpdir(), `prime-agent-daemon-tests-no-saved-sessions-${process.pid}`);
 	const useResidentCatalog = (daemon: AgentDaemon) => {
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
@@ -2011,6 +2012,7 @@ describe("daemon mode helpers", () => {
 			...state.runtime,
 			dispose,
 			session: {
+				beginClosing: vi.fn(),
 				sessionId: "session-child",
 				sessionFile: undefined,
 				abort: vi.fn(() => new Promise<void>(() => {})),
@@ -2046,7 +2048,11 @@ describe("daemon mode helpers", () => {
 
 	it("lists and routes agent messages to peers hosted by another worker", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -2122,7 +2128,11 @@ describe("daemon mode helpers", () => {
 
 	it("routes nonresident agent-message targets through the supervisor wake path", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -2424,7 +2434,11 @@ describe("daemon mode helpers", () => {
 
 	it("reports queued status when a direct accept races into the queue", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -3081,7 +3095,11 @@ describe("daemon mode helpers", () => {
 
 	it("counts accepted in-flight agent messages against the target queue cap", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -3161,7 +3179,11 @@ describe("daemon mode helpers", () => {
 
 	it("reports non-streaming busy sessions as active in agent-observe summaries", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -3473,6 +3495,7 @@ describe("daemon mode helpers", () => {
 				`${readFileSync(childRegistry, "utf8")}${JSON.stringify({
 					type: "rlm_subagent",
 					childId: "sibling-grandchild",
+					sessionId: secondGrandchild.getSessionId(),
 					sessionName: "sibling-grandchild",
 					sessionDir: secondGrandchildDir,
 					sessionFile: secondGrandchildFile,
@@ -3653,7 +3676,11 @@ describe("daemon mode helpers", () => {
 
 	it("keeps a session ID ambiguous when a reachable agent uses it as its name", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-family-id-ambiguity.sock", {
-			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: vi.fn(),
 		});
 		const parent = makeAgentFamilyState("parent", "parent");
@@ -3685,7 +3712,11 @@ describe("daemon mode helpers", () => {
 
 	it("keeps a duplicate session name ambiguous when two family agents are reachable", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-family-name-ambiguity.sock", {
-			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: vi.fn(),
 		});
 		const parent = makeAgentFamilyState("parent", "helper");
@@ -3793,7 +3824,11 @@ describe("daemon mode helpers", () => {
 
 	it("queues agent messages behind an idle target with a pending retry", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -3850,7 +3885,11 @@ describe("daemon mode helpers", () => {
 
 	it("queues agent messages behind existing pending work on an idle target", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -3906,7 +3945,11 @@ describe("daemon mode helpers", () => {
 
 	it("queues agent messages while the target is compacting", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -3960,7 +4003,11 @@ describe("daemon mode helpers", () => {
 
 	it("queues agent messages while target bash is running", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -4014,7 +4061,11 @@ describe("daemon mode helpers", () => {
 
 	it("acknowledges queued agent messages after queue insertion", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -4152,7 +4203,11 @@ describe("daemon mode helpers", () => {
 
 	it("rejects agent messages when queued delivery is coalesced", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -4200,7 +4255,11 @@ describe("daemon mode helpers", () => {
 
 	it("rejects agent messages when direct delivery preflight fails", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+				sessionDir: emptySavedSessionsDir,
+			},
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
@@ -4852,6 +4911,7 @@ describe("daemon mode helpers", () => {
 			cwd: "/tmp",
 			metadata: { kind: "subagent", createdAt: 1 },
 			session: {
+				beginClosing: vi.fn(),
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
@@ -5450,6 +5510,7 @@ describe("daemon mode helpers", () => {
 				...state.runtime,
 				dispose: vi.fn(async () => {}),
 				session: {
+					beginClosing: vi.fn(),
 					sessionId: "session-active",
 					sessionFile: undefined,
 					isBashRunning: false,
@@ -8583,6 +8644,7 @@ describe("daemon mode helpers", () => {
 				cwd: tempDir,
 				dispose,
 				session: {
+					beginClosing: vi.fn(),
 					sessionId: "session-1",
 					sessionFile,
 					messages: ["user message"],
@@ -8679,6 +8741,7 @@ describe("daemon mode helpers", () => {
 					await disposeGate;
 				}),
 				session: {
+					beginClosing: vi.fn(),
 					sessionId: "session-1",
 					sessionFile,
 					messages: ["user message"],
@@ -8747,6 +8810,7 @@ describe("daemon mode helpers", () => {
 				...state.runtime,
 				cwd: tempDir,
 				session: {
+					beginClosing: vi.fn(),
 					sessionId: "session-1",
 					sessionFile: join(tempDir, "session.jsonl"),
 					sessionManager: { appendSessionState },
@@ -8807,6 +8871,7 @@ describe("daemon mode helpers", () => {
 					...state.runtime,
 					cwd: tempDir,
 					session: {
+						beginClosing: vi.fn(),
 						sessionId,
 						sessionFile: join(tempDir, `${sessionId}.jsonl`),
 						sessionManager: { appendSessionState },
@@ -8934,6 +8999,7 @@ describe("daemon mode helpers", () => {
 					await disposeGate;
 				}),
 				session: {
+					beginClosing: vi.fn(),
 					sessionId: "session-1",
 					sessionFile: join(tempDir, "session.jsonl"),
 					messages: ["user message"],
@@ -11072,6 +11138,7 @@ function makeRuntimeSession(
 			return sessionManager.getSessionName();
 		},
 		setSubagentRuntimeHost: vi.fn(),
+		beginClosing: vi.fn(),
 		getRlmChildRunStatus: vi.fn(() => "running"),
 		registerRlmChildSession: vi.fn(() => true),
 		releaseRlmChildSession: vi.fn(() => vi.fn()),
@@ -11123,6 +11190,7 @@ function makeAgentFamilyState(
 			isSessionActive: false,
 			hasAcceptedPromptInFlight: false,
 			unfinishedActionCount: 0,
+			beginClosing: vi.fn(),
 			messages: [],
 			state: { pendingToolCalls: new Set(), streamingMessage: undefined },
 			sessionManager: {
@@ -11149,6 +11217,7 @@ function makeState(activeSessionId: string, parentActiveSessionId?: string): Act
 				createdAt: 1,
 				parentActiveSessionId,
 			},
+			session: { beginClosing: vi.fn() },
 		},
 	} as unknown as ActiveSessionState;
 }

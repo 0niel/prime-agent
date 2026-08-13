@@ -1106,7 +1106,7 @@ describe("AgentSession rlm recursion", () => {
 		(child as unknown as { _repliedToParentSinceTask: boolean })._repliedToParentSinceTask = true;
 
 		const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
-			defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+			defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: join(tempDir, "saved-sessions") },
 			createRuntime: vi.fn(),
 		});
 		const parentState = {

@@ -166,6 +166,7 @@ describe("AgentSessionRuntime characterization", () => {
 				},
 			},
 			setSubagentRuntimeHost: vi.fn(),
+			beginClosing: vi.fn(),
 			dispose: disposeSession,
 			disposeAsync: disposeSession,
 		} as unknown as AgentSession;
