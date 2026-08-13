@@ -1383,7 +1383,7 @@ describe("AgentSession rlm recursion", () => {
 	it("releases a hosted child when its initial task fails", async () => {
 		const child = createSession({ rlmSessionDir: join(tempDir, "host-error-child") });
 		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
-		const releaseRlmSubagentRuntime = vi.fn(async () => {});
+		const releaseRlmSubagentRuntime = vi.fn(async () => ({ retained: false }));
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
@@ -2470,6 +2470,7 @@ describe("AgentSession rlm recursion", () => {
 				deleteRlmSubagentRuntime: deleteRuntime,
 				releaseRlmSubagentRuntime: async (runtime, options) => {
 					options.parentSession.registerRlmChildSession(options.id, runtime.session);
+					return { retained: true };
 				},
 			},
 		});
@@ -2493,7 +2494,7 @@ describe("AgentSession rlm recursion", () => {
 	it("releases a hosted child when completion persistence fails", async () => {
 		const child = createSession({ rlmSessionDir: join(tempDir, "host-completion-failure-child") });
 		const disposeChild = vi.spyOn(child, "disposeAsync");
-		const releaseRlmSubagentRuntime = vi.fn(async () => {});
+		const releaseRlmSubagentRuntime = vi.fn(async () => ({ retained: false }));
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
@@ -3070,7 +3071,7 @@ describe("AgentSession rlm recursion", () => {
 		await child.disposeAsync();
 	});
 
-	it("keeps a host-owned runtime's dir when a spawn is revoked before admission", async () => {
+	it("removes a host-owned runtime dir when release does not retain a revoked spawn", async () => {
 		const controller = new AbortController();
 		const child = createSession();
 		const disposeChild = vi.spyOn(child, "disposeAsync");
@@ -3082,11 +3083,12 @@ describe("AgentSession rlm recursion", () => {
 				options.onSessionPublished?.(child);
 				return { session: child };
 			},
-			// Daemon-like release: record the deletion durably and close the session;
-			// the artifact tree stays on disk per the daemon persistence contract.
+			// A release hook may close a child even when its persistence failed. It
+			// explicitly declines retention, so the caller must clean the exact orphan.
 			releaseRlmSubagentRuntime: async (runtime, _options, status) => {
 				releaseStatuses.push(status);
 				await runtime.session.disposeAsync();
+				return { retained: false };
 			},
 			deleteRlmSubagentRuntime: async (_childId, session) => {
 				await session?.disposeAsync();
@@ -3101,13 +3103,13 @@ describe("AgentSession rlm recursion", () => {
 		await expect(admission).rejects.toThrow("host request authority was revoked");
 		const internals = root as unknown as InspectableRlmSession;
 		await waitFor(() => internals._activeRlmChildRuns.size === 0);
-		await waitFor(() => disposeChild.mock.calls.length > 0);
+		expect(disposeChild).toHaveBeenCalledOnce();
 		expect(releaseStatuses).toEqual(["cancelled"]);
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 		expect(root.messages.filter((message) => message.role === "custom")).toEqual([]);
 		const artifactDir = root.sessionManager.getSessionArtifactDir();
 		if (!artifactDir) throw new Error("Missing session artifact dir");
-		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toHaveLength(1);
+		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toHaveLength(0);
 	});
 
 	it("removes a dispose-only host child's dir when a spawn is revoked before admission", async () => {

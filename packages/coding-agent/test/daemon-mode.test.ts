@@ -779,7 +779,7 @@ describe("daemon mode helpers", () => {
 		let internals: {
 			sessions: Map<string, ActiveSessionState>;
 			closeSession: (state: ActiveSessionState, reason: "completed" | "killed") => Promise<void>;
-			recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<void>;
+			recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<boolean>;
 			createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
 		};
 		const closeSession = vi.fn(async (state: ActiveSessionState) => {
@@ -789,7 +789,7 @@ describe("daemon mode helpers", () => {
 		internals.sessions.set(parentState.activeSessionId, parentState);
 		internals.sessions.set(childState.activeSessionId, childState);
 		internals.closeSession = closeSession;
-		const recordDeletion = vi.fn(async () => undefined);
+		const recordDeletion = vi.fn(async () => true);
 		internals.recordRlmSubagentDeletion = recordDeletion;
 
 		await internals
@@ -815,7 +815,8 @@ describe("daemon mode helpers", () => {
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 
-		// A registry failure must not strand the cancelled child as a stale resident session.
+		// A registry failure must not strand the cancelled child as a stale resident session,
+		// and must tell the caller to remove its never-admitted artifact dir.
 		internals.sessions.set(childState.activeSessionId, childState);
 		internals.recordRlmSubagentDeletion = vi.fn(async () => {
 			throw new Error("registry write failed");
@@ -828,7 +829,7 @@ describe("daemon mode helpers", () => {
 					{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
 					"cancelled",
 				),
-		).rejects.toThrow("registry write failed");
+		).resolves.toEqual({ retained: false });
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
