@@ -38,7 +38,7 @@ const workerLaunchTestState = vi.hoisted(() => ({
 	gateMarkerPath: "",
 	tsxCliPath: "",
 	cliEntrypoint: "",
-	spawned: [] as Array<{ child: ChildProcess; args: readonly string[] }>,
+	spawned: [] as Array<{ child: ChildProcess; args: readonly string[]; options: SpawnOptions }>,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -50,7 +50,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 		spawn(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
 			const child = actual.spawn(command, args, options);
 			if (workerLaunchTestState.capture) {
-				workerLaunchTestState.spawned.push({ child, args });
+				workerLaunchTestState.spawned.push({ child, args, options });
 			}
 			return child;
 		},
@@ -507,6 +507,72 @@ describe("daemon worker supervisor monitoring", () => {
 		releaseOldAssertion();
 		await staleCommand;
 		expect(handleWorkerCommand).not.toHaveBeenCalled();
+	});
+
+	it("does not inherit ambient credentials when an ownerless resident supplies an explicit launch environment", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-sanitized-launch-env-test-"));
+		const descriptorDir = join(root, "descriptors");
+		const markerPath = join(root, "startup-marker");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.forceMissingProcessStartId = true;
+		workerLaunchTestState.fixtureMode = "successful-gate";
+		workerLaunchTestState.gateMarkerPath = markerPath;
+		const previousSecret = process.env.PRIME_AGENT_TEST_AMBIENT_CREDENTIAL;
+		process.env.PRIME_AGENT_TEST_AMBIENT_CREDENTIAL = "must-not-reach-worker";
+		const workers = new Map<string, unknown>();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			connectWorker: vi.fn(async (worker: { descriptor: { rootActiveSessionId: string } }) => {
+				await waitForFile(markerPath);
+				return {
+					request: vi.fn(async () => ({
+						success: true,
+						data: {
+							id: worker.descriptor.rootActiveSessionId,
+							activeSessionId: worker.descriptor.rootActiveSessionId,
+							sessionId: "session-sanitized-env",
+							cwd: root,
+						},
+					})),
+				};
+			}),
+			subscribeWorker: vi.fn(async () => undefined),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+			syncAgentPeers: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: {
+				type: "create";
+				launchEnv: Record<string, string>;
+				config: { cwd: string; agentDir: string };
+			}): Promise<{ descriptor: { lifecycle: string } }>;
+		};
+
+		try {
+			await supervisor.launchWorker({
+				type: "create",
+				launchEnv: {},
+				config: { cwd: root, agentDir: root },
+			});
+			const captured = workerLaunchTestState.spawned.at(-1);
+			const environment = captured?.options.env;
+			expect(environment?.PRIME_AGENT_TEST_AMBIENT_CREDENTIAL).toBeUndefined();
+			if (captured?.child) {
+				captured.child.kill("SIGKILL");
+				await waitForCapturedChildClose(captured.child);
+			}
+		} finally {
+			if (previousSecret === undefined) delete process.env.PRIME_AGENT_TEST_AMBIENT_CREDENTIAL;
+			else process.env.PRIME_AGENT_TEST_AMBIENT_CREDENTIAL = previousSecret;
+		}
 	});
 
 	it.each([
@@ -1780,6 +1846,7 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: string;
 				lifecycle: "failed" | "recovering" | "ready";
 				consecutiveFailures: number;
+				launchEnv?: Record<string, string>;
 				stopRequestedAt?: string;
 				archiveOnStop?: boolean;
 				lastError?: string;
@@ -1805,6 +1872,7 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: "active-fresh-resident",
 				lifecycle: "failed",
 				consecutiveFailures: 2,
+				launchEnv: { PRIME_AGENT_TRACES_BASE_URL: "persisted-safe-endpoint" },
 			},
 			intentionalStop: false,
 		};
@@ -1835,7 +1903,10 @@ describe("daemon worker supervisor monitoring", () => {
 			type: "create",
 			launchEnv: { ACP_FIXTURE_API_KEY: "second-secret" },
 		});
-		expect(worker.recoveryLaunchEnv).toEqual({ ACP_FIXTURE_API_KEY: "first-secret" });
+		expect(worker.recoveryLaunchEnv).toEqual({
+			PRIME_AGENT_TRACES_BASE_URL: "persisted-safe-endpoint",
+			ACP_FIXTURE_API_KEY: "first-secret",
+		});
 		expect(recoverWorker).toHaveBeenCalledOnce();
 		finish.resolve();
 		await expect(Promise.all([first, second])).resolves.toEqual([worker, worker]);

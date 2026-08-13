@@ -2157,7 +2157,10 @@ export class DaemonSupervisor {
 			}
 			const previousDescriptor = worker.descriptor;
 			const previousIntentionalStop = worker.intentionalStop;
-			worker.recoveryLaunchEnv = command.launchEnv;
+			worker.recoveryLaunchEnv = {
+				...worker.descriptor.launchEnv,
+				...command.launchEnv,
+			};
 			worker.recoveryCreateCommand = command;
 			worker.intentionalStop = false;
 			worker.descriptor = {
@@ -2283,8 +2286,8 @@ export class DaemonSupervisor {
 		// Do not propagate credentials inherited by a replacement supervisor during
 		// automatic resident recovery; the allowlist is sufficient for a relaunch.
 		const inheritedEnv =
-			existing && ownerClientIdForDescriptor === undefined
-				? filterPersistedDaemonLaunchEnv(collectDaemonLaunchEnv(process.env))
+			ownerClientIdForDescriptor === undefined && launchEnv !== undefined
+				? (filterPersistedDaemonLaunchEnv(collectDaemonLaunchEnv(process.env)) ?? {})
 				: process.env;
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
