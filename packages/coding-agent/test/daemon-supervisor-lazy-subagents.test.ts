@@ -488,6 +488,105 @@ describe("daemon supervisor passive subagent topology", () => {
 		await expect(first).resolves.toMatchObject({ success: true });
 	});
 
+	it("shares the active and saved sibling scope reservation across differently located children", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-active-saved-scope-reservation-"));
+		tempDirs.push(directory);
+		const activePath = join(directory, "children", "active.jsonl");
+		const savedPath = join(directory, "children", "nested", "saved.jsonl");
+		const active = summary({
+			id: "active-id",
+			sessionId: "active-id",
+			sessionFile: activePath,
+			parentSessionPath: "../parent.jsonl",
+			rlmDepth: 1,
+		});
+		const base = {
+			cwd: directory,
+			created: new Date(0),
+			modified: new Date(0),
+			messageCount: 0,
+			firstMessage: "",
+			allMessagesText: "",
+			rlmDepth: 1,
+		};
+		const saved = { ...base, id: "saved-id", path: savedPath, parentSessionPath: "../../parent.jsonl" };
+		let releaseRename!: () => void;
+		let signalRename!: () => void;
+		const renameGate = new Promise<void>((resolve) => {
+			releaseRename = resolve;
+		});
+		const renameStarted = new Promise<void>((resolve) => {
+			signalRename = resolve;
+		});
+		const rename = vi.fn(async () => {
+			signalRename();
+			await renameGate;
+		});
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		Object.assign(supervisor, {
+			workers: new Map([["active", worker("active", [active])]]),
+			catalog: { siblings: vi.fn(async () => [saved]), list: vi.fn(async () => [saved]), rename },
+		});
+		const client = { id: "client", attachedActiveSessionIds: new Set<string>() };
+
+		const activeRename = supervisor.handleCommand(client, {
+			type: "rename_saved_session",
+			sessionPath: activePath,
+			name: "shared",
+		});
+		await renameStarted;
+		await expect(
+			supervisor.handleCommand(client, { type: "rename_saved_session", sessionPath: savedPath, name: "shared" }),
+		).rejects.toThrow("an agent of that name already exists at depth 1 under this parent");
+		expect(rename).toHaveBeenCalledOnce();
+		releaseRename();
+		await expect(activeRename).resolves.toMatchObject({ success: true });
+	});
+
+	it("fails closed before mutation for an active nonroot relative parent without a session file", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-unanchored-active-parent-"));
+		tempDirs.push(directory);
+		const sessionPath = join(directory, "child.jsonl");
+		const unanchored = summary({
+			id: "unanchored-id",
+			sessionId: "unanchored-id",
+			parentSessionPath: "../parent.jsonl",
+			rlmDepth: 1,
+		});
+		const saved = {
+			id: "saved-id",
+			path: sessionPath,
+			cwd: directory,
+			created: new Date(0),
+			modified: new Date(0),
+			messageCount: 0,
+			firstMessage: "",
+			allMessagesText: "",
+			rlmDepth: 0,
+		};
+		const rename = vi.fn();
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		Object.assign(supervisor, {
+			workers: new Map([["unanchored", worker("unanchored", [unanchored])]]),
+			catalog: { siblings: vi.fn(async () => [saved]), list: vi.fn(async () => [saved]), rename },
+		});
+		const client = { id: "client", attachedActiveSessionIds: new Set<string>() };
+
+		await expect(
+			supervisor.handleCommand(client, { type: "rename_saved_session", sessionPath, name: "blocked" }),
+		).rejects.toThrow("Non-root session has an unanchored relative parent path");
+		expect(rename).not.toHaveBeenCalled();
+		expect(() => supervisor.familyCatalogEntry(unanchored)).toThrow(
+			"Non-root session has an unanchored relative parent path",
+		);
+	});
+
 	it("publishes an opening reservation before named create validation awaits", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-named-create-race-"));
 		tempDirs.push(directory);

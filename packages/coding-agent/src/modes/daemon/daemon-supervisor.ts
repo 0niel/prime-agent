@@ -341,9 +341,35 @@ function throwIfAdmissionCancelled(admission: SupervisorPromptAdmission | undefi
 }
 
 /** Match catalog sibling topology: relative parents are rooted at each child session file. */
-function canonicalSavedSiblingParentPath(session: Pick<SessionInfo, "path" | "parentSessionPath">): string | undefined {
-	if (!session.parentSessionPath) return undefined;
-	return canonicalSessionPath(resolve(dirname(session.path), session.parentSessionPath));
+/**
+ * Normalize the structural namespace occupied by a session name. Every
+ * reservation, availability check, and family-catalog entry must derive this
+ * scope from the same persisted/live summary shape: a relative parent edge is
+ * meaningful only relative to the child transcript that contains it.
+ */
+function summarySiblingScope(
+	summary: Pick<SessionSummary, "rlmDepth" | "parentSessionId" | "parentSessionPath" | "sessionFile">,
+): { depth: number; parentSessionId?: string; parentSessionPath?: string } {
+	const depth = summary.rlmDepth ?? (summary.parentSessionPath ? 1 : 0);
+	if (depth <= 0) return { depth };
+
+	let parentSessionPath: string | undefined;
+	if (summary.parentSessionPath) {
+		if (isAbsolute(summary.parentSessionPath)) {
+			parentSessionPath = canonicalSessionPath(summary.parentSessionPath);
+		} else {
+			if (!summary.sessionFile) {
+				throw new Error("Non-root session has an unanchored relative parent path");
+			}
+			parentSessionPath = canonicalSessionPath(resolve(dirname(summary.sessionFile), summary.parentSessionPath));
+		}
+	}
+
+	return {
+		depth,
+		...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
+		...(parentSessionPath ? { parentSessionPath } : {}),
+	};
 }
 
 class SupervisorRecoveryCancelledError extends Error {
@@ -2098,8 +2124,12 @@ export class DaemonSupervisor {
 				? this.savedSiblingNameReservationInput(target, savedSiblings, createCommand.name)
 				: this.summaryNameReservationInput(targetSummary, createCommand.name);
 			return this.withSessionNameReservation(reservation, async () => {
-				if (target?.parentSessionPath && (target.rlmDepth ?? 0) > 0) {
-					this.assertSavedSiblingNameAvailable(savedSiblings, target, createCommand.name!);
+				if (target) {
+					await this.assertSupervisorSavedSessionNameAvailable(
+						createCommand.sessionPath!,
+						createCommand.name!,
+						config.sessionDir,
+					);
 				} else {
 					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!, config.sessionDir);
 				}
@@ -3180,15 +3210,13 @@ export class DaemonSupervisor {
 	}
 
 	private async assertSupervisorSessionNameAvailable(
-		target: Pick<SessionSummary, "sessionId" | "rlmDepth" | "parentSessionId" | "parentSessionPath">,
+		target: Pick<SessionSummary, "sessionId" | "rlmDepth" | "parentSessionId" | "parentSessionPath" | "sessionFile">,
 		name: string,
 		sessionDir?: string,
 	): Promise<void> {
 		assertAgentSessionNameAvailable(await this.familyCatalogEntries(sessionDir), {
 			name,
-			depth: target.rlmDepth ?? 0,
-			parentSessionId: target.parentSessionId,
-			parentSessionPath: target.parentSessionPath ? canonicalSessionPath(target.parentSessionPath) : undefined,
+			...summarySiblingScope(target),
 			ignoreSessionId: target.sessionId,
 		});
 	}
@@ -3211,28 +3239,17 @@ export class DaemonSupervisor {
 
 	private savedSiblingNameReservationInput(
 		saved: SessionInfo,
-		siblings: readonly SessionInfo[],
+		_siblings: readonly SessionInfo[],
 		name: string,
 	): { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string } {
-		const parentSessionPath = canonicalSavedSiblingParentPath(saved);
-		return {
-			name,
-			depth: saved.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0,
-			...(parentSessionPath ? { parentSessionPath } : {}),
-		};
+		return { name, ...summarySiblingScope(summaryForInactiveSession(saved)) };
 	}
 
 	private summaryNameReservationInput(
-		target: Pick<SessionSummary, "rlmDepth" | "parentSessionId" | "parentSessionPath">,
+		target: Pick<SessionSummary, "rlmDepth" | "parentSessionId" | "parentSessionPath" | "sessionFile">,
 		name: string,
 	): { name: string; depth: number; parentSessionId?: string; parentSessionPath?: string } {
-		const depth = target.rlmDepth ?? (target.parentSessionPath ? 1 : 0);
-		return {
-			name,
-			depth,
-			...(depth > 0 && target.parentSessionId ? { parentSessionId: target.parentSessionId } : {}),
-			...(depth > 0 && target.parentSessionPath ? { parentSessionPath: target.parentSessionPath } : {}),
-		};
+		return { name, ...summarySiblingScope(target) };
 	}
 
 	private async assertSupervisorSavedSessionNameAvailable(
@@ -3250,16 +3267,23 @@ export class DaemonSupervisor {
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		if (saved.parentSessionPath && (saved.rlmDepth ?? 0) > 0) {
 			this.assertSavedSiblingNameAvailable(siblings, saved, name);
-		} else {
+		}
+		// Saved rows and resident summaries share the same structural namespace.
+		// The bounded sibling catalog validates the durable sibling shape above.
+		// Only consult the all-session catalog when it is available: the bounded
+		// catalog is the compatibility surface for saved-only callers and already
+		// protects its complete saved scope.
+		if ("list" in (this.catalog as object)) {
 			await this.assertSupervisorSessionNameAvailable(summaryForInactiveSession(saved), name, sessionDir);
 		}
 	}
 
 	private assertSavedSiblingNameAvailable(siblings: SessionInfo[], target: SessionInfo, name: string): void {
-		const setDepth = target.rlmDepth ?? siblings.find((sibling) => sibling.rlmDepth !== undefined)?.rlmDepth ?? 0;
+		const targetSummary = summaryForInactiveSession(target);
+		const targetScope = summarySiblingScope(targetSummary);
 		const targetPath = canonicalSessionPath(target.path);
-		const parentSessionPath = canonicalSavedSiblingParentPath(target);
-		if (setDepth <= 0 || !parentSessionPath) {
+		const parentSessionPath = targetScope.parentSessionPath;
+		if (targetScope.depth <= 0 || !parentSessionPath) {
 			throw new Error("Saved sibling catalog has no direct parent");
 		}
 
@@ -3274,13 +3298,13 @@ export class DaemonSupervisor {
 		let targetCount = 0;
 		for (const sibling of siblings) {
 			const siblingPath = canonicalSessionPath(sibling.path);
-			const siblingParentPath = canonicalSavedSiblingParentPath(sibling);
+			const siblingScope = summarySiblingScope(summaryForInactiveSession(sibling));
 			if (
 				ids.has(sibling.id) ||
 				paths.has(siblingPath) ||
 				sibling.id === parentId ||
-				siblingParentPath !== parentSessionPath ||
-				(sibling.rlmDepth !== undefined && sibling.rlmDepth !== setDepth)
+				siblingScope.depth !== targetScope.depth ||
+				siblingScope.parentSessionPath !== parentSessionPath
 			) {
 				throw new Error("Saved sibling catalog is structurally ambiguous");
 			}
@@ -3296,7 +3320,7 @@ export class DaemonSupervisor {
 			[
 				{
 					id: parentId,
-					depth: setDepth - 1,
+					depth: targetScope.depth - 1,
 					status: "inactive" as const,
 					sessionPath: parentSessionPath,
 				},
@@ -3305,18 +3329,12 @@ export class DaemonSupervisor {
 					return {
 						id: summary.sessionId,
 						...(summary.sessionName ? { name: summary.sessionName } : {}),
-						depth: setDepth,
+						...summarySiblingScope(summary),
 						status: classifySessionRosterStatus(summary),
-						parentSessionPath,
 					};
 				}),
 			],
-			{
-				name,
-				depth: setDepth,
-				parentSessionPath,
-				ignoreSessionId: target.id,
-			},
+			{ name, ...targetScope, ignoreSessionId: target.id },
 		);
 	}
 
@@ -3399,24 +3417,11 @@ export class DaemonSupervisor {
 	}
 
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
-		const depth = summary.rlmDepth ?? (summary.parentSessionPath ? 1 : 0);
 		return {
 			id: summary.sessionId,
 			...(summary.sessionName ? { name: summary.sessionName } : {}),
-			depth,
+			...summarySiblingScope(summary),
 			status: classifySessionRosterStatus(summary),
-			...(depth > 0 && summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
-			...(depth > 0 && summary.parentSessionPath && (isAbsolute(summary.parentSessionPath) || summary.sessionFile)
-				? {
-						parentSessionPath: canonicalSessionPath(
-							isAbsolute(summary.parentSessionPath)
-								? summary.parentSessionPath
-								: summary.sessionFile
-									? resolve(dirname(summary.sessionFile), summary.parentSessionPath)
-									: summary.parentSessionPath,
-						),
-					}
-				: {}),
 			...(summary.sessionFile ? { sessionPath: canonicalSessionPath(summary.sessionFile) } : {}),
 		};
 	}
