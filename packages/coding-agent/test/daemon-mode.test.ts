@@ -8414,19 +8414,20 @@ describe("daemon mode helpers", () => {
 			})) as { data: { deleted: boolean } };
 			expect(unknown.data).toEqual({ deleted: false });
 
-			const result = (await internals.handleCommand(client, {
-				type: "delete_rlm_subagent",
-				activeSessionId: parentState.activeSessionId,
-				childId: fixture.childId,
-			})) as { data: { deleted: boolean } };
-			expect(result.data).toEqual({ deleted: true });
+			await expect(
+				internals.handleCommand(client, {
+					type: "delete_rlm_subagent",
+					activeSessionId: parentState.activeSessionId,
+					childId: fixture.childId,
+				}),
+			).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 			expect(existsSync(fixture.childSessionFile)).toBe(true);
 			const persisted = readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")
 				.trim()
 				.split(/\r?\n/)
 				.map((line) => JSON.parse(line) as { childId: string; status: string });
-			expect(persisted.at(-1)).toMatchObject({ childId: fixture.childId, status: "deleted" });
+			expect(persisted.at(-1)).toMatchObject({ childId: fixture.childId, status: "completed" });
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
