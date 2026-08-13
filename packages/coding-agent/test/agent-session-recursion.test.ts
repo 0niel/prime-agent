@@ -3315,7 +3315,7 @@ describe("AgentSession rlm recursion", () => {
 		const child = createSession();
 		const disposeChild = vi.spyOn(child, "disposeAsync");
 		let releaseAttempts = 0;
-		const deleteRuntime = vi.fn(async (childId: string, session?: AgentSession, authority) => {
+		const deleteRuntime = vi.fn(async (childId: string, session: AgentSession | undefined, authority) => {
 			expect(authority).toMatchObject({
 				childId,
 				sessionFile: child.sessionFile,
