@@ -997,13 +997,35 @@ export class AgentDaemon {
 			if (!trimmed) continue;
 			try {
 				const entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
+				const validIsoTimestamp =
+					typeof entry.updatedAt === "string" &&
+					Number.isFinite(Date.parse(entry.updatedAt)) &&
+					new Date(Date.parse(entry.updatedAt)).toISOString() === entry.updatedAt;
+				const validModel =
+					entry.model === undefined ||
+					(typeof entry.model === "object" &&
+						entry.model !== null &&
+						!Array.isArray(entry.model) &&
+						typeof entry.model.provider === "string" &&
+						typeof entry.model.modelId === "string");
 				if (
 					entry.type !== "rlm_subagent" ||
 					typeof entry.childId !== "string" ||
 					typeof entry.sessionName !== "string" ||
 					typeof entry.sessionDir !== "string" ||
 					typeof entry.sessionFile !== "string" ||
+					typeof entry.parentSessionId !== "string" ||
+					entry.parentSessionId.length === 0 ||
+					(entry.parentSessionFile !== undefined && typeof entry.parentSessionFile !== "string") ||
+					(entry.rlmParentNodeId !== undefined && typeof entry.rlmParentNodeId !== "string") ||
+					(entry.prompt !== undefined && typeof entry.prompt !== "string") ||
+					(entry.spawnCode !== undefined && typeof entry.spawnCode !== "string") ||
+					!validModel ||
 					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
+					typeof entry.createdAt !== "number" ||
+					!Number.isSafeInteger(entry.createdAt) ||
+					entry.createdAt < 0 ||
+					!validIsoTimestamp ||
 					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
 					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
 				) {
