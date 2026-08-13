@@ -3115,10 +3115,18 @@ describe("AgentSession rlm recursion", () => {
 		if (!artifactDir) throw new Error("Missing session artifact dir");
 		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toHaveLength(1);
 
-		await internals._reapDeletedRlmSubagentRuntimesAfterCompaction();
+		const quarantinedChildId = [...internals._rlmChildDeletionQuarantines.keys()][0];
+		if (!quarantinedChildId) throw new Error("Missing deletion quarantine");
+		// The exact opaque id can retry cleanup even though the lease is omitted from
+		// every product-facing list and cannot be selected by its name or session id.
+		await expect(root.deleteRlmSubagent(quarantinedChildId)).resolves.toMatchObject({
+			subagent: { rlm_child_id: quarantinedChildId },
+		});
 		expect(internals._rlmChildDeletionQuarantines).toHaveLength(1);
 		retryDurability = "absent";
-		await internals._reapDeletedRlmSubagentRuntimesAfterCompaction();
+		await expect(root.deleteRlmSubagent(quarantinedChildId)).resolves.toMatchObject({
+			subagent: { rlm_child_id: quarantinedChildId },
+		});
 		expect(internals._rlmChildDeletionQuarantines).toHaveLength(0);
 		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toHaveLength(0);
 	});
