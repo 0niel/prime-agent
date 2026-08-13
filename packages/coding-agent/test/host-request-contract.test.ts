@@ -41,15 +41,15 @@ describe("staged host-request handler authority", () => {
 
 	it("passes dispatcher context to rest and default-parameter handlers", async () => {
 		const rest = createHostRequestHandler(async (...args: [Record<string, unknown>, HostRequestContext]) => ({
-			requestId: args[1].requestId,
+			aborted: args[1].signal.aborted,
 		}));
 		const defaulted = createHostRequestHandler(
 			async (_payload, context = undefined as unknown as HostRequestContext) => ({
-				generation: context.generation,
+				aborted: context.signal.aborted,
 			}),
 		);
-		expect((await invokeHostRequestHandlerForTest(rest, {})).requestId).toEqual(expect.any(String));
-		expect((await invokeHostRequestHandlerForTest(defaulted, {})).generation).toBe(1);
+		expect((await invokeHostRequestHandlerForTest(rest, {})).aborted).toBe(false);
+		expect((await invokeHostRequestHandlerForTest(defaulted, {})).aborted).toBe(false);
 	});
 
 	it("does not accept a structural or payload-supplied context", async () => {
@@ -59,8 +59,6 @@ describe("staged host-request handler authority", () => {
 			return {};
 		});
 		const fabricated = {
-			requestId: "python",
-			generation: 1,
 			signal: new AbortController().signal,
 			isCurrent: () => true,
 		};
