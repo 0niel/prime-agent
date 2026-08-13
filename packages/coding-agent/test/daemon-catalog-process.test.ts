@@ -477,13 +477,91 @@ describe("daemon catalog selector resolution", () => {
 		parent.newSession({ id: "parent", rlmDepth: 0 });
 		parent.appendSessionInfo("parent");
 		const hostile = SessionManager.create(root, sessionDir);
-		hostile.newSession({ id: "hostile", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		hostile.newSession({ id: "hostile", parentSession: join(root, "outside.jsonl"), rlmDepth: 1 });
 		hostile.appendSessionInfo("hostile");
 		const baseline = getOpenCatalogAuthorityFdCountForTest();
 		for (let attempt = 0; attempt < 64; attempt++) {
 			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
 			expect(getOpenCatalogAuthorityFdCountForTest()).toBe(baseline);
 		}
+	});
+
+	it("treats forked flat-dir sessions as family roots for both fork header shapes", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-fork-roots-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		// Current fork writer: parentSession plus a copied numeric rlmDepth.
+		const forkWithDepth = SessionManager.create(root, sessionDir);
+		forkWithDepth.newSession({ id: "fork-depth", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		forkWithDepth.appendSessionInfo("fork-depth");
+		// Older fork writer: parentSession with no rlmDepth claim at all.
+		const forkNoDepth = SessionManager.create(root, sessionDir);
+		forkNoDepth.newSession({ id: "fork-nodepth", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		forkNoDepth.appendSessionInfo("fork-nodepth");
+		const forkNoDepthFile = forkNoDepth.getSessionFile()!;
+		const [headerLine, ...rest] = readFileSync(forkNoDepthFile, "utf8").trimEnd().split(/\r?\n/);
+		const header = JSON.parse(headerLine!) as Record<string, unknown>;
+		delete header.rlmDepth;
+		writeFileSync(forkNoDepthFile, `${[JSON.stringify(header), ...rest].join("\n")}\n`);
+
+		const family = await listCatalogFamilySessions(sessionDir);
+		expect(family).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "parent", rlmDepth: 0 }),
+				expect.objectContaining({ id: "fork-depth", rlmDepth: 0 }),
+				expect.objectContaining({ id: "fork-nodepth", rlmDepth: 0 }),
+			]),
+		);
+		// Fork lineage is not rlm topology: it must not surface as a parent claim.
+		for (const info of family) expect(info.parentSessionPath).toBeUndefined();
+		// A fork root is its own sibling set, not a sibling of the source's rlm children.
+		await expect(listSavedSessionSiblings(forkWithDepth.getSessionFile()!, sessionDir)).resolves.toEqual([
+			expect.objectContaining({ id: "fork-depth" }),
+		]);
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
+		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("keeps strict topology invariants for registry-reached children", async () => {
+		const make = (mutateHeader: (header: Record<string, unknown>) => void) => {
+			const root = mkdtempSync(join(tmpdir(), "prime-catalog-strict-child-"));
+			const sessionDir = join(root, "sessions");
+			const parent = SessionManager.create(root, sessionDir);
+			parent.newSession({ id: "parent", rlmDepth: 0 });
+			parent.appendSessionInfo("parent");
+			const child = SessionManager.create(root, join(root, "session-artifacts", "parent", "sub-child"));
+			child.newSession({ id: "child", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+			child.appendSessionInfo("child");
+			const childFile = child.getSessionFile()!;
+			const [headerLine, ...rest] = readFileSync(childFile, "utf8").trimEnd().split(/\r?\n/);
+			const header = JSON.parse(headerLine!) as Record<string, unknown>;
+			mutateHeader(header);
+			writeFileSync(childFile, `${[JSON.stringify(header), ...rest].join("\n")}\n`);
+			const registry = join(root, "session-artifacts", "parent", "rlm-subagents.jsonl");
+			mkdirSync(dirname(registry), { recursive: true });
+			writeFileSync(
+				registry,
+				JSON.stringify({ type: "rlm_subagent", childId: "child", sessionFile: childFile, status: "completed" }),
+			);
+			return sessionDir;
+		};
+		await expect(
+			listCatalogFamilySessions(
+				make((header) => {
+					delete header.rlmDepth;
+				}),
+			),
+		).rejects.toThrow("child lacks a persisted depth");
+		await expect(
+			listCatalogFamilySessions(
+				make((header) => {
+					delete header.parentSession;
+				}),
+			),
+		).rejects.toThrow("child lacks a persisted parent path");
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
 	});
 
 	it("rejects an unregistered parent-claiming seed and conflicting duplicate identity", async () => {
@@ -493,7 +571,7 @@ describe("daemon catalog selector resolution", () => {
 		parent.newSession({ id: "parent", rlmDepth: 0 });
 		parent.appendSessionInfo("parent");
 		const orphan = SessionManager.create(root, sessionDir);
-		orphan.newSession({ id: "evil", parentSession: parent.getSessionFile(), rlmDepth: 1 });
+		orphan.newSession({ id: "evil", parentSession: join(root, "outside.jsonl"), rlmDepth: 1 });
 		orphan.appendSessionInfo("evil");
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("managed session seed claims a parent");
 

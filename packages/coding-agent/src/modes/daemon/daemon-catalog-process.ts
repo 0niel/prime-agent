@@ -98,9 +98,14 @@ interface TrustedFile {
 }
 
 interface TrustedSession extends SessionInfo {
-	/** The header claim is intentionally separate from SessionInfo's legacy fallback. */
-	persistedDepth: number;
+	/** The header claims are intentionally separate from SessionInfo's legacy fallback. */
+	persistedDepth?: number;
 	persistedParentPath?: string;
+}
+
+/** A family member whose depth has been verified against the walk. */
+interface FamilySession extends TrustedSession {
+	persistedDepth: number;
 }
 
 function rlmSubagentRegistryPath(parent: SessionInfo, roots: ManagedRoots): string | undefined {
@@ -271,20 +276,40 @@ async function readTrustedSession(path: string, roots: ManagedRoots): Promise<Tr
 		header.id === "" ||
 		(hasParent && typeof header.parentSession !== "string") ||
 		(hasParent && header.parentSession === "") ||
-		(hasParent && !hasDepth) ||
-		(!hasParent && header.rlmDepth !== undefined && !hasDepth)
+		(header.rlmDepth !== undefined && !hasDepth)
 	)
 		throw invalidFamilyTopology("session header lacks trustworthy topology claims");
-	const persistedDepth = hasDepth ? (header.rlmDepth as number) : 0;
+	const persistedDepth = hasDepth ? (header.rlmDepth as number) : undefined;
 	const info = await readSessionInfoFromBuffer(path, trusted.contents, { mtimeMs: trusted.mtimeMs });
 	if (!info || info.id !== header.id) throw invalidFamilyTopology("session metadata does not match its header");
 	return {
 		...info,
 		path,
-		rlmDepth: persistedDepth,
-		persistedDepth,
+		rlmDepth: persistedDepth ?? 0,
+		...(persistedDepth !== undefined ? { persistedDepth } : {}),
 		...(hasParent ? { persistedParentPath: header.parentSession as string } : {}),
 	};
+}
+
+/**
+ * /fork and lineage-carrying /new save sessions directly into the sessions dir
+ * with a parentSession claim naming their source. That claim is fork ancestry,
+ * not rlm topology: the session is a family root and the claim is ignored.
+ * Parent claims that leave the sessions dir still fail closed.
+ */
+function asTrustedFamilyRoot(trusted: TrustedSession, roots: ManagedRoots): FamilySession {
+	if (trusted.persistedParentPath !== undefined) {
+		const claimedParent = resolve(dirname(trusted.path), trusted.persistedParentPath);
+		if (dirname(trusted.path) !== roots.session.lexical || !isWithin(roots.session.lexical, claimedParent)) {
+			throw invalidFamilyTopology("managed session seed claims a parent");
+		}
+		const { persistedParentPath: _forkSource, parentSessionPath: _forkLineage, ...root } = trusted;
+		return { ...root, rlmDepth: 0, persistedDepth: 0 };
+	}
+	if (trusted.persistedDepth !== undefined && trusted.persistedDepth !== 0) {
+		throw invalidFamilyTopology("managed session seed claims a nonzero depth");
+	}
+	return { ...trusted, rlmDepth: 0, persistedDepth: 0 };
 }
 
 async function readLatestRegistry(
@@ -329,13 +354,10 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 	const roots = await SessionManager.listAll(undefined, effectiveSessionDir);
 	const authority = managedRoots(effectiveSessionDir);
 	try {
-		const sessions = new Map<string, TrustedSession>();
+		const sessions = new Map<string, FamilySession>();
 		const ids = new Map<string, string>();
 		for (const root of roots) {
-			const trusted = await readTrustedSession(root.path, authority);
-			if (trusted.persistedDepth !== 0 || trusted.persistedParentPath !== undefined) {
-				throw invalidFamilyTopology("managed session seed claims a parent");
-			}
+			const trusted = asTrustedFamilyRoot(await readTrustedSession(root.path, authority), authority);
 			const existingPath = ids.get(trusted.id);
 			if (existingPath && existingPath !== trusted.path)
 				throw invalidFamilyTopology("family contains a duplicate session id");
@@ -344,7 +366,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 		}
 		let edges = 0;
 		const visited = new Set<string>();
-		const visit = async (parent: TrustedSession, depth: number, ancestors: ReadonlySet<string>): Promise<void> => {
+		const visit = async (parent: FamilySession, depth: number, ancestors: ReadonlySet<string>): Promise<void> => {
 			if (depth > MAX_RLM_FAMILY_DEPTH) throw invalidFamilyTopology("family depth limit exhausted");
 			const parentPath = parent.path;
 			if (ancestors.has(parentPath)) throw invalidFamilyTopology("family contains a cycle");
@@ -361,11 +383,14 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				if (++edges > MAX_RLM_FAMILY_EDGES) throw invalidFamilyTopology("family edge limit exhausted");
 				const childPath = entry.sessionFile as string;
 				if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
-				const child = await readTrustedSession(childPath, authority);
-				if (child.id !== entry.childId) throw invalidFamilyTopology("registry child id does not match session id");
-				if (child.persistedParentPath === undefined)
+				const trustedChild = await readTrustedSession(childPath, authority);
+				if (trustedChild.id !== entry.childId)
+					throw invalidFamilyTopology("registry child id does not match session id");
+				if (trustedChild.persistedParentPath === undefined)
 					throw invalidFamilyTopology("child lacks a persisted parent path");
-				const claimedParentPath = resolve(dirname(child.path), child.persistedParentPath);
+				if (trustedChild.persistedDepth === undefined) throw invalidFamilyTopology("child lacks a persisted depth");
+				const child: FamilySession = { ...trustedChild, persistedDepth: trustedChild.persistedDepth };
+				const claimedParentPath = resolve(dirname(child.path), trustedChild.persistedParentPath);
 				readTrustedFile(claimedParentPath, authority, 128 * 1024 * 1024);
 				if (claimedParentPath !== parentPath)
 					throw invalidFamilyTopology("child parent path does not match traversed parent");
