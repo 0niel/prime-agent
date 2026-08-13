@@ -53,6 +53,17 @@ function osc52Writes(): string[] {
 	return stdoutWrites.filter((write) => write.startsWith("\x1b]52;c;"));
 }
 
+function mockChildProcess(): ReturnType<typeof spawn> {
+	const child = new EventEmitter() as ReturnType<typeof spawn>;
+	child.stdin = new EventEmitter() as ReturnType<typeof spawn>["stdin"];
+	child.stdin!.end = vi.fn();
+	child.stdin!.destroy = vi.fn();
+	child.kill = vi.fn();
+	child.unref = vi.fn();
+	mockedSpawn.mockReturnValue(child);
+	return child;
+}
+
 beforeEach(() => {
 	vi.unstubAllEnvs();
 	vi.stubEnv("SSH_CONNECTION", "");
@@ -141,11 +152,7 @@ describe("copyToClipboard", () => {
 		mockedPlatform.mockReturnValue("linux");
 		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
 		mocks.isWaylandSession.mockReturnValue(true);
-		const child = new EventEmitter() as ReturnType<typeof spawn>;
-		child.stdin = new EventEmitter() as ReturnType<typeof spawn>["stdin"];
-		child.stdin!.end = vi.fn();
-		child.unref = vi.fn();
-		mockedSpawn.mockReturnValue(child);
+		const child = mockChildProcess();
 
 		const copying = copyToClipboard("hello");
 		child.emit("error", new Error("ENOENT"));
@@ -154,16 +161,28 @@ describe("copyToClipboard", () => {
 		expect(osc52Writes()).toHaveLength(1);
 	});
 
+	test("writes Wayland clipboard text through stdin and releases child ownership", async () => {
+		mockedPlatform.mockReturnValue("linux");
+		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+		mocks.isWaylandSession.mockReturnValue(true);
+		const child = mockChildProcess();
+
+		const copying = copyToClipboard("hello");
+		child.emit("spawn");
+		child.emit("close", 0, null);
+		await copying;
+
+		expect(child.stdin!.end).toHaveBeenCalledWith("hello");
+		expect(child.unref).toHaveBeenCalledOnce();
+		expect(osc52Writes()).toHaveLength(0);
+	});
+
 	test("falls back when wl-copy exits nonzero after accepting stdin", async () => {
 		mockedPlatform.mockReturnValue("linux");
 		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
 		vi.stubEnv("DISPLAY", ":0");
 		mocks.isWaylandSession.mockReturnValue(true);
-		const child = new EventEmitter() as ReturnType<typeof spawn>;
-		child.stdin = new EventEmitter() as ReturnType<typeof spawn>["stdin"];
-		child.stdin!.end = vi.fn();
-		child.kill = vi.fn();
-		mockedSpawn.mockReturnValue(child);
+		const child = mockChildProcess();
 		mockedSpawnSync.mockReturnValue({ status: 0, signal: null } as ReturnType<typeof spawnSync>);
 
 		const copying = copyToClipboard("hello");
@@ -176,32 +195,31 @@ describe("copyToClipboard", () => {
 		expect(osc52Writes()).toHaveLength(0);
 	});
 
-	test("kills a hung wl-copy process and falls back after the timeout", async () => {
+	test("detaches a hung wl-copy process and falls back at the completion deadline", async () => {
 		vi.useFakeTimers();
 		try {
 			mockedPlatform.mockReturnValue("linux");
 			vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
 			mocks.isWaylandSession.mockReturnValue(true);
-			const child = new EventEmitter() as ReturnType<typeof spawn>;
-			child.stdin = new EventEmitter() as ReturnType<typeof spawn>["stdin"];
-			child.stdin!.end = vi.fn();
-			child.kill = vi.fn();
-			mockedSpawn.mockReturnValue(child);
+			const child = mockChildProcess();
 
 			const copying = copyToClipboard("hello");
 			child.emit("spawn");
 			await vi.advanceTimersByTimeAsync(5000);
-
-			expect(child.kill).toHaveBeenCalledWith("SIGKILL");
-			child.emit("close", null, "SIGKILL");
 			await copying;
+
+			expect(child.unref).toHaveBeenCalledOnce();
+			expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+			expect(child.stdin!.destroy).toHaveBeenCalledOnce();
 			expect(osc52Writes()).toHaveLength(1);
+			expect(vi.getTimerCount()).toBe(0);
+			child.emit("error", new Error("late error"));
 		} finally {
 			vi.useRealTimers();
 		}
 	});
 
-	test("passes hostile clipboard text only on stdin and falls back from xclip to xsel", async () => {
+	test("passes clipboard text only on stdin and falls back from xclip to xsel", async () => {
 		mockedPlatform.mockReturnValue("linux");
 		vi.stubEnv("DISPLAY", ":0");
 		const hostileText = "$(touch /tmp/never) ; echo injected";

@@ -25,24 +25,37 @@ function copyToWaylandClipboard(text: string, timeoutMs = 5000): Promise<boolean
 	return new Promise((resolve) => {
 		const proc = spawn("wl-copy", [], { shell: false, stdio: ["pipe", "ignore", "ignore"] });
 		let settled = false;
-		let timer: NodeJS.Timeout;
 		const finish = (success: boolean) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
 			resolve(success);
 		};
-		timer = setTimeout(() => {
-			proc.kill("SIGKILL");
-		}, timeoutMs);
-		timer.unref();
-		proc.on("error", () => finish(false));
-		proc.stdin.on("error", () => {
-			proc.kill();
+		const onError = () => {
+			if (settled) return;
+			proc.stdin.destroy();
 			finish(false);
-		});
-		proc.on("spawn", () => proc.stdin.end(text));
-		proc.on("close", (code, signal) => finish(code === 0 && signal === null));
+		};
+		const onStdinError = () => {
+			if (settled) return;
+			proc.kill("SIGKILL");
+			finish(false);
+		};
+		const onSpawn = () => {
+			if (!settled) proc.stdin.end(text);
+		};
+		const onClose = (code: number | null, signal: NodeJS.Signals | null) => finish(code === 0 && signal === null);
+		const timer = setTimeout(() => {
+			proc.kill("SIGKILL");
+			proc.stdin.destroy();
+			finish(false);
+		}, timeoutMs);
+
+		proc.unref();
+		proc.once("error", onError);
+		proc.stdin.once("error", onStdinError);
+		proc.once("spawn", onSpawn);
+		proc.once("close", onClose);
 	});
 }
 
