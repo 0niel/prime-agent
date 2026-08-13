@@ -12,13 +12,14 @@ import {
 	mkdtempSync,
 	openSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, parse, resolve } from "node:path";
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
@@ -44,18 +45,10 @@ function pathExistsLexical(path: string): boolean {
 
 function ensureNoSymlinkPath(path: string, mode: number): void {
 	const target = resolve(path);
-	let existing = target;
-	while (!pathExistsLexical(existing)) {
-		const parent = dirname(existing);
-		if (parent === existing) throw new Error(`Private path has no existing ancestor: ${path}`);
-		existing = parent;
-	}
-	if (lstatSync(existing).isSymbolicLink()) {
-		throw new Error(`Refusing to use non-directory private path: ${existing}`);
-	}
-	const suffix = target.slice(existing.length).split(/[/\\]/).filter(Boolean);
-	let current = existing;
-	for (const component of suffix) {
+	const root = parse(target).root;
+	const components = target.slice(root.length).split(/[/\\]/).filter(Boolean);
+	let current = root;
+	for (const [index, component] of components.entries()) {
 		current = join(current, component);
 		if (!pathExistsLexical(current)) {
 			try {
@@ -65,6 +58,10 @@ function ensureNoSymlinkPath(path: string, mode: number): void {
 			}
 		}
 		const stats = lstatSync(current);
+		if (index === 0 && stats.isSymbolicLink()) {
+			current = realpathSync(current);
+			continue;
+		}
 		if (stats.isSymbolicLink() || !stats.isDirectory()) {
 			throw new Error(`Refusing to use non-directory private path: ${current}`);
 		}
@@ -86,12 +83,13 @@ function isAlreadyExistsError(error: unknown): boolean {
 function openRegularFileNoSymlink(path: string, flags: number): number {
 	assertRegularFileNoSymlink(path);
 	const fd = openSync(path, flags | requireNoFollow(constants.O_NOFOLLOW) | NONBLOCK_FLAG);
-	const stats = fstatSync(fd);
-	if (!stats.isFile()) {
+	try {
+		if (!fstatSync(fd).isFile()) throw new Error(`Refusing to use non-regular private file: ${path}`);
+		return fd;
+	} catch (error) {
 		closeSync(fd);
-		throw new Error(`Refusing to use non-regular private file: ${path}`);
+		throw error;
 	}
-	return fd;
 }
 
 export function assertRegularFileNoSymlink(path: string): void {
@@ -220,8 +218,8 @@ export function writePrivateFileAtomicLines(
 	options: { preserveOwnership?: boolean } = {},
 ): void {
 	ensurePrivateDirectory(dirname(path));
+	if (pathExistsLexical(path)) assertRegularFileNoSymlink(path);
 	const metadata = options.preserveOwnership && pathExistsLexical(path) ? statSync(path) : undefined;
-	if (metadata) assertRegularFileNoSymlink(path);
 	const tempPath = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
 	let fd: number | undefined;
 	try {

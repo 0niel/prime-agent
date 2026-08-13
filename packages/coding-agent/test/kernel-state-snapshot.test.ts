@@ -95,7 +95,8 @@ describe("buildSnapshotCode", () => {
 	it("uses dill with private exclusive atomic writes and skips internal handles", () => {
 		expect(code).toContain("import dill");
 		expect(code).toContain("os.O_EXCL");
-		expect(code).toContain('getattr(os, "O_NOFOLLOW", 0)');
+		expect(code).toContain('hasattr(os, "O_NOFOLLOW")');
+		expect(code).toContain("os.O_NOFOLLOW");
 		expect(code).toContain("os.replace");
 		expect(code).toContain("os.lstat(out_dir)");
 		expect(code).toContain("os.fchmod");
@@ -113,7 +114,8 @@ describe("buildRestoreCode", () => {
 		expect(code).toContain("os.path.lexists");
 		expect(code).toContain("os.lstat");
 		expect(code).toContain("S_ISREG");
-		expect(code).toContain('getattr(os, "O_NOFOLLOW", 0)');
+		expect(code).toContain('hasattr(os, "O_NOFOLLOW")');
+		expect(code).toContain("os.O_NOFOLLOW");
 		expect(code).toContain("dill.loads");
 	});
 });

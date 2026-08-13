@@ -1,4 +1,4 @@
-import { constants, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { constants, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -46,6 +46,7 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import {
+	ensurePrivateDirectory,
 	ensurePrivateFile,
 	PRIVATE_FILE_SYSTEM_UNSUPPORTED_ERROR,
 	readPrivateFile,
@@ -111,5 +112,17 @@ describe("ensurePrivateFile exclusive-create races", () => {
 
 		expect(() => ensurePrivateFile(path, "ignored")).toThrow("non-regular private file");
 		expect(readFileSync(target, "utf8")).toBe("sentinel");
+	});
+
+	it("rejects an existing directory beneath a symlinked ancestor", () => {
+		directory = mkdtempSync(join(tmpdir(), "pi-private-file-race-"));
+		const outside = join(directory, "outside");
+		const existing = join(outside, "existing");
+		const link = join(directory, "link");
+		mkdirSync(existing, { recursive: true });
+		symlinkSync(outside, link, "dir");
+
+		expect(() => ensurePrivateDirectory(join(link, "existing"))).toThrow("non-directory private path");
+		expect(statSync(existing).mode & 0o777).not.toBe(0o700);
 	});
 });

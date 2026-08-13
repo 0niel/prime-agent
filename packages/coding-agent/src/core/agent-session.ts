@@ -15,7 +15,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -50,6 +50,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
+import { ensurePrivateDirectory, writePrivateFileAtomic } from "../utils/private-files.js";
 import { sleep } from "../utils/sleep.js";
 import {
 	AGENT_MESSAGE_CUSTOM_TYPE,
@@ -8959,13 +8960,13 @@ export class AgentSession {
 	// does RLM work. The temp dir is created lazily in _createChildRlmSessionDir.
 	private _ensureRlmSessionDir(): string | undefined {
 		if (this._rlmSessionDir) {
-			mkdirSync(this._rlmSessionDir, { recursive: true });
+			ensurePrivateDirectory(this._rlmSessionDir);
 			return this._rlmSessionDir;
 		}
 
 		const sessionArtifactDir = this.sessionManager.getSessionArtifactDir();
 		if (sessionArtifactDir) {
-			mkdirSync(sessionArtifactDir, { recursive: true });
+			ensurePrivateDirectory(sessionArtifactDir);
 			this._rlmSessionDir = sessionArtifactDir;
 			return sessionArtifactDir;
 		}
@@ -8978,7 +8979,7 @@ export class AgentSession {
 		for (let i = 0; i < 100; i++) {
 			const childDir = join(parentDir, `sub-${randomUUID().slice(0, 8)}`);
 			try {
-				mkdirSync(childDir);
+				mkdirSync(childDir, { mode: 0o700 });
 				return childDir;
 			} catch (error) {
 				if (error instanceof Error && "code" in error && error.code === "EEXIST") {
@@ -11215,7 +11216,7 @@ export class AgentSession {
 			prevId = entry.id;
 		}
 
-		writeFileSync(filePath, `${lines.join("\n")}\n`);
+		writePrivateFileAtomic(filePath, `${lines.join("\n")}\n`, { privateParent: false });
 		return filePath;
 	}
 

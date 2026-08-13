@@ -59,6 +59,9 @@ export function buildSnapshotCode(outPath: string, manifestPath: string, maxByte
 	return `
 def _prime_agent_snapshot_state():
     import builtins as _b, json, os, stat, sys, datetime
+    if not _b.hasattr(os, "O_NOFOLLOW"):
+        _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"error": "O_NOFOLLOW unavailable"}))
+        return
     try:
         import dill
     except _b.Exception as _err:
@@ -109,7 +112,7 @@ def _prime_agent_snapshot_state():
         os.makedirs(out_dir, mode=0o700, exist_ok=False)
     tmp = ${pyStr(outPath)} + ".tmp." + _b.str(os.getpid()) + "." + os.urandom(8).hex()
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _b.getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         fd = os.open(tmp, flags, 0o600)
         with os.fdopen(fd, "wb") as fh:
             dill.dump(payload, fh)
@@ -143,7 +146,7 @@ def _prime_agent_snapshot_state():
     manifest_tmp = None
     try:
         manifest_tmp = ${pyStr(manifestPath)} + ".tmp." + _b.str(os.getpid()) + "." + os.urandom(8).hex()
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _b.getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         fd = os.open(manifest_tmp, flags, 0o600)
         with os.fdopen(fd, "w") as fh:
             json.dump(manifest, fh)
@@ -183,6 +186,9 @@ export function buildRestoreCode(inPath: string): string {
 	return `
 def _prime_agent_restore_state():
     import builtins as _b, json, os, sys
+    if not _b.hasattr(os, "O_NOFOLLOW"):
+        _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": [], "error": "O_NOFOLLOW unavailable"}))
+        return
     if not os.path.lexists(${pyStr(inPath)}):
         _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": []}))
         return
@@ -198,7 +204,7 @@ def _prime_agent_restore_state():
         if not _stat.S_ISREG(snapshot_stat.st_mode):
             _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"restored": [], "failed": [], "error": "load failed: snapshot is not a regular file"}))
             return
-        flags = os.O_RDONLY | _b.getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | os.O_NOFOLLOW
         fd = os.open(${pyStr(inPath)}, flags)
         with os.fdopen(fd, "rb") as fh:
             payload = dill.load(fh)

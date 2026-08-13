@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../../../src/core/auth-storage.js";
-import { SessionManager } from "../../../src/core/session-manager.js";
+import { readSessionInfo, SessionManager } from "../../../src/core/session-manager.js";
 
 const describePosix = process.platform === "win32" ? describe.skip : describe;
 
@@ -92,6 +92,19 @@ describe("issue #1105 session storage security", () => {
 			expect(() => SessionManager.open(sessionFile, sessionDir)).toThrow("non-regular private file");
 		});
 
+		it("omits symlinked transcripts from catalog scans", async () => {
+			const target = join(tempRoot, "outside-session.jsonl");
+			writeFileSync(
+				target,
+				`${JSON.stringify({ type: "session", version: 3, id: "outside", timestamp: new Date().toISOString(), cwd: tempRoot })}
+`,
+			);
+			const transcript = join(tempRoot, "linked.jsonl");
+			symlinkSync(target, transcript);
+
+			expect(await readSessionInfo(transcript)).toBeNull();
+		});
+
 		it("rejects a symlinked per-session artifact directory", () => {
 			const sessionDir = join(tempRoot, "sessions");
 			const manager = SessionManager.create(tempRoot, sessionDir);
@@ -135,6 +148,19 @@ describe("issue #1105 session storage security", () => {
 
 			expect(storage.drainErrors().some((error) => error.message.includes("non-regular private file"))).toBe(true);
 			expect(readFileSync(target, "utf8")).toBe('{"sentinel":true}');
+		});
+		it("does not chmod an inferred parent when opening a user-selected transcript", () => {
+			const sharedDir = join(tempRoot, "shared");
+			mkdirSync(sharedDir, { mode: 0o755 });
+			const sessionFile = join(sharedDir, "external.jsonl");
+			writeFileSync(
+				sessionFile,
+				`${JSON.stringify({ type: "session", version: 3, id: "external", timestamp: new Date().toISOString(), cwd: tempRoot })}
+`,
+			);
+
+			SessionManager.open(sessionFile);
+			expect(statSync(sharedDir).mode & 0o777).toBe(0o755);
 		});
 	});
 });

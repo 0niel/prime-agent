@@ -8,6 +8,7 @@
 - Restored bare `prime-agent --resume` opening the agents view and the `/resume [id|path]` slash command; bare commands open the agents view and an argument resumes that session in place.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 - Fixed ctrl+p ("Toggle agent message expansion") only toggling received agent messages; it now expands and collapses sent agent messages together with received ones.
+- Fixed session and artifact storage accepting traversal IDs, symlinked paths, permissive modes, and unsafe snapshot files ([#1105](https://github.com/PrimeIntellect-ai/prime-agent/pull/1105)).
 
 ## [0.7.2] - 2026-08-11
 
@@ -15,7 +16,6 @@
 - Added `app.messages.expand` (`ctrl+p`) to collapse or expand agent-to-agent messages separately from `ctrl+o` tool output.
 - Added a `ctrl+t` expand hint to collapsed thinking blocks, matching the tool output hint.
 - Changed expand/collapse hints to a consistent bracketed `(Ctrl+O to expand)` style across tool, message, summary, and error rows.
-- Fixed session and artifact storage accepting traversal IDs, symlinked paths, permissive modes, and unsafe snapshot files ([#1105](https://github.com/PrimeIntellect-ai/prime-agent/pull/1105)).
 - Added a configurable copy action to login dialogs so raw sign-in URLs can be copied without selecting wrapped text ([#643](https://github.com/PrimeIntellect-ai/prime-agent/issues/643)).
 - Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).
 - Changed sent agent messages in the IPython cell UI to show only the message text with a `╰─` gutter when expanded, matching received messages, and hid the raw `agent_message.send` receipt dictionary.

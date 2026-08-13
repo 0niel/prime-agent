@@ -90,8 +90,15 @@ def _state_file(state_dir: str | Path | None = None, *, global_: bool = False) -
             "Use get_harness_state(global_=True) for global state."
         )
     if root:
-        return Path(root).expanduser().resolve() / _DEFAULT_FILE_NAME
+        return Path(os.path.abspath(Path(root).expanduser())) / _DEFAULT_FILE_NAME
     return _agent_dir() / _DEFAULT_HARNESS_DIR_NAME / _DEFAULT_FILE_NAME
+
+
+def _require_no_follow() -> int:
+    flag = getattr(os, "O_NOFOLLOW", None)
+    if flag is None:
+        raise OSError("Private file storage requires O_NOFOLLOW support")
+    return flag
 
 
 def _chmod_open_file(fd: int, path: Path, mode: int) -> None:
@@ -102,14 +109,25 @@ def _chmod_open_file(fd: int, path: Path, mode: int) -> None:
 
 
 def _ensure_private_directory(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = Path(os.path.abspath(path))
+    current = Path(target.anchor)
+    for index, component in enumerate(target.parts[1:]):
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+            info = current.lstat()
+        if index == 0 and stat.S_ISLNK(info.st_mode):
+            current = current.resolve()
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"Refusing to use non-directory private path: {current}")
     info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise OSError(f"Refusing to use non-directory private path: {path}")
     if os.name == "nt":
         path.chmod(0o700)
         return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _require_no_follow()
     fd = os.open(path, flags)
     try:
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
@@ -118,12 +136,27 @@ def _ensure_private_directory(path: Path) -> None:
     finally:
         os.close(fd)
 
+def _assert_no_symlinked_ancestors(path: Path) -> None:
+    target = Path(os.path.abspath(path))
+    current = Path(target.anchor)
+    for index, component in enumerate(target.parts[1:-1]):
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        if index == 0 and stat.S_ISLNK(info.st_mode):
+            current = current.resolve()
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"Refusing to use non-directory private path: {current}")
+
 
 def _open_private_for_read(path: Path):
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise OSError(f"Refusing to use non-regular private file: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | _require_no_follow()
     fd = os.open(path, flags)
     try:
         opened = os.fstat(fd)
@@ -143,7 +176,7 @@ def _write_private_json_atomic(path: Path, data: dict[str, Any]) -> None:
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise OSError(f"Refusing to replace non-regular private file: {path}")
     temp_path = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _require_no_follow()
     fd: int | None = None
     try:
         fd = os.open(temp_path, flags, 0o600)
@@ -232,12 +265,11 @@ class HarnessState:
         # path resolution itself fails, so constructing it cannot re-raise that error.
         if in_memory:
             self.file_path: Path | None = None
+            self._lexical_file_path: Path | None = None
         else:
-            self.file_path = (
-                Path(file_path).expanduser().parent.resolve() / Path(file_path).expanduser().name
-                if file_path
-                else _state_file(global_=(scope == "global"))
-            )
+            lexical_path = Path(file_path).expanduser() if file_path else _state_file(global_=(scope == "global"))
+            self._lexical_file_path = Path(os.path.abspath(lexical_path))
+            self.file_path = lexical_path.parent.resolve() / lexical_path.name
         self.scope: HarnessScope = scope
         # When set, local mutations raise instead of vanishing into a volatile
         # store; reads and global_=True delegation keep working.
@@ -247,23 +279,20 @@ class HarnessState:
         self._global_target_state_dir: Path | None = None
         # mtime of the file as of the last load/save, used to detect out-of-process
         # writes (e.g. the host `/refine` command) and avoid clobbering them.
-        self._loaded_mtime: int | None = None
+        self._loaded_mtime: tuple[str, int | None] = ("missing", None)
         self.load()
 
     def _ensure_local_writable(self) -> None:
         if self._local_write_error is not None:
             raise RuntimeError(self._local_write_error)
 
-    def _disk_mtime(self) -> int | None:
-        if self.file_path is None:
-            return None
-        try:
-            info = self.file_path.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                return None
-            return info.st_mtime_ns
-        except OSError:
-            return None
+    def _disk_mtime(self) -> tuple[str, int | None]:
+        if self.file_path is None or not os.path.lexists(self.file_path):
+            return ("missing", None)
+        info = self.file_path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return ("unsafe", None)
+        return ("regular", info.st_mtime_ns)
 
     def _sync_from_disk(self) -> None:
         """Reload if another process rewrote the state file since we last touched it.
@@ -278,15 +307,22 @@ class HarnessState:
             self.load()
 
     def load(self) -> "HarnessState":
+        if self._lexical_file_path is not None:
+            try:
+                _assert_no_symlinked_ancestors(self._lexical_file_path)
+            except OSError as error:
+                self._local_write_error = str(error)
+                self._loaded_mtime = ("unsafe", None)
+                return self
         if self.file_path is None or not os.path.lexists(self.file_path):
-            self._loaded_mtime = None
+            self._loaded_mtime = ("missing", None)
             return self
         info = self.file_path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             # Keep prompt construction/read APIs available, but permanently block
             # mutation of this unsafe persistent sink.
             self._local_write_error = f"Refusing to use non-regular private file: {self.file_path}"
-            self._loaded_mtime = None
+            self._loaded_mtime = ("unsafe", None)
             return self
         mtime = self._disk_mtime()
         try:
@@ -383,7 +419,7 @@ class HarnessState:
             },
             "refinements": [asdict(event) for event in self.refinements],
         }
-        _write_private_json_atomic(self.file_path, data)
+        _write_private_json_atomic(self._lexical_file_path or self.file_path, data)
         self._loaded_mtime = self._disk_mtime()
         return self
 
@@ -415,8 +451,8 @@ class HarnessState:
                 metadata=metadata,
                 source=source,
             )
-        self._ensure_local_writable()
         self._sync_from_disk()
+        self._ensure_local_writable()
         return self._upsert(
             kind,
             title,
@@ -500,8 +536,8 @@ class HarnessState:
         id, global_ = _strip_scope_prefix(id, global_)
         if target := self._global_target(global_, kwargs):
             return target.delete(kind, id)
-        self._ensure_local_writable()
         self._sync_from_disk()
+        self._ensure_local_writable()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         if id not in self.entries[kind]:
@@ -550,8 +586,8 @@ class HarnessState:
                 metadata=metadata,
                 source=source,
             )
-        self._ensure_local_writable()
         self._sync_from_disk()
+        self._ensure_local_writable()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         entry_id = id or _slug(title, kind)
@@ -597,8 +633,8 @@ class HarnessState:
                 metadata=metadata,
                 source=source,
             )
-        self._ensure_local_writable()
         self._sync_from_disk()
+        self._ensure_local_writable()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
         if id not in self.entries[kind]:
@@ -774,8 +810,8 @@ class HarnessState:
     ) -> RefinementEvent:
         if target := self._global_target(global_, kwargs):
             return target.record_refinement(trigger, changes, evidence=evidence, outcome=outcome, id=id)
-        self._ensure_local_writable()
         self._sync_from_disk()
+        self._ensure_local_writable()
         event_id = id or f"refine_{len(self.refinements) + 1:04d}"
         normalized_changes = [changes] if isinstance(changes, str) else list(changes)
         event = RefinementEvent(

@@ -186,6 +186,43 @@ class HarnessStateTest(unittest.TestCase):
                 state.save()
             self.assertEqual(outside.read_text(encoding="utf-8"), '{"sentinel": true}')
 
+    @unittest.skipIf(os.name == "nt", "POSIX symlink semantics")
+    def test_existing_harness_directory_below_symlinked_ancestor_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            outside = Path(temp_dir) / "outside"
+            existing = outside / "existing"
+            existing.mkdir(parents=True, mode=0o755)
+            link = Path(temp_dir) / "link"
+            link.symlink_to(outside, target_is_directory=True)
+            state = HarnessState(link / "existing" / "harness_state.json")
+
+            with self.assertRaisesRegex(RuntimeError, "non-directory private path"):
+                state.save()
+            self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o755)
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink semantics")
+    def test_cached_missing_state_rejects_unsafe_replacement_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            outside = Path(temp_dir) / "outside.json"
+            outside.write_text('{"sentinel": true}', encoding="utf-8")
+            state_path.symlink_to(outside)
+
+            with self.assertRaisesRegex(RuntimeError, "non-regular private file"):
+                state.create_memory("Blocked", "must not remain in memory", id="blocked")
+            self.assertIsNone(state.get("memory", "blocked"))
+
+    @unittest.skipIf(os.name == "nt", "POSIX no-follow capability")
+    def test_missing_no_follow_capability_fails_closed(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            with patch.object(os, "O_NOFOLLOW", new=None):
+                with self.assertRaisesRegex(OSError, "O_NOFOLLOW"):
+                    state.save()
+
     def test_load_ignores_unknown_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "harness_state.json"

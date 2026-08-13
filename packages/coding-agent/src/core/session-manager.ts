@@ -2,7 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "fs";
-import { readdir, readFile, stat } from "fs/promises";
+import { lstat, readdir, readFile, stat } from "fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
@@ -1033,6 +1033,8 @@ const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
+		const lexicalStats = await lstat(filePath);
+		if (lexicalStats.isSymbolicLink() || !lexicalStats.isFile()) return null;
 		stats = await stat(filePath);
 	} catch {
 		return null;
@@ -1239,11 +1241,12 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		preloadedEntries?: FileEntry[],
+		ownsSessionDir = true,
 	) {
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
 		this.persist = persist;
-		if (persist && sessionDir) {
+		if (persist && sessionDir && ownsSessionDir) {
 			ensurePrivateDirectory(sessionDir);
 		}
 
@@ -2209,7 +2212,7 @@ export class SessionManager {
 		}
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ?? resolve(path, "..");
-		return new SessionManager(cwd ?? process.cwd(), dir, path, true);
+		return new SessionManager(cwd ?? process.cwd(), dir, path, true, undefined, sessionDir !== undefined);
 	}
 
 	/**
@@ -2228,7 +2231,7 @@ export class SessionManager {
 		}
 		const cwd = cwdOverride ?? (entries[0] as SessionHeader).cwd;
 		const dir = sessionDir ?? resolve(path, "..");
-		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries);
+		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries, sessionDir !== undefined);
 	}
 
 	/**

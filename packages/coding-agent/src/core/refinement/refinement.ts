@@ -1,5 +1,5 @@
-import { existsSync, lstatSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { join, parse, resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
@@ -286,22 +286,24 @@ function unsafeHarnessDirectoryError(path: string): string {
 }
 
 function validateHarnessDirectory(path: string): string | undefined {
-	let current = resolve(path);
-	while (true) {
+	const target = resolve(path);
+	const root = parse(target).root;
+	let current = root;
+	for (const [index, component] of target.slice(root.length).split(/[/\\]/).filter(Boolean).entries()) {
+		current = join(current, component);
 		try {
 			const info = lstatSync(current);
+			if (index === 0 && info.isSymbolicLink()) {
+				current = realpathSync(current);
+				continue;
+			}
 			if (info.isSymbolicLink() || !info.isDirectory()) return unsafeHarnessDirectoryError(current);
-			// The closest existing component is the caller-controlled persistence
-			// root; checking beyond it would reject OS-managed aliases such as /var.
-			return undefined;
 		} catch (error) {
-			if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
-				return unsafeHarnessDirectoryError(current);
+			if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+			return unsafeHarnessDirectoryError(current);
 		}
-		const parent = dirname(current);
-		if (parent === current) return undefined;
-		current = parent;
 	}
+	return undefined;
 }
 
 export function loadHarnessState(
