@@ -636,6 +636,15 @@ describe("daemon catalog selector resolution", () => {
 				}),
 			),
 		).rejects.toThrow("child lacks a persisted parent path");
+		// Registry-reached children never use the root-only classifier: a large
+		// apparent session header is strictly rejected rather than skipped.
+		await expect(
+			listCatalogFamilySessions(
+				make((header) => {
+					header.padding = "x".repeat(200 * 1024);
+				}),
+			),
+		).rejects.toThrow("Invalid RLM artifact family topology");
 		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
 	});
 
@@ -742,9 +751,10 @@ describe("daemon catalog selector resolution", () => {
 				`${[
 					JSON.stringify({ type: "message", message: { role: "user", content: payload } }),
 					JSON.stringify({ type: "session_info", name: payload }),
+					JSON.stringify({ type: "session_state", state: { status: "archived" } }),
 					JSON.stringify({
 						type: "agent_status",
-						status: { summary: payload, taskState: payload, basedOnMessageCount: 1 },
+						status: { summary: payload, taskState: "completed", basedOnMessageCount: 1 },
 					}),
 				].join("\n")}\n`,
 			);
@@ -761,10 +771,29 @@ describe("daemon catalog selector resolution", () => {
 						agentStatus: expect.objectContaining({ summary: expect.any(String), basedOnMessageCount: 1 }),
 					}),
 				);
-				expect(session?.agentStatus?.taskState).toBeUndefined();
+				expect(session?.state).toEqual({ status: "archived" });
+				expect(session?.agentStatus?.taskState).toBe("completed");
 				expect(responses).toHaveLength(1);
 				const response = responses[0]!;
-				expect(JSON.parse(response.line).id).toBe(response.id);
+				const wire = JSON.parse(response.line) as {
+					id: string;
+					data: {
+						valid: boolean;
+						messageCount: number;
+						state?: { status: string };
+						agentStatus?: { taskState?: string };
+					};
+				};
+				// Compaction may touch display strings only: the protocol UUID and
+				// typed controls are byte-for-byte stable in the exact wire envelope.
+				expect(wire.id).toBe(response.id);
+				expect(wire.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+				expect(wire.data).toMatchObject({
+					valid: true,
+					messageCount: 1,
+					state: { status: "archived" },
+					agentStatus: { taskState: "completed" },
+				});
 				expect(Buffer.byteLength(response.line, "ascii")).toBeLessThanOrEqual(256 * 1024);
 			} finally {
 				setCatalogAfterHelperResponseForTest(undefined);
@@ -962,7 +991,7 @@ process.stdin.on("data", chunk => {
  while (true) {
   const end=input.indexOf("\n"); if (end<0) break;
   const request=JSON.parse(input.slice(0,end)); input=input.slice(end+1);
-  const payload=request.mode === "header" ? { id:request.id, data:${JSON.stringify(Buffer.from(header).toString("base64"))}, mtimeMs:0, dev:"1", ino:"1" } : request.mode === "metadata" ? { id:request.id, data:{valid:true,messageCount:0,firstMessage:"(no messages)",allMessagesText:"",modifiedMs:0}, mtimeMs:0, dev:"1", ino:"1" } : { id:request.id, mtimeMs:0, dev:"1", ino:"1" };
+  const payload=(request.mode === "header" || request.mode === "classify") ? { id:request.id, data:${JSON.stringify(Buffer.from(header).toString("base64"))}, mtimeMs:0, dev:"1", ino:"1" } : request.mode === "metadata" ? { id:request.id, data:{valid:true,messageCount:0,firstMessage:"(no messages)",allMessagesText:"",modifiedMs:0}, mtimeMs:0, dev:"1", ino:"1" } : { id:request.id, mtimeMs:0, dev:"1", ino:"1" };
   process.stdout.write(JSON.stringify(payload)+"\n");
   if (request.mode === "metadata") setTimeout(() => process.stdout.write("{\"unsolicited\":true}\n"), 25);
  }
