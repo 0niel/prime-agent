@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, openSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import { getSessionsDir } from "../../config.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -68,7 +68,8 @@ interface SavedRlmSubagentRegistryEntry {
 	status?: unknown;
 }
 
-const MAX_RLM_REGISTRY_BYTES = 1024 * 1024;
+// Registry records carry prompts and spawn code; real profiles reach a few MB.
+const MAX_RLM_REGISTRY_BYTES = 16 * 1024 * 1024;
 const MAX_SESSION_HEADER_BYTES = 256 * 1024;
 const MAX_RLM_REGISTRY_RECORDS = 10_000;
 const MAX_RLM_FAMILY_EDGES = 10_000;
@@ -105,10 +106,11 @@ interface FamilySession extends TrustedSession {
 }
 
 function rlmSubagentRegistryPath(parent: SessionInfo, roots: ManagedRoots): string | undefined {
-	const parentDir = dirname(parent.path);
-	const artifactDir =
-		parentDir === roots.session.lexical ? roots.artifacts?.lexical : join(parentDir, "session-artifacts");
-	return artifactDir ? join(artifactDir, parent.id, "rlm-subagents.jsonl") : undefined;
+	// The session writer keeps a session's child registry beside its session
+	// dir: <dirname(sessionDir)>/session-artifacts/<header id>. Every such
+	// location is inside the profile's top-level artifacts root.
+	if (!roots.artifacts) return undefined;
+	return join(dirname(dirname(parent.path)), "session-artifacts", parent.id, "rlm-subagents.jsonl");
 }
 
 function isWithin(root: string, target: string): boolean {
@@ -515,18 +517,26 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				const childPath = entry.sessionFile as string;
 				if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
 				const trustedChild = await readTrustedSession(childPath, reader);
-				if (trustedChild.id !== entry.childId)
-					throw invalidFamilyTopology("registry child id does not match session id");
+				// Registry childId is the rlm child id (e.g. "sub-1a2b3c4d"), not the
+				// session id. The child's identity anchor is its filename: the session
+				// writer names every child file after its header id.
+				if (basename(childPath, ".jsonl") !== trustedChild.id)
+					throw invalidFamilyTopology("registry child session file does not match its header id");
 				if (trustedChild.persistedParentPath === undefined)
 					throw invalidFamilyTopology("child lacks a persisted parent path");
-				if (trustedChild.persistedDepth === undefined) throw invalidFamilyTopology("child lacks a persisted depth");
-				const child: FamilySession = { ...trustedChild, persistedDepth: trustedChild.persistedDepth };
+				// Old writers persisted no rlmDepth on children: an absent claim is
+				// derived from the traversed edge, but a contradicting claim is corrupt.
+				if (trustedChild.persistedDepth !== undefined && trustedChild.persistedDepth !== parent.persistedDepth + 1)
+					throw invalidFamilyTopology("child depth does not equal parent depth plus one");
+				const child: FamilySession = {
+					...trustedChild,
+					persistedDepth: parent.persistedDepth + 1,
+					rlmDepth: parent.persistedDepth + 1,
+				};
 				const claimedParentPath = resolve(dirname(child.path), trustedChild.persistedParentPath);
 				await reader.read(claimedParentPath, 0, "stat");
 				if (claimedParentPath !== parentPath)
 					throw invalidFamilyTopology("child parent path does not match traversed parent");
-				if (child.persistedDepth !== parent.persistedDepth + 1)
-					throw invalidFamilyTopology("child depth does not equal parent depth plus one");
 				const existingPath = ids.get(child.id);
 				if (existingPath && existingPath !== child.path)
 					throw invalidFamilyTopology("family contains a duplicate session id");
