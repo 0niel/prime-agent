@@ -9774,6 +9774,23 @@ export class AgentSession {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 		};
 		this._activeRlmChildRuns.set(run.id, run);
+		// Revocation must be armed before the first queued update reaches subscribers:
+		// a subscriber can revoke the request authority as its reaction to that very
+		// update, and an abort listener attached afterwards would never fire.
+		let admissionCommitted = false;
+		const revokeAdmission = () => {
+			if (!admissionCommitted) this._cancelRlmChildRun(run, "host request authority was revoked");
+		};
+		if (requestAuthority) requestAuthority.signal.addEventListener("abort", revokeAdmission, { once: true });
+		try {
+			assertRequestCurrent();
+		} catch (error) {
+			if (requestAuthority) requestAuthority.signal.removeEventListener("abort", revokeAdmission);
+			this._cancelRlmChildRun(run, "host request authority was revoked");
+			this._activeRlmChildRuns.delete(run.id);
+			rmSync(childSessionDir, { recursive: true, force: true });
+			throw error;
+		}
 		const emitChildUpdate = () => {
 			const childModel = childSession?.model ?? modelSelection.model;
 			this._emit({
@@ -9843,12 +9860,6 @@ export class AgentSession {
 		// Runtime startup and the task run are deliberately detached. The public
 		// spawn resolves at admission, while this task owns live tracking, usage,
 		// retention, cancellation, and late-startup cleanup.
-		let admissionCommitted = false;
-		const revokeAdmission = () => {
-			if (!admissionCommitted) this._cancelRlmChildRun(run, "host request authority was revoked");
-		};
-		if (requestAuthority) requestAuthority.signal.addEventListener("abort", revokeAdmission, { once: true });
-		assertRequestCurrent();
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
 			try {

@@ -3036,6 +3036,58 @@ describe("AgentSession rlm recursion", () => {
 		}
 	});
 
+	it("cleans up a queued run when a subscriber revokes authority on the first child update", async () => {
+		const root = createSession();
+		const controller = new AbortController();
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update" && event.child.status === "queued") {
+				controller.abort();
+			}
+		});
+
+		const admission = root.runRlmChild("revoked by queued-update subscriber", {}, undefined, {
+			signal: controller.signal,
+		});
+
+		await expect(admission).rejects.toThrow("host request authority was revoked");
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._activeRlmChildRuns.size === 0);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+	});
+
+	it("cleans up a run when authority is already revoked at registration", async () => {
+		const root = createSession();
+		const controller = new AbortController();
+		const internals = root as unknown as InspectableRlmSession & {
+			_findLastAssistantMessage(): unknown;
+		};
+		// Revoke in the last window before the run is registered; an abort listener
+		// attached to an already-aborted signal never fires.
+		const originalFind = internals._findLastAssistantMessage.bind(root);
+		vi.spyOn(internals, "_findLastAssistantMessage").mockImplementation(() => {
+			controller.abort();
+			return originalFind();
+		});
+		let sawQueuedUpdate = false;
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update" && event.child.status === "queued") {
+				sawQueuedUpdate = true;
+			}
+		});
+
+		const admission = root.runRlmChild("revoked before registration", {}, undefined, {
+			signal: controller.signal,
+		});
+
+		await expect(admission).rejects.toThrow("host request authority was revoked");
+		expect(sawQueuedUpdate).toBe(false);
+		expect(internals._activeRlmChildRuns.size).toBe(0);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+		const artifactDir = root.sessionManager.getSessionArtifactDir();
+		if (!artifactDir) throw new Error("Missing session artifact dir");
+		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toEqual([]);
+	});
+
 	it("does not delete a subagent after rlm.delete_subagent authority is revoked", async () => {
 		const childId = "revoked-delete-child";
 		const childDir = join(tempDir, childId);
