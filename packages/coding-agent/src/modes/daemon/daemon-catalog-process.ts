@@ -196,24 +196,28 @@ SEARCH_MAX=65536
 PARSE_MAX=1048576
 PREVIEW_MAX=256
 MAX_METADATA_RESPONSE_BYTES=256*1024
+HEADER_CLASSIFICATION_BYTES=65536
 TRUNCATION_MARKER="... [truncated]"
 def reject(): raise ValueError("invalid")
 def compact_metadata_response(response):
- # json.dumps defaults to ensure_ascii=True. Keep the complete wire response,
- # rather than just metadata, inside the TypeScript-side response cap.
- def encoded_size(): return len(json.dumps(response,separators=(",",":")).encode("ascii"))
+ # Budget the complete protocol envelope, not an assumed metadata shape.
+ # ensure_ascii is explicit because the protocol is newline-delimited ASCII.
+ def encoded_size(): return len(json.dumps(response,separators=(",",":"),ensure_ascii=True).encode("ascii"))
  if encoded_size()<=MAX_METADATA_RESPONSE_BYTES: return
  data=response.get("data")
  if not isinstance(data,dict): reject()
  targets=[]
- def add_target(container,key):
-  if isinstance(container.get(key),str):
-   targets.append((container,key,container[key]))
- add_target(data,"firstMessage"); add_target(data,"allMessagesText"); add_target(data,"name")
- status=data.get("agentStatus")
- if isinstance(status,dict): add_target(status,"summary")
- # Clear every unbounded display field before allocating the remaining escaped-byte
- # budget in a stable priority order. Fields remain present and string typed.
+ # Walk every string value recursively, in insertion/index order. The protocol
+ # currently has a typed metadata shape, but this prevents a future nested
+ # display field from bypassing the full-envelope budget.
+ def collect(container):
+  values=container.items() if isinstance(container,dict) else enumerate(container) if isinstance(container,list) else ()
+  for key,value in values:
+   if isinstance(value,str): targets.append((container,key,value))
+   elif isinstance(value,(dict,list)): collect(value)
+ collect(response)
+ # Clear every string before allocating the remaining escaped-byte budget in a
+ # stable order. Fields remain present and string typed.
  for container,key,_ in targets: container[key]=""
  if encoded_size()>MAX_METADATA_RESPONSE_BYTES: reject()
  for container,key,original in targets:
@@ -222,7 +226,7 @@ def compact_metadata_response(response):
    return original if prefix==length else original[:prefix]+TRUNCATION_MARKER
   # A marker is useful when it fits; otherwise preserve the greatest raw
   # prefix. Either search uses the exact ensure_ascii serialized byte count.
-  use_marker=encoded_size()+len(json.dumps(TRUNCATION_MARKER))<=MAX_METADATA_RESPONSE_BYTES
+  use_marker=encoded_size()+len(json.dumps(TRUNCATION_MARKER,ensure_ascii=True))<=MAX_METADATA_RESPONSE_BYTES
   def fits(prefix):
    container[key]=candidate(prefix) if use_marker else original[:prefix]
    return encoded_size()<=MAX_METADATA_RESPONSE_BYTES
@@ -308,9 +312,15 @@ def scan_metadata(fd,mtime_ms):
     if status in ("active","archived","crash"): state={"status":status}
     elif status in ("hidden","sleep"): state={"status":"archived"}
    elif kind=="agent_status":
+    # Keep the recap schema typed before it crosses the bounded wire. An
+    # arbitrary taskState string is neither an AgentTaskState nor compactable.
     value=entry.get("status")
-    if isinstance(value,dict):
-     agent_status={key:value[key] for key in ("summary","taskState","basedOnMessageCount") if key in value}
+    summary=value.get("summary") if isinstance(value,dict) else None
+    based=value.get("basedOnMessageCount") if isinstance(value,dict) else None
+    if isinstance(summary,str) and isinstance(based,int) and not isinstance(based,bool) and based>=0:
+     agent_status={"summary":summary,"basedOnMessageCount":based}
+     task_state=value.get("taskState")
+     if task_state in ("needs_input","completed"): agent_status["taskState"]=task_state
    if header is None:
     if kind!="session": return {"valid":False}
     header=entry
@@ -364,7 +374,11 @@ def serve(req):
       # An oversized first record can be an incomplete concurrent write. It is
       # distinguishable from an I/O/protocol failure so root classification can
       # ignore it, while registry-reached sessions remain strict.
-      if mode=="header": payload["truncated"]=True; chunks=[]; break
+      if mode=="header":
+       # Return only a small bounded prefix for root classification. It fits
+       # inside the outer 256 KiB envelope; registry-reached headers stay
+       # strict in TypeScript whenever this flag is present.
+       payload["truncated"]=True; chunks=[b"".join(chunks)[:HEADER_CLASSIFICATION_BYTES]]; break
       reject()
     if not payload.get("truncated"): payload["data"]=base64.b64encode(b"".join(chunks)).decode("ascii")
    elif mode=="metadata": payload["data"]=scan_metadata(fd,before.st_mtime_ns/1000000)
@@ -387,7 +401,9 @@ while True:
  if isinstance(request,dict) and request.get("mode")=="metadata" and "data" in response:
   try: compact_metadata_response(response)
   except Exception: response={"error":"failed","id":response.get("id")}
- serialized=json.dumps(response,separators=(",",":"))
+ # This is the exact full response envelope budgeted above. Keep
+ # ensure_ascii explicit: changing a Python default cannot weaken the cap.
+ serialized=json.dumps(response,separators=(",",":"),ensure_ascii=True)
  if len(serialized.encode("ascii"))>MAX_METADATA_RESPONSE_BYTES: sys.exit(1)
  sys.stdout.write(serialized+"\n"); sys.stdout.flush()
 `;
@@ -439,7 +455,11 @@ function isTrustedSessionMetadata(value: unknown): value is TrustedSessionMetada
 			(!metadata.agentStatus ||
 				typeof metadata.agentStatus !== "object" ||
 				typeof (metadata.agentStatus as { summary?: unknown }).summary !== "string" ||
-				typeof (metadata.agentStatus as { basedOnMessageCount?: unknown }).basedOnMessageCount !== "number"))
+				!Number.isSafeInteger((metadata.agentStatus as { basedOnMessageCount?: unknown }).basedOnMessageCount) ||
+				(metadata.agentStatus as { basedOnMessageCount: number }).basedOnMessageCount < 0 ||
+				((metadata.agentStatus as { taskState?: unknown }).taskState !== undefined &&
+					(metadata.agentStatus as { taskState?: unknown }).taskState !== "needs_input" &&
+					(metadata.agentStatus as { taskState?: unknown }).taskState !== "completed")))
 	) {
 		return false;
 	}
@@ -620,12 +640,11 @@ class TrustedReadSession {
 		if (
 			wire.error !== undefined ||
 			(wire.truncated !== undefined && !truncatedHeader) ||
-			(!truncatedHeader &&
-				(mode === "stat"
-					? wire.data !== undefined
-					: mode === "metadata"
-						? !isTrustedSessionMetadata(wire.data)
-						: typeof wire.data !== "string")) ||
+			(mode === "stat"
+				? wire.data !== undefined
+				: mode === "metadata"
+					? !isTrustedSessionMetadata(wire.data)
+					: typeof wire.data !== "string") ||
 			typeof wire.mtimeMs !== "number" ||
 			typeof wire.dev !== "string" ||
 			typeof wire.ino !== "string"
@@ -798,16 +817,27 @@ async function readTrustedRootCandidate(
 	// junk: it may have replaced an identified root before descriptor open.
 	if (header.dev !== listed.dev || header.ino !== listed.ino)
 		throw invalidFamilyTopology("root candidate changed after directory enumeration");
-	if (header.truncated) throw invalidFamilyTopology("session header exceeds the trusted read limit");
 	const line = header.contents.toString("utf8").split(/\r?\n/, 1)[0] ?? "";
 	if (!line.trim()) return undefined;
-	let candidate: { type?: unknown; id?: unknown };
+	let candidate: { type?: unknown; id?: unknown } | undefined;
 	try {
 		candidate = JSON.parse(line) as { type?: unknown; id?: unknown };
 	} catch {
+		// A bounded prefix may end in a concurrent partial write. Only a prefix
+		// that already purports to carry a session or identifier claim is part of
+		// the topology; unrelated incomplete junk remains skippable.
+		if (/^\s*\{[\s\S]*?"type"\s*:\s*"session(?:"|\\|$)|^\s*\{[\s\S]*?"id"\s*:/u.test(line))
+			throw invalidFamilyTopology("session header exceeds the trusted read limit");
 		return undefined;
 	}
-	if (!candidate || typeof candidate !== "object" || candidate.type !== "session") return undefined;
+	if (!candidate || typeof candidate !== "object") return undefined;
+	// A complete prefix carrying either claim is fatal when truncated. A
+	// registry-reached child never calls this root-only classifier and remains
+	// strict unconditionally in readTrustedSession.
+	if (header.truncated && (candidate.type === "session" || candidate.id !== undefined))
+		throw invalidFamilyTopology("session header exceeds the trusted read limit");
+	if (header.truncated) return undefined;
+	if (candidate.type !== "session") return undefined;
 	if (typeof candidate.id !== "string" || candidate.id === "") return undefined;
 	return readTrustedSession(path, reader);
 }
