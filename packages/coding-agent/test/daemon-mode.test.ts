@@ -836,7 +836,7 @@ describe("daemon mode helpers", () => {
 			);
 		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1", undefined, childState.runtime.session);
 		expect(recordDeletion.mock.invocationCallOrder[0]).toBeLessThan(closeSession.mock.invocationCallOrder[1]!);
-		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
+		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed", false);
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 
 		// A registry failure is precommit: keep the live incarnation resident and
@@ -871,7 +871,7 @@ describe("daemon mode helpers", () => {
 		).resolves.toEqual({ deletionDurability: "tombstoned" });
 		expect(retryDeletion).toHaveBeenCalledOnce();
 		expect(closeSession).toHaveBeenCalledTimes(closeCountBeforeFailure + 1);
-		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
+		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed", false);
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
 
@@ -1597,7 +1597,7 @@ describe("daemon mode helpers", () => {
 			expect(readFileSync(join(after.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")).toContain(
 				'"status":"deleted"',
 			);
-			expect(afterInternals.sessions.has(afterChild.activeSessionId)).toBe(false);
+			await vi.waitFor(() => expect(afterInternals.sessions.has(afterChild.activeSessionId)).toBe(false));
 		} finally {
 			rmSync(beforeTempDir, { recursive: true, force: true });
 			rmSync(afterTempDir, { recursive: true, force: true });
@@ -11390,6 +11390,90 @@ function makeAgentFamilyState(
 	} as never;
 	return { state, acceptAgentMessagePrompt };
 }
+
+describe("daemon tombstoned retirement", () => {
+	it("returns from host deletion while an exact tombstoned close remains gated and hidden", async () => {
+		const daemon = new AgentDaemon("/tmp/gated-retirement.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeState("gated-parent");
+		const child = makeState("gated-child", parent.activeSessionId);
+		child.runtime = {
+			...child.runtime,
+			session: { sessionId: "gated-session", sessionFile: "/tmp/child-1.jsonl" },
+		} as ActiveSessionState["runtime"];
+		Object.assign(child.runtime.metadata, { kind: "subagent", rlmChildId: "child-1", sessionDir: "/tmp/child-1" });
+		let release!: () => void;
+		let closed = false;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		}).then(() => {
+			closed = true;
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closingSessions: Map<string, unknown>;
+			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+			isPublicRlmState(state: ActiveSessionState): boolean;
+			recordRlmSubagentDeletion: ReturnType<typeof vi.fn>;
+			readLatestRlmSubagentRegistry: ReturnType<typeof vi.fn>;
+			closeSession: ReturnType<typeof vi.fn>;
+		};
+		internals.sessions.set(parent.activeSessionId, parent);
+		internals.sessions.set(child.activeSessionId, child);
+		internals.readLatestRlmSubagentRegistry = vi.fn(async () => [
+			{ childId: "child-1", sessionDir: "/tmp/child-1", sessionFile: child.runtime.session.sessionFile },
+		]);
+		internals.recordRlmSubagentDeletion = vi.fn(async () => "tombstoned" as const);
+		internals.closeSession = vi.fn(() => {
+			internals.closingSessions.set(child.activeSessionId, {});
+			return gate;
+		});
+		const result = await internals
+			.createSubagentRuntimeHost(parent)
+			.deleteRlmSubagentRuntime("child-1", child.runtime.session);
+		expect(result).toEqual({ deletionDurability: "tombstoned" });
+		expect(internals.recordRlmSubagentDeletion).toHaveBeenCalledOnce();
+		expect(internals.closeSession).toHaveBeenCalledWith(child, "killed", false);
+		expect(internals.recordRlmSubagentDeletion.mock.invocationCallOrder[0]).toBeLessThan(
+			internals.closeSession.mock.invocationCallOrder[0]!,
+		);
+		expect(closed).toBe(false);
+		expect(internals.isPublicRlmState(child)).toBe(false);
+		release();
+		await gate;
+	});
+
+	it("retains a failed physical disposal and retries the exact runtime", async () => {
+		const daemon = new AgentDaemon("/tmp/retry-retirement.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeState("retry-parent");
+		const child = makeState("retry-child", parent.activeSessionId);
+		const dispose = vi.fn(async () => {});
+		child.runtime.dispose = dispose;
+		const disposeFailure = new Error("dispose failed");
+		const internals = daemon as unknown as {
+			closeDisposeErrors: WeakMap<ActiveSessionState, unknown>;
+			failedTombstonedRlmCloses: Map<string, { error?: unknown }>;
+			detachTombstonedClose(parent: ActiveSessionState, child: ActiveSessionState, id: string): void;
+			closeSession: ReturnType<typeof vi.fn>;
+		};
+		internals.closeSession = vi.fn(async () => {
+			internals.closeDisposeErrors.set(child, disposeFailure);
+			throw disposeFailure;
+		});
+		internals.detachTombstonedClose(parent, child, "child-1");
+		await vi.waitFor(() =>
+			expect(internals.failedTombstonedRlmCloses.get(child.activeSessionId)?.error).toBe(disposeFailure),
+		);
+		internals.detachTombstonedClose(parent, child, "child-1");
+		await vi.waitFor(() => expect(internals.failedTombstonedRlmCloses.has(child.activeSessionId)).toBe(false));
+		expect(dispose).toHaveBeenCalledOnce();
+	});
+});
 
 function makeState(activeSessionId: string, parentActiveSessionId?: string): ActiveSessionState {
 	return {

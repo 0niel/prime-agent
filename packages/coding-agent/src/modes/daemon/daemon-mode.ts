@@ -435,6 +435,20 @@ type AgentFamilyCatalogCandidate = AgentFamilyCatalogEntry & {
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
+type DaemonSessionCloseFailureStage = "dispose" | "persist" | "cascade";
+
+/** Daemon-private close diagnostics used only to authorize exact cleanup retry. */
+class DaemonSessionCloseError extends Error {
+	readonly stage: DaemonSessionCloseFailureStage;
+
+	constructor(stage: DaemonSessionCloseFailureStage, cause: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause), { cause });
+		this.name = "DaemonSessionCloseError";
+		this.stage = stage;
+	}
+}
+class PrivateSessionUnavailableError extends BoundSessionUnavailableError {}
+
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = options.socketPath ?? defaultDaemonSocketPath();
 	const daemon = new AgentDaemon(socketPath, options);
@@ -449,6 +463,15 @@ export function isTerminalRemoteAgentMessageError(error: unknown): error is Erro
 			error.message.startsWith("Ambiguous") ||
 			error.message === AGENT_FAMILY_REACH_ERROR)
 	);
+}
+
+interface FailedTombstonedRlmClose {
+	readonly state: ActiveSessionState;
+	readonly parentActiveSessionId: string;
+	readonly childId: string;
+	cleanup?: Promise<void>;
+	error?: unknown;
+	disposeError?: unknown;
 }
 
 export class AgentDaemon {
@@ -493,6 +516,13 @@ export class AgentDaemon {
 			reasonUpgrade?: Promise<void>;
 		}
 	>();
+	/** Exact removed incarnation retained only when its runtime dispose failed. */
+	private readonly failedSessionCloses = new Map<
+		string,
+		{ state: ActiveSessionState; error: DaemonSessionCloseError }
+	>();
+	private readonly failedTombstonedRlmCloses = new Map<string, FailedTombstonedRlmClose>();
+	private readonly closeDisposeErrors = new WeakMap<ActiveSessionState, unknown>();
 	private readonly sideQuestionRuns = new Map<
 		string,
 		{
@@ -1231,6 +1261,7 @@ export class AgentDaemon {
 		};
 		const residentRootPaths = new Set<string>();
 		for (const parentState of this.sessions.values()) {
+			if (!this.isPublicRlmState(parentState)) continue;
 			const parentFile = parentState.runtime.session.sessionFile;
 			// An in-memory session cannot own a persisted registry.
 			if (!parentFile) continue;
@@ -1269,7 +1300,10 @@ export class AgentDaemon {
 	private async buildRlmChildSnapshotsWithPassiveRlmSubagents(
 		rootState: ActiveSessionState,
 	): Promise<AgentConnectionRlmChildAgentSnapshot[]> {
-		const snapshots = buildRlmChildSnapshots(rootState.activeSessionId, [...this.sessions.values()]);
+		const snapshots = buildRlmChildSnapshots(
+			rootState.activeSessionId,
+			[...this.sessions.values()].filter((state) => this.isPublicRlmState(state)),
+		);
 		const residentParentIds = new Set([
 			rootState.activeSessionId,
 			...snapshots.flatMap((snapshot) => (snapshot.activeSessionId ? [snapshot.activeSessionId] : [])),
@@ -2276,7 +2310,7 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		requirePersistedJob: boolean,
 	): boolean {
-		if (this.sessions.get(state.activeSessionId) !== state || this.closingSessions.has(state.activeSessionId)) {
+		if (this.sessions.get(state.activeSessionId) !== state || !this.isPublicRlmState(state)) {
 			return false;
 		}
 		if (!requirePersistedJob) {
@@ -2318,8 +2352,8 @@ export class AgentDaemon {
 		if (this.bindingSessions.has(state.activeSessionId)) {
 			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is still initializing`);
 		}
-		if (this.closingSessions.has(state.activeSessionId) || state.runtime.session.isClosing) {
-			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is closing`);
+		if (this.closingSessions.has(state.activeSessionId) || this.isQuarantinedRlmState(state)) {
+			throw new PrivateSessionUnavailableError(`Active session ${state.activeSessionId} is unavailable`);
 		}
 		return state;
 	}
@@ -2329,6 +2363,7 @@ export class AgentDaemon {
 		try {
 			return this.getBoundSessionState(id);
 		} catch (error) {
+			if (error instanceof PrivateSessionUnavailableError) throw error;
 			if (error instanceof BoundSessionUnavailableError) {
 				return this.waitForHydratingChild(this.getSessionState(id), id);
 			}
@@ -2350,6 +2385,7 @@ export class AgentDaemon {
 		try {
 			return this.getBoundSessionState(id);
 		} catch (error) {
+			if (error instanceof PrivateSessionUnavailableError) throw error;
 			if (error instanceof BoundSessionUnavailableError) {
 				return this.waitForHydratingChild(this.getSessionState(id), id);
 			}
@@ -2404,7 +2440,7 @@ export class AgentDaemon {
 					// Resolve the exact resident incarnation before any tombstone append. An
 					// older finalizer can share both child id and directory with its
 					// replacement, so neither field is an object-identity fence.
-					const state = [...this.sessions.values()].find(
+					const liveState = [...this.sessions.values()].find(
 						(candidate) =>
 							candidate.runtime.metadata.kind === "subagent" &&
 							candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
@@ -2412,10 +2448,11 @@ export class AgentDaemon {
 					);
 					// A same-id republish supersedes an older finalizer without giving it
 					// authority over the replacement.
-					if (state !== undefined && state.runtime.session !== runtime.session) {
+					if (liveState !== undefined && liveState.runtime.session !== runtime.session) {
 						return { deletionDurability: "stale" };
 					}
 					authority?.assertCurrent();
+					const state = liveState ?? this.findExactRlmState(parentState.activeSessionId, options.id, runtime.session);
 					if (
 						!state ||
 						state.runtime.session !== runtime.session ||
@@ -2444,6 +2481,10 @@ export class AgentDaemon {
 					}
 
 					try {
+						if (deletionDurability === "tombstoned") {
+							this.detachTombstonedClose(parentState, state, options.id);
+							return { deletionDurability };
+						}
 						if (deletionDurability === "absent") authority?.assertCurrent();
 						await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
 					} catch (error) {
@@ -2462,7 +2503,7 @@ export class AgentDaemon {
 				this.recordRlmSubagentDeletion(parentState, childId, authority),
 			deleteRlmSubagentRuntime: async (childId, session, authority) => {
 				try {
-					const state = [...this.sessions.values()].find(
+					const liveState = [...this.sessions.values()].find(
 						(candidate) =>
 							candidate.runtime.metadata.kind === "subagent" &&
 							candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
@@ -2470,10 +2511,11 @@ export class AgentDaemon {
 					);
 					// A same-id republish supersedes an older deleter without letting it
 					// mutate the replacement's registry, jobs, or lifetime.
-					if (state !== undefined && session !== undefined && state.runtime.session !== session) {
+					if (liveState !== undefined && session !== undefined && liveState.runtime.session !== session) {
 						return { deletionDurability: "stale" };
 					}
 					authority?.assertCurrent();
+					const state = liveState ?? this.findExactRlmState(parentState.activeSessionId, childId, session);
 					const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
 						(entry) => entry.childId === childId,
 					);
@@ -2547,6 +2589,11 @@ export class AgentDaemon {
 						throw new Error("RLM subagent deletion durability is still unknown");
 					}
 					try {
+						if (deletionDurability === "tombstoned" && state) {
+							this.detachTombstonedClose(parentState, state, childId);
+							if (childSessionFile) this.cancelScheduledJobsForSessionFile(childSessionFile);
+							return { deletionDurability };
+						}
 						if (deletionDurability === "absent") authority?.assertCurrent();
 						if (state) await this.closeSession(state, "killed", false);
 						if (childSessionFile) this.cancelScheduledJobsForSessionFile(childSessionFile);
@@ -3755,7 +3802,7 @@ export class AgentDaemon {
 			case "ack_result":
 				return undefined;
 			case "list": {
-				const activeSessions = Array.from(this.sessions.values());
+				const activeSessions = Array.from(this.sessions.values()).filter((state) => this.isPublicRlmState(state));
 				const scheduledJobs = this.cronStore.list();
 				if (!command.all) {
 					return success(command.id, "list", {
@@ -5457,13 +5504,89 @@ export class AgentDaemon {
 		);
 	}
 
+	private isQuarantinedRlmState(state: ActiveSessionState): boolean {
+		let child = state;
+		const visited = new Set<string>();
+		while (child.runtime.metadata.kind === "subagent") {
+			if (visited.has(child.activeSessionId)) return false;
+			visited.add(child.activeSessionId);
+			const { parentActiveSessionId, rlmChildId } = child.runtime.metadata;
+			if (!parentActiveSessionId || !rlmChildId) return false;
+			const parent = this.sessions.get(parentActiveSessionId);
+			if (!parent) return false;
+			if (parent.runtime.session.isRlmChildDeletionQuarantined?.(rlmChildId) === true) return true;
+			child = parent;
+		}
+		return false;
+	}
+
+	private isPublicRlmState(state: ActiveSessionState): boolean {
+		return !this.closingSessions.has(state.activeSessionId) && !this.isQuarantinedRlmState(state);
+	}
+
+	private findExactRlmState(
+		parentId: string,
+		childId: string,
+		session?: AgentSession,
+	): ActiveSessionState | undefined {
+		return (
+			[...this.failedTombstonedRlmCloses.values()].find(
+				(record) =>
+					record.parentActiveSessionId === parentId &&
+					record.childId === childId &&
+					(!session || record.state.runtime.session === session),
+			)?.state ??
+			[...this.sessions.values()].find((state) => {
+				const metadata = state.runtime.metadata;
+				return (
+					metadata.kind === "subagent" &&
+					metadata.parentActiveSessionId === parentId &&
+					metadata.rlmChildId === childId &&
+					(!session || state.runtime.session === session)
+				);
+			})
+		);
+	}
+
+	private detachTombstonedClose(parent: ActiveSessionState, state: ActiveSessionState, childId: string): void {
+		const existing = this.failedTombstonedRlmCloses.get(state.activeSessionId);
+		if (existing?.state === state) {
+			if (existing.error !== undefined && existing.disposeError !== undefined && !existing.cleanup) {
+				const cleanup = Promise.resolve().then(() => state.runtime.dispose());
+				existing.cleanup = cleanup
+					.then(() => {
+						if (this.failedTombstonedRlmCloses.get(state.activeSessionId) === existing)
+							this.failedTombstonedRlmCloses.delete(state.activeSessionId);
+					})
+					.catch((error: unknown) => {
+						existing.error = error;
+						existing.disposeError = error;
+						existing.cleanup = undefined;
+					});
+			}
+			return;
+		}
+		const record: FailedTombstonedRlmClose = { state, parentActiveSessionId: parent.activeSessionId, childId };
+		this.failedTombstonedRlmCloses.set(state.activeSessionId, record);
+		void this.closeSession(state, "killed", false).then(
+			() => {
+				if (this.failedTombstonedRlmCloses.get(state.activeSessionId) === record)
+					this.failedTombstonedRlmCloses.delete(state.activeSessionId);
+			},
+			(error: unknown) => {
+				record.error = error;
+				record.disposeError = this.closeDisposeErrors.get(state);
+			},
+		);
+	}
+
 	// Half-bound sessions are hidden from other sessions' listings; the current
 	// session stays visible to itself (controllers run during its own bind).
 	private listTargetableSessionStates(current: ActiveSessionState): ActiveSessionState[] {
 		return [...this.sessions.values()].filter(
 			(state) =>
-				state.activeSessionId === current.activeSessionId ||
-				(!this.bindingSessions.has(state.activeSessionId) && !this.closingSessions.has(state.activeSessionId)),
+				this.isPublicRlmState(state) &&
+				(state.activeSessionId === current.activeSessionId || !this.bindingSessions.has(state.activeSessionId)),
 		);
 	}
 
@@ -6671,8 +6794,10 @@ export class AgentDaemon {
 		let disposeError: unknown;
 		try {
 			await state.runtime.dispose();
+			this.closeDisposeErrors.delete(state);
 		} catch (error) {
 			disposeError = error;
+			this.closeDisposeErrors.set(state, error);
 		}
 		for (const client of state.clients) {
 			abortClientSnapshotStreaming(client, state.activeSessionId);
