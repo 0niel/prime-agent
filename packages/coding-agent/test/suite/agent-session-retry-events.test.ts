@@ -249,7 +249,10 @@ describe("AgentSession retry and event characterization", () => {
 		});
 	}
 
-	it("does not outer-retry intercept provider errors", async () => {
+	it.each([
+		"unknown after provider",
+		"401 status code: unauthorized API key",
+	])("does not outer-retry intercept provider error: %s", async (errorMessage) => {
 		const harness = await createHarness({
 			provider: "intercept",
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
@@ -257,7 +260,7 @@ describe("AgentSession retry and event characterization", () => {
 		harnesses.push(harness);
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
 		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage: "unknown after provider" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage }),
 			fauxAssistantMessage("must not make a second logical request"),
 		]);
 

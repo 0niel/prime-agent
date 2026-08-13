@@ -3568,7 +3568,9 @@ export class AgentSession {
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			const concreteAuthFailure = this._isConcreteProviderAuthFailure(msg);
 			const retryConcreteAuthFailure =
-				concreteAuthFailure && !this._isStructuredPermanentProviderRetryExhausted(msg);
+				msg.provider !== "intercept" &&
+				concreteAuthFailure &&
+				!this._isStructuredPermanentProviderRetryExhausted(msg);
 			if (this._isRetryableError(msg) || retryConcreteAuthFailure) {
 				if (retryConcreteAuthFailure) {
 					this._captureRetryAuthFailureSource(msg);
