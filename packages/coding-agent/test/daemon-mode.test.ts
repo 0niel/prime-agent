@@ -779,7 +779,10 @@ describe("daemon mode helpers", () => {
 		let internals: {
 			sessions: Map<string, ActiveSessionState>;
 			closeSession: (state: ActiveSessionState, reason: "completed" | "killed") => Promise<void>;
-			recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<boolean>;
+			recordRlmSubagentDeletion(
+				parentState: ActiveSessionState,
+				childId: string,
+			): Promise<"absent" | "tombstoned" | "unknown">;
 			createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
 		};
 		const closeSession = vi.fn(async (state: ActiveSessionState) => {
@@ -789,7 +792,7 @@ describe("daemon mode helpers", () => {
 		internals.sessions.set(parentState.activeSessionId, parentState);
 		internals.sessions.set(childState.activeSessionId, childState);
 		internals.closeSession = closeSession;
-		const recordDeletion = vi.fn(async () => true);
+		const recordDeletion = vi.fn(async () => "tombstoned" as const);
 		internals.recordRlmSubagentDeletion = recordDeletion;
 
 		await internals
@@ -816,7 +819,7 @@ describe("daemon mode helpers", () => {
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 
 		// A registry failure must not strand the cancelled child as a stale resident session,
-		// and must tell the caller to remove its never-admitted artifact dir.
+		// but must retain the artifact because durability is unknown.
 		internals.sessions.set(childState.activeSessionId, childState);
 		internals.recordRlmSubagentDeletion = vi.fn(async () => {
 			throw new Error("registry write failed");
@@ -829,7 +832,7 @@ describe("daemon mode helpers", () => {
 					{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
 					"cancelled",
 				),
-		).resolves.toEqual({ retained: false });
+		).resolves.toEqual({ deletionDurability: "unknown" });
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
@@ -881,7 +884,7 @@ describe("daemon mode helpers", () => {
 			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
 
 			// A real resident child with its row removed has no durable owner. The host
-			// still closes it, and explicitly returns retained:false.
+			// still closes it, and explicitly proves the artifact is absent.
 			const noRowOptions = optionsFor("release-no-row");
 			const noRowRuntime = await internals.createRlmSubagentRuntime(parentState, noRowOptions);
 			writeFileSync(
@@ -893,7 +896,7 @@ describe("daemon mode helpers", () => {
 					.join("\n")}\n`,
 			);
 			await expect(host.releaseRlmSubagentRuntime?.(noRowRuntime, noRowOptions, "cancelled")).resolves.toEqual({
-				retained: false,
+				deletionDurability: "absent",
 			});
 			expect([...internals.sessions.values()].some((state) => state.runtime.session === noRowRuntime.session)).toBe(
 				false,
@@ -904,24 +907,43 @@ describe("daemon mode helpers", () => {
 			const retainedRuntime = await internals.createRlmSubagentRuntime(parentState, retainedOptions);
 			await expect(host.releaseRlmSubagentRuntime?.(retainedRuntime, retainedOptions, "cancelled")).resolves.toEqual(
 				{
-					retained: true,
+					deletionDurability: "tombstoned",
 				},
 			);
 			expect(readFileSync(registryPath, "utf8")).toContain('"childId":"release-tombstoned"');
 			expect(readFileSync(registryPath, "utf8")).toContain('"status":"deleted"');
 
 			// A deterministic append/fsync failure likewise closes the real resident
-			// runtime but cannot claim durable ownership of its artifact directory.
+			// runtime but leaves durable ownership unknown, so the caller retains it.
 			const failedOptions = optionsFor("release-write-failed");
 			const failedRuntime = await internals.createRlmSubagentRuntime(parentState, failedOptions);
 			const append = vi.spyOn(internals, "appendRlmSubagentRegistryEntry").mockReturnValue(false);
 			await expect(host.releaseRlmSubagentRuntime?.(failedRuntime, failedOptions, "cancelled")).resolves.toEqual({
-				retained: false,
+				deletionDurability: "unknown",
 			});
 			expect(append).toHaveBeenCalledWith(parentState, expect.objectContaining({ status: "deleted" }));
 			expect([...internals.sessions.values()].some((state) => state.runtime.session === failedRuntime.session)).toBe(
 				false,
 			);
+
+			// A malformed registry history cannot prove that a child is absent.
+			const malformedOptions = optionsFor("release-malformed");
+			const malformedRuntime = await internals.createRlmSubagentRuntime(parentState, malformedOptions);
+			writeFileSync(registryPath, `${readFileSync(registryPath, "utf8")}not-json\n`);
+			await expect(
+				host.releaseRlmSubagentRuntime?.(malformedRuntime, malformedOptions, "cancelled"),
+			).resolves.toEqual({ deletionDurability: "unknown" });
+
+			// An unreadable registry has the same fail-closed result, rather than
+			// treating the missing child row as authority to remove artifacts.
+			append.mockRestore();
+			const readFaultOptions = optionsFor("release-read-fault");
+			const readFaultRuntime = await internals.createRlmSubagentRuntime(parentState, readFaultOptions);
+			rmSync(registryPath);
+			mkdirSync(registryPath);
+			await expect(
+				host.releaseRlmSubagentRuntime?.(readFaultRuntime, readFaultOptions, "cancelled"),
+			).resolves.toEqual({ deletionDurability: "unknown" });
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

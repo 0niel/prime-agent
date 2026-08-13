@@ -100,7 +100,11 @@ import {
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
-import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
+import type {
+	CreateRlmSubagentRuntimeOptions,
+	RlmSubagentDeletionDurability,
+	SubagentRuntimeHost,
+} from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
 	type IdleEvictionMinutes,
@@ -967,27 +971,75 @@ export class AgentDaemon {
 		});
 	}
 
-	/** Write (or verify) the deletion tombstone and report whether durable ownership exists. */
-	private async recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<boolean> {
-		const latest = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
-			(entry) => entry.childId === childId,
-		);
-		if (!latest) {
-			return false;
+	/**
+	 * Strictly read the registry when absence would authorize destructive cleanup.
+	 * Passive discovery may skip a corrupt historical line, but deletion must not
+	 * mistake that ambiguity for proof that a child was never recorded.
+	 */
+	private async readCompleteRlmSubagentRegistryForDeletion(
+		parentState: ActiveSessionState,
+	): Promise<PersistedRlmSubagentRegistryEntry[] | undefined> {
+		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
+		if (!path) return undefined;
+		let lines: string[];
+		try {
+			lines = (await readFile(path, "utf8")).split(/\r?\n/);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+			this.log(
+				`failed to read RLM subagent registry for deletion: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return undefined;
 		}
-		if (latest.status === "deleted") {
-			return true;
+		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			try {
+				const entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
+				if (
+					entry.type !== "rlm_subagent" ||
+					typeof entry.childId !== "string" ||
+					typeof entry.sessionName !== "string" ||
+					typeof entry.sessionDir !== "string" ||
+					typeof entry.sessionFile !== "string" ||
+					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
+					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
+					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
+				) {
+					return undefined;
+				}
+				latest.set(entry.childId, entry as PersistedRlmSubagentRegistryEntry);
+			} catch {
+				return undefined;
+			}
+		}
+		return [...latest.values()];
+	}
+
+	private async recordRlmSubagentDeletion(
+		parentState: ActiveSessionState,
+		childId: string,
+	): Promise<RlmSubagentDeletionDurability> {
+		const latest = await this.readCompleteRlmSubagentRegistryForDeletion(parentState);
+		if (!latest) return "unknown";
+		const entry = latest.find((candidate) => candidate.childId === childId);
+		if (!entry) {
+			return "absent";
+		}
+		if (entry.status === "deleted") {
+			return "tombstoned";
 		}
 		if (
 			!this.appendRlmSubagentRegistryEntry(parentState, {
-				...latest,
+				...entry,
 				status: "deleted",
 				updatedAt: new Date().toISOString(),
 			})
 		) {
-			throw new Error(`Failed to persist deletion for RLM subagent ${childId}`);
+			return "unknown";
 		}
-		return true;
+		return "tombstoned";
 	}
 
 	private readLatestRlmSubagentRegistry(
@@ -2259,16 +2311,15 @@ export class AgentDaemon {
 				});
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
-				// A caller may only retain a never-admitted cancelled child when the
-				// deletion tombstone is durably written. Close it on any write failure,
-				// then explicitly return that the caller still owns its artifact dir.
-				let retained = false;
+				// Preserve the three-way durability proof through release. A failed
+				// lookup/write is not the same as a verified no-row result.
+				let deletionDurability: RlmSubagentDeletionDurability = "unknown";
 				if (status === "cancelled") {
 					try {
-						retained = await this.recordRlmSubagentDeletion(parentState, options.id);
+						deletionDurability = await this.recordRlmSubagentDeletion(parentState, options.id);
 					} catch {
-						// The close below prevents a stale resident runtime; the caller removes
-						// its exact never-admitted child dir because no durable row exists.
+						// A defensive fail-closed boundary for injected/legacy persistence
+						// implementations which still throw rather than return unknown.
 					}
 				}
 				const state = [...this.sessions.values()].find(
@@ -2283,8 +2334,9 @@ export class AgentDaemon {
 				} else {
 					await runtime.session.disposeAsync();
 				}
-				return { retained };
+				return { deletionDurability };
 			},
+			resolveRlmSubagentDeletion: (childId) => this.recordRlmSubagentDeletion(parentState, childId),
 			deleteRlmSubagentRuntime: async (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>

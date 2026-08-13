@@ -7,6 +7,6 @@ declare module "../src/core/rlm-runtime.js" {
 			runtime: RlmSubagentRuntime,
 			options: CreateRlmSubagentRuntimeOptions,
 			status: "done" | "error" | "cancelled",
-		) => Promise<{ retained: boolean }>;
+		) => Promise<{ deletionDurability: "absent" | "tombstoned" | "unknown" }>;
 	}
 }

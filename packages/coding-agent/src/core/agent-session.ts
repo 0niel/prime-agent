@@ -228,6 +228,7 @@ import {
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
 	type RlmSpawnHandle,
+	type RlmSubagentDeletionDurability,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
@@ -1227,6 +1228,10 @@ export class AgentSession {
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
 	private _rlmChildCleanupFailures = new Map<string, RlmSubagentRegistryEntry>();
+	// A cancelled spawn whose durable deletion could not be proven has no public
+	// lifecycle status. Keep its private cleanup lease through finalization until a
+	// host later proves absence or a durable tombstone.
+	private _rlmChildDeletionQuarantines = new Map<string, RlmSubagentRegistryEntry>();
 	private _deletingRlmChildren = new Map<
 		string,
 		{
@@ -7307,6 +7312,11 @@ export class AgentSession {
 			(childId) => !this._activeRlmChildRuns.get(childId)?.detachedDeletion,
 		);
 		await Promise.allSettled(childIds.map((childId) => this.deleteRlmSubagent(childId)));
+		await Promise.allSettled(
+			[...this._rlmChildDeletionQuarantines.keys()].map((childId) =>
+				this._resolveRlmChildDeletionQuarantine(childId),
+			),
+		);
 	}
 
 	/**
@@ -9268,7 +9278,8 @@ export class AgentSession {
 			if (
 				this._deletingRlmChildren.has(childId) ||
 				recorded.has(childId) ||
-				this._rlmChildCleanupFailures.has(childId)
+				this._rlmChildCleanupFailures.has(childId) ||
+				this._rlmChildDeletionQuarantines.has(childId)
 			) {
 				continue;
 			}
@@ -9294,6 +9305,7 @@ export class AgentSession {
 				this._deletingRlmChildren.has(childId) ||
 				this._deletedRlmChildIds.has(childId) ||
 				this._rlmChildCleanupFailures.has(childId) ||
+				this._rlmChildDeletionQuarantines.has(childId) ||
 				!daemonChild.sessionDir
 			) {
 				continue;
@@ -9468,6 +9480,26 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Reconcile a private cancelled-spawn cleanup lease. `false` deliberately
+	 * means that durability is still unknown, never that deletion succeeded.
+	 */
+	private async _resolveRlmChildDeletionQuarantine(childId: string): Promise<boolean> {
+		const lease = this._rlmChildDeletionQuarantines.get(childId);
+		if (!lease || this._disposed || this._disposing) return false;
+		const durability = await this._subagentRuntimeHost?.resolveRlmSubagentDeletion?.(childId);
+		if (durability === "unknown" || durability === undefined) return false;
+		if (durability === "absent") {
+			// This is the sole path which removes the exact quarantined directory.
+			rmSync(lease.session_dir, { recursive: true, force: true });
+		}
+		// A durable tombstone owns the retained artifact; absence proves this exact
+		// directory is removable. Either conclusion discharges the private lease.
+		this._rlmChildDeletionQuarantines.delete(childId);
+		this._deletedRlmChildIds.add(childId);
+		return true;
+	}
+
 	private _deleteRlmSubagentSession(childId: string, session?: AgentSession): Promise<void> {
 		if (this._subagentRuntimeHost) {
 			return this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
@@ -9481,6 +9513,8 @@ export class AgentSession {
 		this._rlmChildUnsubscribes.delete(childId);
 		this._rlmChildSessions.delete(childId);
 		this._rlmChildCleanupFailures.delete(childId);
+		// Do not clear an unknown-deletion lease here: finalization is precisely the
+		// boundary it must survive.
 		if (!run || this._activeRlmChildRuns.get(childId) === run) {
 			this._activeRlmChildRuns.delete(childId);
 		}
@@ -9920,9 +9954,9 @@ export class AgentSession {
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
 			// A release hook is not itself proof that a cancelled, never-admitted
-			// child is durably unreachable. Only its verified retention outcome may
-			// preserve the artifact directory.
-			let releaseRetained = false;
+			// child is durably unreachable. Preserve uncertainty rather than deleting
+			// an artifact whose durable owner cannot be proven.
+			let deletionDurability: RlmSubagentDeletionDurability = "unknown";
 			try {
 				throwIfCancelled();
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
@@ -10043,7 +10077,7 @@ export class AgentSession {
 						await this._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
 							.then((outcome) => {
-								releaseRetained = outcome.retained;
+								deletionDurability = outcome.deletionDurability;
 							})
 							.catch(() => void child.disposeAsync().catch(() => undefined));
 					} else {
@@ -10089,8 +10123,13 @@ export class AgentSession {
 							subagentOptions,
 							run.status === "cancelled" ? "cancelled" : "error",
 						);
-						releaseRetained = outcome.retained;
-						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
+						deletionDurability = outcome.deletionDurability;
+						if (
+							run.status === "cancelled" &&
+							deletionDurability !== "unknown" &&
+							!this._disposed &&
+							!this._disposing
+						) {
 							this._deletedRlmChildIds.add(run.id);
 							this._removeRlmSubagentTracking(run.id);
 						}
@@ -10105,6 +10144,9 @@ export class AgentSession {
 							await childSession.disposeAsync();
 						}
 						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
+							// The known dispose-only host owns no durable registry, so a successful
+							// fallback delete is affirmative absence rather than an I/O guess.
+							deletionDurability = "absent";
 							this._deletedRlmChildIds.add(run.id);
 							this._removeRlmSubagentTracking(run.id);
 						}
@@ -10112,11 +10154,25 @@ export class AgentSession {
 						// A failed best-effort retry remains available through the retained cleanup maps.
 					}
 				}
-				// A never-admitted cancelled child's dir is an orphan unless the release
-				// path verified durable ownership (for example, a daemon tombstone). A
-				// hook's presence alone does not make its artifact tree recoverable.
-				if (!admissionCommitted && run.status === "cancelled" && !run.detachedDeletion && !releaseRetained) {
-					rmSync(childSessionDir, { recursive: true, force: true });
+				// Only an authoritative, successful no-row result proves this exact
+				// never-admitted dir is ours to remove. A durable tombstone retains it;
+				// ambiguity is quarantined privately rather than being coerced into an
+				// active, idle, or inactive public child.
+				if (!admissionCommitted && run.status === "cancelled" && !run.detachedDeletion) {
+					if (deletionDurability === "absent") {
+						rmSync(childSessionDir, { recursive: true, force: true });
+					} else if (deletionDurability === "unknown" && !this._disposed && !this._disposing) {
+						// Preserve a private cleanup lease through finalization. Unlike an
+						// explicit-delete failure, it is neither listed nor selector-addressable.
+						this._rlmChildDeletionQuarantines.set(run.id, {
+							rlm_child_id: run.id,
+							active_session_id: null,
+							session_id: childSession?.sessionId ?? null,
+							session_name: sessionName,
+							session_dir: childSessionDir,
+							status: "error",
+						});
+					}
 				}
 			} finally {
 				if (run.detachedDeletion && childRuntime) {
@@ -10136,8 +10192,18 @@ export class AgentSession {
 						run.abort = noopRlmChildAbort;
 						run.unsubscribe = undefined;
 						run.session = undefined;
-					} else if (run.status !== "error" || run.detachedDeletion) {
+					} else if (
+						(run.status !== "error" || run.detachedDeletion) &&
+						!this._rlmChildCleanupFailures.has(run.id)
+					) {
 						this._removeRlmSubagentTracking(run.id, run);
+					} else if (this._rlmChildCleanupFailures.has(run.id)) {
+						// Unknown durability has a retry record but is not an active product
+						// child. Drop live tracking without clearing that internal record.
+						this._activeRlmChildRuns.delete(run.id);
+						run.unsubscribe?.();
+						run.abort = noopRlmChildAbort;
+						run.unsubscribe = undefined;
 					} else {
 						run.unsubscribe?.();
 						run.abort = noopRlmChildAbort;
