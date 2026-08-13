@@ -16,13 +16,13 @@ import {
 	getCatalogHelperSpawnCountForTest,
 	getOpenCatalogAuthorityFdCountForTest,
 	listCatalogFamilySessions,
+	listCatalogFamilySessionsWithLimitForTest,
 	listSavedSessionSiblings,
 	resolveCatalogSessionMatch,
 	setCatalogAfterHelperResponseForTest,
 	setCatalogAfterTrustedHeaderForTest,
 	setCatalogBeforeTrustedOpenForTest,
 	setCatalogHelperLaunchForTest,
-	setCatalogMaxRlmFamilyNodesForTest,
 } from "../src/modes/daemon/daemon-catalog-process.js";
 
 function session(id: string, name: string | undefined, path: string): SessionInfo {
@@ -884,21 +884,21 @@ describe("daemon catalog selector resolution", () => {
 			trustedOpens++;
 		});
 		try {
-			// The narrow limit hook proves both the exact-limit success case and
-			// over-limit failure without creating 10,001 filesystem entries.
-			setCatalogMaxRlmFamilyNodesForTest(1);
-			await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([
+			// The per-call helper proves exact/over behavior without mutable global
+			// security state or creating 10,001 filesystem entries.
+			await expect(listCatalogFamilySessionsWithLimitForTest(sessionDir, 1)).resolves.toEqual([
 				expect.objectContaining({ id: "parent" }),
 			]);
 			expect(trustedOpens).toBeGreaterThan(0);
 			trustedOpens = 0;
 			writeFileSync(join(sessionDir, "unrelated.jsonl"), "not json\n");
-			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("family node limit exhausted");
+			await expect(listCatalogFamilySessionsWithLimitForTest(sessionDir, 1)).rejects.toThrow(
+				"family node limit exhausted during root discovery",
+			);
 			// No candidate descriptor may be opened, classified, or metadata-scanned
 			// after discovery proves the family is over the hard bound.
 			expect(trustedOpens).toBe(0);
 		} finally {
-			setCatalogMaxRlmFamilyNodesForTest(undefined);
 			setCatalogBeforeTrustedOpenForTest(undefined);
 			rmSync(root, { recursive: true, force: true });
 		}

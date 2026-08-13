@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, lstatSync, openSync, readdirSync } from "node:fs";
+import { closeSync, constants, lstatSync, opendirSync, openSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import { getSessionsDir } from "../../config.js";
@@ -81,16 +81,10 @@ const MAX_RLM_FAMILY_EDGES = 10_000;
 const MAX_RLM_FAMILY_NODES = 10_000;
 const MAX_RLM_FAMILY_DEPTH = 64;
 
-// A narrow test seam avoids creating ten thousand filesystem entries merely to
-// verify that root enumeration fails before opening any candidate descriptor.
-let maxRlmFamilyNodesForTest: number | undefined;
-/** @internal */
-export function setCatalogMaxRlmFamilyNodesForTest(limit: number | undefined): void {
-	maxRlmFamilyNodesForTest = limit;
-}
-
-function maxRlmFamilyNodes(): number {
-	return maxRlmFamilyNodesForTest ?? MAX_RLM_FAMILY_NODES;
+function validateFamilyNodeLimit(limit: number): void {
+	if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_RLM_FAMILY_NODES) {
+		throw new Error("Invalid catalog family node limit");
+	}
 }
 
 interface ManagedRoot {
@@ -1078,35 +1072,57 @@ async function readLatestRegistry(
 	return [...latest.values()];
 }
 
-function listSessionCandidates(sessionDir: string): Array<{ path: string; dev: string; ino: string }> {
+function listSessionCandidates(sessionDir: string, limit: number): Array<{ path: string; dev: string; ino: string }> {
+	let directory: ReturnType<typeof opendirSync>;
 	try {
-		const candidates: Array<{ path: string; dev: string; ino: string }> = [];
-		const limit = maxRlmFamilyNodes();
-		for (const entry of readdirSync(sessionDir)) {
-			if (!entry.endsWith(".jsonl")) continue;
-			const path = join(resolve(sessionDir), entry);
-			try {
-				const stat = lstatSync(path);
-				// Count every stable root candidate, including junk and duplicate ids,
-				// before opening a descriptor or scanning metadata. Removed entries
-				// retain their historical behavior and never become candidates.
-				candidates.push({ path, dev: String(stat.dev), ino: String(stat.ino) });
-				if (candidates.length > limit) throw invalidFamilyTopology("family node limit exhausted");
-			} catch (error) {
-				if ((error as Error).message.includes("family node limit exhausted")) throw error;
-				// Removed during enumeration: it was never a stable root candidate.
-			}
-		}
-		return candidates;
+		directory = opendirSync(sessionDir);
 	} catch (error) {
-		if ((error as Error).message.includes("family node limit exhausted")) throw error;
-		return [];
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
 	}
+
+	const candidates: Array<{ path: string; dev: string; ino: string }> = [];
+	const limitExceeded = Symbol("catalog root discovery limit exceeded");
+	try {
+		try {
+			while (true) {
+				const entry = directory.readSync();
+				if (!entry) break;
+				if (!entry.name.endsWith(".jsonl")) continue;
+				const path = join(resolve(sessionDir), entry.name);
+				let stat: ReturnType<typeof lstatSync>;
+				try {
+					stat = lstatSync(path);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+						// Removed during enumeration: it was never a stable root candidate.
+						continue;
+					}
+					throw error;
+				}
+				candidates.push({ path, dev: String(stat.dev), ino: String(stat.ino) });
+				// Stop immediately at limit + 1. No further directory entries are read,
+				// and no candidate descriptor is opened from an incomplete root set.
+				if (candidates.length > limit) throw limitExceeded;
+			}
+		} catch (error) {
+			if (error === limitExceeded) {
+				throw invalidFamilyTopology("family node limit exhausted during root discovery");
+			}
+			throw error;
+		}
+	} finally {
+		directory.closeSync();
+	}
+	return candidates;
 }
 
-export async function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
+async function listCatalogFamilySessionsWithLimit(
+	sessionDir: string | undefined,
+	limit: number,
+): Promise<SessionInfo[]> {
 	const effectiveSessionDir = sessionDir ?? getSessionsDir();
-	const roots = listSessionCandidates(effectiveSessionDir);
+	const roots = listSessionCandidates(effectiveSessionDir, limit);
 	const authority = managedRoots(effectiveSessionDir);
 	const reader = new TrustedReadSession(authority);
 	let result: SessionInfo[] | undefined;
@@ -1194,8 +1210,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				) {
 					throw invalidFamilyTopology("family contains a conflicting duplicate");
 				}
-				if (!existing && sessions.size >= maxRlmFamilyNodes())
-					throw invalidFamilyTopology("family node limit exhausted");
+				if (!existing && sessions.size >= limit) throw invalidFamilyTopology("family node limit exhausted");
 				ids.set(child.id, child.path);
 				sessions.set(child.path, child);
 				await visit(child, depth + 1, childAncestors);
@@ -1222,6 +1237,19 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 	if (cleanupFailure !== undefined) throw cleanupFailure;
 	return result!;
 }
+/** @internal Deterministic per-call limit seam for root-discovery tests. */
+export function listCatalogFamilySessionsWithLimitForTest(
+	sessionDir: string | undefined,
+	limit: number,
+): Promise<SessionInfo[]> {
+	validateFamilyNodeLimit(limit);
+	return listCatalogFamilySessionsWithLimit(sessionDir, limit);
+}
+
+export function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
+	return listCatalogFamilySessionsWithLimit(sessionDir, MAX_RLM_FAMILY_NODES);
+}
+
 export async function listSavedSessionSiblings(sessionPath: string, sessionDir?: string): Promise<SessionInfo[]> {
 	const family = await listCatalogFamilySessions(sessionDir);
 	const targetPath = resolve(sessionPath);
