@@ -589,6 +589,22 @@ describe("buildRlmChildSnapshots", () => {
 		expect(snapshots.map((snapshot) => [snapshot.id, snapshot.status])).toEqual([["sub-aaa", "running"]]);
 	});
 
+	it("omits a precommit-quarantined resident child from attach snapshots", () => {
+		const parent = makeState({ activeSessionId: "parent", quarantinedRlmChildren: ["sub-private"] });
+		const privateChild = makeState({
+			activeSessionId: "private-child",
+			metadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "sub-private" },
+		});
+		const visibleChild = makeState({
+			activeSessionId: "visible-child",
+			metadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "sub-visible" },
+		});
+
+		expect(buildRlmChildSnapshots("parent", [parent, privateChild, visibleChild])).toMatchObject([
+			{ id: "sub-visible" },
+		]);
+	});
+
 	it("keeps terminal run status while projecting a retained child's active follow-up", () => {
 		const parent = makeState({
 			activeSessionId: "parent",
@@ -692,6 +708,7 @@ interface StateOptions {
 	hasUserContent?: boolean;
 	summaryState?: ActiveSessionState["summaryState"];
 	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
+	quarantinedRlmChildren?: string[];
 	hasRunningRlmChildren?: boolean;
 	hasAcceptedPromptInFlight?: boolean;
 	unfinishedActionCount?: number;
@@ -742,6 +759,8 @@ function makeState(options: StateOptions): ActiveSessionState {
 				},
 				messages: options.messages ?? ([] as AgentMessage[]),
 				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
+				isRlmChildDeletionQuarantined: (childId: string) =>
+					options.quarantinedRlmChildren?.includes(childId) ?? false,
 				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
 				hasAcceptedPromptInFlight: options.hasAcceptedPromptInFlight ?? false,
 				unfinishedActionCount: options.unfinishedActionCount ?? (options.hasAcceptedPromptInFlight ? 1 : 0),

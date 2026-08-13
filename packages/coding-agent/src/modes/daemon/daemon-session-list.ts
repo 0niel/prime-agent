@@ -354,6 +354,11 @@ export function buildRlmChildSnapshots(
 	const visit = (parent: ActiveSessionState | undefined, parentActiveSessionId: string): void => {
 		const parentNodeId = parent?.runtime.metadata.rlmChildId;
 		for (const child of childrenByParent.get(parentActiveSessionId) ?? []) {
+			const childId = child.runtime.metadata.rlmChildId;
+			// A precommit release failure retains a resident runtime only for exact
+			// tombstone-and-close retry. It is not a public child, and neither are any
+			// descendants reachable solely through that private runtime.
+			if (childId && parent?.runtime.session.isRlmChildDeletionQuarantined(childId)) continue;
 			snapshots.push(rlmChildSnapshotForActiveSession(child, child.runtime.metadata, parentNodeId, parent));
 			// A child passes its own node id to its children as their parent id.
 			visit(child, child.activeSessionId);
