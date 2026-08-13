@@ -900,6 +900,57 @@ describe("daemon catalog selector resolution", () => {
 		);
 		rmSync(partialEscape);
 
+		// Invalid escapes in a terminated unrelated value must not conceal later
+		// outer claims in the bounded helper prefix.
+		for (const [name, malformed] of [
+			["invalid-simple-escape", "\\q"],
+			["invalid-unicode-escape", "\\u12xz"],
+		] as const) {
+			const file = join(sessionDir, `${name}.jsonl`);
+			writeFileSync(file, `{"junk":"${malformed}","\\u0069d":"claimed","padding":"${"x".repeat(200 * 1024)}"}`);
+			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+				"session header exceeds the trusted read limit",
+			);
+			rmSync(file);
+		}
+
+		const malformedUnicodeBeforeEscapedType = join(sessionDir, "invalid-unicode-before-escaped-type.jsonl");
+		writeFileSync(
+			malformedUnicodeBeforeEscapedType,
+			`{"junk":"\\u12xz","\\u0074ype":"\\u0073ession","padding":"${"x".repeat(200 * 1024)}"}`,
+		);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(malformedUnicodeBeforeEscapedType);
+
+		const malformedNested = join(sessionDir, "malformed-nested-value.jsonl");
+		writeFileSync(malformedNested, `{"junk":{"inner":"\\q"},"id":"claimed","padding":"${"x".repeat(200 * 1024)}"}`);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(malformedNested);
+
+		for (const [name, typeValue, id] of [
+			["null-type-before-id", "null", '"claimed"'],
+			["object-type-before-escaped-id", '{"nested":"value"}', '"claimed"'],
+			["array-type-before-id", '["value"]', '"claimed"'],
+		] as const) {
+			const file = join(sessionDir, `${name}.jsonl`);
+			writeFileSync(file, `{"type":${typeValue},"\\u0069d":${id},"padding":"${"x".repeat(200 * 1024)}"}`);
+			await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+				"session header exceeds the trusted read limit",
+			);
+			rmSync(file);
+		}
+
+		// Once the bounded scanner reaches the outer close without a claim, an
+		// otherwise malformed unrelated record remains safely skippable.
+		const malformedUnrelated = join(sessionDir, "malformed-unrelated-junk.jsonl");
+		writeFileSync(malformedUnrelated, `{"junk":"\\q","padding":"${"x".repeat(200 * 1024)}"}`);
+		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([expect.objectContaining({ id: "parent" })]);
+		rmSync(malformedUnrelated);
+
 		writeFileSync(
 			join(sessionDir, "escaped-unrelated-junk.jsonl"),
 			`{"\\u006aunk":"\\u0073ession","padding":"${"x".repeat(200 * 1024)}"}\n`,
