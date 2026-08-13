@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -20,8 +20,33 @@ function record(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
+function residentWorkerDescriptorPath(agentDir: string): string {
+	const workersRoot = join(agentDir, "daemon-workers");
+	for (const directory of readdirSync(workersRoot)) {
+		const candidate = join(workersRoot, directory);
+		const descriptor = readdirSync(candidate).find((name) => name.endsWith(".json"));
+		if (descriptor) return join(candidate, descriptor);
+	}
+	throw new Error("Resident worker descriptor was not persisted");
+}
+
+async function waitForFailedResidentWorker(descriptorPath: string): Promise<void> {
+	const deadline = Date.now() + 15_000;
+	while (Date.now() < deadline) {
+		try {
+			const descriptor = JSON.parse(readFileSync(descriptorPath, "utf8")) as { lifecycle?: unknown };
+			if (descriptor.lifecycle === "failed") return;
+		} catch {
+			// Recovery is still updating the descriptor.
+		}
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+	}
+	throw new Error("Resident ACP worker did not enter the fresh-environment recovery state");
+}
+
 async function stopChild(child: ChildProcess): Promise<void> {
 	if (child.exitCode !== null || child.signalCode !== null) return;
+	child.stdin?.end();
 	const exited = once(child, "exit").then(() => undefined);
 	const exitedGracefully = await Promise.race([
 		exited.then(() => true),
@@ -154,7 +179,9 @@ function writeModels(agentDir: string, baseUrl: string): void {
 				fixture: {
 					baseUrl,
 					api: "openai-completions",
-					apiKey: "fixture-key",
+					// Resolve it afresh from the worker's live environment. The value
+					// itself never belongs in models.json or a worker descriptor.
+					apiKey: "ACP_FIXTURE_API_KEY",
 					models: [{ id: "fixture/model", reasoning: false, input: ["text"] }],
 				},
 			},
@@ -166,9 +193,18 @@ function writeSse(res: import("node:http").ServerResponse, body: Record<string, 
 	res.write(`data: ${JSON.stringify(body)}\n\n`);
 }
 
-async function startIpythonFixture(): Promise<{ baseUrl: string; sawLiveNamespace: () => boolean }> {
+async function startIpythonFixture(): Promise<{
+	baseUrl: string;
+	sawLiveNamespace: () => boolean;
+	authenticatedRequestCount: (secret: string) => number;
+}> {
 	let sawLiveNamespace = false;
+	const authenticatedRequests = new Map<string, number>();
 	const server = createServer(async (req, res) => {
+		const authorization = req.headers.authorization;
+		if (typeof authorization === "string") {
+			authenticatedRequests.set(authorization, (authenticatedRequests.get(authorization) ?? 0) + 1);
+		}
 		let body = "";
 		for await (const chunk of req) body += chunk.toString();
 		const request = record(JSON.parse(body));
@@ -240,10 +276,20 @@ async function startIpythonFixture(): Promise<{ baseUrl: string; sawLiveNamespac
 	await new Promise<void>((resolveListening) => server.listen(0, "127.0.0.1", resolveListening));
 	const address = server.address();
 	if (!address || typeof address === "string") throw new Error("Fixture server did not expose a TCP port");
-	return { baseUrl: `http://127.0.0.1:${address.port}/v1`, sawLiveNamespace: () => sawLiveNamespace };
+	return {
+		baseUrl: `http://127.0.0.1:${address.port}/v1`,
+		sawLiveNamespace: () => sawLiveNamespace,
+		authenticatedRequestCount: (secret) => authenticatedRequests.get(`Bearer ${secret}`) ?? 0,
+	};
 }
 
-function launchAcp(agentDir: string, projectDir: string, daemonSocket: string, resume: boolean): AcpStdioClient {
+function launchAcp(
+	agentDir: string,
+	projectDir: string,
+	daemonSocket: string,
+	resume: boolean,
+	fixtureApiKey = "acp-initial-fixture-secret",
+): AcpStdioClient {
 	const child = spawn(
 		process.execPath,
 		[
@@ -266,6 +312,9 @@ function launchAcp(agentDir: string, projectDir: string, daemonSocket: string, r
 				...process.env,
 				[ENV_AGENT_DIR]: agentDir,
 				HOME: agentDir,
+				// This is intentionally runtime-only. Recovery reacquires it from the
+				// fresh ACP client's environment rather than serializing a descriptor.
+				ACP_FIXTURE_API_KEY: fixtureApiKey,
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
 			},
 			stdio: ["pipe", "pipe", "pipe"],
@@ -276,6 +325,20 @@ function launchAcp(agentDir: string, projectDir: string, daemonSocket: string, r
 }
 
 describe("ACP daemon lifecycle negotiation", () => {
+	it("closes resident child stdin before waiting for exit", async () => {
+		const child = spawn(
+			process.execPath,
+			["-e", 'process.stdin.once("end", () => process.exit(0)); process.stdin.resume();'],
+			{ stdio: ["pipe", "ignore", "ignore"] },
+		);
+		children.add(child);
+
+		await stopChild(child);
+		children.delete(child);
+
+		expect(child.exitCode).toBe(0);
+	});
+
 	it("keeps only reattachable ACP sessions resident", () => {
 		// Resident workers survive ACP stdio disconnect only when a later
 		// --continue can find their session file. All ephemeral or non-ACP modes
@@ -286,36 +349,62 @@ describe("ACP daemon lifecycle negotiation", () => {
 		expect(isClientOwnedDaemonSession("print", false)).toBe(true);
 	});
 
-	it(
-		"preserves an ACP kernel's live Python namespace across client disconnect and re-attach",
-		{ tags: ["kernel-heavy"], timeout: 240_000 },
-		async () => {
-			const root = mkdtempSync(join(tmpdir(), "pi-acp-resident-"));
-			temporaryRoots.push(root);
-			const agentDir = join(root, "agent");
-			const projectDir = join(root, "project");
-			const daemonSocket = join(root, "daemon.sock");
-			daemonSockets.push(daemonSocket);
-			mkdirSync(agentDir, { recursive: true });
-			mkdirSync(projectDir, { recursive: true });
-			const fixture = await startIpythonFixture();
-			writeModels(agentDir, fixture.baseUrl);
+	it("recovers a crashed resident ACP worker only with fresh environment-backed model authentication", {
+		tags: ["kernel-heavy"],
+		timeout: 240_000,
+	}, async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-acp-resident-"));
+		temporaryRoots.push(root);
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const daemonSocket = join(root, "daemon.sock");
+		daemonSockets.push(daemonSocket);
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(projectDir, { recursive: true });
+		const fixture = await startIpythonFixture();
+		writeModels(agentDir, fixture.baseUrl);
 
-			const first = launchAcp(agentDir, projectDir, daemonSocket, false);
-			const firstSession = await first.start(projectDir);
-			await first.prompt(firstSession, "set reconnect state");
-			await first.close();
-			children.delete(first.child);
+		const initialSecret = "acp-initial-fixture-secret";
+		const recoveredSecret = "acp-fresh-recovery-secret";
+		const first = launchAcp(agentDir, projectDir, daemonSocket, false, initialSecret);
+		const firstSession = await first.start(projectDir);
+		await first.prompt(firstSession, "set reconnect state");
+		await first.close();
+		children.delete(first.child);
 
-			const reattached = launchAcp(agentDir, projectDir, daemonSocket, true);
-			const reattachedSession = await reattached.start(projectDir);
-			await reattached.prompt(reattachedSession, "read reconnect state");
-			await reattached.close();
-			children.delete(reattached.child);
+		const reattached = launchAcp(agentDir, projectDir, daemonSocket, true, initialSecret);
+		const reattachedSession = await reattached.start(projectDir);
+		await reattached.prompt(reattachedSession, "read reconnect state");
+		await reattached.close();
+		children.delete(reattached.child);
 
-			// `object()` restores as a distinct object, so True proves this was the
-			// live kernel namespace rather than a replacement kernel revived from disk.
-			expect(fixture.sawLiveNamespace()).toBe(true);
-		},
-	);
+		// `object()` restores as a distinct object, so True proves this was the
+		// live kernel namespace rather than a replacement kernel revived from disk.
+		expect(fixture.sawLiveNamespace()).toBe(true);
+
+		const descriptorPath = residentWorkerDescriptorPath(agentDir);
+		const descriptorText = readFileSync(descriptorPath, "utf8");
+		expect(descriptorText).not.toContain(initialSecret);
+		expect(descriptorText).not.toContain(recoveredSecret);
+		expect(descriptorText).not.toContain("ACP_FIXTURE_API_KEY");
+		const descriptor = JSON.parse(descriptorText) as { pid?: number };
+		if (typeof descriptor.pid !== "number") throw new Error("Resident ACP worker did not expose its pid");
+		const authenticatedBeforeCrash = fixture.authenticatedRequestCount(initialSecret);
+		expect(authenticatedBeforeCrash).toBeGreaterThan(0);
+
+		process.kill(-descriptor.pid, "SIGKILL");
+		await waitForFailedResidentWorker(descriptorPath);
+
+		const recovered = launchAcp(agentDir, projectDir, daemonSocket, true, recoveredSecret);
+		const recoveredSession = await recovered.start(projectDir);
+		await recovered.prompt(recoveredSession, "recover authenticated model access");
+		await recovered.close();
+		children.delete(recovered.child);
+
+		expect(fixture.authenticatedRequestCount(recoveredSecret)).toBeGreaterThan(0);
+		expect(fixture.authenticatedRequestCount(initialSecret)).toBe(authenticatedBeforeCrash);
+		const recoveredDescriptorText = readFileSync(descriptorPath, "utf8");
+		expect(recoveredDescriptorText).not.toContain(initialSecret);
+		expect(recoveredDescriptorText).not.toContain(recoveredSecret);
+	});
 });

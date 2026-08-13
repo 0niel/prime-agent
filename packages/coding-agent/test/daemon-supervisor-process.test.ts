@@ -109,6 +109,10 @@ function spawnSupervisor(
 	]) {
 		delete supervisorEnv[key];
 	}
+	// Synthetic supervisors are roots, never descendants of the test worker.
+	for (const key of Object.keys(supervisorEnv)) {
+		if (key.startsWith("RLM_")) delete supervisorEnv[key];
+	}
 	const child = spawn(
 		process.execPath,
 		[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline", ...extraArgs],
@@ -496,16 +500,39 @@ describe("daemon supervisor resident workers", () => {
 		if (!adoptedSummary.workerPid) throw new Error("Adopted resident worker did not expose its pid");
 		process.kill(-adoptedSummary.workerPid, "SIGKILL");
 		await waitForProcessGone(adoptedSummary.workerPid);
-		let recoveredSummary: SessionSummary | undefined;
-		const recoveryDeadline = Date.now() + 15_000;
-		while (!recoveredSummary && Date.now() < recoveryDeadline) {
-			const listed = await replacementClient.request({ type: "list" });
-			recoveredSummary = requireSessionList(listed.success ? listed.data : undefined).find(
-				(session) => session.workerPid !== adoptedSummary.workerPid,
+		// An ownerless resident never restarts from descriptor or ambient
+		// credentials. Its durable endpoint remains redacted, and a new local
+		// client must explicitly supply a fresh launch environment to recover it.
+		let failedSummary: SessionSummary | undefined;
+		const failedDeadline = Date.now() + 10_000;
+		while (Date.now() < failedDeadline) {
+			const failed = await replacementClient.request({ type: "list" });
+			failedSummary = requireSessionList(failed.success ? failed.data : undefined).find(
+				(session) => session.workerPid === adoptedSummary.workerPid,
 			);
-			if (!recoveredSummary) await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+			if (failedSummary?.workerState === "failed") break;
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
-		expect(recoveredSummary).toBeDefined();
+		expect(failedSummary?.workerState).toBe("failed");
+		expect(readFileSync(markerPath, "utf8").trim().split("\n")).toHaveLength(1);
+
+		const sessionPath = summary.sessionFile;
+		if (!sessionPath) throw new Error("Resident worker did not expose its session file");
+		const freshCredential = "fresh-must-not-be-persisted";
+		const resumed = await replacementClient.request({
+			type: "create",
+			lifecycle: "resident",
+			sessionPath,
+			launchEnv: {
+				PRIME_AGENT_TRACES_BASE_URL: launchEnvSentinel,
+				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				PRIME_AGENT_TEST_CREDENTIAL: freshCredential,
+			},
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, extensions: [extensionPath] },
+		});
+		expect(resumed.success).toBe(true);
+		const recoveredSummary = requireSummary(resumed.success ? resumed.data : undefined);
+		if (recoveredSummary.workerPid) workerPids.add(recoveredSummary.workerPid);
 		let markerLines: string[] = [];
 		const markerDeadline = Date.now() + 15_000;
 		while (Date.now() < markerDeadline) {
@@ -518,11 +545,13 @@ describe("daemon supervisor resident workers", () => {
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
 		}
 		expect(markerLines).toHaveLength(2);
-		// Recovery retains the descriptor's allowlisted endpoint. Credential
-		// exclusion is asserted against the durable descriptor above; a process
-		// may also inherit credentials from the supervisor's own environment.
-		expect(markerLines[1]).toMatch(new RegExp(`^${recoveredSummary?.workerPid}:${launchEnvSentinel}:`));
-		expect(recoveredSummary?.workerPid).not.toBe(adoptedSummary.workerPid);
+		expect(markerLines[1]).toMatch(
+			new RegExp(`^${recoveredSummary.workerPid}:${launchEnvSentinel}:${freshCredential}$`),
+		);
+		expect(recoveredSummary.workerPid).not.toBe(adoptedSummary.workerPid);
+		const recoveredDescriptorText = JSON.stringify(readWorkerDescriptor(agentDir));
+		expect(recoveredDescriptorText).not.toContain(freshCredential);
+		expect(recoveredDescriptorText).not.toContain("PRIME_AGENT_TEST_CREDENTIAL");
 
 		await replacementClient.request({ type: "shutdown" });
 		replacementClient.close();
@@ -1536,23 +1565,32 @@ describe("daemon supervisor resident workers", () => {
 			workerPids.delete(pid);
 		}
 
-		let recovered: SessionSummary | undefined;
-		const recoveryDeadline = Date.now() + 20_000;
-		while (Date.now() < recoveryDeadline) {
+		let failed: SessionSummary | undefined;
+		const failedDeadline = Date.now() + 10_000;
+		while (Date.now() < failedDeadline) {
 			const response = await client.request({ type: "list" });
 			if (response.success) {
-				recovered = requireSessionList(response.data).find(
+				failed = requireSessionList(response.data).find(
 					(summary) =>
 						(summary.activeSessionId ?? summary.id) === (createdSummary.activeSessionId ?? createdSummary.id),
 				);
-				if (recovered?.workerState === "ready" && recovered.workerPid !== createdSummary.workerPid) {
-					break;
-				}
+				if (failed?.workerState === "failed") break;
 			}
-			await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
+		expect(failed).toMatchObject({ workerState: "failed", activeSessionId: createdSummary.activeSessionId });
+
+		const resumed = await client.request({
+			type: "create",
+			lifecycle: "resident",
+			sessionPath: sessionFile,
+			launchEnv: { TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json") },
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		expect(resumed.success).toBe(true);
+		const recovered = requireSummary(resumed.success ? resumed.data : undefined);
 		expect(recovered).toMatchObject({ workerState: "ready", activeSessionId: createdSummary.activeSessionId });
-		if (!recovered?.workerPid) {
+		if (!recovered.workerPid) {
 			throw new Error("Recovered worker did not expose its pid");
 		}
 		workerPids.add(recovered.workerPid);
