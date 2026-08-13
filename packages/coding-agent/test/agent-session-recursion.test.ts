@@ -2542,7 +2542,11 @@ describe("AgentSession rlm recursion", () => {
 			streamFn: (_model, context) => {
 				const stream = createAssistantMessageEventStream();
 				void finishGate.then(() =>
-					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${userText(context)}`) }),
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: assistantMessage(`child answer: ${userText(context)}`),
+					}),
 				);
 				return stream;
 			},
@@ -2589,7 +2593,13 @@ describe("AgentSession rlm recursion", () => {
 			rlmSessionDir: join(tempDir, "error-finalizer-race-child"),
 			streamFn: () => {
 				const stream = createAssistantMessageEventStream();
-				void failGate.then(() => stream.push({ type: "error", reason: "error", error: { ...assistantMessage("child failure"), stopReason: "error" } }));
+				void failGate.then(() =>
+					stream.push({
+						type: "error",
+						reason: "error",
+						error: { ...assistantMessage("child failure"), stopReason: "error" },
+					}),
+				);
 				return stream;
 			},
 		});
@@ -2663,7 +2673,8 @@ describe("AgentSession rlm recursion", () => {
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
 				deleteRlmSubagentRuntime: async (_id, session) => {
-					if (++deleteAttempts === 1) throw new RlmSubagentHostDeletionError("tombstoned", new Error("first close failed"));
+					if (++deleteAttempts === 1)
+						throw new RlmSubagentHostDeletionError("tombstoned", new Error("first close failed"));
 					await session?.disposeAsync();
 				},
 			},

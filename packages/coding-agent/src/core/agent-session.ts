@@ -10277,6 +10277,7 @@ export class AgentSession {
 							undefined,
 							inFlight?.lease,
 							async (authority) => {
+								if (this._deletedRlmChildIds.has(run.id)) return { subagent: finalizerSubagent };
 								if (this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 									try {
 										const outcome = await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
