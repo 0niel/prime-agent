@@ -1031,12 +1031,33 @@ export class AgentDaemon {
 		authority?: RlmSubagentDeletionAuthority,
 	): Promise<RlmSubagentDeletionDurability> {
 		const latest = await this.readCompleteRlmSubagentRegistryForDeletion(parentState);
+		// Every outcome still precedes a potential runtime close except the
+		// synchronous append boundary below, so revocation must win here too.
+		authority?.assertCurrent();
 		if (!latest) return "unknown";
 		const entry = latest.find((candidate) => candidate.childId === childId);
+		// The authority is minted by AgentSession's per-child coordinator. It
+		// binds this append to a particular incarnation, not merely a recycled id.
+		// Validate it once after the asynchronous read and once at the synchronous
+		// append/fsync boundary below.
+		// Compatibility callers only supplied assertCurrent before generations
+		// existed. New coordinator authorities always carry both incarnation fields.
+		if (
+			authority &&
+			((typeof authority.childId === "string" && authority.childId !== childId) ||
+				(entry !== undefined &&
+					typeof authority.sessionDir === "string" &&
+					authority.sessionDir !== entry.sessionDir))
+		) {
+			authority.assertCurrent();
+			return "unknown";
+		}
 		if (!entry) {
+			authority?.assertCurrent();
 			return "absent";
 		}
 		if (entry.status === "deleted") {
+			authority?.assertCurrent();
 			return "tombstoned";
 		}
 		// The complete read above is asynchronous. Revalidate immediately before
@@ -2352,7 +2373,7 @@ export class AgentDaemon {
 			},
 			resolveRlmSubagentDeletion: (childId, authority) =>
 				this.recordRlmSubagentDeletion(parentState, childId, authority),
-			deleteRlmSubagentRuntime: async (childId, session) => {
+			deleteRlmSubagentRuntime: async (childId, session, authority) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
 						candidate.runtime.metadata.kind === "subagent" &&
@@ -2362,12 +2383,37 @@ export class AgentDaemon {
 				const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
 					(entry) => entry.childId === childId,
 				);
+				// A child id alone is never an incarnation proof. Do not close a
+				// freshly recycled resident state under an old attempt token.
+				if (
+					authority &&
+					state?.runtime.metadata.sessionDir !== undefined &&
+					state.runtime.metadata.sessionDir !== authority.sessionDir
+				) {
+					authority.assertCurrent();
+					throw new Error("RLM subagent deletion authority does not match runtime incarnation");
+				}
 				const childSessionFile = persisted?.sessionFile ?? state?.runtime.session.sessionFile;
 				// Persist the deletion boundary before tearing down the runtime. As with a
 				// resident child, deletion keeps its transcript and artifact tree on disk.
-				await this.recordRlmSubagentDeletion(parentState, childId);
+				const deletionDurability = await this.recordRlmSubagentDeletion(parentState, childId, authority);
+				// A stale incarnation, corrupt registry, or failed append is not
+				// permission to destroy a runtime. Only absence or a tombstone is a
+				// durable deletion boundary.
+				if (deletionDurability === "unknown") {
+					throw new Error("RLM subagent deletion durability is still unknown");
+				}
+				// Absence has no append point of no return: retain authority through
+				// the immediately following destructive close. A tombstone commit,
+				// however, is intentionally durable even if its reply is later stale.
+				if (deletionDurability === "absent") authority?.assertCurrent();
+				// The append is the linearization point. A late request abort must
+				// suppress its reply, not undo or race the already durable tombstone.
 				const staleSession = state && session && state.runtime.session !== session ? session : undefined;
 				try {
+					// `absent` did not append anything. Recheck adjacent to the
+					// destructive call itself; do not apply this after tombstoning.
+					if (deletionDurability === "absent") authority?.assertCurrent();
 					if (state) {
 						await this.closeSession(state, "killed", false);
 					} else {

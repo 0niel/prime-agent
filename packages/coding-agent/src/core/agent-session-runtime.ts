@@ -11,7 +11,12 @@ import { flushAgentTraceUpload } from "./agent-traces.js";
 import { isNoModelsAvailableMessage } from "./auth-guidance.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
-import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
+import type {
+	CreateRlmSubagentRuntimeOptions,
+	RlmSubagentDeletionAuthority,
+	RlmSubagentRuntime,
+	SubagentRuntimeHost,
+} from "./rlm-runtime.js";
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
@@ -394,12 +399,21 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return runtime;
 	}
 
-	async deleteRlmSubagentRuntime(childId: string, session: AgentSession): Promise<void> {
+	async deleteRlmSubagentRuntime(
+		childId: string,
+		session: AgentSession,
+		authority?: RlmSubagentDeletionAuthority,
+	): Promise<void> {
+		// Inline teardown has no daemon append, so the exact coordinator token is
+		// its sole pre-destruction fence.
+		authority?.assertCurrent();
 		const runtime = this.subagentRuntimes.get(childId);
 		if (!runtime) {
+			authority?.assertCurrent();
 			await session.disposeAsync();
 			return;
 		}
+		authority?.assertCurrent();
 		this.subagentRuntimes.delete(childId);
 		const shouldDisposeStaleSession = runtime.session !== session;
 		try {

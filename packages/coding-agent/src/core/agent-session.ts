@@ -228,6 +228,7 @@ import {
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
 	type RlmSpawnHandle,
+	type RlmSubagentDeletionAuthority,
 	type RlmSubagentDeletionDurability,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
@@ -1229,10 +1230,18 @@ export class AgentSession {
 	// lifecycle status. Keep its private cleanup lease through finalization until a
 	// host later proves absence or a durable tombstone.
 	private _rlmChildDeletionQuarantines = new Map<string, RlmSubagentRegistryEntry>();
+	/**
+	 * One deletion transaction per child id. A transaction owns a monotonically
+	 * increasing generation and the exact registry entry/lease it was minted
+	 * for; neither a stale waiter nor a reused child id can commit with it.
+	 */
+	private _rlmChildDeletionGeneration = 0;
 	private _deletingRlmChildren = new Map<
 		string,
 		{
 			subagent: RlmSubagentRegistryEntry;
+			generation: number;
+			lease?: RlmSubagentRegistryEntry;
 			promise: Promise<RlmDeleteSubagentResult>;
 		}
 	>();
@@ -7257,9 +7266,17 @@ export class AgentSession {
 			(childId) => !this._activeRlmChildRuns.get(childId)?.detachedDeletion,
 		);
 		await Promise.allSettled(childIds.map((childId) => this.deleteRlmSubagent(childId)));
+		// Quarantine reconciliation shares the same per-child coordinator as an
+		// explicit retry. A reaper is a waiter/promotion candidate, never a
+		// second durable writer racing the user request.
 		await Promise.allSettled(
-			[...this._rlmChildDeletionQuarantines.keys()].map((childId) =>
-				this._resolveRlmChildDeletionQuarantine(childId),
+			[...this._rlmChildDeletionQuarantines.entries()].map(([childId, lease]) =>
+				this._coordinateRlmSubagentDeletion(lease, undefined, lease, async (authority) => {
+					if (!(await this._resolveRlmChildDeletionQuarantine(childId, authority))) {
+						throw new Error("RLM subagent deletion durability is still unknown");
+					}
+					return { subagent: lease };
+				}),
 			),
 		);
 	}
@@ -9319,11 +9336,11 @@ export class AgentSession {
 		if (isRunning()) {
 			return "running";
 		}
-		const result = await this._trackRlmSubagentDeletion(subagent, () => {
+		const result = await this._coordinateRlmSubagentDeletion(subagent, undefined, undefined, (authority) => {
 			if (isRunning()) {
 				return Promise.resolve({ subagent, outcome: "skipped_running" });
 			}
-			return this._deleteResolvedRlmSubagent(subagent);
+			return this._deleteResolvedRlmSubagent(subagent, authority);
 		});
 		return result.outcome === "skipped_running" ? "running" : "deleted";
 	}
@@ -9357,19 +9374,29 @@ export class AgentSession {
 			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
 		}
 		if (inFlight[0]) {
-			// A coalesced waiter retains its own revocation boundary rather than
-			// inheriting the initiating request's authority.
-			const result = await inFlight[0].promise;
-			assertDeleteAuthority();
-			return result;
+			// Join through the coordinator rather than returning the bare owner
+			// promise: if an aborted owner fails before commit, this live waiter can
+			// promote a fresh generation after it drains.
+			const joined = inFlight[0];
+			return this._coordinateRlmSubagentDeletion(joined.subagent, signal, joined.lease, (authority) => {
+				if (joined.lease) {
+					return this._resolveRlmChildDeletionQuarantine(joined.subagent.rlm_child_id, authority).then(
+						(resolved) => {
+							if (!resolved) throw new Error("RLM subagent deletion durability is still unknown");
+							return { subagent: joined.subagent };
+						},
+					);
+				}
+				return this._deleteResolvedRlmSubagent(joined.subagent, authority);
+			});
 		}
 		// Quarantine is deliberately absent from public list/roster/hydration, but
 		// the caller holding the exact opaque child id may explicitly retry its
 		// durability check. Names and session ids cannot address private leases.
 		const quarantined = this._rlmChildDeletionQuarantines.get(target);
 		if (quarantined) {
-			return this._trackRlmSubagentDeletion(quarantined, async () => {
-				if (!(await this._resolveRlmChildDeletionQuarantine(target, assertDeleteAuthority))) {
+			return this._coordinateRlmSubagentDeletion(quarantined, signal, quarantined, async (authority) => {
+				if (!(await this._resolveRlmChildDeletionQuarantine(target, authority))) {
 					throw new Error("RLM subagent deletion durability is still unknown");
 				}
 				return { subagent: quarantined };
@@ -9377,7 +9404,7 @@ export class AgentSession {
 		}
 		if (localMatches[0]) {
 			const subagent = localMatches[0];
-			return this._trackRlmSubagentDeletion(subagent, async () => {
+			return this._coordinateRlmSubagentDeletion(subagent, signal, undefined, async (authority) => {
 				const listedAgents = await this._agentMessageController?.listAgents();
 				const listedSubagents = this._buildRlmSubagentList(listedAgents).subagents;
 				const passiveMatches = listedSubagents.filter(
@@ -9399,8 +9426,8 @@ export class AgentSession {
 							session_name: daemonChild.sessionName ?? subagent.session_name,
 						}
 					: subagent;
-				assertDeleteAuthority();
-				return this._deleteResolvedRlmSubagent(resolvedSubagent);
+				authority.assertCurrent();
+				return this._deleteResolvedRlmSubagent(resolvedSubagent, authority);
 			});
 		}
 
@@ -9413,29 +9440,107 @@ export class AgentSession {
 			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
 		}
 		const subagent = directMatches[0] ?? (await this._resolveDirectRlmSubagent(target));
-		return this._trackRlmSubagentDeletion(subagent, () => {
-			assertDeleteAuthority();
-			return this._deleteResolvedRlmSubagent(subagent);
+		return this._coordinateRlmSubagentDeletion(subagent, signal, undefined, (authority) => {
+			authority.assertCurrent();
+			return this._deleteResolvedRlmSubagent(subagent, authority);
 		});
 	}
 
-	private async _trackRlmSubagentDeletion(
-		subagent: RlmSubagentRegistryEntry,
-		startDeletion: () => Promise<RlmDeleteSubagentResult>,
-	): Promise<RlmDeleteSubagentResult> {
-		const existing = this._deletingRlmChildren.get(subagent.rlm_child_id);
-		if (existing) return existing.promise;
-		const deletion = Promise.resolve().then(startDeletion);
-		this._deletingRlmChildren.set(subagent.rlm_child_id, {
-			subagent,
-			promise: deletion,
+	/** Await a shared durable attempt without transferring the caller's abort authority. */
+	private async _awaitRlmDeletionWithAuthority<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+		if (!signal) return promise;
+		if (signal.aborted) throw new Error("host request authority was revoked");
+		return await new Promise<T>((resolve, reject) => {
+			const abort = () => reject(new Error("host request authority was revoked"));
+			signal.addEventListener("abort", abort, { once: true });
+			void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
 		});
-		try {
-			return await deletion;
-		} finally {
-			if (this._deletingRlmChildren.get(subagent.rlm_child_id)?.promise === deletion) {
-				this._deletingRlmChildren.delete(subagent.rlm_child_id);
+	}
+
+	/**
+	 * The sole deletion transaction coordinator. It serializes explicit retries
+	 * and compaction reapers by child id, then fences the owner with both a
+	 * monotonic generation and the exact child incarnation/lease. An owner that
+	 * loses request authority before commit leaves no mutation; a live waiter
+	 * retries as the next generation rather than inheriting stale authority.
+	 */
+	private async _coordinateRlmSubagentDeletion(
+		subagent: RlmSubagentRegistryEntry,
+		signal: AbortSignal | undefined,
+		lease: RlmSubagentRegistryEntry | undefined,
+		startDeletion: (authority: RlmSubagentDeletionAuthority) => Promise<RlmDeleteSubagentResult>,
+	): Promise<RlmDeleteSubagentResult> {
+		for (;;) {
+			if (signal?.aborted) throw new Error("host request authority was revoked");
+			const existing = this._deletingRlmChildren.get(subagent.rlm_child_id);
+			if (existing) {
+				// Same id is not enough: an id reuse must never join an older lease.
+				if (
+					existing.subagent.session_dir !== subagent.session_dir ||
+					existing.subagent.session_id !== subagent.session_id ||
+					existing.lease !== lease
+				) {
+					throw new Error("RLM subagent deletion lease changed");
+				}
+				try {
+					const result = await this._awaitRlmDeletionWithAuthority(existing.promise, signal);
+					if (signal?.aborted) throw new Error("host request authority was revoked");
+					return result;
+				} catch (error) {
+					// A request-scoped owner may have been revoked before its append
+					// boundary. A still-live explicit caller or reaper promotes itself
+					// after that owner drains, with a fresh never-reused generation.
+					if (
+						signal?.aborted ||
+						!(error instanceof Error) ||
+						error.message !== "host request authority was revoked"
+					) {
+						throw error;
+					}
+					await Promise.resolve();
+					continue;
+				}
 			}
+			const generation = ++this._rlmChildDeletionGeneration;
+			let authority!: RlmSubagentDeletionAuthority;
+			const deletion = Promise.resolve().then(() => startDeletion(authority));
+			authority = {
+				childId: subagent.rlm_child_id,
+				sessionDir: subagent.session_dir,
+				generation,
+				assertCurrent: () => {
+					if (signal?.aborted) throw new Error("host request authority was revoked");
+					const current = this._deletingRlmChildren.get(subagent.rlm_child_id);
+					if (
+						!current ||
+						current.generation !== generation ||
+						current.subagent !== subagent ||
+						current.lease !== lease ||
+						(lease && this._rlmChildDeletionQuarantines.get(subagent.rlm_child_id) !== lease)
+					) {
+						throw new Error("host request authority was revoked");
+					}
+				},
+			};
+			this._deletingRlmChildren.set(subagent.rlm_child_id, { subagent, generation, lease, promise: deletion });
+			// A request-scoped waiter may abort while the shared commit owner keeps
+			// running. Only the owner's settlement may release the single-flight
+			// slot; otherwise a later retry could append concurrently.
+			void deletion.then(
+				() => {
+					if (this._deletingRlmChildren.get(subagent.rlm_child_id)?.generation === generation) {
+						this._deletingRlmChildren.delete(subagent.rlm_child_id);
+					}
+				},
+				() => {
+					if (this._deletingRlmChildren.get(subagent.rlm_child_id)?.generation === generation) {
+						this._deletingRlmChildren.delete(subagent.rlm_child_id);
+					}
+				},
+			);
+			const result = await this._awaitRlmDeletionWithAuthority(deletion, signal);
+			if (signal?.aborted) throw new Error("host request authority was revoked");
+			return result;
 		}
 	}
 
@@ -9445,17 +9550,24 @@ export class AgentSession {
 	 */
 	private async _resolveRlmChildDeletionQuarantine(
 		childId: string,
-		assertDeleteAuthority: () => void = () => {},
+		authority?: RlmSubagentDeletionAuthority,
 	): Promise<boolean> {
 		const lease = this._rlmChildDeletionQuarantines.get(childId);
 		if (!lease || this._disposed || this._disposing) return false;
-		const durability = await this._subagentRuntimeHost?.resolveRlmSubagentDeletion?.(childId, {
-			assertCurrent: assertDeleteAuthority,
-		});
+		authority?.assertCurrent();
+		const durability = await this._subagentRuntimeHost?.resolveRlmSubagentDeletion?.(
+			childId,
+			authority ?? {
+				childId,
+				sessionDir: lease.session_dir,
+				generation: 0,
+				assertCurrent: () => {},
+			},
+		);
 		if (durability !== "absent" && durability !== "tombstoned") return false;
 		// The host await is a revocation boundary. Do not mutate the artifact or
 		// private deletion bookkeeping after its caller has lost authority.
-		assertDeleteAuthority();
+		authority?.assertCurrent();
 		// A retry/reaper can yield while the host reads. It may only discharge the
 		// exact lease it resolved, never a newer lease reusing this child id.
 		if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return false;
@@ -9470,9 +9582,15 @@ export class AgentSession {
 		return true;
 	}
 
-	private _deleteRlmSubagentSession(childId: string, session?: AgentSession): Promise<void> {
+	private _deleteRlmSubagentSession(
+		childId: string,
+		session?: AgentSession,
+		authority?: RlmSubagentDeletionAuthority,
+	): Promise<void> {
 		if (this._subagentRuntimeHost) {
-			return this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
+			return authority
+				? this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session, authority)
+				: this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
 		}
 		return session?.disposeAsync() ?? Promise.resolve();
 	}
@@ -9511,22 +9629,29 @@ export class AgentSession {
 		});
 	}
 
-	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
+	private async _deleteResolvedRlmSubagent(
+		subagent: RlmSubagentRegistryEntry,
+		authority?: RlmSubagentDeletionAuthority,
+	): Promise<RlmDeleteSubagentResult> {
+		// Nothing local is a durable commit. The host must assert the same token
+		// immediately before any durable/inline teardown; local publication only
+		// follows that successful boundary.
+		authority?.assertCurrent();
 		const childId = subagent.rlm_child_id;
 		const run = this._activeRlmChildRuns.get(childId);
 		if (run) {
-			if (!this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
-				this._emitRlmSubagentRemoval(subagent);
-			}
 			const liveSession = run.session;
 			if (run.status === "error" && !liveSession && run.settled) {
+				authority?.assertCurrent();
+				this._emitRlmSubagentRemoval(subagent);
 				this._deletedRlmChildIds.add(childId);
 				this._removeRlmSubagentTracking(childId, run);
 				return { subagent };
 			}
 			if (liveSession) {
+				authority?.assertCurrent();
 				try {
-					await this._deleteRlmSubagentSession(childId, liveSession);
+					await this._deleteRlmSubagentSession(childId, liveSession, authority);
 				} catch (error) {
 					if (this._disposed || this._disposing) {
 						this._removeRlmSubagentTracking(childId, run);
@@ -9542,23 +9667,30 @@ export class AgentSession {
 					run.session = undefined;
 					throw error;
 				}
+				// The successful host call is the deletion boundary. Do not let a
+				// late reply abort undo a committed deletion.
+				if (!this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
+					this._emitRlmSubagentRemoval(subagent);
+				}
 				this._deletedRlmChildIds.add(childId);
 				this._removeRlmSubagentTracking(childId, run);
 				return { subagent };
 			}
-
-			// Startup can be blocked in a host before it has a session to close. Admit
-			// deletion immediately, but retain the cancelled run as a hidden tombstone
-			// until startup settles so selectors cannot be reused underneath it.
+			// Startup has no session/host destruction boundary yet, so this mutation
+			// itself needs the request token immediately beforehand.
+			authority?.assertCurrent();
+			if (!this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
+				this._emitRlmSubagentRemoval(subagent);
+			}
 			run.detachedDeletion = subagent;
 			this._deletedRlmChildIds.add(childId);
 			return { subagent };
 		}
 
-		this._emitRlmSubagentRemoval(subagent);
 		const retained = this._rlmChildSessions.get(childId);
+		authority?.assertCurrent();
 		try {
-			await this._deleteRlmSubagentSession(childId, retained);
+			await this._deleteRlmSubagentSession(childId, retained, authority);
 		} catch (error) {
 			if (this._disposed || this._disposing) {
 				this._removeRlmSubagentTracking(childId);
@@ -9568,6 +9700,7 @@ export class AgentSession {
 			}
 			throw error;
 		}
+		this._emitRlmSubagentRemoval(subagent);
 		this._deletedRlmChildIds.add(childId);
 		this._removeRlmSubagentTracking(childId);
 		return { subagent };

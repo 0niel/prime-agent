@@ -245,6 +245,16 @@ export interface RlmSubagentReleaseOutcome {
  * deletion lease. This is a typed host contract, never child-controlled data.
  */
 export interface RlmSubagentDeletionAuthority {
+	/** Exact child incarnation this attempt is allowed to reconcile. */
+	childId: string;
+	sessionDir: string;
+	/** Monotonic per-parent attempt token; never reused after an aborted owner. */
+	generation: number;
+	/**
+	 * Throws unless this exact generation still owns the exact child lease. The
+	 * daemon calls this after its asynchronous registry read and immediately
+	 * before the synchronous append/fsync boundary.
+	 */
 	assertCurrent(): void;
 }
 
@@ -264,6 +274,10 @@ export interface SubagentRuntimeHost {
 		authority: RlmSubagentDeletionAuthority,
 	): Promise<RlmSubagentDeletionDurability>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
-	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
+	deleteRlmSubagentRuntime(
+		childId: string,
+		session?: AgentSession,
+		authority?: RlmSubagentDeletionAuthority,
+	): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
 }
