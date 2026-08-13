@@ -978,6 +978,47 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("rechecks retry authority before appending a daemon deletion tombstone", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-deletion-authority-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				recordRlmSubagentDeletion(
+					parentState: ActiveSessionState,
+					childId: string,
+					authority?: { assertCurrent(): void },
+				): Promise<"absent" | "tombstoned" | "unknown">;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const before = readFileSync(registryPath, "utf8");
+			const revoked = new Error("host request authority was revoked");
+
+			// The complete asynchronous registry read must not become authority to
+			// append after the caller has been revoked.
+			await expect(
+				internals.recordRlmSubagentDeletion(parentState, fixture.childId, {
+					assertCurrent: () => {
+						throw revoked;
+					},
+				}),
+			).rejects.toBe(revoked);
+			expect(readFileSync(registryPath, "utf8")).toBe(before);
+
+			await expect(
+				internals.recordRlmSubagentDeletion(parentState, fixture.childId, { assertCurrent: () => {} }),
+			).resolves.toBe("tombstoned");
+			expect(readFileSync(registryPath, "utf8").match(/"childId":"child-1"/g)).toHaveLength(2);
+			expect(readFileSync(registryPath, "utf8").match(/"status":"deleted"/g)).toHaveLength(1);
+			await expect(
+				internals.recordRlmSubagentDeletion(parentState, "unknown", { assertCurrent: () => {} }),
+			).resolves.toBe("absent");
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("persists a real child completion for passive discovery, roster, and listing", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-real-completion-"));
 		try {

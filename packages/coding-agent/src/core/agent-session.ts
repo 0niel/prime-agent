@@ -9414,7 +9414,11 @@ export class AgentSession {
 			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
 		}
 		if (inFlight[0]) {
-			return inFlight[0].promise;
+			// A coalesced waiter retains its own revocation boundary rather than
+			// inheriting the initiating request's authority.
+			const result = await inFlight[0].promise;
+			assertDeleteAuthority();
+			return result;
 		}
 		// Quarantine is deliberately absent from public list/roster/hydration, but
 		// the caller holding the exact opaque child id may explicitly retry its
@@ -9502,11 +9506,16 @@ export class AgentSession {
 	): Promise<boolean> {
 		const lease = this._rlmChildDeletionQuarantines.get(childId);
 		if (!lease || this._disposed || this._disposing) return false;
-		const durability = await this._subagentRuntimeHost?.resolveRlmSubagentDeletion?.(childId);
+		const durability = await this._subagentRuntimeHost?.resolveRlmSubagentDeletion?.(childId, {
+			assertCurrent: assertDeleteAuthority,
+		});
 		if (durability !== "absent" && durability !== "tombstoned") return false;
 		// The host await is a revocation boundary. Do not mutate the artifact or
 		// private deletion bookkeeping after its caller has lost authority.
 		assertDeleteAuthority();
+		// A retry/reaper can yield while the host reads. It may only discharge the
+		// exact lease it resolved, never a newer lease reusing this child id.
+		if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return false;
 		if (durability === "absent") {
 			// This is the sole path which removes the exact quarantined directory.
 			rmSync(lease.session_dir, { recursive: true, force: true });

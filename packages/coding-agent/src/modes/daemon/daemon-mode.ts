@@ -102,6 +102,7 @@ import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type {
 	CreateRlmSubagentRuntimeOptions,
+	RlmSubagentDeletionAuthority,
 	RlmSubagentDeletionDurability,
 	SubagentRuntimeHost,
 } from "../../core/rlm-runtime.js";
@@ -1042,6 +1043,7 @@ export class AgentDaemon {
 	private async recordRlmSubagentDeletion(
 		parentState: ActiveSessionState,
 		childId: string,
+		authority?: RlmSubagentDeletionAuthority,
 	): Promise<RlmSubagentDeletionDurability> {
 		const latest = await this.readCompleteRlmSubagentRegistryForDeletion(parentState);
 		if (!latest) return "unknown";
@@ -1052,6 +1054,11 @@ export class AgentDaemon {
 		if (entry.status === "deleted") {
 			return "tombstoned";
 		}
+		// The complete read above is asynchronous. Revalidate immediately before
+		// entering the synchronous append/fsync commit region: before that point a
+		// stale request must leave no registry mutation behind. Once append starts,
+		// finish the durable commit and let the caller suppress its stale reply.
+		authority?.assertCurrent();
 		if (
 			!this.appendRlmSubagentRegistryEntry(parentState, {
 				...entry,
@@ -2358,7 +2365,8 @@ export class AgentDaemon {
 				}
 				return { deletionDurability };
 			},
-			resolveRlmSubagentDeletion: (childId) => this.recordRlmSubagentDeletion(parentState, childId),
+			resolveRlmSubagentDeletion: (childId, authority) =>
+				this.recordRlmSubagentDeletion(parentState, childId, authority),
 			deleteRlmSubagentRuntime: async (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
