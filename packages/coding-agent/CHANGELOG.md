@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed the agents view to sort idle and inactive sessions by last message time, newest first, while keeping running agents in stable creation order.
 - Fixed `openai-codex` models being invisible to `rlm` subagents and `find_models` because model discovery reported Prime Agent's own version as the Codex client version ([#1375](https://github.com/PrimeIntellect-ai/prime-agent/pull/1375) by [@bilelrais](https://github.com/bilelrais)).
 - Added a working hint that recommends sharing traces with Prime Intellect to help train open-source LLMs.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
