@@ -75,7 +75,7 @@ interface SavedRlmSubagentRegistryEntry {
 
 // Registry records carry prompts and spawn code; real profiles reach a few MB.
 const MAX_RLM_REGISTRY_BYTES = 16 * 1024 * 1024;
-const MAX_SESSION_HEADER_BYTES = 256 * 1024;
+const MAX_SESSION_HEADER_BYTES = 64 * 1024;
 const MAX_RLM_REGISTRY_RECORDS = 10_000;
 const MAX_RLM_FAMILY_EDGES = 10_000;
 const MAX_RLM_FAMILY_NODES = 10_000;
@@ -207,17 +207,15 @@ def compact_metadata_response(response):
  data=response.get("data")
  if not isinstance(data,dict): reject()
  targets=[]
- # Walk every string value recursively, in insertion/index order. The protocol
- # currently has a typed metadata shape, but this prevents a future nested
- # display field from bypassing the full-envelope budget.
- def collect(container):
-  values=container.items() if isinstance(container,dict) else enumerate(container) if isinstance(container,list) else ()
-  for key,value in values:
-   if isinstance(value,str): targets.append((container,key,value))
-   elif isinstance(value,(dict,list)): collect(value)
- collect(response)
- # Clear every string before allocating the remaining escaped-byte budget in a
- # stable order. Fields remain present and string typed.
+ # Only the approved human-facing metadata strings are compactable. Protocol
+ # control fields and typed metadata enums remain byte-for-byte unchanged.
+ def add_target(container,key):
+  if isinstance(container.get(key),str): targets.append((container,key,container[key]))
+ add_target(data,"firstMessage"); add_target(data,"allMessagesText"); add_target(data,"name")
+ status=data.get("agentStatus")
+ if isinstance(status,dict): add_target(status,"summary")
+ # Clear every display string before allocating the remaining escaped-byte
+ # budget in a stable order. Fields remain present and string typed.
  for container,key,_ in targets: container[key]=""
  if encoded_size()>MAX_METADATA_RESPONSE_BYTES: reject()
  for container,key,original in targets:
@@ -348,7 +346,7 @@ def scan_metadata(fd,mtime_ms):
 def serve(req):
  request_id=req.get("id"); parts=req.get("parts"); limit=req.get("limit"); mode=req.get("mode"); root=req.get("root")
  if not isinstance(request_id,str) or not request_id or len(request_id)>128: reject()
- if mode not in ("read","header","stat","metadata") or root not in (3,4): reject()
+ if mode not in ("read","header","classify","stat","metadata") or root not in (3,4): reject()
  if not isinstance(parts,list) or not parts or not isinstance(limit,int) or limit<0 or limit>MAX: reject()
  if any(not isinstance(p,str) or not p or p in (".","..") or "/" in p or "\\" in p for p in parts): reject()
  current=os.dup(root)
@@ -361,26 +359,23 @@ def serve(req):
    if not stat.S_ISREG(before.st_mode): reject()
    if mode=="read" and before.st_size>limit: reject()
    payload={}
-   if mode in ("read","header"):
+   if mode in ("read","header","classify"):
     chunks=[]; total=0; done=False
     while not done:
      chunk=os.read(fd,min(65536,limit+1-total))
      if not chunk: break
-     if mode=="header":
+     if mode in ("header","classify"):
       cut=chunk.find(b"\n")
       if cut>=0: chunk=chunk[:cut+1]; done=True
      chunks.append(chunk); total+=len(chunk)
      if total>limit:
-      # An oversized first record can be an incomplete concurrent write. It is
-      # distinguishable from an I/O/protocol failure so root classification can
-      # ignore it, while registry-reached sessions remain strict.
-      if mode=="header":
-       # Return only a small bounded prefix for root classification. It fits
-       # inside the outer 256 KiB envelope; registry-reached headers stay
-       # strict in TypeScript whenever this flag is present.
+      # Only root classification may receive an incomplete first record. Its
+      # raw prefix is independently bounded so base64 plus the full envelope
+      # remains below the protocol cap. Strict registry/session reads reject.
+      if mode=="classify":
        payload["truncated"]=True; chunks=[b"".join(chunks)[:HEADER_CLASSIFICATION_BYTES]]; break
       reject()
-    if not payload.get("truncated"): payload["data"]=base64.b64encode(b"".join(chunks)).decode("ascii")
+    payload["data"]=base64.b64encode(b"".join(chunks)).decode("ascii")
    elif mode=="metadata": payload["data"]=scan_metadata(fd,before.st_mtime_ns/1000000)
    after=os.fstat(fd)
    if (before.st_dev,before.st_ino,before.st_mode)!=(after.st_dev,after.st_ino,after.st_mode): reject()
@@ -401,10 +396,11 @@ while True:
  if isinstance(request,dict) and request.get("mode")=="metadata" and "data" in response:
   try: compact_metadata_response(response)
   except Exception: response={"error":"failed","id":response.get("id")}
- # This is the exact full response envelope budgeted above. Keep
- # ensure_ascii explicit: changing a Python default cannot weaken the cap.
+ # Metadata is the only compacted response. Its exact full envelope, including
+ # the request id and every escaped control/display field, is bounded here.
+ # Registry records deliberately retain their larger strict read budget.
  serialized=json.dumps(response,separators=(",",":"),ensure_ascii=True)
- if len(serialized.encode("ascii"))>MAX_METADATA_RESPONSE_BYTES: sys.exit(1)
+ if isinstance(request,dict) and request.get("mode")=="metadata" and len(serialized.encode("ascii"))>MAX_METADATA_RESPONSE_BYTES: sys.exit(1)
  sys.stdout.write(serialized+"\n"); sys.stdout.flush()
 `;
 
@@ -429,10 +425,21 @@ export function setCatalogHelperLaunchForTest(launch: { command: string; args: s
 	catalogHelperLaunchForTest = launch;
 }
 
-type TrustedReadMode = "read" | "header" | "stat" | "metadata";
+type TrustedReadMode = "read" | "header" | "classify" | "stat" | "metadata";
 
 const TRUSTED_READ_TIMEOUT_MS = 5_000;
 const MAX_METADATA_RESPONSE_BYTES = 256 * 1024;
+
+/** Test-only seam observes the exact helper response before protocol validation. */
+let afterCatalogHelperResponseForTest:
+	| ((mode: TrustedReadMode, requestId: string, responseLine: string) => void)
+	| undefined;
+/** @internal */
+export function setCatalogAfterHelperResponseForTest(
+	hook: ((mode: TrustedReadMode, requestId: string, responseLine: string) => void) | undefined,
+): void {
+	afterCatalogHelperResponseForTest = hook;
+}
 
 function isTrustedSessionMetadata(value: unknown): value is TrustedSessionMetadata {
 	if (!value || typeof value !== "object") return false;
@@ -450,7 +457,9 @@ function isTrustedSessionMetadata(value: unknown): value is TrustedSessionMetada
 		(metadata.state !== undefined &&
 			(!metadata.state ||
 				typeof metadata.state !== "object" ||
-				typeof (metadata.state as { status?: unknown }).status !== "string")) ||
+				((metadata.state as { status?: unknown }).status !== "active" &&
+					(metadata.state as { status?: unknown }).status !== "archived" &&
+					(metadata.state as { status?: unknown }).status !== "crash"))) ||
 		(metadata.agentStatus !== undefined &&
 			(!metadata.agentStatus ||
 				typeof metadata.agentStatus !== "object" ||
@@ -614,7 +623,7 @@ class TrustedReadSession {
 		const requestId = randomUUID();
 		const line = await this.exchange(
 			JSON.stringify({ id: requestId, parts, limit: maxBytes, mode, root: rootFd }),
-			mode === "metadata" ? MAX_METADATA_RESPONSE_BYTES : maxBytes * 2 + 64 * 1024,
+			mode === "read" ? maxBytes * 2 + 64 * 1024 : MAX_METADATA_RESPONSE_BYTES,
 		);
 		let wire: {
 			id?: unknown;
@@ -627,6 +636,7 @@ class TrustedReadSession {
 		};
 		try {
 			wire = JSON.parse(line) as typeof wire;
+			afterCatalogHelperResponseForTest?.(mode, requestId, line);
 		} catch {
 			this.fail(new Error("catalog openat helper response is invalid"));
 			throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
@@ -636,7 +646,7 @@ class TrustedReadSession {
 			throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
 		}
 		if (wire.error === "absent") throw invalidFamilyTopology("descriptor-relative artifact is absent");
-		const truncatedHeader = mode === "header" && wire.truncated === true;
+		const truncatedHeader = mode === "classify" && wire.truncated === true;
 		if (
 			wire.error !== undefined ||
 			(wire.truncated !== undefined && !truncatedHeader) ||
@@ -812,7 +822,7 @@ async function readTrustedRootCandidate(
 	listed: { dev: string; ino: string },
 	reader: TrustedReadSession,
 ): Promise<TrustedSession | undefined> {
-	const header = await reader.read(path, MAX_SESSION_HEADER_BYTES, "header");
+	const header = await reader.read(path, MAX_SESSION_HEADER_BYTES, "classify");
 	// A candidate changing after enumeration cannot safely be reclassified as
 	// junk: it may have replaced an identified root before descriptor open.
 	if (header.dev !== listed.dev || header.ino !== listed.ino)
@@ -838,7 +848,8 @@ async function readTrustedRootCandidate(
 		throw invalidFamilyTopology("session header exceeds the trusted read limit");
 	if (header.truncated) return undefined;
 	if (candidate.type !== "session") return undefined;
-	if (typeof candidate.id !== "string" || candidate.id === "") return undefined;
+	// Once a complete root record purports to be a session, strict parsing owns
+	// it. A missing/blank id is corruption, not unrelated no-id junk.
 	return readTrustedSession(path, reader);
 }
 
