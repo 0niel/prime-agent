@@ -236,7 +236,7 @@ export interface CreateRlmSubagentRuntimeOptions {
  * This is deliberately not a public child status: uncertainty must never make a
  * private artifact appear active, idle, or inactive.
  */
-export type RlmSubagentDeletionDurability = "absent" | "tombstoned" | "unknown";
+export type RlmSubagentDeletionDurability = "absent" | "tombstoned" | "stale" | "unknown";
 
 export interface RlmSubagentReleaseOutcome {
 	deletionDurability: RlmSubagentDeletionDurability;
@@ -245,7 +245,7 @@ export interface RlmSubagentReleaseOutcome {
 /** The durable phase reached by a host-owned deletion attempt. */
 export type RlmSubagentDeletionPhase = "precommit" | "tombstoned";
 
-/** A successful host deletion always proves a concrete durable outcome. */
+/** A host result either removes the selected incarnation or observes it was superseded. */
 export interface RlmSubagentHostDeletionResult {
 	deletionDurability: Exclude<RlmSubagentDeletionDurability, "unknown">;
 }

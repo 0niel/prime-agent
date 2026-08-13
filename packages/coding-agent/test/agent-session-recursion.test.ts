@@ -143,6 +143,9 @@ interface InspectableRlmSession {
 	_rlmChildSessions: Map<string, AgentSession>;
 	_rlmChildUnsubscribes: Map<string, () => void>;
 	_createKernelHostHandlers(): HostRequestHandlers;
+	_deleteResolvedRlmSubagent(
+		subagent: Awaited<ReturnType<AgentSession["listRlmSubagents"]>>["subagents"][number],
+	): Promise<unknown>;
 	_reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void>;
 }
 
@@ -2479,6 +2482,50 @@ describe("AgentSession rlm recursion", () => {
 
 		await expect(Promise.all([first, second])).resolves.toEqual(["running", "running"]);
 		expect(deleteRuntime).not.toHaveBeenCalled();
+	});
+
+	it("keeps a newer retained child tracked when stale inline cleanup settles", async () => {
+		const childId = "recycled-retained-child";
+		const staleDir = join(tempDir, "stale-retained");
+		const stale = { _rlmSessionDir: staleDir, sessionId: "stale", dispose: vi.fn() } as unknown as AgentSession;
+		const newer = {
+			_rlmSessionDir: join(tempDir, "new-retained"),
+			sessionId: "new",
+			dispose: vi.fn(),
+		} as unknown as AgentSession;
+		let root!: AgentSession;
+		const deleteRuntime = vi.fn(async () => {
+			(root as unknown as InspectableRlmSession)._rlmChildSessions.set(childId, newer);
+			return { deletionDurability: "stale" as const };
+		});
+		root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		const inspectable = root as unknown as InspectableRlmSession;
+		const childUpdates: string[] = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") childUpdates.push(event.child.status);
+		});
+		inspectable._rlmChildSessions.set(childId, stale);
+		const subagent = {
+			rlm_child_id: childId,
+			active_session_id: null,
+			session_id: "stale",
+			session_name: "stale-retained",
+			session_dir: staleDir,
+			status: "completed" as const,
+		};
+
+		await expect(inspectable._deleteResolvedRlmSubagent(subagent)).resolves.toEqual({ subagent });
+		expect(deleteRuntime).toHaveBeenCalledWith(childId, stale);
+		expect(inspectable._rlmChildSessions.get(childId)).toBe(newer);
+		expect(inspectable._deletedRlmChildIds.has(childId)).toBe(false);
+		expect(childUpdates).toEqual([]);
 	});
 
 	it("deletes only inactive RLM children through the explicit inactive path", async () => {

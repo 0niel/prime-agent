@@ -3789,15 +3789,17 @@ export class AgentSession {
 	 * Close external admission synchronously while leaving refinement and the final
 	 * kernel snapshot available to the orderly async teardown.
 	 */
-	private _beginClosing(): void {
+	private _beginClosing(
+		deliveryError = new Error("Session closed before prompt delivery."),
+		completionError = deliveryError,
+	): void {
 		if (this._closing || this._disposed) return;
 		this._closing = true;
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionActionCommitDisposeAbortController.abort();
-		const error = new Error("Session closed before prompt delivery.");
-		this._rejectQueuedAgentMessageDeliveries(error, error);
-		this._cancelSessionActions(() => true, error);
+		this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
+		this._cancelSessionActions(() => true, deliveryError);
 		this.agent.clearAllQueues();
 		this._notifySessionInputCheckpointChange();
 	}
@@ -4030,7 +4032,9 @@ export class AgentSession {
 		if (this._disposed) {
 			return;
 		}
-		this._beginClosing();
+		const deliveryError = new Error("Session disposed before prompt delivery.");
+		const completionError = new Error("Session disposed before prompt completion.");
+		this._beginClosing(deliveryError, completionError);
 		this._disposed = true;
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
@@ -4059,8 +4063,6 @@ export class AgentSession {
 			this._rlmChildCleanupFailures.clear();
 			this._deletedRlmChildIds.clear();
 			this._pendingNextTurnMessages = [];
-			const deliveryError = new Error("Session disposed before prompt delivery.");
-			const completionError = new Error("Session disposed before prompt completion.");
 			this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
 			for (const [agentMessageId, outcome] of this._agentMessageOutcomes) {
 				if (outcome.delivery) this._settleAgentMessage(agentMessageId, "delivery", deliveryError);
@@ -4658,10 +4660,13 @@ export class AgentSession {
 	}
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
-		this._assertSessionActionAdmissionAvailable();
+		// A direct non-streaming prompt is the explicit resume path after abort.
+		// Preserve queued extension actions and admit this turn so the normal FIFO
+		// pump can drain them; other suspended admissions remain fail-closed.
 		if (!this.isStreaming) {
 			this._sessionInputPumpSuspended = false;
 		}
+		this._assertSessionActionAdmissionAvailable();
 		const commitFence = this.isStreaming
 			? undefined
 			: await this._acquireDirectTurnAdmissionFence(options?.signal).catch((error: unknown) => {
@@ -9786,7 +9791,17 @@ export class AgentSession {
 		const retained = this._rlmChildSessions.get(childId);
 		authority?.assertCurrent();
 		try {
-			await this._deleteRlmSubagentSession(childId, retained, authority);
+			const deletion = await this._deleteRlmSubagentSession(childId, retained, authority);
+			// A retained old incarnation can be disposed after its child id has
+			// been republished. Do not turn that stale cleanup into a removal event
+			// or clear the newer runtime's tracking.
+			if (
+				deletion.deletionDurability === "stale" ||
+				this._activeRlmChildRuns.has(childId) ||
+				this._rlmChildSessions.get(childId) !== retained
+			) {
+				return { subagent };
+			}
 		} catch (error) {
 			if (this._disposed || this._disposing) {
 				this._removeRlmSubagentTracking(childId);

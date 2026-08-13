@@ -2481,21 +2481,39 @@ export class AgentDaemon {
 						(persistedMatchesAuthority &&
 							(typeof authority?.sessionFile !== "string" || session.sessionFile === authority.sessionFile) &&
 							(typeof authority?.sessionId !== "string" || session.sessionId === authority.sessionId));
+					const residentMatchesAuthority =
+						state !== undefined &&
+						persistedMatchesAuthority &&
+						state.runtime.metadata.sessionDir === authority?.sessionDir &&
+						state.runtime.session.sessionFile === authority.sessionFile &&
+						state.runtime.session.sessionId === authority.sessionId;
 					if (
 						(state !== undefined && session !== undefined && state.runtime.session !== session) ||
-						(state !== undefined && session === undefined) ||
-						(state === undefined && session === undefined && !persistedMatchesAuthority) ||
+						(state !== undefined && session === undefined && !residentMatchesAuthority) ||
+						// A complete registry read proving there is no current row is enough
+						// to report a benign absent deletion. Any matching row remains
+						// fail-closed unless its complete incarnation authority matches.
+						(state === undefined &&
+							session === undefined &&
+							persisted !== undefined &&
+							!persistedMatchesAuthority) ||
 						(state === undefined && session !== undefined && !suppliedSessionMatchesPersisted) ||
 						(authority !== undefined &&
-							(state !== undefined
-								? state.runtime.metadata.sessionDir !== authority.sessionDir ||
-									(typeof authority.sessionFile === "string" &&
-										state.runtime.session.sessionFile !== authority.sessionFile) ||
-									(typeof authority.sessionId === "string" &&
-										state.runtime.session.sessionId !== authority.sessionId)
-								: !persistedMatchesAuthority))
+							state !== undefined &&
+							(state.runtime.metadata.sessionDir !== authority.sessionDir ||
+								(typeof authority.sessionFile === "string" &&
+									state.runtime.session.sessionFile !== authority.sessionFile) ||
+								(typeof authority.sessionId === "string" &&
+									state.runtime.session.sessionId !== authority.sessionId)))
 					) {
 						throw new Error("RLM subagent deletion does not match the resident runtime incarnation");
+					}
+					// `readLatestRlmSubagentRegistry(..., true)` completed successfully.
+					// When it proves this child has no current row and no resident object
+					// exists, deletion is already benign regardless of a stale or partial
+					// coordinator token. Existing rows above still require exact authority.
+					if (state === undefined && persisted === undefined) {
+						return { deletionDurability: "absent" };
 					}
 					const childSessionFile = persisted?.sessionFile ?? state?.runtime.session.sessionFile;
 					const deletionDurability = await this.recordRlmSubagentDeletion(

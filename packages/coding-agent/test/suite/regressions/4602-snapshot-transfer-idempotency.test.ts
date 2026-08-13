@@ -183,7 +183,12 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			clients: new Set<DaemonSocketClient>(),
 			eventGeneration: "generation-4602",
 			lastEventSequence: 1,
-			runtime: { metadata: { kind: "top-level", createdAt: 1 } },
+			runtime: {
+				metadata: { kind: "top-level", createdAt: 1 },
+				// Resident daemon states always carry a runtime session. A persisted
+				// path lets passive discovery inspect its (empty) registry normally.
+				session: { sessionFile: "/tmp/eng-4602-session.jsonl" },
+			},
 		} as unknown as ActiveSessionState;
 		const socket = new PassThrough();
 		const client = {

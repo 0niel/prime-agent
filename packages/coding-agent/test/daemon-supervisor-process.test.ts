@@ -312,8 +312,8 @@ describe("daemon supervisor resident workers", () => {
 			if (!sessionFile) throw new Error("Missing child fixture path");
 			return { childId, sessionName, childSessionDir, manager, sessionFile };
 		};
-		const child = makeChild("passive-child", "passive-child-worker", 2);
-		const createChild = makeChild("passive-create-child", "passive-create-worker", 3);
+		const child = makeChild("sub-a1b2c3d4", "passive-child-worker", 2);
+		const createChild = makeChild("sub-e5f6a7b8", "passive-create-worker", 3);
 		writeFileSync(
 			join(parentArtifactDir, "rlm-subagents.jsonl"),
 			`${[child, createChild]

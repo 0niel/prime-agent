@@ -1207,6 +1207,22 @@ describe("daemon mode helpers", () => {
 			await expect(internals.recordRlmSubagentDeletion(parent, fixture.childId)).resolves.toBe("unknown");
 			expect(readFileSync(registryPath, "utf8")).toBe(modern);
 
+			// In contrast, a complete registry read can prove a no-row request is
+			// already absent without inventing an incarnation authority. Existing
+			// rows above remain fail-closed.
+			await expect(host.deleteRlmSubagentRuntime("missing-child")).resolves.toEqual({
+				deletionDurability: "absent",
+			});
+			await expect(
+				host.deleteRlmSubagentRuntime("missing-child", undefined, {
+					childId: "missing-child",
+					sessionDir: join(tempDir, "stale-missing-child"),
+					generation: 1,
+					assertCurrent: () => {},
+				}),
+			).resolves.toEqual({ deletionDurability: "absent" });
+			expect(readFileSync(registryPath, "utf8")).toBe(modern);
+
 			const legacy = JSON.parse(modern) as Record<string, unknown>;
 			delete legacy.sessionId;
 			writeFileSync(registryPath, `${JSON.stringify(legacy)}\n`);

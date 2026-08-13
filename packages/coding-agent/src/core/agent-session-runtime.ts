@@ -443,7 +443,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			}
 			authority.assertCurrent();
 			await session.disposeAsync();
-			return { deletionDurability: "absent" };
+			// The supplied retained object was an old incarnation. Its disposal
+			// neither deletes nor proves absence of the newer map-resident child.
+			return { deletionDurability: "stale" };
 		}
 		if (
 			authority &&

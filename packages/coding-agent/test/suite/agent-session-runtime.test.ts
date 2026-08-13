@@ -343,7 +343,9 @@ describe("AgentSessionRuntime characterization", () => {
 			generation: 1,
 			assertCurrent: vi.fn(),
 		};
-		await runtime.deleteRlmSubagentRuntime("replaced-child", staleSession, staleAuthority);
+		await expect(runtime.deleteRlmSubagentRuntime("replaced-child", staleSession, staleAuthority)).resolves.toEqual({
+			deletionDurability: "stale",
+		});
 		expect(disposeStaleSession).toHaveBeenCalledOnce();
 		expect(disposeReplacedRuntime).not.toHaveBeenCalled();
 		expect(runtimeWithSubagents.subagentRuntimes.get("replaced-child")).toBe(replacedRuntime);

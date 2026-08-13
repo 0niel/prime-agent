@@ -52,8 +52,10 @@ interface SupervisorInternals {
 }
 
 const tempDirs: string[] = [];
+const supervisors: SupervisorInternals[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+	for (const supervisor of supervisors.splice(0)) await (supervisor.catalog.stop as () => Promise<void>)();
 	for (const directory of tempDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
@@ -110,6 +112,7 @@ function makeSupervisor(idleEvictionMinutes: number | "off" = 90): SupervisorInt
 		supervisor.workers.delete(worker.descriptor.workerId);
 	});
 	supervisor.log = vi.fn();
+	supervisors.push(supervisor);
 	return supervisor;
 }
 
