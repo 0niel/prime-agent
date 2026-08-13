@@ -9178,6 +9178,11 @@ export class AgentSession {
 		return this._activeRlmChildRuns.get(childId)?.status;
 	}
 
+	/** Whether this exact child is awaiting private deletion reconciliation. */
+	isRlmChildDeletionQuarantined(childId: string): boolean {
+		return this._rlmChildDeletionQuarantines.has(childId);
+	}
+
 	private async _currentActiveSessionId(): Promise<string | undefined> {
 		try {
 			return (await this._agentMessageController?.listAgents())?.current?.activeSessionId;
