@@ -506,6 +506,21 @@ describe("daemon catalog selector resolution", () => {
 		await expect(listCatalogFamilySessions(duplicateDir)).rejects.toThrow("duplicate session id");
 	});
 
+	it("releases the session authority descriptor when the artifacts root open fails", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-artifacts-open-fail-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+		// A symlinked artifacts root fails the O_NOFOLLOW open with a non-ENOENT error.
+		const realArtifacts = join(root, "session-artifacts-real");
+		mkdirSync(realArtifacts);
+		symlinkSync(realArtifacts, join(root, "session-artifacts"));
+		const baseline = getOpenCatalogAuthorityFdCountForTest();
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(baseline);
+	});
+
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {
 		const sessions = [
 			session("named-session-id", "target", "/tmp/by-name.jsonl"),

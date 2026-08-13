@@ -145,6 +145,7 @@ function managedRoots(sessionDir: string | undefined): ManagedRoots {
 		return { session, artifacts };
 	} catch (error) {
 		closeSync(session.fd);
+		openAuthorityFdCountForTest--;
 		throw error;
 	}
 }
