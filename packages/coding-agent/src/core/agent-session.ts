@@ -9653,10 +9653,16 @@ export class AgentSession {
 			// A precommit release failure left the host runtime live. Durability alone
 			// cannot discharge that lease: retry the typed host deletion so the exact
 			// resident incarnation is closed before local tracking is cleared.
-			await this._deleteRlmSubagentSession(childId, retained, authority);
+			const deletion = await this._deleteRlmSubagentSession(childId, retained, authority);
 			authority?.assertCurrent();
+			if (
+				deletion.deletionDurability === "stale" ||
+				this._activeRlmChildRuns.has(childId) ||
+				this._rlmChildSessions.get(childId) !== retained
+			) {
+				return false;
+			}
 			if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return false;
-			if (this._rlmChildSessions.get(childId) !== retained) return false;
 			this._removeRlmSubagentTracking(childId);
 		}
 		if (durability === "absent") {
@@ -10481,7 +10487,14 @@ export class AgentSession {
 					run.detachedDeletion = publishedDeletion;
 					await this._coordinateRlmSubagentDeletion(publishedDeletion, undefined, undefined, async (authority) => {
 						try {
-							await this._deleteRlmSubagentSession(run.id, publishedRuntime.session, authority);
+							const deletion = await this._deleteRlmSubagentSession(run.id, publishedRuntime.session, authority);
+							if (
+								deletion.deletionDurability === "stale" ||
+								this._activeRlmChildRuns.get(run.id) !== run ||
+								run.session !== publishedRuntime.session
+							) {
+								return { subagent: publishedDeletion, outcome: "preserved_newer" };
+							}
 						} catch (error) {
 							if (!this._disposed && !this._disposing) {
 								this._rlmChildSessions.set(run.id, publishedRuntime.session);

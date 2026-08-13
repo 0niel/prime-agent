@@ -3059,6 +3059,47 @@ describe("AgentSession rlm recursion", () => {
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 	});
 
+	it("preserves a replacement active child when delayed startup deletion settles stale", async () => {
+		let releaseRuntimeCreation: () => void = () => {};
+		const runtimeCreationGate = new Promise<void>((resolve) => {
+			releaseRuntimeCreation = resolve;
+		});
+		let runtimeCreationStarted = false;
+		const stale = createSession({ rlmSessionDir: join(tempDir, "stale-startup") });
+		const newer = createSession({ rlmSessionDir: join(tempDir, "new-startup") });
+		let root!: AgentSession;
+		const deleteRuntime = vi.fn(async (childId: string) => {
+			const internals = root as unknown as InspectableRlmSession;
+			const original = internals._activeRlmChildRuns.get(childId);
+			if (!original) throw new Error("Missing delayed startup run");
+			internals._activeRlmChildRuns.set(childId, { ...original, session: newer });
+			return { deletionDurability: "stale" as const };
+		});
+		root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					runtimeCreationStarted = true;
+					await runtimeCreationGate;
+					return { session: stale };
+				},
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		await root.runRlmChild("delayed stale cleanup", { name: "delayed-stale-worker" });
+		await waitFor(() => runtimeCreationStarted);
+		const childId = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.keys()][0];
+		if (!childId) throw new Error("Missing queued child");
+		await root.deleteRlmSubagent(childId);
+		releaseRuntimeCreation();
+		await waitFor(() => deleteRuntime.mock.calls.length === 1);
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._activeRlmChildRuns.get(childId)?.session === newer);
+		expect(internals._deletedRlmChildIds.has(childId)).toBe(false);
+		expect(internals._activeRlmChildRuns.get(childId)?.session).toBe(newer);
+		await stale.disposeAsync();
+		await newer.disposeAsync();
+	});
+
 	it("keeps late startup cleanup retryable when release and fallback delete fail", async () => {
 		let releaseRuntimeCreation: () => void = () => {};
 		const runtimeCreationGate = new Promise<void>((resolve) => {
@@ -3512,6 +3553,46 @@ describe("AgentSession rlm recursion", () => {
 		expect(disposeChild).toHaveBeenCalledOnce();
 		expect(internals._rlmChildDeletionQuarantines).toHaveLength(0);
 		expect(internals._rlmChildSessions).toHaveLength(0);
+	});
+
+	it("preserves a replacement retained child when quarantined deletion settles stale", async () => {
+		const childId = "recycled-quarantine-child";
+		const staleDir = join(tempDir, "stale-quarantine");
+		const stale = { _rlmSessionDir: staleDir, sessionId: "stale" } as unknown as AgentSession;
+		const newer = { _rlmSessionDir: join(tempDir, "new-quarantine"), sessionId: "new" } as unknown as AgentSession;
+		let root!: AgentSession;
+		const rootEntry = {
+			rlm_child_id: childId,
+			active_session_id: null,
+			session_id: "stale",
+			status: "error" as const,
+			session_name: "stale-quarantine",
+			session_dir: staleDir,
+		};
+		const deleteRuntime = vi.fn(async () => {
+			(root as unknown as InspectableRlmSession)._rlmChildSessions.set(childId, newer);
+			return { deletionDurability: "stale" as const };
+		});
+		root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				resolveRlmSubagentDeletion: async () => "tombstoned",
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		const internals = root as unknown as InspectableRlmSession;
+		internals._rlmChildDeletionQuarantines.set(childId, rootEntry);
+		internals._rlmChildSessions.set(childId, stale);
+
+		await expect(root.deleteRlmSubagent(childId)).rejects.toThrow(
+			"RLM subagent deletion durability is still unknown",
+		);
+		expect(deleteRuntime).toHaveBeenCalledWith(childId, stale, expect.any(Object));
+		expect(internals._rlmChildSessions.get(childId)).toBe(newer);
+		expect(internals._rlmChildDeletionQuarantines.get(childId)).toBe(rootEntry);
+		expect(internals._deletedRlmChildIds.has(childId)).toBe(false);
 	});
 
 	it("rejects a quarantine retry revoked after host durability resolves without mutating", async () => {
