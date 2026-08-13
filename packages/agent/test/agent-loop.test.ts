@@ -9,7 +9,14 @@ import {
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.js";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.js";
+import type {
+	AgentContext,
+	AgentEvent,
+	AgentLoopConfig,
+	AgentMessage,
+	AgentTool,
+	StreamFn,
+} from "../src/types.js";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -115,7 +122,7 @@ describe("Agent relay identity", () => {
 		const seenRelayIds: string[] = [];
 		const retryRelayIds: string[] = [];
 		const eventPayloads: string[] = [];
-		const streamFn = vi.fn((_model: Model, _context, options) => {
+		const streamFn: StreamFn = vi.fn((_model, _context, options) => {
 			const relayId = options?.headers?.["X-Prime-Agent-Relay-ID"];
 			if (!relayId) throw new Error("missing relay ID");
 			seenRelayIds.push(relayId);
@@ -174,7 +181,7 @@ describe("Agent relay identity", () => {
 	it("does not add a relay ID for non-intercept providers", async () => {
 		let headers: Record<string, string> | undefined;
 		const stream = new MockAssistantStream();
-		const streamFn = vi.fn((_model: Model, _context, options) => {
+		const streamFn: StreamFn = vi.fn((_model, _context, options) => {
 			headers = options?.headers;
 			queueMicrotask(() => {
 				stream.push({
