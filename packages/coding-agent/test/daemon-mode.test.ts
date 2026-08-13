@@ -1074,6 +1074,7 @@ describe("daemon mode helpers", () => {
 			const internals = fixture.daemon as unknown as {
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
 				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				closeSession(state: ActiveSessionState, reason: "killed", allowPassivation: false): Promise<void>;
 				cancelScheduledJobsForSessionFile(sessionFile: string): void;
 			};
 			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
@@ -1118,16 +1119,25 @@ describe("daemon mode helpers", () => {
 				sessionId: replacementSessionId,
 				generation: 2,
 			};
+			const replacement = await internals.createRuntime({
+				type: "create",
+				sessionPath: fixture.childSessionFile,
+			});
+			const close = vi.spyOn(internals, "closeSession");
 			await expect(
-				host.deleteRlmSubagentRuntime(fixture.childId, undefined, currentAuthority),
+				host.deleteRlmSubagentRuntime(fixture.childId, replacement.runtime.session, currentAuthority),
 			).rejects.toMatchObject({
 				name: "RlmSubagentHostDeletionError",
 				phase: "tombstoned",
 			});
+			expect(close).toHaveBeenCalledOnce();
 			expect(readFileSync(registryPath, "utf8").match(/"status":"deleted"/g)).toHaveLength(1);
-			await expect(host.deleteRlmSubagentRuntime(fixture.childId, undefined, currentAuthority)).resolves.toEqual({
-				deletionDurability: "tombstoned",
-			});
+			// The coordinator retains the session object after postcommit failure, but
+			// daemon state is already absent. Retry only the remaining scheduler work.
+			await expect(
+				host.deleteRlmSubagentRuntime(fixture.childId, replacement.runtime.session, currentAuthority),
+			).resolves.toEqual({ deletionDurability: "tombstoned" });
+			expect(close).toHaveBeenCalledOnce();
 			expect(cleanup).toHaveBeenCalledTimes(2);
 			expect(readFileSync(registryPath, "utf8").match(/"status":"deleted"/g)).toHaveLength(1);
 		} finally {
