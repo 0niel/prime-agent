@@ -3120,6 +3120,9 @@ describe("AgentSession rlm recursion", () => {
 		if (!quarantinedChildId) throw new Error("Missing deletion quarantine");
 		// The exact opaque id can retry cleanup even though the lease is omitted from
 		// every product-facing list and cannot be selected by its name or session id.
+		await expect(root.deleteRlmSubagent("revoked during late publication")).rejects.toThrow(
+			'No direct RLM subagent matches "revoked during late publication"',
+		);
 		await expect(root.deleteRlmSubagent(quarantinedChildId)).resolves.toMatchObject({
 			subagent: { rlm_child_id: quarantinedChildId },
 		});
