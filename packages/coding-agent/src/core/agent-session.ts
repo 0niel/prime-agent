@@ -8821,7 +8821,9 @@ export class AgentSession {
 			})),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
-			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
+			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target, signal) =>
+				this.deleteRlmSubagent(target, signal),
+			),
 			"model.info": createHostRequestHandler(async (_payload, _context) => ({
 				id: this.model?.id ?? null,
 				provider: this.model?.provider ?? null,
@@ -9372,7 +9374,12 @@ export class AgentSession {
 	}
 
 	/** Delete a running, retained, or passive direct child selected from this parent session's registry. */
-	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
+	async deleteRlmSubagent(target: string, signal?: AbortSignal): Promise<RlmDeleteSubagentResult> {
+		// Re-checked before each mutating delete so a revocation mid-resolution never mutates.
+		const assertDeleteAuthority = () => {
+			if (signal?.aborted) throw new Error("host request authority was revoked");
+		};
+		assertDeleteAuthority();
 		const inFlight = [...this._deletingRlmChildren.values()].filter(({ subagent }) =>
 			this._rlmSubagentMatchesTarget(subagent, target),
 		);
@@ -9421,6 +9428,7 @@ export class AgentSession {
 							session_name: daemonChild.sessionName ?? subagent.session_name,
 						}
 					: subagent;
+				assertDeleteAuthority();
 				return this._deleteResolvedRlmSubagent(resolvedSubagent);
 			});
 		}
@@ -9434,7 +9442,10 @@ export class AgentSession {
 			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
 		}
 		const subagent = directMatches[0] ?? (await this._resolveDirectRlmSubagent(target));
-		return this._trackRlmSubagentDeletion(subagent, () => this._deleteResolvedRlmSubagent(subagent));
+		return this._trackRlmSubagentDeletion(subagent, () => {
+			assertDeleteAuthority();
+			return this._deleteResolvedRlmSubagent(subagent);
+		});
 	}
 
 	private async _trackRlmSubagentDeletion(

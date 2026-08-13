@@ -53,7 +53,7 @@ export interface RlmFindModelsResult {
 
 export type RlmRunHandler = (request: RlmRunRequest) => Promise<Record<string, unknown>>;
 export type RlmListSubagentsHandler = () => RlmListSubagentsResult | Promise<RlmListSubagentsResult>;
-export type RlmDeleteSubagentHandler = (target: string) => Promise<RlmDeleteSubagentResult>;
+export type RlmDeleteSubagentHandler = (target: string, signal: AbortSignal) => Promise<RlmDeleteSubagentResult>;
 export type RlmFindModelsHandler = (query: string, limit: number) => RlmFindModelsResult | Promise<RlmFindModelsResult>;
 
 const RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH = 64;
@@ -192,11 +192,11 @@ export function createRlmListSubagentsHostHandler(handler: RlmListSubagentsHandl
 
 /** Delete one direct child selected from the current parent session's registry. */
 export function createRlmDeleteSubagentHostHandler(handler: RlmDeleteSubagentHandler): HostRequestHandler {
-	return createHostRequestHandler(async (payload, _context) => {
+	return createHostRequestHandler(async (payload, context) => {
 		if (typeof payload.target !== "string" || !payload.target.trim()) {
 			throw new Error("rlm.delete_subagent target must be a non-empty string");
 		}
-		const { subagent, outcome } = await handler(payload.target.trim());
+		const { subagent, outcome } = await handler(payload.target.trim(), context.signal);
 		return outcome === undefined ? { subagent } : { subagent, outcome };
 	});
 }
