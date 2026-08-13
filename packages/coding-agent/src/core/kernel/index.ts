@@ -82,14 +82,11 @@ export interface HostRequestHandlerOptions {
 /** The stable marker makes default/rest callbacks unambiguous without Function.length. */
 export const contextAwareHostRequestHandler: HostRequestHandlerOptions = Object.freeze({ contextAware: true });
 
-/** Implementations receive dispatcher-minted context; the marker makes rest/default callbacks unambiguous. */
-export type HostRequestHandlerImplementation = (
+/** Handlers receive dispatcher-minted context; provenance is always checked at dispatch time. */
+export type HostRequestHandler = (
 	payload: HostRequestPayload,
 	context: HostRequestContext,
 ) => Promise<Record<string, unknown>>;
-
-/** Public registration shape; provenance is always checked at dispatch time. */
-export type HostRequestHandler = HostRequestHandlerImplementation;
 
 /** A factory-minted capability. Raw, copied-brand, and fabricated handlers are rejected. */
 type HostRequestHandlerCapability = HostRequestHandler & { readonly [hostRequestHandlerBrand]: true };
