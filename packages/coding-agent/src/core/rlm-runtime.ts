@@ -2,7 +2,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSession } from "./agent-session.js";
 import type { ToolDefinition } from "./extensions/index.js";
-import { contextAwareHostRequestHandler, createHostRequestHandler, type HostRequestHandler } from "./kernel/index.js";
+import { createHostRequestHandler, type HostRequestHandler } from "./kernel/index.js";
 
 export interface RlmRunRequest {
 	prompt: string;
@@ -168,7 +168,7 @@ export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHand
 			isCurrent: () => context.isCurrent(),
 		});
 		return result as unknown as Record<string, unknown>;
-	}, contextAwareHostRequestHandler);
+	});
 }
 
 /** Search a bounded authenticated model catalog without adding it to the system prompt. */
@@ -182,7 +182,7 @@ export function createRlmFindModelsHostHandler(handler: RlmFindModelsHandler): H
 			throw new Error(`rlm.find_models limit must be an integer from 1 to ${MAX_RLM_MODEL_SEARCH_LIMIT}`);
 		}
 		return { models: (await handler(payload.query, limit as number)).models };
-	}, contextAwareHostRequestHandler);
+	});
 }
 
 /** Expose the current parent session's RLM child registry to its kernel. */
@@ -190,7 +190,7 @@ export function createRlmListSubagentsHostHandler(handler: RlmListSubagentsHandl
 	return createHostRequestHandler(async (_payload, _context) => {
 		const { subagents } = await handler();
 		return { subagents };
-	}, contextAwareHostRequestHandler);
+	});
 }
 
 /** Delete one direct child selected from the current parent session's registry. */
@@ -201,7 +201,7 @@ export function createRlmDeleteSubagentHostHandler(handler: RlmDeleteSubagentHan
 		}
 		const { subagent, outcome } = await handler(payload.target.trim());
 		return outcome === undefined ? { subagent } : { subagent, outcome };
-	}, contextAwareHostRequestHandler);
+	});
 }
 
 export interface RlmSubagentRuntime {

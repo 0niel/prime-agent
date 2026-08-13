@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { contextAwareHostRequestHandler, createHostRequestHandler, type HostRequestHandlers } from "./kernel/index.js";
+import { createHostRequestHandler, type HostRequestHandlers } from "./kernel/index.js";
 
 export const AGENT_OBSERVE_SKILL_NAME = "agent-observe";
 export const AGENT_OBSERVE_IMPORT_NAME = "agent_observe";
@@ -72,12 +72,11 @@ export function createAgentObserveHostHandlers(controller: AgentObserveControlle
 	return {
 		"agent_observe.list": createHostRequestHandler(
 			async (_payload, _context) => controller.listAgents() as unknown as Record<string, unknown>,
-			contextAwareHostRequestHandler,
 		),
 		"agent_observe.get": createHostRequestHandler(async (payload, _context) => {
 			if (typeof payload.target !== "string") throw new Error("agent_observe.get target must be a string");
 			return (await controller.getAgent(payload.target)) as unknown as Record<string, unknown>;
-		}, contextAwareHostRequestHandler),
+		}),
 		"agent_observe.recent": createHostRequestHandler(async (payload, _context) => {
 			if (typeof payload.target !== "string") throw new Error("agent_observe.recent target must be a string");
 			return (await controller.recentMessages({
@@ -85,7 +84,7 @@ export function createAgentObserveHostHandlers(controller: AgentObserveControlle
 				limit: normalizeOptionalInteger(payload.limit, "agent_observe.recent limit"),
 				maxChars: normalizeOptionalInteger(payload.max_chars ?? payload.maxChars, "agent_observe.recent max_chars"),
 			})) as unknown as Record<string, unknown>;
-		}, contextAwareHostRequestHandler),
+		}),
 	};
 }
 
