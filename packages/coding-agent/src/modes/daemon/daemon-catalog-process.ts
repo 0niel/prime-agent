@@ -817,6 +817,123 @@ async function readTrustedSession(path: string, reader: TrustedReadSession): Pro
  * record purports to be an identified session, the strict descriptor-bound
  * reader owns every topology and protocol failure.
  */
+interface JsonStringPrefix {
+	value: string;
+	end: number;
+	terminated: boolean;
+	partialEscape: boolean;
+}
+
+/** Read a JSON string without treating malformed input as executable JSON. */
+function readJsonStringPrefix(text: string, start: number): JsonStringPrefix | undefined {
+	if (text[start] !== '"') return undefined;
+	let value = "";
+	let index = start + 1;
+	while (index < text.length) {
+		const char = text[index++];
+		if (char === '"') return { value, end: index, terminated: true, partialEscape: false };
+		if (char !== "\\") {
+			value += char;
+			continue;
+		}
+		if (index === text.length) return { value, end: index, terminated: false, partialEscape: true };
+		const escapedChar = text[index++];
+		const simpleEscape =
+			escapedChar === '"'
+				? '"'
+				: escapedChar === "\\"
+					? "\\"
+					: escapedChar === "/"
+						? "/"
+						: escapedChar === "b"
+							? "\b"
+							: escapedChar === "f"
+								? "\f"
+								: escapedChar === "n"
+									? "\n"
+									: escapedChar === "r"
+										? "\r"
+										: escapedChar === "t"
+											? "\t"
+											: undefined;
+		if (simpleEscape !== undefined) {
+			value += simpleEscape;
+			continue;
+		}
+		if (escapedChar !== "u") return { value, end: index, terminated: false, partialEscape: false };
+		if (index + 4 > text.length) return { value, end: text.length, terminated: false, partialEscape: true };
+		const hex = text.slice(index, index + 4);
+		if (!/^[0-9a-f]{4}$/iu.test(hex)) return { value, end: index + 4, terminated: false, partialEscape: false };
+		value += String.fromCharCode(Number.parseInt(hex, 16));
+		index += 4;
+	}
+	return { value, end: index, terminated: false, partialEscape: false };
+}
+
+function skipJsonValuePrefix(text: string, start: number): number {
+	let index = start;
+	while (/\s/u.test(text[index] ?? "")) index++;
+	const opening = text[index];
+	if (opening === '"') return readJsonStringPrefix(text, index)?.end ?? text.length;
+	if (opening !== "{" && opening !== "[") {
+		while (index < text.length && !/[\s,}\]]/u.test(text[index] ?? "")) index++;
+		return index;
+	}
+	const closings = [opening === "{" ? "}" : "]"];
+	index++;
+	while (index < text.length && closings.length > 0) {
+		const char = text[index];
+		if (char === '"') {
+			const string = readJsonStringPrefix(text, index);
+			if (!string) return text.length;
+			index = string.end;
+			if (!string.terminated) return index;
+			continue;
+		}
+		if (char === "{") closings.push("}");
+		else if (char === "[") closings.push("]");
+		else if (char === closings.at(-1)) closings.pop();
+		index++;
+	}
+	return index;
+}
+
+/**
+ * Recognize only outer-object topology claims in an incomplete JSON prefix.
+ * JSON string escapes are decoded only while scanning their bounded syntax, so
+ * escaped keys cannot hide claims and strings in unrelated values cannot create
+ * one. A cut through a key escape is ambiguous and therefore fails closed.
+ */
+function hasApparentSessionTopologyClaimPrefix(text: string): boolean {
+	let index = 0;
+	while (/\s/u.test(text[index] ?? "")) index++;
+	if (text[index++] !== "{") return false;
+	while (index < text.length) {
+		while (/\s/u.test(text[index] ?? "")) index++;
+		if (text[index] === "}") return false;
+		const key = readJsonStringPrefix(text, index);
+		if (!key) return false;
+		if (!key.terminated) return key.partialEscape;
+		index = key.end;
+		while (/\s/u.test(text[index] ?? "")) index++;
+		if (text[index] !== ":") return false;
+		index++;
+		while (/\s/u.test(text[index] ?? "")) index++;
+		if (key.value === "id") return true;
+		if (key.value === "type") {
+			const value = readJsonStringPrefix(text, index);
+			if (!value) return false;
+			if (!value.terminated) return value.partialEscape || "session".startsWith(value.value);
+			if (value.value === "session") return true;
+		}
+		index = skipJsonValuePrefix(text, index);
+		while (/\s/u.test(text[index] ?? "")) index++;
+		if (text[index] !== ",") return false;
+		index++;
+	}
+	return false;
+}
+
 async function readTrustedRootCandidate(
 	path: string,
 	listed: { dev: string; ino: string },
@@ -834,9 +951,9 @@ async function readTrustedRootCandidate(
 		candidate = JSON.parse(line) as { type?: unknown; id?: unknown };
 	} catch {
 		// A bounded prefix may end in a concurrent partial write. Only a prefix
-		// that already purports to carry a session or identifier claim is part of
-		// the topology; unrelated incomplete junk remains skippable.
-		if (/^\s*\{[\s\S]*?"type"\s*:\s*"session(?:"|\\|$)|^\s*\{[\s\S]*?"id"\s*:/u.test(line))
+		// carrying a safely decoded topology claim is part of the topology;
+		// unrelated incomplete junk remains skippable.
+		if (hasApparentSessionTopologyClaimPrefix(line))
 			throw invalidFamilyTopology("session header exceeds the trusted read limit");
 		return undefined;
 	}
