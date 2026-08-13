@@ -3250,6 +3250,52 @@ describe("AgentSession rlm recursion", () => {
 		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toHaveLength(0);
 	});
 
+	it("retains a precommit late-admission release for an exact-id tombstone-and-close retry", async () => {
+		const controller = new AbortController();
+		const child = createSession();
+		const disposeChild = vi.spyOn(child, "disposeAsync");
+		let releaseAttempts = 0;
+		const deleteRuntime = vi.fn(async (_childId: string, session?: AgentSession) => {
+			await session?.disposeAsync();
+		});
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async (options) => {
+					controller.abort();
+					options.onSessionPublished?.(child);
+					return { session: child };
+				},
+				releaseRlmSubagentRuntime: async () => {
+					releaseAttempts++;
+					throw new RlmSubagentHostDeletionError("precommit", new Error("registry write failed"));
+				},
+				resolveRlmSubagentDeletion: async () => "tombstoned",
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+
+		await expect(
+			root.runRlmChild("precommit late publication", {}, undefined, { signal: controller.signal }),
+		).rejects.toThrow("host request authority was revoked");
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._activeRlmChildRuns.size === 0);
+		expect(releaseAttempts).toBe(1);
+		expect(disposeChild).not.toHaveBeenCalled();
+		expect(internals._rlmChildDeletionQuarantines).toHaveLength(1);
+		expect(internals._rlmChildSessions).toHaveLength(1);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+		const childId = [...internals._rlmChildDeletionQuarantines.keys()][0];
+		if (!childId) throw new Error("Missing deletion quarantine");
+
+		await expect(root.deleteRlmSubagent(childId)).resolves.toMatchObject({
+			subagent: { rlm_child_id: childId },
+		});
+		expect(deleteRuntime).toHaveBeenCalledOnce();
+		expect(disposeChild).toHaveBeenCalledOnce();
+		expect(internals._rlmChildDeletionQuarantines).toHaveLength(0);
+		expect(internals._rlmChildSessions).toHaveLength(0);
+	});
+
 	it("rejects a quarantine retry revoked after host durability resolves without mutating", async () => {
 		const admissionController = new AbortController();
 		const child = createSession();
