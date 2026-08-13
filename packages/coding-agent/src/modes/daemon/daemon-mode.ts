@@ -402,6 +402,11 @@ interface PersistedRlmSubagentRegistryEntry {
 	updatedAt: string;
 }
 
+/** A pre-session-id registry row is only usable to upgrade an exact resident. */
+type DeletionRlmSubagentRegistryEntry = Omit<PersistedRlmSubagentRegistryEntry, "sessionId"> & {
+	sessionId?: string;
+};
+
 type PassiveRlmRoot =
 	| { rootParentState: ActiveSessionState; rootInfo?: never }
 	| { rootParentState?: never; rootInfo: SessionInfo };
@@ -965,11 +970,13 @@ export class AgentDaemon {
 	/**
 	 * Strictly read the registry when absence would authorize destructive cleanup.
 	 * Passive discovery may skip a corrupt historical line, but deletion must not
-	 * mistake that ambiguity for proof that a child was never recorded.
+	 * mistake that ambiguity for proof that a child was never recorded. A row
+	 * written before session ids existed is retained only for an exact resident
+	 * session to upgrade; it is never evidence for passive cleanup.
 	 */
 	private async readCompleteRlmSubagentRegistryForDeletion(
 		parentState: ActiveSessionState,
-	): Promise<PersistedRlmSubagentRegistryEntry[] | undefined> {
+	): Promise<DeletionRlmSubagentRegistryEntry[] | undefined> {
 		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
 		if (!path) return undefined;
 		let lines: string[];
@@ -982,12 +989,12 @@ export class AgentDaemon {
 			);
 			return undefined;
 		}
-		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
+		const latest = new Map<string, DeletionRlmSubagentRegistryEntry>();
 		for (const line of lines) {
 			const trimmed = line.trim();
 			if (!trimmed) continue;
 			try {
-				const entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
+				const entry = JSON.parse(trimmed) as Partial<DeletionRlmSubagentRegistryEntry>;
 				const validIsoTimestamp =
 					typeof entry.updatedAt === "string" &&
 					Number.isFinite(Date.parse(entry.updatedAt)) &&
@@ -1005,8 +1012,8 @@ export class AgentDaemon {
 					typeof entry.sessionName !== "string" ||
 					typeof entry.sessionDir !== "string" ||
 					typeof entry.sessionFile !== "string" ||
-					typeof entry.sessionId !== "string" ||
-					entry.sessionId.length === 0 ||
+					(entry.sessionId !== undefined &&
+						(typeof entry.sessionId !== "string" || entry.sessionId.length === 0)) ||
 					typeof entry.parentSessionId !== "string" ||
 					entry.parentSessionId.length === 0 ||
 					(entry.parentSessionFile !== undefined && typeof entry.parentSessionFile !== "string") ||
@@ -1024,7 +1031,7 @@ export class AgentDaemon {
 				) {
 					return undefined;
 				}
-				latest.set(entry.childId, entry as PersistedRlmSubagentRegistryEntry);
+				latest.set(entry.childId, entry as DeletionRlmSubagentRegistryEntry);
 			} catch {
 				return undefined;
 			}
@@ -1036,53 +1043,62 @@ export class AgentDaemon {
 		parentState: ActiveSessionState,
 		childId: string,
 		authority?: RlmSubagentDeletionAuthority,
+		residentSession?: AgentSession,
 	): Promise<RlmSubagentDeletionDurability> {
 		const latest = await this.readCompleteRlmSubagentRegistryForDeletion(parentState);
-		// Every outcome still precedes a potential runtime close except the
-		// synchronous append boundary below, so revocation must win here too.
+		// This check follows the registry read even when this compatible resident
+		// path has no coordinator authority.
 		authority?.assertCurrent();
 		if (!latest) return "unknown";
-		const entry = latest.find((candidate) => candidate.childId === childId);
-		// The authority is minted by AgentSession's per-child coordinator. It
-		// binds this append to a particular incarnation, not merely a recycled id.
-		// Validate it once after the asynchronous read and once at the synchronous
-		// append/fsync boundary below.
-		// Compatibility callers only supplied assertCurrent before generations
-		// existed. New coordinator authorities always carry both incarnation fields.
 		if (
 			authority &&
 			(authority.childId !== childId ||
-				(entry !== undefined &&
-					(authority.sessionDir !== entry.sessionDir ||
-						typeof authority.sessionFile !== "string" ||
-						authority.sessionFile !== entry.sessionFile ||
-						typeof authority.sessionId !== "string" ||
-						authority.sessionId !== entry.sessionId)))
+				typeof authority.sessionDir !== "string" ||
+				typeof authority.sessionFile !== "string" ||
+				authority.sessionFile.length === 0 ||
+				typeof authority.sessionId !== "string" ||
+				authority.sessionId.length === 0)
 		) {
 			authority.assertCurrent();
 			return "unknown";
 		}
+		const entry = latest.find((candidate) => candidate.childId === childId);
 		if (!entry) {
 			authority?.assertCurrent();
 			return "absent";
 		}
-		if (authority) {
-			const info = await readSessionInfo(entry.sessionFile);
-			authority.assertCurrent();
-			if (!info || info.id !== entry.sessionId || authority.sessionId !== info.id) return "unknown";
-		}
+		// Validate the saved-session header after the asynchronous registry read
+		// before any append can be considered. This fences authority-free resident
+		// cleanup just as strictly as coordinator-owned cleanup.
+		const info = await readSessionInfo(entry.sessionFile);
+		authority?.assertCurrent();
+		if (!info) return "unknown";
+		const residentMatchesHeader =
+			residentSession !== undefined &&
+			residentSession.sessionFile === entry.sessionFile &&
+			residentSession.sessionId === info.id &&
+			(entry.sessionId === undefined || entry.sessionId === info.id);
+		const authorityMatchesEntry =
+			authority !== undefined &&
+			authority.childId === entry.childId &&
+			authority.sessionDir === entry.sessionDir &&
+			authority.sessionFile === entry.sessionFile &&
+			authority.sessionId === entry.sessionId &&
+			info.id === entry.sessionId;
+		const legacyResidentUpgrade = entry.sessionId === undefined && authority === undefined && residentMatchesHeader;
+		if (!authorityMatchesEntry && !(authority === undefined && residentMatchesHeader)) return "unknown";
+		if (entry.sessionId === undefined && !legacyResidentUpgrade) return "unknown";
 		if (entry.status === "deleted") {
 			authority?.assertCurrent();
 			return "tombstoned";
 		}
-		// The complete read above is asynchronous. Revalidate immediately before
-		// entering the synchronous append/fsync commit region: before that point a
-		// stale request must leave no registry mutation behind. Once append starts,
-		// finish the durable commit and let the caller suppress its stale reply.
+		// The header and authority are both checked immediately before the
+		// synchronous append/fsync boundary. Once append starts, finish it.
 		authority?.assertCurrent();
 		if (
 			!this.appendRlmSubagentRegistryEntry(parentState, {
 				...entry,
+				sessionId: entry.sessionId ?? info.id,
 				status: "deleted",
 				updatedAt: new Date().toISOString(),
 			})
@@ -2392,7 +2408,12 @@ export class AgentDaemon {
 
 					let deletionDurability: RlmSubagentDeletionDurability = "unknown";
 					if (status === "cancelled") {
-						deletionDurability = await this.recordRlmSubagentDeletion(parentState, options.id, authority);
+						deletionDurability = await this.recordRlmSubagentDeletion(
+							parentState,
+							options.id,
+							authority,
+							state.runtime.session,
+						);
 						if (deletionDurability === "unknown") {
 							throw new Error("RLM subagent deletion durability is still unknown");
 						}
@@ -2460,7 +2481,12 @@ export class AgentDaemon {
 						throw new Error("RLM subagent deletion does not match the resident runtime incarnation");
 					}
 					const childSessionFile = persisted?.sessionFile ?? state?.runtime.session.sessionFile;
-					const deletionDurability = await this.recordRlmSubagentDeletion(parentState, childId, authority);
+					const deletionDurability = await this.recordRlmSubagentDeletion(
+						parentState,
+						childId,
+						authority,
+						state?.runtime.session,
+					);
 					if (deletionDurability === "unknown") {
 						throw new Error("RLM subagent deletion durability is still unknown");
 					}

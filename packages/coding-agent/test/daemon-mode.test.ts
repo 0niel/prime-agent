@@ -1016,6 +1016,66 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("fails closed for incomplete or passive deletion and upgrades only an exact resident legacy row", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-resident-deletion-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				recordRlmSubagentDeletion(
+					parentState: ActiveSessionState,
+					childId: string,
+					authority?: { assertCurrent(): void; childId?: string; sessionDir?: string },
+					residentSession?: ActiveSessionState["runtime"]["session"],
+				): Promise<"absent" | "tombstoned" | "unknown">;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const child = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const modern = readFileSync(registryPath, "utf8");
+
+			// A coordinator-shaped request that omits either incarnation fence must
+			// not use a matching resident object as a fallback authorization.
+			await expect(
+				internals.recordRlmSubagentDeletion(
+					parent,
+					fixture.childId,
+					{
+						childId: fixture.childId,
+						sessionDir: fixture.childSessionDir,
+						assertCurrent: () => {},
+					},
+					child.runtime.session,
+				),
+			).resolves.toBe("unknown");
+			expect(readFileSync(registryPath, "utf8")).toBe(modern);
+
+			// A passive authority-free request has no incarnation proof and cannot
+			// turn a valid current registry record into a destructive append.
+			await expect(internals.recordRlmSubagentDeletion(parent, fixture.childId)).resolves.toBe("unknown");
+			expect(readFileSync(registryPath, "utf8")).toBe(modern);
+
+			const legacy = JSON.parse(modern) as Record<string, unknown>;
+			delete legacy.sessionId;
+			writeFileSync(registryPath, `${JSON.stringify(legacy)}\n`);
+			await expect(
+				internals.recordRlmSubagentDeletion(parent, fixture.childId, undefined, child.runtime.session),
+			).resolves.toBe("tombstoned");
+			const entries = readFileSync(registryPath, "utf8")
+				.trim()
+				.split(/\r?\n/u)
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			expect(entries).toHaveLength(2);
+			expect(entries[1]).toMatchObject({
+				childId: fixture.childId,
+				status: "deleted",
+				sessionId: child.runtime.session.sessionId,
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rechecks retry authority before appending a daemon deletion tombstone", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-deletion-authority-"));
 		try {
@@ -1061,7 +1121,7 @@ describe("daemon mode helpers", () => {
 					sessionDir: "/tmp/unknown",
 					assertCurrent: () => {},
 				}),
-			).resolves.toBe("absent");
+			).resolves.toBe("unknown");
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
