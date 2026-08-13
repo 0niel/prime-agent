@@ -1022,6 +1022,8 @@ describe("daemon mode helpers", () => {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
 			const internals = fixture.daemon as unknown as {
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				closeSession(state: ActiveSessionState, reason: "killed", allowPassivation: false): Promise<void>;
 				recordRlmSubagentDeletion(
 					parentState: ActiveSessionState,
 					childId: string,
@@ -1033,6 +1035,21 @@ describe("daemon mode helpers", () => {
 			const child = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
 			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
 			const modern = readFileSync(registryPath, "utf8");
+			const host = internals.createSubagentRuntimeHost(parent);
+			const close = vi.spyOn(internals, "closeSession");
+			const incompleteAuthority = {
+				childId: fixture.childId,
+				sessionDir: fixture.childSessionDir,
+				generation: 1,
+				assertCurrent: () => {},
+			};
+
+			// The public host path must fail before both tombstone append and resident close.
+			await expect(
+				host.deleteRlmSubagentRuntime(fixture.childId, child.runtime.session, incompleteAuthority),
+			).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
+			expect(close).not.toHaveBeenCalled();
+			expect(readFileSync(registryPath, "utf8")).toBe(modern);
 
 			// A coordinator-shaped request that omits either incarnation fence must
 			// not use a matching resident object as a fallback authorization.
