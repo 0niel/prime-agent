@@ -2450,9 +2450,8 @@ export class AgentDaemon {
 					const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
 						(entry) => entry.childId === childId,
 					);
-					// Concrete deletion requires exact object identity. A passive request and a
-					// post-tombstone cleanup retry have no resident state, so both must bind to
-					// the exact persisted incarnation before they can touch its tombstone or jobs.
+					// Concrete deletion requires exact authority. An omitted session is valid
+					// only when its persisted row and resident runtime name the same incarnation.
 					const persistedMatchesAuthority =
 						persisted !== undefined &&
 						authority !== undefined &&
@@ -2461,6 +2460,14 @@ export class AgentDaemon {
 						persisted.sessionFile === authority.sessionFile &&
 						typeof authority.sessionId === "string" &&
 						persisted.sessionId === authority.sessionId;
+					const residentMatchesAuthority =
+						state !== undefined &&
+						authority !== undefined &&
+						state.runtime.metadata.sessionDir === authority.sessionDir &&
+						typeof authority.sessionFile === "string" &&
+						state.runtime.session.sessionFile === authority.sessionFile &&
+						typeof authority.sessionId === "string" &&
+						state.runtime.session.sessionId === authority.sessionId;
 					const suppliedSessionMatchesPersisted =
 						session === undefined ||
 						(persistedMatchesAuthority &&
@@ -2468,17 +2475,13 @@ export class AgentDaemon {
 							(typeof authority?.sessionId !== "string" || session.sessionId === authority.sessionId));
 					if (
 						(state !== undefined && session !== undefined && state.runtime.session !== session) ||
-						(state !== undefined && session === undefined) ||
-						(state === undefined && session === undefined && !persistedMatchesAuthority) ||
+						(state !== undefined &&
+							session === undefined &&
+							(!persistedMatchesAuthority || !residentMatchesAuthority)) ||
+						(state === undefined && session === undefined) ||
 						(state === undefined && session !== undefined && !suppliedSessionMatchesPersisted) ||
 						(authority !== undefined &&
-							(state !== undefined
-								? state.runtime.metadata.sessionDir !== authority.sessionDir ||
-									(typeof authority.sessionFile === "string" &&
-										state.runtime.session.sessionFile !== authority.sessionFile) ||
-									(typeof authority.sessionId === "string" &&
-										state.runtime.session.sessionId !== authority.sessionId)
-								: !persistedMatchesAuthority))
+							(state !== undefined ? !residentMatchesAuthority : !persistedMatchesAuthority))
 					) {
 						throw new Error("RLM subagent deletion does not match the resident runtime incarnation");
 					}

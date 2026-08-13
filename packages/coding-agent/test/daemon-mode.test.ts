@@ -1110,6 +1110,73 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("permits omitted-session deletion only for an exact persisted resident authority", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-resident-authority-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				closeSession(state: ActiveSessionState, reason: "killed", allowPassivation: false): Promise<void>;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const child = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const host = internals.createSubagentRuntimeHost(parent);
+			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const close = vi.spyOn(internals, "closeSession");
+			const authority = {
+				childId: fixture.childId,
+				sessionDir: fixture.childSessionDir,
+				sessionFile: fixture.childSessionFile,
+				sessionId: child.runtime.session.sessionId,
+				generation: 1,
+				assertCurrent: () => {},
+			};
+
+			await expect(host.deleteRlmSubagentRuntime(fixture.childId, undefined, authority)).resolves.toEqual({
+				deletionDurability: "tombstoned",
+			});
+			expect(close).toHaveBeenCalledOnce();
+			expect(readFileSync(registryPath, "utf8").match(/"status":"deleted"/g)).toHaveLength(1);
+
+			const staleFixture = makePersistedRlmDaemonFixture(join(tempDir, "stale"));
+			const staleInternals = staleFixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				closeSession(state: ActiveSessionState, reason: "killed", allowPassivation: false): Promise<void>;
+			};
+			const staleParent = await staleInternals.createRuntime({
+				type: "create",
+				sessionPath: staleFixture.parentSessionFile,
+			});
+			const staleChild = await staleInternals.createRuntime({
+				type: "create",
+				sessionPath: staleFixture.childSessionFile,
+			});
+			const staleRegistryPath = join(staleFixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const staleEntry = JSON.parse(readFileSync(staleRegistryPath, "utf8")) as Record<string, unknown>;
+			writeFileSync(staleRegistryPath, `${JSON.stringify({ ...staleEntry, sessionId: "stale-session-id" })}\n`);
+			const staleBefore = readFileSync(staleRegistryPath, "utf8");
+			const staleClose = vi.spyOn(staleInternals, "closeSession");
+			await expect(
+				staleInternals
+					.createSubagentRuntimeHost(staleParent)
+					.deleteRlmSubagentRuntime(staleFixture.childId, undefined, {
+						...authority,
+						childId: staleFixture.childId,
+						sessionDir: staleFixture.childSessionDir,
+						sessionFile: staleFixture.childSessionFile,
+						sessionId: "stale-session-id",
+					}),
+			).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
+			expect(staleClose).not.toHaveBeenCalled();
+			expect(staleChild.runtime.session.sessionId).not.toBe("stale-session-id");
+			expect(readFileSync(staleRegistryPath, "utf8")).toBe(staleBefore);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rechecks retry authority before appending a daemon deletion tombstone", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-deletion-authority-"));
 		try {
@@ -7825,7 +7892,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("deletes a passive child without hydrating it and treats unknown children benignly", async () => {
+	it("rejects passive deletion without a resident incarnation and treats unknown children benignly", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-lazy-rlm-delete-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
@@ -7867,19 +7934,20 @@ describe("daemon mode helpers", () => {
 			})) as { data: { deleted: boolean } };
 			expect(unknown.data).toEqual({ deleted: false });
 
-			const result = (await internals.handleCommand(client, {
-				type: "delete_rlm_subagent",
-				activeSessionId: parentState.activeSessionId,
-				childId: fixture.childId,
-			})) as { data: { deleted: boolean } };
-			expect(result.data).toEqual({ deleted: true });
+			await expect(
+				internals.handleCommand(client, {
+					type: "delete_rlm_subagent",
+					activeSessionId: parentState.activeSessionId,
+					childId: fixture.childId,
+				}),
+			).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 			expect(existsSync(fixture.childSessionFile)).toBe(true);
 			const persisted = readFileSync(join(fixture.parentArtifactDir, "rlm-subagents.jsonl"), "utf8")
 				.trim()
 				.split(/\r?\n/)
 				.map((line) => JSON.parse(line) as { childId: string; status: string });
-			expect(persisted.at(-1)).toMatchObject({ childId: fixture.childId, status: "deleted" });
+			expect(persisted.at(-1)).toMatchObject({ childId: fixture.childId, status: "completed" });
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
