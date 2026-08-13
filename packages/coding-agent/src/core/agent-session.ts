@@ -10048,14 +10048,15 @@ export class AgentSession {
 					}
 				}
 				// A never-admitted cancelled child's dir is an orphan only when nothing
-				// durable references it. Once a runtime host produced a runtime or a
-				// session, its release/delete hooks own persistence (a daemon records a
-				// deleted registry entry that keeps the artifact tree on disk).
+				// durable references it. A host with a release hook records deletion
+				// durably (a daemon keeps the artifact tree for its deleted registry
+				// entry); a dispose-only host, like the default in-process runtime,
+				// persists nothing, so its dir is still an orphan to remove.
 				if (
 					!admissionCommitted &&
 					run.status === "cancelled" &&
 					!run.detachedDeletion &&
-					(!this._subagentRuntimeHost || (!childRuntime && !childSession))
+					(!this._subagentRuntimeHost?.releaseRlmSubagentRuntime || (!childRuntime && !childSession))
 				) {
 					rmSync(childSessionDir, { recursive: true, force: true });
 				}
