@@ -340,8 +340,7 @@ exit (Ctrl+C, Ctrl+D, SIGHUP, SIGTERM)
 
 #### resources_discover
 
-Fired after `session_start` so extensions can contribute additional skill, prompt, and theme paths.
-The startup path uses `reason: "startup"`. Reload uses `reason: "reload"`.
+Fired after `session_start` so extensions can contribute additional skill, prompt, and theme paths. The startup path uses `reason: "startup"`. Reload uses `reason: "reload"`.
 
 ```typescript
 pi.on("resources_discover", async (event, _ctx) => {
@@ -387,8 +386,7 @@ pi.on("session_before_switch", async (event, ctx) => {
 });
 ```
 
-After a successful switch or new-session action, Prime Agent emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "new" | "resume"` and `previousSessionFile`.
-Do cleanup work in `session_shutdown`, then reestablish any in-memory state in `session_start`.
+After a successful switch or new-session action, Prime Agent emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "new" | "resume"` and `previousSessionFile`. Do cleanup work in `session_shutdown`, then reestablish any in-memory state in `session_start`.
 
 #### session_before_fork
 
@@ -404,8 +402,7 @@ pi.on("session_before_fork", async (event, ctx) => {
 });
 ```
 
-After a successful fork or clone, Prime Agent emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "fork"` and `previousSessionFile`.
-Do cleanup work in `session_shutdown`, then reestablish any in-memory state in `session_start`.
+After a successful fork or clone, Prime Agent emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "fork"` and `previousSessionFile`. Do cleanup work in `session_shutdown`, then reestablish any in-memory state in `session_start`.
 
 #### session_before_compact / session_compact
 
@@ -898,8 +895,7 @@ Use this for abort-aware nested work started by extension handlers, for example:
 - model calls that accept `signal`
 - file or process helpers that accept `AbortSignal`
 
-`ctx.signal` is typically defined during active turn events such as `tool_call`, `tool_result`, `message_update`, and `turn_end`.
-It is usually `undefined` in idle or non-turn contexts such as session events, extension commands, and shortcuts fired while Prime Agent is idle.
+`ctx.signal` is typically defined during active turn events such as `tool_call`, `tool_result`, `message_update`, and `turn_end`. It is usually `undefined` in idle or non-turn contexts such as session events, extension commands, and shortcuts fired while Prime Agent is idle.
 
 ```typescript
 pi.on("tool_result", async (event, ctx) => {
@@ -1236,8 +1232,7 @@ Register a custom tool callable by the LLM. See [Custom Tools](#custom-tools) fo
 
 Use `pi.setActiveTools()` to enable or disable tools (including dynamically added tools) at runtime.
 
-Use `promptGuidelines` to append tool-specific bullets to the default system prompt when the tool is active.
-`promptSnippet` remains available as metadata for extensions that compose custom prompts, but the default prompt relies on provider tool schemas instead of a separate tool list.
+Use `promptGuidelines` to append tool-specific bullets to the default system prompt when the tool is active. `promptSnippet` remains available as metadata for extensions that compose custom prompts, but the default prompt relies on provider tool schemas instead of a separate tool list.
 
 **Important:** `promptGuidelines` bullets are appended flat with no automatic tool name prefix. Each guideline must name the tool it refers to — avoid "Use this tool when..." because the LLM cannot tell which tool "this" means. Write "Use my_tool when..." instead.
 
@@ -1423,8 +1418,7 @@ pi.registerCommand("deploy", {
 
 ### pi.getCommands()
 
-Get the slash commands available for invocation via `prompt` in the current session. Includes extension commands, prompt templates, and skill commands.
-The list matches the RPC `get_commands` ordering: extensions first, then templates, then skills.
+Get the slash commands available for invocation via `prompt` in the current session. Includes extension commands, prompt templates, and skill commands. The list matches the RPC `get_commands` ordering: extensions first, then templates, then skills.
 
 ```typescript
 const commands = pi.getCommands();
@@ -1451,8 +1445,7 @@ Each entry has this shape:
 
 Use `sourceInfo` as the canonical provenance field. Do not infer ownership from command names or from ad hoc path parsing.
 
-Built-in interactive commands (like `/model` and `/settings`) are not included here. They are handled only in interactive
-mode and would not execute if sent via `prompt`.
+Built-in interactive commands (like `/model` and `/settings`) are not included here. They are handled only in interactive mode and would not execute if sent via `prompt`.
 
 ### pi.registerMessageRenderer(customType, renderer)
 

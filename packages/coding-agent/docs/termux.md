@@ -52,15 +52,13 @@ termux-open-url "https://example.com"
 ## Opening Files
 
 ```bash
-termux-open file.pdf          # Opens with default app
-termux-open -c image.jpg      # Choose app
+termux-open file.pdf          # Opens with default app termux-open -c image.jpg      # Choose app
 ```
 
 ## Clipboard
 
 ```bash
-termux-clipboard-set "text"   # Copy
-termux-clipboard-get          # Paste
+termux-clipboard-set "text"   # Copy termux-clipboard-get          # Paste
 ```
 
 ## Notifications
@@ -72,9 +70,7 @@ termux-notification -t "Title" -c "Content"
 ## Device Info
 
 ```bash
-termux-battery-status         # Battery info
-termux-wifi-connectioninfo    # WiFi info
-termux-telephony-deviceinfo   # Device info
+termux-battery-status         # Battery info termux-wifi-connectioninfo    # WiFi info termux-telephony-deviceinfo   # Device info
 ```
 
 ## Sharing
@@ -86,10 +82,7 @@ termux-share -a send file.txt # Share file
 ## Other Useful Commands
 
 ```bash
-termux-toast "message"        # Quick toast popup
-termux-vibrate                # Vibrate device
-termux-tts-speak "hello"      # Text to speech
-termux-camera-photo out.jpg   # Take photo
+termux-toast "message"        # Quick toast popup termux-vibrate                # Vibrate device termux-tts-speak "hello"      # Text to speech termux-camera-photo out.jpg   # Take photo
 ```
 
 ## Notes

@@ -544,8 +544,7 @@ When the next `prompt` command is sent, all messages (including `BashExecutionMe
 ````text
 Ran `ls -la`
 ```
-total 48
-drwxr-xr-x ...
+total 48 drwxr-xr-x ...
 ```
 ````
 

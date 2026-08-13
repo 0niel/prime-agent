@@ -57,11 +57,7 @@ Built-in skills behave like any other skill but have the lowest precedence: a us
 
 ### websearch
 
-Setup: get a free API key at [serper.dev](https://serper.dev), then run `/login`,
-switch to **MCP Connections** using the displayed tab shortcuts, and choose
-**Serper (web search)** to paste it. The key is stored alongside your other
-credentials (in `auth.json`) and read by the skill on each call — no environment
-variables required, and it works even if you add the key mid-session.
+Setup: get a free API key at [serper.dev](https://serper.dev), then run `/login`, switch to **MCP Connections** using the displayed tab shortcuts, and choose **Serper (web search)** to paste it. The key is stored alongside your other credentials (in `auth.json`) and read by the skill on each call — no environment variables required, and it works even if you add the key mid-session.
 
 Optional overrides (environment variables):
 
@@ -78,8 +74,7 @@ Once loaded, the model can call it directly in the IPython kernel by import name
 print(await websearch("latest Prime Agent release"))
 ```
 
-Until a key is configured, web search returns a clear message telling the agent
-to walk you through `/login`.
+Until a key is configured, web search returns a clear message telling the agent to walk you through `/login`.
 
 Disable only the built-in `websearch` skill in settings:
 
@@ -318,8 +313,7 @@ Per the [Agent Skills specification](https://agentskills.io/specification#frontm
 - No consecutive hyphens
 - Must match parent directory name
 
-Valid: `pdf-processing`, `data-analysis`, `code-review`
-Invalid: `PDF-Processing`, `-pdf`, `pdf--processing`
+Valid: `pdf-processing`, `data-analysis`, `code-review` Invalid: `PDF-Processing`, `-pdf`, `pdf--processing`
 
 ### Description Best Practices
 
@@ -380,8 +374,7 @@ cd /path/to/brave-search && npm install
 ## Search
 
 ```bash
-./search.js "query"              # Basic search
-./search.js "query" --content    # Include page content
+./search.js "query"              # Basic search ./search.js "query" --content    # Include page content
 ```
 
 ## Extract Page Content
