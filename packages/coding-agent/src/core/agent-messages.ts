@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { contextAwareHostRequestHandler, createHostRequestHandler, type HostRequestHandler } from "./kernel/index.js";
+import { createHostRequestHandler, type HostRequestHandler } from "./kernel/index.js";
 import type { CustomMessage } from "./messages.js";
 import { canonicalSessionPath } from "./session-lease.js";
 
@@ -538,7 +538,7 @@ export function createAgentMessageHostHandlers(
 		"agent_message.list_agents": createHostRequestHandler(async (_payload, _context) => {
 			if (!controller.roster) throw new Error("agent family roster is not available in this session");
 			return (await controller.roster()) as unknown as Record<string, unknown>;
-		}, contextAwareHostRequestHandler),
+		}),
 		"agent_message.send": createHostRequestHandler(async (payload, _context) => {
 			if (typeof payload.message !== "string") {
 				throw new Error("agent_message.send message must be a string");
@@ -611,7 +611,7 @@ export function createAgentMessageHostHandlers(
 				message: payload.message,
 				receiverRole: payload.receiver_role as AgentFamilyRelationship,
 			})) as unknown as Record<string, unknown>;
-		}, contextAwareHostRequestHandler),
+		}),
 	};
 }
 

@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import {
-	contextAwareHostRequestHandler,
 	createHostRequestHandler,
 	type HostRequestContext,
 	type HostRequestHandler,
@@ -72,7 +71,7 @@ export function createTestHostHandlers<
 >(handlers: T): Record<keyof T, HostRequestHandler> {
 	return Object.fromEntries(
 		Object.entries(handlers).map(([type, implementation]) => {
-			const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+			const handler = createHostRequestHandler(implementation);
 			testHostHandlerImplementations.set(handler, implementation);
 			return [type, handler];
 		}),

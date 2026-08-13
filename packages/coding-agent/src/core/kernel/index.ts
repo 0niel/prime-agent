@@ -74,14 +74,6 @@ const hostRequestHandlerBrand = Symbol("hostRequestHandler");
 const factoryCreatedHostRequestHandlers = new WeakSet<object>();
 const dispatcherCreatedHostRequestContexts = new WeakSet<object>();
 
-/** Context-aware registrations are explicit; implementation arity is not authority. */
-export interface HostRequestHandlerOptions {
-	readonly contextAware: true;
-}
-
-/** The stable marker makes default/rest callbacks unambiguous without Function.length. */
-export const contextAwareHostRequestHandler: HostRequestHandlerOptions = Object.freeze({ contextAware: true });
-
 /** Handlers receive dispatcher-minted context; provenance is always checked at dispatch time. */
 export type HostRequestHandler = (
 	payload: HostRequestPayload,
@@ -122,17 +114,12 @@ function mintHostRequestContext(
 }
 
 /**
- * Factory registration deliberately requires an explicit capability marker. This
- * accepts binary, rest, and default-parameter implementations without treating
- * Function.length as a security boundary. A missing marker rejects a unary
- * JavaScript registration before it can execute.
+ * Mint a host-request capability. Only factory-minted handlers are dispatched,
+ * and every call is gated on a dispatcher-minted context.
  */
 export function createHostRequestHandler<
 	T extends (payload: HostRequestPayload, context: HostRequestContext) => Promise<Record<string, unknown>>,
->(implementation: T, options: HostRequestHandlerOptions): HostRequestHandlerCapability {
-	if (options?.contextAware !== true) {
-		throw new Error("host request handlers require the context-aware marker");
-	}
+>(implementation: T): HostRequestHandlerCapability {
 	const handler = async (payload: HostRequestPayload, context: HostRequestContext) => {
 		assertGenuineHostRequestContext(context);
 		return implementation(payload, context);

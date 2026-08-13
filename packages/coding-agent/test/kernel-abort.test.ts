@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AGENT_MESSAGE_DISPLAY_MIME,
-	contextAwareHostRequestHandler,
 	createHostRequestHandler,
 	type HostRequestContext,
 	KernelManager,
@@ -263,7 +262,7 @@ describe("KernelManager abort handling", () => {
 			capturedContext = context;
 			return { ok: true };
 		});
-		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const handler = createHostRequestHandler(implementation);
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const internals = manager as unknown as {
 			state: "running";
@@ -300,7 +299,7 @@ describe("KernelManager abort handling", () => {
 			});
 			return { ok: true };
 		});
-		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const handler = createHostRequestHandler(implementation);
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const internals = manager as unknown as {
 			state: "running";
@@ -338,7 +337,7 @@ describe("KernelManager abort handling", () => {
 				resolveHandler = resolve;
 			});
 			return { current: context.isCurrent() };
-		}, contextAwareHostRequestHandler);
+		});
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const sent: Record<string, unknown>[] = [];
 		const internals = manager as unknown as {
@@ -386,7 +385,7 @@ describe("KernelManager abort handling", () => {
 				throw new Error("first request failed after close");
 			}
 			return { request: "second" };
-		}, contextAwareHostRequestHandler);
+		});
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const sent: Record<string, unknown>[] = [];
 		const internals = manager as unknown as {
@@ -423,7 +422,7 @@ describe("KernelManager abort handling", () => {
 	it("sends one error reply when a current host request throws", async () => {
 		const handler = createHostRequestHandler(async () => {
 			throw new Error("handler failed");
-		}, contextAwareHostRequestHandler);
+		});
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const sent: Record<string, unknown>[] = [];
 		const internals = manager as unknown as {
@@ -451,7 +450,7 @@ describe("KernelManager abort handling", () => {
 
 	it("does not report handler failure or send an error reply when the ok reply fails", async () => {
 		const implementation = vi.fn(async () => ({ completed: true }));
-		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const handler = createHostRequestHandler(implementation);
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const sendCommMessage = vi.fn(async () => {
 			throw new Error("reply send failed");
@@ -499,7 +498,7 @@ describe("KernelManager abort handling", () => {
 			});
 			return { ok: true };
 		});
-		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const handler = createHostRequestHandler(implementation);
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const internals = manager as unknown as {
 			state: "running";
@@ -560,7 +559,7 @@ describe("KernelManager abort handling", () => {
 			});
 			return { ok: true };
 		});
-		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const handler = createHostRequestHandler(implementation);
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const internals = manager as unknown as {
 			state: "running";
@@ -615,7 +614,7 @@ describe("KernelManager abort handling", () => {
 			capturedContext = context;
 			return { ok: true };
 		});
-		const handler = createHostRequestHandler(implementation, contextAwareHostRequestHandler);
+		const handler = createHostRequestHandler(implementation);
 		const manager = new KernelManager({ cwd: process.cwd(), hostHandlers: { test: handler } });
 		const internals = manager as unknown as {
 			hostRequestsClosed: boolean;
