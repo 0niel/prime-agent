@@ -2699,24 +2699,45 @@ describe("AgentSession rlm recursion", () => {
 	it("keeps failed closure retryable without hanging or late resurrection", async () => {
 		const child = createSession({ rlmSessionDir: join(tempDir, "retry-child") });
 		child.setSessionName("release-worker");
-		let attempts = 0;
+		const childId = "retry-child";
+		const suppliedSessions: Array<AgentSession | undefined> = [];
+		const authorities: Array<{ sessionFile?: string; sessionId?: string }> = [];
+		let tombstones = 0;
+		let schedulerAttempts = 0;
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
-				deleteRlmSubagentRuntime: async (_id, session) => {
-					if (++attempts === 1) throw new RlmSubagentHostDeletionError("tombstoned", new Error("close failed"));
-					await session?.disposeAsync();
+				deleteRlmSubagentRuntime: async (_id, suppliedSession, authority) => {
+					suppliedSessions.push(suppliedSession);
+					authorities.push({ sessionFile: authority?.sessionFile, sessionId: authority?.sessionId });
+					if (tombstones === 0) tombstones++;
+					if (++schedulerAttempts === 1) {
+						throw new RlmSubagentHostDeletionError("tombstoned", new Error("close failed"));
+					}
+					await suppliedSession?.disposeAsync();
+					return { deletionDurability: "tombstoned" };
 				},
 			},
 		});
-		expect(root.registerRlmChildSession("retry-child", child)).toBe(true);
+		expect(root.registerRlmChildSession(childId, child)).toBe(true);
 		await expect(root.deleteRlmSubagent("release-worker")).rejects.toThrow("close failed");
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-		expect((root as unknown as InspectableRlmSession)._rlmChildCleanupFailures.size).toBe(1);
+		const internals = root as unknown as InspectableRlmSession;
+		expect(internals._rlmChildCleanupFailures.size).toBe(1);
+		expect(internals._rlmChildSessions.get(childId)).toBe(child);
+
 		await expect(root.deleteRlmSubagent("release-worker")).resolves.toMatchObject({
-			subagent: { rlm_child_id: "retry-child" },
+			subagent: { rlm_child_id: childId },
 		});
-		expect((root as unknown as InspectableRlmSession)._rlmChildCleanupFailures.size).toBe(0);
+		expect(suppliedSessions).toEqual([child, child]);
+		expect(authorities).toEqual([
+			{ sessionFile: child.sessionFile, sessionId: child.sessionId },
+			{ sessionFile: child.sessionFile, sessionId: child.sessionId },
+		]);
+		expect(tombstones).toBe(1);
+		expect(schedulerAttempts).toBe(2);
+		expect(internals._rlmChildSessions.has(childId)).toBe(false);
+		expect(internals._rlmChildCleanupFailures.size).toBe(0);
 	});
 
 	it("does not restore failed delete retry state after parent teardown", async () => {

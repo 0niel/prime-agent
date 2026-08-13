@@ -9628,6 +9628,7 @@ export class AgentSession {
 			authority ?? {
 				childId,
 				sessionDir: lease.session_dir,
+				...(lease.session_file ? { sessionFile: lease.session_file } : {}),
 				...(lease.session_id ? { sessionId: lease.session_id } : {}),
 				generation: 0,
 				assertCurrent: () => {},
@@ -10419,6 +10420,7 @@ export class AgentSession {
 							rlm_child_id: run.id,
 							active_session_id: null,
 							session_id: childSession?.sessionId ?? null,
+							...(childSession?.sessionFile ? { session_file: childSession.sessionFile } : {}),
 							session_name: sessionName,
 							session_dir: childSessionDir,
 							status: "error",
