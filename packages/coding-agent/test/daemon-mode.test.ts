@@ -1045,12 +1045,22 @@ describe("daemon mode helpers", () => {
 			expect(readFileSync(registryPath, "utf8")).toBe(before);
 
 			await expect(
-				internals.recordRlmSubagentDeletion(parentState, fixture.childId, { assertCurrent: () => {} }),
+				internals.recordRlmSubagentDeletion(parentState, fixture.childId, {
+					childId: fixture.childId,
+					sessionDir: fixture.childSessionDir,
+					sessionFile: fixture.childSessionFile,
+					sessionId: JSON.parse(before).sessionId as string,
+					assertCurrent: () => {},
+				}),
 			).resolves.toBe("tombstoned");
 			expect(readFileSync(registryPath, "utf8").match(/"childId":"child-1"/g)).toHaveLength(2);
 			expect(readFileSync(registryPath, "utf8").match(/"status":"deleted"/g)).toHaveLength(1);
 			await expect(
-				internals.recordRlmSubagentDeletion(parentState, "unknown", { assertCurrent: () => {} }),
+				internals.recordRlmSubagentDeletion(parentState, "unknown", {
+					childId: "unknown",
+					sessionDir: "/tmp/unknown",
+					assertCurrent: () => {},
+				}),
 			).resolves.toBe("absent");
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
@@ -1069,13 +1079,13 @@ describe("daemon mode helpers", () => {
 			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
 			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
 			const original = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
-			const replacementFile = join(fixture.childSessionDir, "replacement.jsonl");
-			writeFileSync(replacementFile, "replacement");
+			const oldSessionId = original.sessionId as string;
+			const replacementSessionId = "replacement-session-id";
 			writeFileSync(
 				registryPath,
-				`${JSON.stringify({
+				`${JSON.stringify(original)}\n${JSON.stringify({
 					...original,
-					sessionFile: replacementFile,
+					sessionId: replacementSessionId,
 					updatedAt: "2026-01-01T00:00:02.000Z",
 				})}\n`,
 			);
@@ -1084,7 +1094,7 @@ describe("daemon mode helpers", () => {
 				childId: fixture.childId,
 				sessionDir: fixture.childSessionDir,
 				sessionFile: fixture.childSessionFile,
-				sessionId: "old-session-id",
+				sessionId: oldSessionId,
 				generation: 1,
 				assertCurrent: () => {},
 			};
@@ -1100,8 +1110,7 @@ describe("daemon mode helpers", () => {
 			});
 			const currentAuthority = {
 				...oldAuthority,
-				sessionFile: replacementFile,
-				sessionId: "replacement-session-id",
+				sessionId: replacementSessionId,
 				generation: 2,
 			};
 			await expect(
@@ -5318,6 +5327,7 @@ describe("daemon mode helpers", () => {
 					sessionName: "heartbeat-child",
 					sessionDir: childSessionDir,
 					sessionFile: childSessionFile,
+					sessionId: childManager.getSessionId(),
 					parentSessionId: parentManager.getSessionId(),
 					parentSessionFile,
 					rlmDepth: 1,
@@ -5873,6 +5883,7 @@ describe("daemon mode helpers", () => {
 					sessionName: "cycle-to-root",
 					sessionDir: join(tempDir, "sessions"),
 					sessionFile: fixture.parentSessionFile,
+					sessionId: fixture.parentSessionId,
 					parentSessionId: childInfo.id,
 					parentSessionFile: fixture.childSessionFile,
 					status: "completed",
@@ -6101,6 +6112,7 @@ describe("daemon mode helpers", () => {
 					sessionName: "spawn-worker",
 					sessionDir: siblingSessionDir,
 					sessionFile: siblingSessionFile,
+					sessionId: siblingManager.getSessionId(),
 					parentSessionId: fixture.parentSessionId,
 					parentSessionFile: fixture.parentSessionFile,
 					status: "completed",
@@ -10202,6 +10214,7 @@ function makePersistedRlmDaemonFixture(
 			sessionName: "nested-worker",
 			sessionDir: grandchildSessionDir,
 			sessionFile: grandchildSessionFile,
+			sessionId: grandchildManager.getSessionId(),
 			parentSessionId: childManager.getSessionId(),
 			parentSessionFile: childSessionFile,
 			rlmDepth: 2,
@@ -10221,6 +10234,7 @@ function makePersistedRlmDaemonFixture(
 			sessionName: "spawn-worker",
 			sessionDir: childSessionDir,
 			sessionFile: childSessionFile,
+			sessionId: childManager.getSessionId(),
 			parentSessionId: parentManager.getSessionId(),
 			parentSessionFile,
 			rlmDepth: 1,

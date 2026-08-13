@@ -387,6 +387,8 @@ interface PersistedRlmSubagentRegistryEntry {
 	sessionName: string;
 	sessionDir: string;
 	sessionFile: string;
+	/** Exact saved-session incarnation; paths and directories may be recycled. */
+	sessionId: string;
 	parentSessionId: string;
 	parentSessionFile?: string;
 	rlmDepth?: number;
@@ -927,6 +929,7 @@ export class AgentDaemon {
 			sessionName: string;
 			sessionDir: string;
 			sessionFile: string;
+			sessionId: string;
 			rlmDepth: number;
 			rlmMaxDepth: number;
 			rlmParentNodeId?: string;
@@ -944,6 +947,7 @@ export class AgentDaemon {
 			sessionName: input.sessionName,
 			sessionDir: input.sessionDir,
 			sessionFile: input.sessionFile,
+			sessionId: input.sessionId,
 			parentSessionId: parentSession.sessionId,
 			...(parentSession.sessionFile ? { parentSessionFile: parentSession.sessionFile } : {}),
 			rlmDepth: input.rlmDepth,
@@ -1001,6 +1005,8 @@ export class AgentDaemon {
 					typeof entry.sessionName !== "string" ||
 					typeof entry.sessionDir !== "string" ||
 					typeof entry.sessionFile !== "string" ||
+					typeof entry.sessionId !== "string" ||
+					entry.sessionId.length === 0 ||
 					typeof entry.parentSessionId !== "string" ||
 					entry.parentSessionId.length === 0 ||
 					(entry.parentSessionFile !== undefined && typeof entry.parentSessionFile !== "string") ||
@@ -1045,10 +1051,13 @@ export class AgentDaemon {
 		// existed. New coordinator authorities always carry both incarnation fields.
 		if (
 			authority &&
-			((typeof authority.childId === "string" && authority.childId !== childId) ||
+			(authority.childId !== childId ||
 				(entry !== undefined &&
-					((typeof authority.sessionDir === "string" && authority.sessionDir !== entry.sessionDir) ||
-						(typeof authority.sessionFile === "string" && authority.sessionFile !== entry.sessionFile))))
+					(authority.sessionDir !== entry.sessionDir ||
+						typeof authority.sessionFile !== "string" ||
+						authority.sessionFile !== entry.sessionFile ||
+						typeof authority.sessionId !== "string" ||
+						authority.sessionId !== entry.sessionId)))
 		) {
 			authority.assertCurrent();
 			return "unknown";
@@ -1056,6 +1065,11 @@ export class AgentDaemon {
 		if (!entry) {
 			authority?.assertCurrent();
 			return "absent";
+		}
+		if (authority) {
+			const info = await readSessionInfo(entry.sessionFile);
+			authority.assertCurrent();
+			if (!info || info.id !== entry.sessionId || authority.sessionId !== info.id) return "unknown";
 		}
 		if (entry.status === "deleted") {
 			authority?.assertCurrent();
@@ -1122,6 +1136,8 @@ export class AgentDaemon {
 					typeof entry.sessionName !== "string" ||
 					typeof entry.sessionDir !== "string" ||
 					typeof entry.sessionFile !== "string" ||
+					typeof entry.sessionId !== "string" ||
+					entry.sessionId.length === 0 ||
 					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
 					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
 					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
@@ -1163,7 +1179,8 @@ export class AgentDaemon {
 				if (entry.status === "deleted" || visited.has(sessionKey)) continue;
 				visited.add(sessionKey);
 				const info = await readSessionInfo(entry.sessionFile);
-				if (!info) continue;
+				// A path is recyclable; passive authority belongs only to this saved header.
+				if (!info || info.id !== entry.sessionId) continue;
 				// A resident child walks its own registry as an outer root below. Avoid
 				// both duplicate rows and attributing its descendants to an ancestor.
 				if (!includeResident && this.findSessionBySessionFile(entry.sessionFile)) continue;
@@ -2336,6 +2353,7 @@ export class AgentDaemon {
 					sessionName: session.sessionName ?? childId,
 					sessionDir: metadata.sessionDir ?? dirname(state.runtime.session.sessionFile),
 					sessionFile: state.runtime.session.sessionFile,
+					sessionId: session.sessionId,
 					rlmDepth: session.rlmDepth,
 					rlmMaxDepth: session.rlmMaxDepth,
 					rlmParentNodeId: metadata.rlmParentNodeId,
@@ -2414,10 +2432,12 @@ export class AgentDaemon {
 					// the exact persisted incarnation before they can touch its tombstone or jobs.
 					const persistedMatchesAuthority =
 						persisted !== undefined &&
-						(authority === undefined ||
-							(persisted.sessionDir === authority.sessionDir &&
-								(typeof authority.sessionFile !== "string" ||
-									persisted.sessionFile === authority.sessionFile)));
+						authority !== undefined &&
+						persisted.sessionDir === authority.sessionDir &&
+						typeof authority.sessionFile === "string" &&
+						persisted.sessionFile === authority.sessionFile &&
+						typeof authority.sessionId === "string" &&
+						persisted.sessionId === authority.sessionId;
 					const suppliedSessionMatchesPersisted =
 						session === undefined ||
 						(persistedMatchesAuthority &&
@@ -2426,6 +2446,7 @@ export class AgentDaemon {
 					if (
 						(state !== undefined && session !== undefined && state.runtime.session !== session) ||
 						(state !== undefined && session === undefined) ||
+						(state === undefined && session === undefined && !persistedMatchesAuthority) ||
 						(state === undefined && session !== undefined && !suppliedSessionMatchesPersisted) ||
 						(authority !== undefined &&
 							(state !== undefined
@@ -2562,6 +2583,7 @@ export class AgentDaemon {
 						sessionName: options.sessionName,
 						sessionDir: options.sessionDir,
 						sessionFile: runtime.session.sessionFile,
+						sessionId: runtime.session.sessionId,
 						rlmDepth: options.rlmDepth,
 						rlmMaxDepth: options.rlmMaxDepth,
 						rlmParentNodeId: options.rlmParentNodeId,
