@@ -3036,6 +3036,59 @@ describe("AgentSession rlm recursion", () => {
 		}
 	});
 
+	it("does not delete a subagent after rlm.delete_subagent authority is revoked", async () => {
+		const childId = "revoked-delete-child";
+		const childDir = join(tempDir, childId);
+		mkdirSync(childDir, { recursive: true });
+		const child = createSession({ rlmSessionDir: childDir });
+		child.setSessionName("revoked-delete-worker");
+		const disposeChild = vi.spyOn(child, "disposeAsync");
+		let listingStarted: () => void = () => {};
+		const listingStartedGate = new Promise<void>((resolve) => {
+			listingStarted = resolve;
+		});
+		let releaseListing: () => void = () => {};
+		const listingGate = new Promise<void>((resolve) => {
+			releaseListing = resolve;
+		});
+		const root = createSession({
+			agentMessageController: {
+				listAgents: async () => {
+					listingStarted();
+					await listingGate;
+					return { agents: [] };
+				},
+				sendAgentMessage: vi.fn(),
+			},
+		});
+		expect(root.registerRlmChildSession(childId, child)).toBe(true);
+
+		const replies: CapturedCommReply[] = [];
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: (root as unknown as InspectableRlmSession)._createKernelHostHandlers(),
+		});
+		try {
+			const kernel = manager as unknown as KernelCommTestApi;
+			kernel.sendCommMessage = async (commId, data) => {
+				replies.push({ commId, data });
+			};
+			kernel.handleCommMessage(
+				rlmCommOpenData("comm-delete-revoked", { type: "rlm.delete_subagent", target: "revoked-delete-worker" }),
+			);
+			await listingStartedGate;
+			kernel.handleCommMessage(rlmCommClose("comm-delete-revoked"));
+			releaseListing();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(disposeChild).not.toHaveBeenCalled();
+			expect((await root.listRlmSubagents()).subagents).toMatchObject([{ rlm_child_id: childId }]);
+			expect(replies).toEqual([]);
+		} finally {
+			releaseListing();
+			await manager.dispose();
+		}
+	});
+
 	it("runs parallel rlm comm requests independently", async () => {
 		let active = 0;
 		let maxActive = 0;
