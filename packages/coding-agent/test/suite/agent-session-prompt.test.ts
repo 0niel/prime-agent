@@ -381,6 +381,50 @@ describe("AgentSession prompt characterization", () => {
 		expect(expandedPrompt).toBe("Review this code: src/index.ts");
 	});
 
+	it.each(["beginClosing", "dispose"] as const)(
+		"rejects extension commands and input handler prompts after $closeEntry during streaming without extension side effects",
+		async (closeEntry) => {
+			const commandRuns: string[] = [];
+			const inputRuns: string[] = [];
+			const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.registerCommand("testcmd", {
+							description: "Test command",
+							handler: async (args) => {
+								commandRuns.push(args);
+							},
+						});
+						pi.on("input", (event) => {
+							inputRuns.push(event.text);
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			await waitForToolStart;
+			inputRuns.length = 0;
+			if (closeEntry === "beginClosing") harness.session.beginClosing();
+			else harness.session.dispose();
+
+			await expect(harness.session.prompt("/testcmd must-not-run")).rejects.toThrow(
+				"Cannot admit a session action because the session is disposing or disposed.",
+			);
+			await expect(harness.session.prompt("must-not-reach-input-handler", { streamingBehavior: "followUp" })).rejects.toThrow(
+				"Cannot admit a session action because the session is disposing or disposed.",
+			);
+			expect(commandRuns).toEqual([]);
+			expect(inputRuns).toEqual([]);
+
+			releaseToolExecution();
+			await promptPromise.catch(() => undefined);
+		},
+	);
+
 	it("dispatches extension commands without consuming a provider response", async () => {
 		const commandRuns: string[] = [];
 		const harness = await createHarness({

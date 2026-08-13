@@ -4648,9 +4648,9 @@ export class AgentSession {
 	}
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
+		this._assertSessionActionAdmissionAvailable();
 		if (!this.isStreaming) {
 			this._sessionInputPumpSuspended = false;
-			this._assertSessionActionAdmissionAvailable();
 		}
 		const commitFence = this.isStreaming
 			? undefined
