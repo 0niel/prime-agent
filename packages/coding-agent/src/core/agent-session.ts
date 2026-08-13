@@ -3780,13 +3780,13 @@ export class AgentSession {
 	 * the latest state reaches disk instead of racing process exit.
 	 */
 	async disposeAsync(): Promise<void> {
-		if (this._disposed) {
-			return this._disposeCallbacksPromise;
-		}
-		// Concurrent callers await the same in-flight teardown so none resolves before
-		// the kernel snapshot flush finishes.
+		// Concurrent and late callers await the same async teardown, including its
+		// terminal failure. A purely synchronous dispose has no such promise.
 		if (this._disposeAsyncPromise) {
 			return this._disposeAsyncPromise;
+		}
+		if (this._disposed) {
+			return this._disposeCallbacksPromise;
 		}
 		this._asyncTeardownStarted = true;
 		this._disposeAsyncPromise = (async () => {

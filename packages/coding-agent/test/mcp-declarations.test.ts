@@ -9,7 +9,11 @@ import {
 	emptyMcpDeclarationDocument,
 	parseMcpDeclarationDocument,
 } from "../src/core/mcp/mcp-declarations.js";
-import { admitProjectMcpDeclarations, resolveProjectMcpDeclarations } from "../src/core/mcp/mcp-project-trust.js";
+import {
+	admitProjectMcpDeclarations,
+	releaseProjectMcpDeclarationAdmission,
+	resolveProjectMcpDeclarations,
+} from "../src/core/mcp/mcp-project-trust.js";
 import { redactMcpValue } from "../src/core/mcp/mcp-redaction.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
@@ -181,6 +185,26 @@ describe("M01 declarative MCP contract", () => {
 		} finally {
 			f.dispose();
 			other.dispose();
+		}
+	});
+
+	it("keeps the authority-pinned directory alive across independent binding releases", () => {
+		const f = fixture();
+		try {
+			const first = admitProjectMcpDeclarations(f.directory, f.authority)!;
+			const second = admitProjectMcpDeclarations(f.directory, f.authority)!;
+			releaseProjectMcpDeclarationAdmission(first);
+			expect(resolveProjectMcpDeclarations(projectDocument, first)).toEqual({
+				document: { version: 1, servers: {} },
+				effective: false,
+			});
+			expect(resolveProjectMcpDeclarations(projectDocument, second)).toEqual({
+				document: projectDocument,
+				effective: true,
+			});
+			releaseProjectMcpDeclarationAdmission(second);
+		} finally {
+			f.dispose();
 		}
 	});
 

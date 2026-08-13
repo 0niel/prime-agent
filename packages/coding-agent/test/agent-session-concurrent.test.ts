@@ -300,6 +300,51 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(internals._disposed).toBe(true);
 	});
 
+	it("shares a terminal teardown failure with callers arriving after disposed is set", async () => {
+		createSession();
+		const kernelFailure = new Error("kernel disposal failed");
+		const kernelDispose = vi.fn(async () => {
+			throw kernelFailure;
+		});
+		let releaseCallback: () => void = () => {};
+		const callbackGate = new Promise<void>((resolve) => {
+			releaseCallback = resolve;
+		});
+		let callbackStarted: () => void = () => {};
+		const callbackStartedGate = new Promise<void>((resolve) => {
+			callbackStarted = resolve;
+		});
+		const callback = vi.fn(async () => {
+			callbackStarted();
+			await callbackGate;
+		});
+		session.registerDisposeCallback(callback);
+		const internals = session as unknown as {
+			_ipythonKernelProvisioner?: { dispose(): Promise<void> };
+			_disposed: boolean;
+		};
+		internals._ipythonKernelProvisioner = { dispose: kernelDispose };
+
+		const first = session.disposeAsync();
+		await callbackStartedGate;
+		expect(internals._disposed).toBe(true);
+		expect(callback).toHaveBeenCalledOnce();
+		const late = session.disposeAsync();
+		let lateSettled = false;
+		void late
+			.finally(() => {
+				lateSettled = true;
+			})
+			.catch(() => undefined);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(lateSettled).toBe(false);
+		releaseCallback();
+		await expect(first).rejects.toBe(kernelFailure);
+		await expect(late).rejects.toBe(kernelFailure);
+		expect(kernelDispose).toHaveBeenCalledOnce();
+		expect(callback).toHaveBeenCalledOnce();
+	});
+
 	it("blocks runtime reload from replacing the authoritative kernel during async disposal", async () => {
 		createSession();
 		let releaseKernel: () => void = () => {};

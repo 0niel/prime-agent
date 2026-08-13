@@ -170,12 +170,14 @@ describe("MCP injected probe execution boundary", () => {
 		const calls: string[] = [];
 		const delays: number[] = [];
 		const originalSetTimeout = globalThis.setTimeout;
-		const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(
-			((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
-				delays.push(Number(delay));
-				return originalSetTimeout(callback, delay, ...args);
-			}) as typeof setTimeout,
-		);
+		const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: (...args: unknown[]) => void,
+			delay?: number,
+			...args: unknown[]
+		) => {
+			delays.push(Number(delay));
+			return originalSetTimeout(callback, delay, ...args);
+		}) as typeof setTimeout);
 		try {
 			await expect(
 				runMcpDeclarationProbe(declaration, fakeTransport(calls), { trusted: true, timeoutMs: 0.5 }),
