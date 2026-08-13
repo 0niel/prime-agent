@@ -9422,7 +9422,9 @@ export class AgentSession {
 		const quarantined = this._rlmChildDeletionQuarantines.get(target);
 		if (quarantined) {
 			return this._trackRlmSubagentDeletion(quarantined, async () => {
-				await this._resolveRlmChildDeletionQuarantine(target);
+				if (!(await this._resolveRlmChildDeletionQuarantine(target, assertDeleteAuthority))) {
+					throw new Error("RLM subagent deletion durability is still unknown");
+				}
 				return { subagent: quarantined };
 			});
 		}
@@ -9494,11 +9496,17 @@ export class AgentSession {
 	 * Reconcile a private cancelled-spawn cleanup lease. `false` deliberately
 	 * means that durability is still unknown, never that deletion succeeded.
 	 */
-	private async _resolveRlmChildDeletionQuarantine(childId: string): Promise<boolean> {
+	private async _resolveRlmChildDeletionQuarantine(
+		childId: string,
+		assertDeleteAuthority: () => void = () => {},
+	): Promise<boolean> {
 		const lease = this._rlmChildDeletionQuarantines.get(childId);
 		if (!lease || this._disposed || this._disposing) return false;
 		const durability = await this._subagentRuntimeHost?.resolveRlmSubagentDeletion?.(childId);
-		if (durability === "unknown" || durability === undefined) return false;
+		if (durability !== "absent" && durability !== "tombstoned") return false;
+		// The host await is a revocation boundary. Do not mutate the artifact or
+		// private deletion bookkeeping after its caller has lost authority.
+		assertDeleteAuthority();
 		if (durability === "absent") {
 			// This is the sole path which removes the exact quarantined directory.
 			rmSync(lease.session_dir, { recursive: true, force: true });

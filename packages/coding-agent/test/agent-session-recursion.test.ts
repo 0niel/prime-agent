@@ -138,6 +138,7 @@ interface InspectableRlmSession {
 		string,
 		Awaited<ReturnType<AgentSession["listRlmSubagents"]>>["subagents"][number]
 	>;
+	_deletedRlmChildIds: Set<string>;
 	_rlmChildSessions: Map<string, AgentSession>;
 	_rlmChildUnsubscribes: Map<string, () => void>;
 	_createKernelHostHandlers(): HostRequestHandlers;
@@ -3123,16 +3124,76 @@ describe("AgentSession rlm recursion", () => {
 		await expect(root.deleteRlmSubagent("revoked during late publication")).rejects.toThrow(
 			'No direct RLM subagent matches "revoked during late publication"',
 		);
-		await expect(root.deleteRlmSubagent(quarantinedChildId)).resolves.toMatchObject({
-			subagent: { rlm_child_id: quarantinedChildId },
-		});
+		await expect(root.deleteRlmSubagent(quarantinedChildId)).rejects.toThrow(
+			"RLM subagent deletion durability is still unknown",
+		);
 		expect(internals._rlmChildDeletionQuarantines).toHaveLength(1);
+		expect(internals._deletedRlmChildIds.has(quarantinedChildId)).toBe(false);
 		retryDurability = "absent";
 		await expect(root.deleteRlmSubagent(quarantinedChildId)).resolves.toMatchObject({
 			subagent: { rlm_child_id: quarantinedChildId },
 		});
 		expect(internals._rlmChildDeletionQuarantines).toHaveLength(0);
 		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toHaveLength(0);
+	});
+
+	it("rejects a quarantine retry revoked after host durability resolves without mutating", async () => {
+		const admissionController = new AbortController();
+		const child = createSession();
+		let resolveStarted: () => void = () => {};
+		const resolutionStarted = new Promise<void>((resolve) => {
+			resolveStarted = resolve;
+		});
+		let releaseResolution: () => void = () => {};
+		const resolutionGate = new Promise<void>((resolve) => {
+			releaseResolution = resolve;
+		});
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async (options) => {
+					admissionController.abort();
+					options.onSessionPublished?.(child);
+					return { session: child };
+				},
+				releaseRlmSubagentRuntime: async (runtime) => {
+					await runtime.session.disposeAsync();
+					return { deletionDurability: "unknown" };
+				},
+				resolveRlmSubagentDeletion: async () => {
+					resolveStarted();
+					await resolutionGate;
+					return "absent";
+				},
+				deleteRlmSubagentRuntime: async (_childId, session) => session?.disposeAsync(),
+			},
+		});
+
+		await expect(
+			root.runRlmChild("late-revoked quarantine retry", {}, undefined, { signal: admissionController.signal }),
+		).rejects.toThrow("host request authority was revoked");
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => internals._rlmChildDeletionQuarantines.size === 1);
+		const childId = [...internals._rlmChildDeletionQuarantines.keys()][0];
+		if (!childId) throw new Error("Missing deletion quarantine");
+		const artifactDir = root.sessionManager.getSessionArtifactDir();
+		if (!artifactDir) throw new Error("Missing session artifact dir");
+		const retryController = new AbortController();
+		const retry = root.deleteRlmSubagent(childId, retryController.signal);
+		await resolutionStarted;
+		retryController.abort();
+		releaseResolution();
+
+		await expect(retry).rejects.toThrow("host request authority was revoked");
+		expect(internals._rlmChildDeletionQuarantines.has(childId)).toBe(true);
+		expect(internals._deletedRlmChildIds.has(childId)).toBe(false);
+		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-")).length).toBe(1);
+
+		await expect(root.deleteRlmSubagent(childId)).resolves.toMatchObject({
+			subagent: { rlm_child_id: childId },
+		});
+		expect(internals._rlmChildDeletionQuarantines.has(childId)).toBe(false);
+		expect(internals._deletedRlmChildIds.has(childId)).toBe(true);
+		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-")).length).toBe(0);
 	});
 
 	it("retains a host-owned runtime dir when revoked-spawn release is tombstoned", async () => {
