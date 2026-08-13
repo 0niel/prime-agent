@@ -229,6 +229,17 @@ export interface CreateRlmSubagentRuntimeOptions {
 	onSessionPublished?: (session: AgentSession) => void;
 }
 
+/**
+ * What the host can prove about a cancelled, never-admitted child's deletion.
+ * This is deliberately not a public child status: uncertainty must never make a
+ * private artifact appear active, idle, or inactive.
+ */
+export type RlmSubagentDeletionDurability = "absent" | "tombstoned" | "unknown";
+
+export interface RlmSubagentReleaseOutcome {
+	deletionDurability: RlmSubagentDeletionDurability;
+}
+
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
 	/** Persist host-owned completion before the child becomes passivation-eligible. */
@@ -238,7 +249,9 @@ export interface SubagentRuntimeHost {
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,
 		status: "done" | "error" | "cancelled",
-	) => Promise<{ retained: boolean }>;
+	) => Promise<RlmSubagentReleaseOutcome>;
+	/** Re-check a release whose durability was unknown, without inventing a public child status. */
+	resolveRlmSubagentDeletion?(childId: string): Promise<RlmSubagentDeletionDurability>;
 	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
 	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
