@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, openSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -126,6 +126,12 @@ export function getOpenCatalogAuthorityFdCountForTest(): number {
 	return openAuthorityFdCountForTest;
 }
 
+let helperSpawnCountForTest = 0;
+/** @internal */
+export function getCatalogHelperSpawnCountForTest(): number {
+	return helperSpawnCountForTest;
+}
+
 function openAuthorityRoot(path: string, optional = false): ManagedRoot | undefined {
 	try {
 		// O_NOFOLLOW binds authority to the directory itself, never a pathname target.
@@ -167,13 +173,12 @@ def flags(directory=False):
  value=os.O_RDONLY|os.O_NOFOLLOW
  if directory: value|=os.O_DIRECTORY
  return value
-def main():
- req=json.loads(sys.stdin.buffer.read(131073))
- parts=req.get("parts"); limit=req.get("limit"); mode=req.get("mode")
- if mode not in ("read","header","stat"): reject()
+def serve(req):
+ parts=req.get("parts"); limit=req.get("limit"); mode=req.get("mode"); root=req.get("root")
+ if mode not in ("read","header","stat") or root not in (3,4): reject()
  if not isinstance(parts,list) or not parts or not isinstance(limit,int) or limit<0 or limit>MAX: reject()
  if any(not isinstance(p,str) or not p or p in (".","..") or "/" in p or "\\" in p for p in parts): reject()
- current=os.dup(3)
+ current=os.dup(root)
  try:
   for part in parts[:-1]:
    nxt=os.open(part,flags(True),dir_fd=current); os.close(current); current=nxt
@@ -197,12 +202,17 @@ def main():
    after=os.fstat(fd)
    if (before.st_dev,before.st_ino,before.st_mode)!=(after.st_dev,after.st_ino,after.st_mode): reject()
    payload.update({"mtimeMs":after.st_mtime_ns/1000000,"dev":str(after.st_dev),"ino":str(after.st_ino)})
-   print(json.dumps(payload,separators=(",",":")))
+   return payload
   finally: os.close(fd)
  finally: os.close(current)
-try: main()
-except FileNotFoundError: sys.exit(44)
-except Exception: sys.stderr.write("catalog openat helper failed\n"); sys.exit(1)
+while True:
+ line=sys.stdin.buffer.readline(131073)
+ if not line: break
+ if len(line)>131072 or not line.endswith(b"\n"): sys.exit(1)
+ try: response=serve(json.loads(line))
+ except FileNotFoundError: response={"error":"absent"}
+ except Exception: response={"error":"failed"}
+ sys.stdout.write(json.dumps(response,separators=(",",":"))+"\n"); sys.stdout.flush()
 `;
 
 /** Test-only seam runs after authority selection but before descriptor-relative traversal. */
@@ -214,44 +224,91 @@ export function setCatalogBeforeTrustedOpenForTest(hook: ((path: string) => void
 
 type TrustedReadMode = "read" | "header" | "stat";
 
-function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number, mode: TrustedReadMode): TrustedFile {
-	if (!isAbsolute(rawPath) || rawPath !== resolve(rawPath))
-		throw invalidFamilyTopology("session path is not canonical");
-	const root = [roots.session, roots.artifacts].find((candidate) => candidate && isWithin(candidate.lexical, rawPath));
-	if (!root) throw invalidFamilyTopology("session path escapes managed roots");
-	const suffix = relative(root.lexical, rawPath);
-	const parts = suffix.split(sep);
-	if (!suffix || parts.some((part) => !part || part === "." || part === "..")) {
-		throw invalidFamilyTopology("session path lacks a trusted file component");
+const TRUSTED_READ_TIMEOUT_MS = 5_000;
+
+/**
+ * One helper process serves every descriptor-relative read of a family walk.
+ * Both authority roots are passed at spawn (session on fd 3, artifacts on
+ * fd 4 when present) and selected per request; requests are newline-delimited
+ * JSON on stdin with one JSON response line each. Any protocol violation
+ * kills the helper and fails the walk closed.
+ */
+class TrustedReadSession {
+	private readonly child: ChildProcess;
+	private stdoutBuffer = "";
+	private failure: Error | undefined;
+	private pending:
+		| { resolve: (line: string) => void; reject: (error: Error) => void; timeout: NodeJS.Timeout; cap: number }
+		| undefined;
+	private queue: Promise<unknown> = Promise.resolve();
+
+	constructor(private readonly roots: ManagedRoots) {
+		const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "ignore", roots.session.fd];
+		if (roots.artifacts) stdio.push(roots.artifacts.fd);
+		this.child = spawn(
+			process.execPath === process.env.PRIME_AGENT_KERNEL_PYTHON
+				? process.execPath
+				: (process.env.PRIME_AGENT_KERNEL_PYTHON ?? "python3"),
+			["-I", "-c", OPENAT_READ_HELPER],
+			{ stdio, shell: false },
+		);
+		helperSpawnCountForTest++;
+		this.child.stdin?.on("error", (error) =>
+			this.fail(new Error(`catalog openat helper write failed: ${String(error)}`)),
+		);
+		this.child.stdout?.setEncoding("utf8");
+		this.child.stdout?.on("data", (chunk: string) => this.handleStdout(chunk));
+		this.child.on("error", (error) => this.fail(new Error(`catalog openat helper failed: ${String(error)}`)));
+		this.child.on("exit", () => this.fail(new Error("catalog openat helper exited")));
 	}
-	beforeTrustedOpenForTest?.(rawPath);
-	const result = spawnSync(
-		process.execPath === process.env.PRIME_AGENT_KERNEL_PYTHON
-			? process.execPath
-			: (process.env.PRIME_AGENT_KERNEL_PYTHON ?? "python3"),
-		["-I", "-c", OPENAT_READ_HELPER],
-		{
-			input: JSON.stringify({ parts, limit: maxBytes, mode }),
-			encoding: "utf8",
-			timeout: 5_000,
-			maxBuffer: maxBytes * 2 + 64 * 1024,
-			stdio: ["pipe", "pipe", "pipe", root.fd],
-			shell: false,
-		},
-	);
-	if (result.status === 44) throw invalidFamilyTopology("descriptor-relative artifact is absent");
-	if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
-		throw invalidFamilyTopology("descriptor-relative artifact read failed");
+
+	async read(rawPath: string, maxBytes: number, mode: TrustedReadMode): Promise<TrustedFile> {
+		const run = this.queue.then(() => this.readSerialized(rawPath, maxBytes, mode));
+		this.queue = run.catch(() => undefined);
+		return run;
 	}
-	try {
-		const wire = JSON.parse(result.stdout) as { data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
+
+	close(): void {
+		this.fail(new Error("catalog openat helper closed"));
+		this.child.stdin?.end();
+		this.child.kill("SIGKILL");
+	}
+
+	private async readSerialized(rawPath: string, maxBytes: number, mode: TrustedReadMode): Promise<TrustedFile> {
+		if (!isAbsolute(rawPath) || rawPath !== resolve(rawPath))
+			throw invalidFamilyTopology("session path is not canonical");
+		const root = [this.roots.session, this.roots.artifacts].find(
+			(candidate) => candidate && isWithin(candidate.lexical, rawPath),
+		);
+		if (!root) throw invalidFamilyTopology("session path escapes managed roots");
+		const suffix = relative(root.lexical, rawPath);
+		const parts = suffix.split(sep);
+		if (!suffix || parts.some((part) => !part || part === "." || part === "..")) {
+			throw invalidFamilyTopology("session path lacks a trusted file component");
+		}
+		beforeTrustedOpenForTest?.(rawPath);
+		const rootFd = root === this.roots.session ? 3 : 4;
+		const line = await this.exchange(
+			JSON.stringify({ parts, limit: maxBytes, mode, root: rootFd }),
+			maxBytes * 2 + 64 * 1024,
+		);
+		let wire: { error?: unknown; data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
+		try {
+			wire = JSON.parse(line) as typeof wire;
+		} catch {
+			this.fail(new Error("catalog openat helper response is invalid"));
+			throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
+		}
+		if (wire.error === "absent") throw invalidFamilyTopology("descriptor-relative artifact is absent");
 		if (
+			wire.error !== undefined ||
 			(mode === "stat" ? wire.data !== undefined : typeof wire.data !== "string") ||
 			typeof wire.mtimeMs !== "number" ||
 			typeof wire.dev !== "string" ||
 			typeof wire.ino !== "string"
-		)
-			throw new Error("invalid");
+		) {
+			throw invalidFamilyTopology("descriptor-relative artifact read failed");
+		}
 		return {
 			path: rawPath,
 			contents: typeof wire.data === "string" ? Buffer.from(wire.data, "base64") : Buffer.alloc(0),
@@ -259,8 +316,63 @@ function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number,
 			dev: wire.dev,
 			ino: wire.ino,
 		};
-	} catch {
-		throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
+	}
+
+	private exchange(request: string, responseCap: number): Promise<string> {
+		if (this.failure)
+			return Promise.reject(
+				invalidFamilyTopology(`descriptor-relative artifact read failed: ${this.failure.message}`),
+			);
+		return new Promise<string>((resolvePending, rejectPending) => {
+			const timeout = setTimeout(() => {
+				this.fail(new Error("catalog openat helper timed out"));
+			}, TRUSTED_READ_TIMEOUT_MS);
+			this.pending = { resolve: resolvePending, reject: rejectPending, timeout, cap: responseCap };
+			this.child.stdin?.write(`${request}\n`, (error) => {
+				if (error) this.fail(new Error(`catalog openat helper write failed: ${String(error)}`));
+			});
+			this.drainStdout();
+		});
+	}
+
+	private handleStdout(chunk: string): void {
+		this.stdoutBuffer += chunk;
+		this.drainStdout();
+	}
+
+	private drainStdout(): void {
+		const pending = this.pending;
+		if (!pending) {
+			if (this.stdoutBuffer !== "") this.fail(new Error("catalog openat helper sent an unsolicited response"));
+			return;
+		}
+		const end = this.stdoutBuffer.indexOf("\n");
+		if (end === -1) {
+			if (this.stdoutBuffer.length > pending.cap) this.fail(new Error("catalog openat helper response overflow"));
+			return;
+		}
+		const line = this.stdoutBuffer.slice(0, end);
+		this.stdoutBuffer = this.stdoutBuffer.slice(end + 1);
+		this.pending = undefined;
+		clearTimeout(pending.timeout);
+		if (line.length > pending.cap) {
+			this.fail(new Error("catalog openat helper response overflow"));
+			pending.reject(invalidFamilyTopology("descriptor-relative artifact response is invalid"));
+			return;
+		}
+		pending.resolve(line);
+	}
+
+	private fail(error: Error): void {
+		if (this.failure) return;
+		this.failure = error;
+		this.child.kill("SIGKILL");
+		const pending = this.pending;
+		this.pending = undefined;
+		if (pending) {
+			clearTimeout(pending.timeout);
+			pending.reject(invalidFamilyTopology(`descriptor-relative artifact read failed: ${error.message}`));
+		}
 	}
 }
 
@@ -270,8 +382,12 @@ function readTrustedFile(rawPath: string, roots: ManagedRoots, maxBytes: number,
  * decision: it comes from the caller's listing when available, otherwise from
  * an ordinary cached read, and is bound to the header by the id cross-check.
  */
-async function readTrustedSession(path: string, roots: ManagedRoots, listed?: SessionInfo): Promise<TrustedSession> {
-	const trusted = readTrustedFile(path, roots, MAX_SESSION_HEADER_BYTES, "header");
+async function readTrustedSession(
+	path: string,
+	reader: TrustedReadSession,
+	listed?: SessionInfo,
+): Promise<TrustedSession> {
+	const trusted = await reader.read(path, MAX_SESSION_HEADER_BYTES, "header");
 	const headerLine = trusted.contents.toString("utf8").split(/\r?\n/, 1)[0];
 	let header: { type?: unknown; id?: unknown; parentSession?: unknown; rlmDepth?: unknown };
 	try {
@@ -328,11 +444,11 @@ function asTrustedFamilyRoot(trusted: TrustedSession, roots: ManagedRoots): Fami
 
 async function readLatestRegistry(
 	path: string,
-	roots: ManagedRoots,
+	reader: TrustedReadSession,
 ): Promise<SavedRlmSubagentRegistryEntry[] | undefined> {
 	let contents: string;
 	try {
-		contents = readTrustedFile(path, roots, MAX_RLM_REGISTRY_BYTES, "read").contents.toString("utf8");
+		contents = (await reader.read(path, MAX_RLM_REGISTRY_BYTES, "read")).contents.toString("utf8");
 	} catch (error) {
 		if ((error as Error).message.includes("descriptor-relative artifact is absent")) return undefined;
 		throw error;
@@ -367,11 +483,12 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 	const effectiveSessionDir = sessionDir ?? getSessionsDir();
 	const roots = await SessionManager.listAll(undefined, effectiveSessionDir);
 	const authority = managedRoots(effectiveSessionDir);
+	const reader = new TrustedReadSession(authority);
 	try {
 		const sessions = new Map<string, FamilySession>();
 		const ids = new Map<string, string>();
 		for (const root of roots) {
-			const trusted = asTrustedFamilyRoot(await readTrustedSession(root.path, authority, root), authority);
+			const trusted = asTrustedFamilyRoot(await readTrustedSession(root.path, reader, root), authority);
 			const existingPath = ids.get(trusted.id);
 			if (existingPath && existingPath !== trusted.path)
 				throw invalidFamilyTopology("family contains a duplicate session id");
@@ -388,7 +505,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 			visited.add(parentPath);
 			const registryPath = rlmSubagentRegistryPath(parent, authority);
 			if (!registryPath) return;
-			const entries = await readLatestRegistry(registryPath, authority);
+			const entries = await readLatestRegistry(registryPath, reader);
 			if (!entries) return;
 			const childAncestors = new Set(ancestors);
 			childAncestors.add(parentPath);
@@ -397,7 +514,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				if (++edges > MAX_RLM_FAMILY_EDGES) throw invalidFamilyTopology("family edge limit exhausted");
 				const childPath = entry.sessionFile as string;
 				if (childAncestors.has(childPath)) throw invalidFamilyTopology("family contains a cycle");
-				const trustedChild = await readTrustedSession(childPath, authority);
+				const trustedChild = await readTrustedSession(childPath, reader);
 				if (trustedChild.id !== entry.childId)
 					throw invalidFamilyTopology("registry child id does not match session id");
 				if (trustedChild.persistedParentPath === undefined)
@@ -405,7 +522,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 				if (trustedChild.persistedDepth === undefined) throw invalidFamilyTopology("child lacks a persisted depth");
 				const child: FamilySession = { ...trustedChild, persistedDepth: trustedChild.persistedDepth };
 				const claimedParentPath = resolve(dirname(child.path), trustedChild.persistedParentPath);
-				readTrustedFile(claimedParentPath, authority, 0, "stat");
+				await reader.read(claimedParentPath, 0, "stat");
 				if (claimedParentPath !== parentPath)
 					throw invalidFamilyTopology("child parent path does not match traversed parent");
 				if (child.persistedDepth !== parent.persistedDepth + 1)
@@ -432,6 +549,7 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 		for (const root of [...sessions.values()]) await visit(root, 0, new Set());
 		return [...sessions.values()];
 	} finally {
+		reader.close();
 		closeManagedRoots(authority);
 	}
 }
