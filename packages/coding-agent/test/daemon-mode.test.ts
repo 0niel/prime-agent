@@ -11445,6 +11445,91 @@ describe("daemon tombstoned retirement", () => {
 		await gate;
 	});
 
+	it("hides a closing child subtree from daemon lists, targets, and cron jobs", async () => {
+		const daemon = new AgentDaemon("/tmp/closing-subtree.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const root = makeState("closing-root");
+		const child = makeState("closing-child", root.activeSessionId);
+		const grandchild = makeState("closing-grandchild", child.activeSessionId);
+		const sibling = makeState("closing-sibling", root.activeSessionId);
+		for (const [state, rlmChildId] of [
+			[root, undefined],
+			[child, "child"],
+			[grandchild, "grandchild"],
+			[sibling, "sibling"],
+		] as const) {
+			state.runtime = {
+				...state.runtime,
+				cwd: "/tmp",
+				diagnostics: [],
+				metadata: {
+					...state.runtime.metadata,
+					kind: state === root ? "top-level" : "subagent",
+					...(rlmChildId ? { rlmChildId } : {}),
+				},
+				session: {
+					sessionId: `session-${state.activeSessionId}`,
+					sessionName: state.activeSessionId,
+					isSessionActive: false,
+					isStreaming: false,
+					isCompacting: false,
+					isBashRunning: false,
+					hasRunningRlmChildren: () => false,
+					messages: [],
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					unfinishedActionCount: 0,
+					sessionManager: { getCwd: () => "/tmp" },
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+				},
+			} as never;
+		}
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closingSessions: Map<string, unknown>;
+			failedTombstonedRlmCloses: Map<string, { state: ActiveSessionState }>;
+			createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			getOrHydrateBoundSessionState(id: string): Promise<ActiveSessionState>;
+			isCronJobRunnableForState(job: AgentCronJob, state: ActiveSessionState, requirePersistedJob: boolean): boolean;
+			isPublicRlmState(state: ActiveSessionState): boolean;
+		};
+		for (const state of [root, child, grandchild, sibling]) internals.sessions.set(state.activeSessionId, state);
+		internals.closingSessions.set(child.activeSessionId, {});
+
+		expect(internals.isPublicRlmState(child)).toBe(false);
+		expect(internals.isPublicRlmState(grandchild)).toBe(false);
+		expect(internals.isPublicRlmState(sibling)).toBe(true);
+		const listed = (await internals.handleCommand(makeClient("list-client", root.activeSessionId), {
+			type: "list",
+		})) as { data: { sessions: SessionSummary[] } };
+		expect(listed.data.sessions.map((session) => session.activeSessionId)).toEqual(
+			expect.arrayContaining([root.activeSessionId, sibling.activeSessionId]),
+		);
+		expect(listed.data.sessions.map((session) => session.activeSessionId)).not.toEqual(
+			expect.arrayContaining([child.activeSessionId, grandchild.activeSessionId]),
+		);
+		const targets = await internals.createAgentMessageController(() => root).listAgents();
+		expect(targets.agents.map((agent) => agent.activeSessionId)).toEqual(
+			expect.arrayContaining([sibling.activeSessionId]),
+		);
+		expect(targets.agents.map((agent) => agent.activeSessionId)).not.toEqual(
+			expect.arrayContaining([child.activeSessionId, grandchild.activeSessionId]),
+		);
+		await expect(internals.getOrHydrateBoundSessionState(grandchild.activeSessionId)).rejects.toThrow("unavailable");
+		const job = { status: "active", activeSessionId: grandchild.activeSessionId } as AgentCronJob;
+		expect(internals.isCronJobRunnableForState(job, grandchild, false)).toBe(false);
+		expect(
+			internals.isCronJobRunnableForState({ ...job, activeSessionId: sibling.activeSessionId }, sibling, false),
+		).toBe(true);
+
+		internals.closingSessions.delete(child.activeSessionId);
+		internals.sessions.delete(child.activeSessionId);
+		internals.failedTombstonedRlmCloses.set(child.activeSessionId, { state: child });
+		expect(internals.isPublicRlmState(grandchild)).toBe(false);
+	});
+
 	it("retains a failed physical disposal and retries the exact runtime", async () => {
 		const daemon = new AgentDaemon("/tmp/retry-retirement.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
