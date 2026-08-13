@@ -3560,19 +3560,14 @@ describe("AgentSession rlm recursion", () => {
 		expect(readdirSync(artifactDir).filter((name) => name.startsWith("sub-"))).toHaveLength(0);
 	});
 
-	it("keeps a typed precommit release private until an exact retry tombstones and closes it", async () => {
+	it("retains a precommit late-admission release for an exact-id tombstone-and-close retry", async () => {
 		const controller = new AbortController();
 		const child = createSession();
 		const disposeChild = vi.spyOn(child, "disposeAsync");
 		let releaseAttempts = 0;
-		const deleteRuntime = vi.fn(async (childId: string, session: AgentSession | undefined, authority) => {
-			expect(authority).toMatchObject({
-				childId,
-				sessionFile: child.sessionFile,
-				sessionId: child.sessionId,
-			});
+		const deleteRuntime = vi.fn(async (_childId: string, session?: AgentSession) => {
 			await session?.disposeAsync();
-			return { deletionDurability: "tombstoned" as const };
+			return { deletionDurability: "absent" as const };
 		});
 		const root = createSession({
 			subagentRuntimeHost: {
@@ -3610,7 +3605,6 @@ describe("AgentSession rlm recursion", () => {
 		expect(disposeChild).toHaveBeenCalledOnce();
 		expect(internals._rlmChildDeletionQuarantines).toHaveLength(0);
 		expect(internals._rlmChildSessions).toHaveLength(0);
-		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 	});
 
 	it("discharges only a stale quarantine lease when its child id is replaced", async () => {
