@@ -182,7 +182,8 @@ def flags(directory=False):
  if directory: value|=os.O_DIRECTORY
  return value
 def serve(req):
- parts=req.get("parts"); limit=req.get("limit"); mode=req.get("mode"); root=req.get("root")
+ request_id=req.get("id"); parts=req.get("parts"); limit=req.get("limit"); mode=req.get("mode"); root=req.get("root")
+ if not isinstance(request_id,str) or not request_id or len(request_id)>128: reject()
  if mode not in ("read","header","stat") or root not in (3,4): reject()
  if not isinstance(parts,list) or not parts or not isinstance(limit,int) or limit<0 or limit>MAX: reject()
  if any(not isinstance(p,str) or not p or p in (".","..") or "/" in p or "\\" in p for p in parts): reject()
@@ -217,9 +218,12 @@ while True:
  line=sys.stdin.buffer.readline(131073)
  if not line: break
  if len(line)>131072 or not line.endswith(b"\n"): sys.exit(1)
- try: response=serve(json.loads(line))
+ request=None
+ try:
+  request=json.loads(line); response=serve(request)
  except FileNotFoundError: response={"error":"absent"}
  except Exception: response={"error":"failed"}
+ response["id"]=request.get("id") if isinstance(request,dict) else None
  sys.stdout.write(json.dumps(response,separators=(",",":"))+"\n"); sys.stdout.flush()
 `;
 
@@ -308,10 +312,17 @@ class TrustedReadSession {
 	/** End input and require the helper to finish silently and successfully. */
 	async close(): Promise<void> {
 		await this.queue;
-		if (this.failure) return;
+		if (this.failure) {
+			// fail() sends SIGKILL only; wait before releasing the authority FDs.
+			await Promise.all([this.exited, this.stdoutFinished]);
+			return;
+		}
 		if (this.pending || this.stdoutBuffer !== "") {
 			this.fail(new Error("catalog openat helper has residual output"));
-			return;
+			await Promise.all([this.exited, this.stdoutFinished]);
+			throw invalidFamilyTopology(
+				"descriptor-relative artifact read failed: catalog openat helper has residual output",
+			);
 		}
 		this.stdinEnded = true;
 		this.child.stdin?.end();
@@ -337,15 +348,20 @@ class TrustedReadSession {
 		}
 		beforeTrustedOpenForTest?.(rawPath);
 		const rootFd = root === this.roots.session ? 3 : 4;
+		const requestId = randomUUID();
 		const line = await this.exchange(
-			JSON.stringify({ parts, limit: maxBytes, mode, root: rootFd }),
+			JSON.stringify({ id: requestId, parts, limit: maxBytes, mode, root: rootFd }),
 			maxBytes * 2 + 64 * 1024,
 		);
-		let wire: { error?: unknown; data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
+		let wire: { id?: unknown; error?: unknown; data?: unknown; mtimeMs?: unknown; dev?: unknown; ino?: unknown };
 		try {
 			wire = JSON.parse(line) as typeof wire;
 		} catch {
 			this.fail(new Error("catalog openat helper response is invalid"));
+			throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
+		}
+		if (wire.id !== requestId) {
+			this.fail(new Error("catalog openat helper response id is shifted"));
 			throw invalidFamilyTopology("descriptor-relative artifact response is invalid");
 		}
 		if (wire.error === "absent") throw invalidFamilyTopology("descriptor-relative artifact is absent");
