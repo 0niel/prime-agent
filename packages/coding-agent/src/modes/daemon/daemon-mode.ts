@@ -435,6 +435,7 @@ export class AgentDaemon {
 		deadline?: ReturnType<typeof setTimeout>;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
+		memoryCheckpointFiles: Set<string>;
 		deferredClientEnv: Array<{
 			client: DaemonSocketClient;
 			state: ActiveSessionState;
@@ -5655,6 +5656,9 @@ export class AgentDaemon {
 						state.runtime.runtimeConfig?.sessionDir ?? this.options.defaultSessionConfig.sessionDir,
 					)
 				: undefined);
+		if (sessionFile && !session.sessionManager.allowsPersistence()) {
+			this.updateRestart?.memoryCheckpointFiles.add(sessionFile);
+		}
 		if (!sessionFile || (this.isEmptyDraftContent(state) && !hasQueuedMessages && !shouldResume)) {
 			return undefined;
 		}
@@ -5736,6 +5740,7 @@ export class AgentDaemon {
 			...(owner ? { owner } : {}),
 			abort: new AbortController(),
 			phase: "preparing",
+			memoryCheckpointFiles: new Set(),
 			deferredClientEnv: [],
 		};
 		this.updateRestart = transaction;
@@ -5854,6 +5859,8 @@ export class AgentDaemon {
 		transaction.abort.abort();
 		if (transaction.phase === "publishing") return;
 		this.removeMemoryRestartCheckpoints(transaction.manifest);
+		for (const path of transaction.memoryCheckpointFiles) rmSync(path, { force: true });
+		transaction.memoryCheckpointFiles.clear();
 		this.updateRestart = undefined;
 		for (const deferred of transaction.deferredClientEnv) {
 			if (

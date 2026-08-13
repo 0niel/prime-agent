@@ -2217,6 +2217,7 @@ export class SessionManager {
 	static async openInMemoryAsync(path: string, sessionDir?: string, cwdOverride?: string): Promise<SessionManager> {
 		const entries = await loadEntriesFromFileAsync(path);
 		if (entries.length === 0) throw new Error(`Session file is empty or invalid: ${path}`);
+		migrateToCurrentVersion(entries);
 		const cwd = cwdOverride ?? (entries[0] as SessionHeader).cwd;
 		const dir = sessionDir ?? resolve(path, "..");
 		return new SessionManager(cwd ?? process.cwd(), dir, undefined, false, entries);

@@ -38,6 +38,7 @@ type AgentDaemonUpdateInternals = {
 		abort: AbortController;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
+		memoryCheckpointFiles: Set<string>;
 		owner?: DaemonSocketClient;
 		deferredClientEnv: Array<{
 			client: DaemonSocketClient;
@@ -166,6 +167,7 @@ describe("issue #4257 update restart resume", () => {
 				id: Symbol("update-restart"),
 				abort: new AbortController(),
 				phase,
+				memoryCheckpointFiles: new Set<string>(),
 				deferredClientEnv: [],
 			};
 		}
@@ -316,6 +318,7 @@ describe("issue #4257 update restart resume", () => {
 			id: Symbol("update-restart"),
 			abort: new AbortController(),
 			phase: "preparing" as const,
+			memoryCheckpointFiles: new Set<string>(),
 			deferredClientEnv: [],
 		};
 		internals.updateRestart = transaction;
@@ -486,6 +489,7 @@ describe("issue #4257 update restart resume", () => {
 					id: Symbol("newer-update-restart"),
 					abort: new AbortController(),
 					phase: "publishing" as const,
+					memoryCheckpointFiles: new Set<string>(),
 					deferredClientEnv: [],
 				};
 				vi.spyOn(internals, "commitPreparedUpdateRestart").mockImplementationOnce(async () => {
