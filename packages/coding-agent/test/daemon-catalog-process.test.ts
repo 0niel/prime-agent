@@ -13,6 +13,7 @@ import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import {
+	getCatalogHelperSpawnCountForTest,
 	getOpenCatalogAuthorityFdCountForTest,
 	listCatalogFamilySessions,
 	listSavedSessionSiblings,
@@ -664,6 +665,18 @@ describe("daemon catalog selector resolution", () => {
 		);
 		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow("Invalid RLM artifact family topology");
 		rmSync(root, { recursive: true, force: true });
+	});
+
+	it("serves an entire family walk from a single helper process", async () => {
+		const { root, sessionDir } = createCatalogFamilyFixture();
+		try {
+			const spawnsBefore = getCatalogHelperSpawnCountForTest();
+			await expect(listCatalogFamilySessions(sessionDir)).resolves.toHaveLength(3);
+			expect(getCatalogHelperSpawnCountForTest()).toBe(spawnsBefore + 1);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+		expect(getOpenCatalogAuthorityFdCountForTest()).toBe(0);
 	});
 
 	it("treats an exact name colliding with another session id prefix as ambiguous", () => {
