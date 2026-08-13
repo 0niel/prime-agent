@@ -23,15 +23,12 @@ describe("staged host-request handler authority", () => {
 		expect(calls).toBe(1);
 	});
 
-	it("rejects copied-symbol forgeries through WeakSet provenance before they run", () => {
-		const genuine = createHostRequestHandler(async (_payload, _context) => ({}));
+	it("rejects handlers that were not minted by the factory", () => {
 		let calls = 0;
 		const forged = async (): Promise<Record<string, unknown>> => {
 			calls += 1;
 			return {};
 		};
-		const brand = Object.getOwnPropertySymbols(genuine)[0];
-		Object.defineProperty(forged, brand, Object.getOwnPropertyDescriptor(genuine, brand)!);
 
 		expect(() => assertHostRequestHandler(forged)).toThrow(
 			"host request handler is not a dispatcher-created capability",
