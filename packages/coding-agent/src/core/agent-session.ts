@@ -15,7 +15,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -8765,8 +8765,8 @@ export class AgentSession {
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
 	private _createKernelHostHandlers(): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
-			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
-				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
+			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode, signal, isCurrent }) => ({
+				...(await this.runRlmChild(prompt, kwargs, cellSourceCode, { signal, isCurrent })),
 			})),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
@@ -9705,7 +9705,14 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
+		requestAuthority?: { signal: AbortSignal; isCurrent(): boolean },
 	): Promise<RlmSpawnHandle> {
+		const assertRequestCurrent = () => {
+			if (requestAuthority && (requestAuthority.signal.aborted || !requestAuthority.isCurrent())) {
+				throw new Error("host request authority was revoked");
+			}
+		};
+		assertRequestCurrent();
 		const { name: rawName, model: rawModel, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
@@ -9732,12 +9739,19 @@ export class AgentSession {
 		} finally {
 			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
 		}
+		assertRequestCurrent();
 		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
 
 		const childSessionDir = this._createChildRlmSessionDir();
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
-		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+		try {
+			if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+			assertRequestCurrent();
+		} catch (error) {
+			rmSync(childSessionDir, { recursive: true, force: true });
+			throw error;
+		}
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
@@ -9830,6 +9844,12 @@ export class AgentSession {
 		// Runtime startup and the task run are deliberately detached. The public
 		// spawn resolves at admission, while this task owns live tracking, usage,
 		// retention, cancellation, and late-startup cleanup.
+		let admissionCommitted = false;
+		const revokeAdmission = () => {
+			if (!admissionCommitted) this._cancelRlmChildRun(run, "host request authority was revoked");
+		};
+		if (requestAuthority) requestAuthority.signal.addEventListener("abort", revokeAdmission, { once: true });
+		assertRequestCurrent();
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
 			try {
@@ -10041,9 +10061,21 @@ export class AgentSession {
 					}
 				}
 				run.settled = true;
+				if (requestAuthority && !admissionCommitted) {
+					requestAuthority.signal.removeEventListener("abort", revokeAdmission);
+				}
 			}
 		})().catch(() => undefined);
 
+		try {
+			if (requestAuthority) await run.publication.promise;
+			assertRequestCurrent();
+			admissionCommitted = true;
+			if (requestAuthority) requestAuthority.signal.removeEventListener("abort", revokeAdmission);
+		} catch (error) {
+			revokeAdmission();
+			throw error;
+		}
 		return {
 			rlm_child_id: childNodeId,
 			name: sessionName,
@@ -10056,8 +10088,9 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
+		requestAuthority?: { signal: AbortSignal; isCurrent(): boolean },
 	): Promise<RlmSpawnHandle> {
-		return this._startRlmChildRun(prompt, kwargs, spawnCode);
+		return this._startRlmChildRun(prompt, kwargs, spawnCode, requestAuthority);
 	}
 
 	// =========================================================================

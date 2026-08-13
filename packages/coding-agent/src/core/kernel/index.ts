@@ -789,9 +789,7 @@ export class KernelManager {
 			conn = await this.waitForResolvedConnection(connectionPath);
 			this.connection = conn;
 		} catch (e) {
-			const canRetryStartup = (this.state as string) !== "shutdown";
-			await this.shutdownInternal();
-			if (canRetryStartup) this.state = "idle";
+			await this.cleanupFailedStartupForRetry();
 			throw e;
 		}
 
@@ -810,9 +808,7 @@ export class KernelManager {
 		try {
 			await this.probeReady();
 		} catch (e) {
-			const canRetryStartup = (this.state as string) !== "shutdown";
-			await this.shutdownInternal();
-			if (canRetryStartup) this.state = "idle";
+			await this.cleanupFailedStartupForRetry();
 			throw e;
 		}
 
@@ -822,6 +818,15 @@ export class KernelManager {
 		}
 		this.state = "running";
 		this.startForkedLivenessMonitor();
+	}
+
+	private async cleanupFailedStartupForRetry(): Promise<void> {
+		const terminalRevision = this.terminalRevision;
+		await this.shutdownInternal();
+		if (!this.terminal && terminalRevision === this.terminalRevision && this.state === "shutdown") {
+			this.hostRequestsClosed = false;
+			this.state = "idle";
+		}
 	}
 
 	// A forked kernel isn't a direct child, so no "exit" fires when it dies. Poll its

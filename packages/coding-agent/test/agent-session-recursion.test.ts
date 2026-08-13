@@ -184,6 +184,15 @@ function rlmCommOpen(commId: string, prompt: string, kwargs: Record<string, unkn
 	return rlmCommOpenData(commId, { type: "rlm.run", prompt, kwargs });
 }
 
+function rlmCommClose(commId: string): TestCommMessage {
+	return {
+		header: { msg_type: "comm_close" },
+		parent_header: {},
+		metadata: {},
+		content: { comm_id: commId },
+	};
+}
+
 function encodeTestMessage(message: TestCommMessage): Buffer[] {
 	return [
 		Buffer.from("<IDS|MSG>"),
@@ -2916,6 +2925,117 @@ describe("AgentSession rlm recursion", () => {
 
 		releaseChild();
 		await waitFor(() => rootRun.status === "done");
+	});
+
+	it("does not admit an rlm child after request authority is revoked during model resolution", async () => {
+		const root = createSession();
+		const controller = new AbortController();
+		let releaseResolution: () => void = () => {};
+		const resolutionGate = new Promise<void>((resolve) => {
+			releaseResolution = resolve;
+		});
+		let resolutionStarted: () => void = () => {};
+		const resolutionStartedGate = new Promise<void>((resolve) => {
+			resolutionStarted = resolve;
+		});
+		const internals = root as unknown as InspectableRlmSession & {
+			_resolveRlmSubagentModel(model?: string): Promise<unknown>;
+		};
+		const originalResolve = internals._resolveRlmSubagentModel.bind(root);
+		vi.spyOn(internals, "_resolveRlmSubagentModel").mockImplementation(async (requestedModel) => {
+			resolutionStarted();
+			await resolutionGate;
+			return originalResolve(requestedModel);
+		});
+
+		const admission = root.runRlmChild("revoked before admission", {}, undefined, {
+			signal: controller.signal,
+			isCurrent: () => !controller.signal.aborted,
+		});
+		await resolutionStartedGate;
+		controller.abort();
+		releaseResolution();
+		await expect(admission).rejects.toThrow("host request authority was revoked");
+		expect(internals._activeRlmChildRuns.size).toBe(0);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+	});
+
+	it("claims cleanup when rlm.run authority is revoked during asynchronous runtime admission", async () => {
+		const root = createSession();
+		const controller = new AbortController();
+		let runtimeEntered: () => void = () => {};
+		const runtimeEnteredGate = new Promise<void>((resolve) => {
+			runtimeEntered = resolve;
+		});
+		let releaseRuntime: () => void = () => {};
+		const runtimeGate = new Promise<void>((resolve) => {
+			releaseRuntime = resolve;
+		});
+		const internals = root as unknown as InspectableRlmSession & {
+			_createRlmSubagentRuntime(options: unknown): Promise<{ session: AgentSession }>;
+		};
+		const originalCreateRuntime = internals._createRlmSubagentRuntime.bind(root);
+		const createRuntime = vi.spyOn(internals, "_createRlmSubagentRuntime").mockImplementation(async (options) => {
+			runtimeEntered();
+			await runtimeGate;
+			return originalCreateRuntime(options);
+		});
+
+		const admission = root.runRlmChild("revoked during runtime admission", {}, undefined, {
+			signal: controller.signal,
+			isCurrent: () => !controller.signal.aborted,
+		});
+		await runtimeEnteredGate;
+		controller.abort();
+		releaseRuntime();
+		await expect(admission).rejects.toThrow("host request authority was revoked");
+		expect(createRuntime).toHaveBeenCalledOnce();
+		await waitFor(() => internals._activeRlmChildRuns.size === 0);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+	});
+
+	it("revokes rlm.run authority before a gated admission can create side effects", async () => {
+		let handlerStarted: () => void = () => {};
+		const handlerStartedGate = new Promise<void>((resolve) => {
+			handlerStarted = resolve;
+		});
+		let releaseHandler: () => void = () => {};
+		const handlerGate = new Promise<void>((resolve) => {
+			releaseHandler = resolve;
+		});
+		let sideEffects = 0;
+		let sawAbortedSignal = false;
+		const replies: CapturedCommReply[] = [];
+		const manager = new KernelManager({
+			python: process.execPath,
+			hostHandlers: createTestHostHandlers({
+				"rlm.run": createRlmRunHostHandler(async ({ signal, isCurrent }) => {
+					handlerStarted();
+					await handlerGate;
+					sawAbortedSignal = signal.aborted && !isCurrent();
+					if (signal.aborted || !isCurrent()) throw new Error("host request authority was revoked");
+					sideEffects++;
+					return { ok: true };
+				}),
+			}),
+		});
+		try {
+			const kernel = manager as unknown as KernelCommTestApi;
+			kernel.sendCommMessage = async (commId, data) => {
+				replies.push({ commId, data });
+			};
+			kernel.handleCommMessage(rlmCommOpen("comm-revoked", "blocked child"));
+			await handlerStartedGate;
+			kernel.handleCommMessage(rlmCommClose("comm-revoked"));
+			releaseHandler();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(sawAbortedSignal).toBe(true);
+			expect(sideEffects).toBe(0);
+			expect(replies).toEqual([]);
+		} finally {
+			releaseHandler();
+			await manager.dispose();
+		}
 	});
 
 	it("runs parallel rlm comm requests independently", async () => {

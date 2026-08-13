@@ -81,6 +81,63 @@ describe("KernelManager startup", () => {
 		await expect(retry).rejects.toThrow("connection unavailable");
 	});
 
+	it.each(["connection", "probe"] as const)(
+		"does not make a %s failure retryable after concurrent disposal during cleanup",
+		async (failurePoint) => {
+			const python = join(tempDir, "python");
+			writeExecutable(python, ["#!/bin/sh", "sleep 30", ""].join("\n"));
+			const manager = new KernelManager({ python, cwd: tempDir });
+			const failure = new Error(`${failurePoint} unavailable`);
+			let releaseCleanup: () => void = () => {};
+			const cleanupGate = new Promise<void>((resolve) => {
+				releaseCleanup = resolve;
+			});
+			let cleanupStarted: () => void = () => {};
+			const cleanupStartedGate = new Promise<void>((resolve) => {
+				cleanupStarted = resolve;
+			});
+			const internals = manager as unknown as {
+				state: "idle" | "starting" | "running" | "shutdown";
+				terminal: boolean;
+				waitForResolvedConnection: () => Promise<never>;
+				probeReady: () => Promise<void>;
+				shutdownInternal: () => Promise<void>;
+			};
+			if (failurePoint === "connection") {
+				internals.waitForResolvedConnection = () => Promise.reject(failure);
+			} else {
+				internals.waitForResolvedConnection = async () =>
+					({
+						ip: "127.0.0.1",
+						transport: "tcp" as const,
+						shell_port: 1,
+						iopub_port: 2,
+						stdin_port: 3,
+						control_port: 4,
+						hb_port: 5,
+						signature_scheme: "hmac-sha256" as const,
+						key: "",
+						kernel_name: "python3",
+					}) as never;
+				internals.probeReady = () => Promise.reject(failure);
+			}
+			internals.shutdownInternal = async () => {
+				internals.state = "shutdown";
+				cleanupStarted();
+				await cleanupGate;
+			};
+
+			const start = manager.start();
+			await cleanupStartedGate;
+			manager.disposeSync();
+			releaseCleanup();
+			await expect(start).rejects.toBe(failure);
+			expect(internals.terminal).toBe(true);
+			expect(internals.state).toBe("shutdown");
+			await expect(manager.start()).rejects.toThrow("Kernel was disposed");
+		},
+	);
+
 	it("keeps disposal during startup terminal", async () => {
 		const python = join(tempDir, "python");
 		writeExecutable(python, ["#!/bin/sh", "sleep 30", ""].join("\n"));

@@ -9,6 +9,9 @@ export interface RlmRunRequest {
 	kwargs: Record<string, unknown>;
 	/** Source of the IPython cell that issued this rlm.run call, when available. */
 	cellSourceCode?: string;
+	/** Dispatcher authority for this admission; revoked requests must not spawn. */
+	signal: AbortSignal;
+	isCurrent(): boolean;
 }
 
 export interface RlmSpawnHandle {
@@ -150,16 +153,19 @@ export function findRlmModelMatches(query: string, models: Model<Api>[], limit: 
 
 /** Adapt an RlmRunHandler into the typed "rlm.run" handler for the kernel host bridge. */
 export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHandler {
-	return createHostRequestHandler(async (payload, _context) => {
+	return createHostRequestHandler(async (payload, context) => {
 		if (typeof payload.prompt !== "string") {
 			throw new Error("rlm.run prompt must be a string");
 		}
 		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
 		const cellSourceCode = typeof payload.cellSourceCode === "string" ? payload.cellSourceCode : undefined;
+		if (context.signal.aborted || !context.isCurrent()) throw new Error("host request authority was revoked");
 		const result = await handler({
 			prompt: payload.prompt,
 			kwargs,
 			cellSourceCode,
+			signal: context.signal,
+			isCurrent: () => context.isCurrent(),
 		});
 		return result as unknown as Record<string, unknown>;
 	}, contextAwareHostRequestHandler);
