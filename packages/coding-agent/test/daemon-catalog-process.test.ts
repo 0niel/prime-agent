@@ -718,7 +718,9 @@ describe("daemon catalog selector resolution", () => {
 	});
 
 	it("caps the exact escaped metadata response while preserving a usable family", async () => {
-		const payloads = ["a".repeat(1_048_000), "漢😀".repeat(65_536), '"\\\b\f\n\r\t\u0000'.repeat(80_000)];
+		// Keep each JSONL record below the parser's 1 MiB record bound while its
+		// combined escaped metadata response still greatly exceeds 256 KiB.
+		const payloads = ["a".repeat(500_000), "漢😀".repeat(50_000), '"\\\b\f\n\r\t\u0000'.repeat(25_000)];
 		for (const [index, payload] of payloads.entries()) {
 			const root = mkdtempSync(join(tmpdir(), `prime-catalog-escaped-cap-${index}-`));
 			const sessionDir = join(root, "sessions");
@@ -738,6 +740,36 @@ describe("daemon catalog selector resolution", () => {
 			);
 			const family = await listCatalogFamilySessions(sessionDir);
 			expect(family).toHaveLength(1);
+			const [session] = family;
+			// A successful descriptor helper exchange proves the exact ASCII-escaped
+			// response stayed inside its 256 KiB wire cap. The compact response still
+			// has every catalog field consumers require.
+			expect(session).toEqual(
+				expect.objectContaining({
+					id: `parent-${index}`,
+					firstMessage: expect.any(String),
+					allMessagesText: expect.any(String),
+					name: expect.any(String),
+					agentStatus: expect.objectContaining({
+						summary: expect.any(String),
+						taskState: "completed",
+						basedOnMessageCount: 1,
+					}),
+				}),
+			);
+			const serialized = JSON.stringify({
+				id: "metadata-response",
+				data: {
+					valid: true,
+					messageCount: session.messageCount,
+					firstMessage: session.firstMessage,
+					allMessagesText: session.allMessagesText,
+					modifiedMs: session.modified.getTime(),
+					name: session.name,
+					agentStatus: session.agentStatus,
+				},
+			});
+			expect(Buffer.byteLength(serialized, "ascii")).toBeLessThanOrEqual(256 * 1024);
 			rmSync(root, { recursive: true, force: true });
 		}
 	});

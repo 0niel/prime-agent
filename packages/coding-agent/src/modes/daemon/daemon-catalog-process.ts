@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, openSync } from "node:fs";
+import { closeSync, constants, lstatSync, openSync, readdirSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import { getSessionsDir } from "../../config.js";
@@ -211,8 +211,7 @@ def compact_metadata_response(response):
    targets.append((container,key,container[key]))
  add_target(data,"firstMessage"); add_target(data,"allMessagesText"); add_target(data,"name")
  status=data.get("agentStatus")
- if isinstance(status,dict):
-  add_target(status,"summary"); add_target(status,"taskState")
+ if isinstance(status,dict): add_target(status,"summary")
  # Clear every unbounded display field before allocating the remaining escaped-byte
  # budget in a stable priority order. Fields remain present and string typed.
  for container,key,_ in targets: container[key]=""
@@ -783,6 +782,37 @@ async function readTrustedSession(path: string, reader: TrustedReadSession): Pro
 }
 
 /**
+ * A sessions directory can contain interrupted writes and unrelated jsonl files.
+ * Classification is deliberately narrow: only a bounded, blank/truncated,
+ * non-JSON, non-session, or identifier-less first record is ignored. Once a
+ * record purports to be an identified session, the strict descriptor-bound
+ * reader owns every topology and protocol failure.
+ */
+async function readTrustedRootCandidate(
+	path: string,
+	listed: { dev: string; ino: string },
+	reader: TrustedReadSession,
+): Promise<TrustedSession | undefined> {
+	const header = await reader.read(path, MAX_SESSION_HEADER_BYTES, "header");
+	// A candidate changing after enumeration cannot safely be reclassified as
+	// junk: it may have replaced an identified root before descriptor open.
+	if (header.dev !== listed.dev || header.ino !== listed.ino)
+		throw invalidFamilyTopology("root candidate changed after directory enumeration");
+	if (header.truncated) throw invalidFamilyTopology("session header exceeds the trusted read limit");
+	const line = header.contents.toString("utf8").split(/\r?\n/, 1)[0] ?? "";
+	if (!line.trim()) return undefined;
+	let candidate: { type?: unknown; id?: unknown };
+	try {
+		candidate = JSON.parse(line) as { type?: unknown; id?: unknown };
+	} catch {
+		return undefined;
+	}
+	if (!candidate || typeof candidate !== "object" || candidate.type !== "session") return undefined;
+	if (typeof candidate.id !== "string" || candidate.id === "") return undefined;
+	return readTrustedSession(path, reader);
+}
+
+/**
  * /fork and lineage-carrying /new save sessions directly into the sessions dir
  * with a parentSession claim naming their source. That claim is fork ancestry,
  * not rlm topology: the session is a family root and the claim is ignored.
@@ -840,13 +870,28 @@ async function readLatestRegistry(
 	return [...latest.values()];
 }
 
+function listSessionCandidates(sessionDir: string): Array<{ path: string; dev: string; ino: string }> {
+	try {
+		return readdirSync(sessionDir)
+			.filter((entry) => entry.endsWith(".jsonl"))
+			.flatMap((entry) => {
+				const path = join(resolve(sessionDir), entry);
+				try {
+					const stat = lstatSync(path);
+					return [{ path, dev: String(stat.dev), ino: String(stat.ino) }];
+				} catch {
+					// Removed during enumeration: it was never a stable root candidate.
+					return [];
+				}
+			});
+	} catch {
+		return [];
+	}
+}
+
 export async function listCatalogFamilySessions(sessionDir?: string): Promise<SessionInfo[]> {
 	const effectiveSessionDir = sessionDir ?? getSessionsDir();
-	// SessionManager performs the non-authoritative flat-directory classification:
-	// interrupted, blank, and unrelated jsonl files are not roots. Topology is
-	// still re-read descriptor-relatively below and any identified candidate
-	// that fails validation is fatal.
-	const roots = await SessionManager.listAll(undefined, effectiveSessionDir);
+	const roots = listSessionCandidates(effectiveSessionDir);
 	const authority = managedRoots(effectiveSessionDir);
 	const reader = new TrustedReadSession(authority);
 	let result: SessionInfo[] | undefined;
@@ -855,7 +900,9 @@ export async function listCatalogFamilySessions(sessionDir?: string): Promise<Se
 		const sessions = new Map<string, FamilySession>();
 		const ids = new Map<string, string>();
 		for (const root of roots) {
-			const trusted = asTrustedFamilyRoot(await readTrustedSession(root.path, reader), authority);
+			const candidate = await readTrustedRootCandidate(root.path, root, reader);
+			if (!candidate) continue;
+			const trusted = asTrustedFamilyRoot(candidate, authority);
 			const existingPath = ids.get(trusted.id);
 			if (existingPath && existingPath !== trusted.path)
 				throw invalidFamilyTopology("family contains a duplicate session id");
