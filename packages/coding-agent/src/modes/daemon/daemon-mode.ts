@@ -181,8 +181,6 @@ import {
 	classifySessionRosterStatus,
 	inactiveLifecycleForSession,
 	isActiveSessionBusy,
-	isRlmChildVisibilityQuarantinedByParent,
-	isRlmSubagentVisibilityQuarantined,
 	type SessionSummary,
 	summaryForActiveSession,
 } from "./daemon-session-list.js";
@@ -438,17 +436,6 @@ export function isTerminalRemoteAgentMessageError(error: unknown): error is Erro
 	);
 }
 
-interface RetiringRlmSubagent {
-	state: ActiveSessionState;
-	parentActiveSessionId: string;
-	childId: string;
-	sessionDir: string;
-	sessionFile?: string;
-	sessionId: string;
-	cleanup?: Promise<void>;
-	error?: unknown;
-}
-
 export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
@@ -491,8 +478,6 @@ export class AgentDaemon {
 			reasonUpgrade?: Promise<void>;
 		}
 	>();
-	/** Tombstoned child incarnations remain resident only until detached close retries finish. */
-	private readonly retiringRlmSubagents = new Map<string, RetiringRlmSubagent>();
 	private readonly sideQuestionRuns = new Map<
 		string,
 		{
@@ -1209,13 +1194,7 @@ export class AgentDaemon {
 		): Promise<void> => {
 			for (const entry of entries) {
 				const sessionKey = resolve(entry.sessionFile);
-				if (
-					entry.status === "deleted" ||
-					visited.has(sessionKey) ||
-					(parentChain.length === 0 &&
-						isRlmChildVisibilityQuarantinedByParent(root.rootParentState, entry.childId))
-				)
-					continue;
+				if (entry.status === "deleted" || visited.has(sessionKey)) continue;
 				visited.add(sessionKey);
 				const info = await readSessionInfo(entry.sessionFile);
 				// A path is recyclable; passive authority belongs only to this saved header.
@@ -1235,7 +1214,6 @@ export class AgentDaemon {
 		};
 		const residentRootPaths = new Set<string>();
 		for (const parentState of this.sessions.values()) {
-			if (this.isPrivateRlmSubagentState(parentState)) continue;
 			const parentFile = parentState.runtime.session.sessionFile;
 			// An in-memory session cannot own a persisted registry.
 			if (!parentFile) continue;
@@ -1274,10 +1252,7 @@ export class AgentDaemon {
 	private async buildRlmChildSnapshotsWithPassiveRlmSubagents(
 		rootState: ActiveSessionState,
 	): Promise<AgentConnectionRlmChildAgentSnapshot[]> {
-		const snapshots = buildRlmChildSnapshots(
-			rootState.activeSessionId,
-			[...this.sessions.values()].filter((state) => !this.isPrivateRlmSubagentState(state)),
-		);
+		const snapshots = buildRlmChildSnapshots(rootState.activeSessionId, [...this.sessions.values()]);
 		const residentParentIds = new Set([
 			rootState.activeSessionId,
 			...snapshots.flatMap((snapshot) => (snapshot.activeSessionId ? [snapshot.activeSessionId] : [])),
@@ -1317,33 +1292,28 @@ export class AgentDaemon {
 		for (const [path, passive] of passiveByPath) {
 			savedByPath.set(path, passive.info);
 		}
-		return buildSessionList(activeSessions, [...savedByPath.values()], scheduledJobs)
-			.filter((summary) => {
-				const state = this.findSessionBySessionFile(summary.sessionFile);
-				return !state || !this.isPrivateRlmSubagentState(state);
-			})
-			.map((summary) => {
-				const passive = summary.sessionFile ? passiveByPath.get(resolve(summary.sessionFile)) : undefined;
-				if (!passive || summary.activeSessionId) return summary;
-				const parentEntry = passive.chain.at(-2);
-				return {
-					...summary,
-					runtimeKind: "subagent",
-					...(passive.chain.length === 1 && passive.rootParentState
-						? { parentActiveSessionId: passive.rootParentState.activeSessionId }
-						: {}),
-					parentSessionId: passive.entry.parentSessionId,
-					parentSessionPath:
-						passive.entry.parentSessionFile ??
-						parentEntry?.sessionFile ??
-						passive.rootParentState?.runtime.session.sessionFile ??
-						passive.rootInfo?.path,
-					rlmDepth: passive.entry.rlmDepth ?? passive.info.rlmDepth,
-					rlmChildId: passive.entry.childId,
-					rlmParentNodeId: passive.entry.rlmParentNodeId ?? passive.entry.childId,
-					spawnCode: passive.entry.spawnCode,
-				};
-			});
+		return buildSessionList(activeSessions, [...savedByPath.values()], scheduledJobs).map((summary) => {
+			const passive = summary.sessionFile ? passiveByPath.get(resolve(summary.sessionFile)) : undefined;
+			if (!passive || summary.activeSessionId) return summary;
+			const parentEntry = passive.chain.at(-2);
+			return {
+				...summary,
+				runtimeKind: "subagent",
+				...(passive.chain.length === 1 && passive.rootParentState
+					? { parentActiveSessionId: passive.rootParentState.activeSessionId }
+					: {}),
+				parentSessionId: passive.entry.parentSessionId,
+				parentSessionPath:
+					passive.entry.parentSessionFile ??
+					parentEntry?.sessionFile ??
+					passive.rootParentState?.runtime.session.sessionFile ??
+					passive.rootInfo?.path,
+				rlmDepth: passive.entry.rlmDepth ?? passive.info.rlmDepth,
+				rlmChildId: passive.entry.childId,
+				rlmParentNodeId: passive.entry.rlmParentNodeId ?? passive.entry.childId,
+				spawnCode: passive.entry.spawnCode,
+			};
+		});
 	}
 
 	private async findPassiveRlmSubagent(
@@ -2331,8 +2301,8 @@ export class AgentDaemon {
 		if (this.bindingSessions.has(state.activeSessionId)) {
 			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is still initializing`);
 		}
-		if (this.closingSessions.has(state.activeSessionId) || this.isPrivateRlmSubagentState(state)) {
-			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is unavailable`);
+		if (this.closingSessions.has(state.activeSessionId)) {
+			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is closing`);
 		}
 		return state;
 	}
@@ -2452,10 +2422,6 @@ export class AgentDaemon {
 					}
 
 					try {
-						if (deletionDurability === "tombstoned") {
-							this.retireRlmSubagentState(parentState, state, options.id, options);
-							return { deletionDurability };
-						}
 						if (deletionDurability === "absent") authority?.assertCurrent();
 						await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
 					} catch (error) {
@@ -2530,14 +2496,6 @@ export class AgentDaemon {
 						throw new Error("RLM subagent deletion durability is still unknown");
 					}
 					try {
-						if (deletionDurability === "tombstoned" && state) {
-							this.retireRlmSubagentState(parentState, state, childId, {
-								id: childId,
-								sessionDir: state.runtime.metadata.sessionDir ?? "",
-							} as CreateRlmSubagentRuntimeOptions);
-							if (childSessionFile) this.cancelScheduledJobsForSessionFile(childSessionFile);
-							return { deletionDurability };
-						}
 						if (deletionDurability === "absent") authority?.assertCurrent();
 						if (state) await this.closeSession(state, "killed", false);
 						if (childSessionFile) this.cancelScheduledJobsForSessionFile(childSessionFile);
@@ -3722,9 +3680,7 @@ export class AgentDaemon {
 			case "ack_result":
 				return undefined;
 			case "list": {
-				const activeSessions = Array.from(this.sessions.values()).filter(
-					(state) => !this.isPrivateRlmSubagentState(state),
-				);
+				const activeSessions = Array.from(this.sessions.values());
 				const scheduledJobs = this.cronStore.list();
 				if (!command.all) {
 					return success(command.id, "list", {
@@ -5421,60 +5377,13 @@ export class AgentDaemon {
 		);
 	}
 
-	private isPrivateRlmSubagentState(state: ActiveSessionState): boolean {
-		return isRlmSubagentVisibilityQuarantined(
-			state,
-			this.sessions,
-			(candidate) => this.retiringRlmSubagents.get(candidate.activeSessionId)?.state === candidate,
-		);
-	}
-
-	private retireRlmSubagentState(
-		parentState: ActiveSessionState,
-		state: ActiveSessionState,
-		childId: string,
-		options: CreateRlmSubagentRuntimeOptions,
-	): void {
-		const existing = this.retiringRlmSubagents.get(state.activeSessionId);
-		if (existing && existing.state === state) {
-			if (!existing.cleanup) this.startRetiredRlmSubagentCleanup(existing);
-			return;
-		}
-		const record = {
-			state,
-			parentActiveSessionId: parentState.activeSessionId,
-			childId,
-			sessionDir: options.sessionDir,
-			sessionFile: state.runtime.session.sessionFile,
-			sessionId: state.runtime.session.sessionId,
-		};
-		this.retiringRlmSubagents.set(state.activeSessionId, record);
-		this.startRetiredRlmSubagentCleanup(record);
-	}
-
-	private startRetiredRlmSubagentCleanup(record: RetiringRlmSubagent): void {
-		if (record.cleanup) return;
-		record.error = undefined;
-		record.cleanup = this.closeSession(record.state, "killed", false)
-			.then(() => {
-				if (this.retiringRlmSubagents.get(record.state.activeSessionId) === record) {
-					this.retiringRlmSubagents.delete(record.state.activeSessionId);
-				}
-			})
-			.catch((error: unknown) => {
-				record.error = error;
-				record.cleanup = undefined;
-			});
-	}
-
 	// Half-bound sessions are hidden from other sessions' listings; the current
 	// session stays visible to itself (controllers run during its own bind).
 	private listTargetableSessionStates(current: ActiveSessionState): ActiveSessionState[] {
 		return [...this.sessions.values()].filter(
 			(state) =>
-				!this.isPrivateRlmSubagentState(state) &&
-				(state.activeSessionId === current.activeSessionId ||
-					(!this.bindingSessions.has(state.activeSessionId) && !this.closingSessions.has(state.activeSessionId))),
+				state.activeSessionId === current.activeSessionId ||
+				(!this.bindingSessions.has(state.activeSessionId) && !this.closingSessions.has(state.activeSessionId)),
 		);
 	}
 
@@ -6394,12 +6303,6 @@ export class AgentDaemon {
 		} catch (error) {
 			disposeError = error;
 		}
-		// A tombstoned retirement may retry physical disposal. Keep the exact state
-		// resident on failure: deleting it here would turn the next close into a
-		// false no-op and lose the only retryable incarnation.
-		if (disposeError) {
-			throw disposeError;
-		}
 		for (const client of state.clients) {
 			abortClientSnapshotStreaming(client, state.activeSessionId);
 		}
@@ -6415,6 +6318,9 @@ export class AgentDaemon {
 			if (sessionFile) {
 				await deleteSessionFile(sessionFile).catch(() => undefined);
 			}
+		}
+		if (disposeError) {
+			throw disposeError;
 		}
 		if (persistError && !keepsResumeEntry && reason !== "completed") {
 			throw persistError;

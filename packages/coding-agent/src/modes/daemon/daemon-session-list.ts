@@ -335,40 +335,10 @@ export function summaryForInactiveSession(
  * rlm_child_update events so attach clients can seed their subagent state
  * from daemon memory instead of replaying the event stream.
  */
-export function isRlmSubagentVisibilityQuarantined(
-	state: ActiveSessionState,
-	sessions: ReadonlyMap<string, ActiveSessionState>,
-	isRetiring: (state: ActiveSessionState) => boolean = () => false,
-): boolean {
-	let descendant = state;
-	const visited = new Set<string>();
-	while (descendant.runtime.metadata.kind === "subagent") {
-		if (isRetiring(descendant)) return true;
-		if (visited.has(descendant.activeSessionId)) return false;
-		visited.add(descendant.activeSessionId);
-		const { parentActiveSessionId, rlmChildId } = descendant.runtime.metadata;
-		if (!parentActiveSessionId || !rlmChildId) return false;
-		const parent = sessions.get(parentActiveSessionId);
-		if (!parent) return false;
-		if (parent.runtime.session.isRlmChildDeletionQuarantined(rlmChildId)) return true;
-		descendant = parent;
-	}
-	return false;
-}
-
-/** Whether this exact registry edge is privately quarantined by its resident parent. */
-export function isRlmChildVisibilityQuarantinedByParent(
-	parent: ActiveSessionState | undefined,
-	childId: string | undefined,
-): boolean {
-	return !!childId && !!parent?.runtime.session.isRlmChildDeletionQuarantined(childId);
-}
-
 export function buildRlmChildSnapshots(
 	rootActiveSessionId: string,
 	activeSessions: readonly ActiveSessionState[],
 ): AgentConnectionRlmChildAgentSnapshot[] {
-	const sessionByActiveId = new Map(activeSessions.map((session) => [session.activeSessionId, session]));
 	const childrenByParent = new Map<string, ActiveSessionState[]>();
 	for (const candidate of activeSessions) {
 		const metadata = candidate.runtime.metadata;
@@ -384,7 +354,11 @@ export function buildRlmChildSnapshots(
 	const visit = (parent: ActiveSessionState | undefined, parentActiveSessionId: string): void => {
 		const parentNodeId = parent?.runtime.metadata.rlmChildId;
 		for (const child of childrenByParent.get(parentActiveSessionId) ?? []) {
-			if (isRlmSubagentVisibilityQuarantined(child, sessionByActiveId)) continue;
+			const childId = child.runtime.metadata.rlmChildId;
+			// A precommit release failure retains a resident runtime only for exact
+			// tombstone-and-close retry. It is not a public child, and neither are any
+			// descendants reachable solely through that private runtime.
+			if (childId && parent?.runtime.session.isRlmChildDeletionQuarantined(childId)) continue;
 			snapshots.push(rlmChildSnapshotForActiveSession(child, child.runtime.metadata, parentNodeId, parent));
 			// A child passes its own node id to its children as their parent id.
 			visit(child, child.activeSessionId);
