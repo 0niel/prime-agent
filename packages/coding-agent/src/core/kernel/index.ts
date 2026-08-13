@@ -70,6 +70,13 @@ export interface HostRequestContext {
 const factoryCreatedHostRequestHandlers = new WeakSet<object>();
 const dispatcherCreatedHostRequestContexts = new WeakSet<object>();
 
+/** Compatibility marker accepted from unchanged context-aware registrations. */
+export interface HostRequestHandlerOptions {
+	readonly contextAware: true;
+}
+
+export const contextAwareHostRequestHandler: HostRequestHandlerOptions = Object.freeze({ contextAware: true });
+
 /** Handlers receive dispatcher-minted context; provenance is always checked at dispatch time. */
 export type HostRequestHandler = (
 	payload: HostRequestPayload,
@@ -94,7 +101,10 @@ function mintHostRequestContext(controller: AbortController): HostRequestContext
  */
 export function createHostRequestHandler<
 	T extends (payload: HostRequestPayload, context: HostRequestContext) => Promise<Record<string, unknown>>,
->(implementation: T): HostRequestHandler {
+>(implementation: T, options?: HostRequestHandlerOptions): HostRequestHandler {
+	if (options !== undefined && options.contextAware !== true) {
+		throw new Error("host request handler options are invalid");
+	}
 	const handler = async (payload: HostRequestPayload, context: HostRequestContext) => {
 		assertGenuineHostRequestContext(context);
 		if (context.signal.aborted) throw new Error("host request authority was revoked");

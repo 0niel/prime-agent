@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-ai/mcp";
 import { registerOAuthProvider, unregisterOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import type { AuthStorage } from "../auth-storage.js";
-import { createHostRequestHandler, type HostRequestHandlers } from "../kernel/index.js";
+import { contextAwareHostRequestHandler, createHostRequestHandler, type HostRequestHandlers } from "../kernel/index.js";
 import type { McpServerConfig } from "../settings-manager.js";
 
 export interface McpManagerOptions {
@@ -165,7 +165,7 @@ export class McpManager {
 				const key = await this.authStorage.getApiKey(this.providerId(server));
 				if (!key) throw new Error(`Could not refresh credentials for ${server}`);
 				return {};
-			}),
+			}, contextAwareHostRequestHandler),
 			// Resolved config so the kernel skill connects to the same URL the host
 			// registered/authenticated (honors a user's mcpServers `url` override).
 			"mcp.config": createHostRequestHandler(async (payload, _context) => {
@@ -178,7 +178,7 @@ export class McpManager {
 					config.headers = integration.headers;
 				}
 				return config;
-			}),
+			}, contextAwareHostRequestHandler),
 		};
 		// Only expose begin_login when an interactive login is actually wired, so the
 		// kernel doesn't get a handler whose only behavior is to throw.
@@ -189,7 +189,7 @@ export class McpManager {
 				if (!server) throw new Error("mcp.begin_login requires a server");
 				await beginLogin(server);
 				return {};
-			});
+			}, contextAwareHostRequestHandler);
 		}
 		return handlers;
 	}
