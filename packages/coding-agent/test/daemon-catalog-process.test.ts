@@ -872,6 +872,42 @@ describe("daemon catalog selector resolution", () => {
 		rmSync(root, { recursive: true, force: true });
 	});
 
+	it("classifies escaped and boundary-truncated root claims with the real helper", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-catalog-escaped-root-classification-"));
+		const sessionDir = join(root, "sessions");
+		const parent = SessionManager.create(root, sessionDir);
+		parent.newSession({ id: "parent", rlmDepth: 0 });
+		parent.appendSessionInfo("parent");
+
+		const escapedClaim = join(sessionDir, "escaped-claim.jsonl");
+		writeFileSync(
+			escapedClaim,
+			`{"\\u0074ype":"\\u0073ession","\\u0069d":"claimed","padding":"${"x".repeat(200 * 1024)}"}\n`,
+		);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(escapedClaim);
+
+		const partialEscape = join(sessionDir, "partial-unicode-escape.jsonl");
+		const partialClaim = '{"\\u0074ype":"\\u0073ess\\u006';
+		writeFileSync(
+			partialEscape,
+			`${" ".repeat(64 * 1024 - Buffer.byteLength(partialClaim, "utf8"))}${partialClaim}9-padding-after-limit`,
+		);
+		await expect(listCatalogFamilySessions(sessionDir)).rejects.toThrow(
+			"session header exceeds the trusted read limit",
+		);
+		rmSync(partialEscape);
+
+		writeFileSync(
+			join(sessionDir, "escaped-unrelated-junk.jsonl"),
+			`{"\\u006aunk":"\\u0073ession","padding":"${"x".repeat(200 * 1024)}"}\n`,
+		);
+		await expect(listCatalogFamilySessions(sessionDir)).resolves.toEqual([expect.objectContaining({ id: "parent" })]);
+		rmSync(root, { recursive: true, force: true });
+	});
+
 	it("keeps registry-reached child headers strict when classification would truncate", async () => {
 		const { root, sessionDir, first } = createCatalogFamilyFixture();
 		try {
