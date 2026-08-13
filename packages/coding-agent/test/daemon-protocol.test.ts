@@ -93,6 +93,23 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("queue_message_mutation");
 	});
 
+	it("schema-gates only authority-aware saved-session renames", () => {
+		const detachedLegacy: DaemonCommand = {
+			type: "rename_saved_session",
+			sessionPath: "/tmp/session.jsonl",
+			name: "renamed",
+		};
+		const activeLegacy: DaemonCommand = { ...detachedLegacy, activeSessionId: "active" };
+		const authorityAware: DaemonCommand = { ...detachedLegacy, sessionDir: "/tmp/sessions" };
+		expect(getDaemonCommandCompatibilities(detachedLegacy)).toEqual([{ minProtocol: 7 }]);
+		expect(getDaemonCommandCompatibilities(activeLegacy)).toEqual([{ minProtocol: 7 }]);
+		expect(getDaemonCommandCompatibilities(authorityAware)).toEqual([{ minProtocol: 7, minSchemaRevision: 17 }]);
+		expect(DAEMON_COMMAND_COMPATIBILITY.rename_saved_session).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 17,
+		});
+	});
+
 	it("schema-gates the RLM max depth commands at their introducing revision", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_rlm_max_depth_status).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
 		expect(DAEMON_COMMAND_COMPATIBILITY.set_rlm_max_depth).toEqual({ minProtocol: 7, minSchemaRevision: 11 });

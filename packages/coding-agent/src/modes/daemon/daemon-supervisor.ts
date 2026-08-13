@@ -253,6 +253,12 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+type FamilyCatalogSource = "persisted" | "artifact" | "live";
+
+type FamilyCatalogCandidate = AgentFamilyCatalogEntry & {
+	source: FamilyCatalogSource;
+};
+
 interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
@@ -1759,14 +1765,24 @@ export class DaemonSupervisor {
 				return this.forwardToWorker(match.worker, command);
 			}
 			case "rename_saved_session": {
-				const target = await this.savedSessionNameReservationInput(command.sessionPath, command.name.trim());
+				const match = command.activeSessionId
+					? await this.findWorkerForClient(client, command.activeSessionId)
+					: undefined;
+				const sessionDir =
+					match?.worker.descriptor.createCommand.config?.sessionDir ??
+					command.sessionDir ??
+					this.defaultSessionConfig.sessionDir;
+				const target = await this.savedSessionNameReservationInput(
+					command.sessionPath,
+					command.name.trim(),
+					sessionDir,
+				);
 				return await this.withSessionNameReservation(target, async () => {
-					await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name);
-					if (!command.activeSessionId) {
+					await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name, sessionDir);
+					if (!match) {
 						await this.catalog.rename(command.sessionPath, command.name);
 						return success(command.id, command.type);
 					}
-					const match = await this.findWorkerForClient(client, command.activeSessionId);
 					return await this.forwardToWorker(match.worker, {
 						...command,
 						activeSessionId: match.summary.activeSessionId ?? match.summary.id,
@@ -1790,19 +1806,25 @@ export class DaemonSupervisor {
 			const source = command.fromActiveSessionId
 				? await this.findWorkerForClient(client, command.fromActiveSessionId)
 				: undefined;
+			// Hold this persisted topology through pre-wake and post-wake checks.
+			const sourceSessionDir =
+				source?.worker.descriptor.createCommand.config?.sessionDir ?? this.defaultSessionConfig.sessionDir;
+			const familyCatalog =
+				source && command.agentOrigin === true ? await this.familyCatalogEntries(sourceSessionDir) : undefined;
+			// Session IDs are the stable identities for this authorization snapshot. Do not
+			// rebuild either endpoint from worker summaries after the snapshot is captured.
+			const sourceSessionId = source?.summary.sessionId;
+			let targetSessionId: string;
 			let target: WorkerMatch;
 			try {
 				target = await this.findWorkerForClient(client, command.targetActiveSessionId);
+				targetSessionId = target.summary.sessionId;
 			} catch (error) {
 				if (!(error instanceof Error) || !error.message.startsWith("Unknown active session:")) throw error;
 				const cwd = source?.summary.cwd ?? this.defaultSessionConfig.cwd ?? process.cwd();
 				let sessionPath: string;
 				try {
-					sessionPath = await this.catalog.resolve(
-						command.targetActiveSessionId,
-						cwd,
-						source?.worker.descriptor.createCommand.config?.sessionDir ?? this.defaultSessionConfig.sessionDir,
-					);
+					sessionPath = await this.catalog.resolve(command.targetActiveSessionId, cwd, sourceSessionDir);
 				} catch (catalogError) {
 					// Preserve selector ambiguity so a2a senders can distinguish it from
 					// the original unknown-active-session lookup failure.
@@ -1811,18 +1833,21 @@ export class DaemonSupervisor {
 					}
 					throw error;
 				}
+				const targetInfo = await readSessionInfo(sessionPath);
+				if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
+				targetSessionId = targetInfo.id;
 				if (source && command.agentOrigin === true) {
-					const targetInfo = await readSessionInfo(sessionPath);
-					if (!targetInfo) throw new Error(`Unknown active session: ${command.targetActiveSessionId}`);
 					assertAgentFamilyReach(
-						this.familyCatalogEntry(source.summary),
-						this.familyCatalogEntry(summaryForInactiveSession(targetInfo)),
+						this.authoritativeFamilyCatalogEntry(familyCatalog!, sourceSessionId!),
+						this.authoritativeFamilyCatalogEntry(familyCatalog!, targetSessionId),
+						familyCatalog!,
 					);
 				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), {
 					type: "create",
 					sessionPath,
 					continueRecent: false,
+					config: { sessionDir: sourceSessionDir },
 				});
 				const summary =
 					this.findSummaryInWorker(worker, sessionPath) ??
@@ -1832,7 +1857,16 @@ export class DaemonSupervisor {
 			}
 			const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
 			if (source && command.agentOrigin === true) {
-				assertAgentFamilyReach(this.familyCatalogEntry(source.summary), this.familyCatalogEntry(target.summary));
+				// Waking must not substitute a different live session for the target that
+				// was authorized by the captured topology.
+				if (target.summary.sessionId !== targetSessionId) {
+					throw new Error("Agent reach is limited to parent, siblings, and children");
+				}
+				assertAgentFamilyReach(
+					this.authoritativeFamilyCatalogEntry(familyCatalog!, sourceSessionId!),
+					this.authoritativeFamilyCatalogEntry(familyCatalog!, targetSessionId),
+					familyCatalog!,
+				);
 			}
 			if (source) {
 				if ((source.summary.activeSessionId ?? source.summary.id) === targetActiveSessionId) {
@@ -1899,7 +1933,11 @@ export class DaemonSupervisor {
 				if (command.type === "rename" || command.type === "set_session_name") {
 					const reservation = this.summaryNameReservationInput(match.summary, command.name.trim());
 					return await this.withSessionNameReservation(reservation, async () => {
-						await this.assertSupervisorSessionNameAvailable(match.summary, reservation.name);
+						await this.assertSupervisorSessionNameAvailable(
+							match.summary,
+							reservation.name,
+							match.worker.descriptor.createCommand.config?.sessionDir ?? this.defaultSessionConfig.sessionDir,
+						);
 						return forward();
 					});
 				}
@@ -1968,7 +2006,7 @@ export class DaemonSupervisor {
 		if ("activeSessionId" in command) {
 			const match = await this.findWorkerForClient(client, command.activeSessionId);
 			cwd = match.summary.cwd;
-			sessionDir = this.defaultSessionConfig.sessionDir;
+			sessionDir = match.worker.descriptor.createCommand.config?.sessionDir ?? this.defaultSessionConfig.sessionDir;
 			activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		} else {
 			cwd = resolve(command.cwd);
@@ -2009,6 +2047,7 @@ export class DaemonSupervisor {
 			createCommand = { ...command, name: normalizedName };
 		}
 		const ownerClientId = command.lifecycle === "client_owned" ? clientId : undefined;
+		const config = mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config);
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1 && !(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker))) {
@@ -2017,7 +2056,6 @@ export class DaemonSupervisor {
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
 			}
-			const config = mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config);
 			const sessionPath = looksLikeSessionPath(command.sessionPath)
 				? resolve(command.sessionPath)
 				: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
@@ -2038,7 +2076,9 @@ export class DaemonSupervisor {
 		}
 		const opening = (async () => {
 			if (!createCommand.name) return this.launchWorker(createCommand, undefined, ownerClientId);
-			const savedSiblings = createCommand.sessionPath ? await this.catalog.siblings(createCommand.sessionPath) : [];
+			const savedSiblings = createCommand.sessionPath
+				? await this.catalog.siblings(createCommand.sessionPath, config.sessionDir)
+				: [];
 			const target = savedSiblings.find(
 				(session) => canonicalSessionPath(session.path) === canonicalSessionPath(createCommand.sessionPath!),
 			);
@@ -2048,7 +2088,7 @@ export class DaemonSupervisor {
 				if (target?.parentSessionPath && (target.rlmDepth ?? 0) > 0) {
 					this.assertSavedSiblingNameAvailable(savedSiblings, target, createCommand.name!);
 				} else {
-					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!);
+					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!, config.sessionDir);
 				}
 				return this.launchWorker(createCommand, undefined, ownerClientId);
 			});
@@ -3008,19 +3048,104 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async familyCatalogEntries(): Promise<AgentFamilyCatalogEntry[]> {
-		const active = [...this.workers.values()].flatMap((worker) => [...worker.summaries.values()]);
-		const activePaths = new Set(
-			active.flatMap((summary) => (summary.sessionFile ? [canonicalSessionPath(summary.sessionFile)] : [])),
+	private async familyCatalogEntries(sessionDir?: string): Promise<readonly AgentFamilyCatalogEntry[]> {
+		const effectiveSessionDir = sessionDir ?? this.defaultSessionConfig.sessionDir;
+		const live = [...this.workers.values()]
+			.filter(
+				(worker) =>
+					(worker.descriptor.createCommand.config?.sessionDir ?? this.defaultSessionConfig.sessionDir) ===
+						effectiveSessionDir ||
+					(Boolean(worker.descriptor.createCommand.config?.sessionDir ?? this.defaultSessionConfig.sessionDir) &&
+						Boolean(effectiveSessionDir) &&
+						canonicalSessionPath(
+							(worker.descriptor.createCommand.config?.sessionDir ?? this.defaultSessionConfig.sessionDir)!,
+						) === canonicalSessionPath(effectiveSessionDir!)),
+			)
+			.flatMap((worker) => [...worker.summaries.values()])
+			.map((summary): FamilyCatalogCandidate => ({ ...this.familyCatalogEntry(summary), source: "live" }));
+		// Keep the persisted row even when its path is currently active. A live
+		// overlay may fill in missing claims, but it may not silently replace a
+		// conflicting durable topology claim.
+		const saved = await this.catalog.list(undefined, sessionDir);
+		const savedPaths = new Set(saved.map((info) => canonicalSessionPath(info.path)));
+		const persisted = saved.map(
+			(info): FamilyCatalogCandidate => ({
+				...this.familyCatalogEntry(summaryForInactiveSession(info)),
+				source: "persisted",
+			}),
 		);
-		const savedRoots = (await this.catalog.list()).filter(
-			(info) =>
-				(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
-				!activePaths.has(canonicalSessionPath(info.path)),
-		);
-		return [...active, ...savedRoots.map((info) => summaryForInactiveSession(info))].map((summary) =>
-			this.familyCatalogEntry(summary),
-		);
+		// The catalog's bounded registry walk supplies artifact-resident parents
+		// and descendants missing from list(). Preserve their durable rows in the
+		// immutable authorization snapshot; live overlays still cannot replace a
+		// conflicting topology claim.
+		const artifactSessions = this.catalog.family ? await this.catalog.family(sessionDir) : saved;
+		const artifacts = artifactSessions
+			.filter((info) => !savedPaths.has(canonicalSessionPath(info.path)))
+			.map(
+				(info): FamilyCatalogCandidate => ({
+					...this.familyCatalogEntry(summaryForInactiveSession(info)),
+					source: "artifact",
+				}),
+			);
+		return Object.freeze(this.mergeEquivalentFamilyCatalogEntries([...persisted, ...artifacts, ...live]));
+	}
+
+	/**
+	 * Collapse durable/live duplicates only when their stable identity and every
+	 * jointly-present topology claim agree. Incompatible candidates intentionally
+	 * remain duplicated: authoritative endpoint lookup then fails closed.
+	 */
+	private mergeEquivalentFamilyCatalogEntries(entries: readonly FamilyCatalogCandidate[]): AgentFamilyCatalogEntry[] {
+		const compatible = (left: FamilyCatalogCandidate, right: FamilyCatalogCandidate) =>
+			left.id === right.id &&
+			(left.sessionPath === undefined ||
+				right.sessionPath === undefined ||
+				left.sessionPath === right.sessionPath) &&
+			left.depth === right.depth &&
+			(left.parentSessionId === undefined ||
+				right.parentSessionId === undefined ||
+				left.parentSessionId === right.parentSessionId) &&
+			(left.parentSessionPath === undefined ||
+				right.parentSessionPath === undefined ||
+				left.parentSessionPath === right.parentSessionPath);
+		const groups: FamilyCatalogCandidate[][] = [];
+		for (const entry of entries) {
+			const group = groups.find((candidate) => candidate.every((member) => compatible(member, entry)));
+			if (group) group.push(entry);
+			else groups.push([entry]);
+		}
+		const statusRank: Record<AgentFamilyCatalogEntry["status"], number> = { inactive: 0, idle: 1, running: 2 };
+		const preferred = <T>(
+			rows: readonly FamilyCatalogCandidate[],
+			get: (row: FamilyCatalogCandidate) => T | undefined,
+		): T | undefined =>
+			[...rows]
+				.sort(
+					(left, right) =>
+						(({ persisted: 0, artifact: 1, live: 2 })[right.source] ?? 0) -
+						({ persisted: 0, artifact: 1, live: 2 }[left.source] ?? 0),
+				)
+				.map(get)
+				.find((value): value is T => value !== undefined);
+		return groups.map((rows) => {
+			const exemplar = rows[0]!;
+			const name = preferred(rows, (row) => row.name);
+			const parentSessionId = preferred(rows, (row) => row.parentSessionId);
+			const parentSessionPath = preferred(rows, (row) => row.parentSessionPath);
+			const sessionPath = preferred(rows, (row) => row.sessionPath);
+			return {
+				id: exemplar.id,
+				depth: exemplar.depth,
+				status: rows.reduce<AgentFamilyCatalogEntry["status"]>(
+					(best, row) => (statusRank[row.status] > statusRank[best] ? row.status : best),
+					"inactive",
+				),
+				...(name ? { name } : {}),
+				...(parentSessionId ? { parentSessionId } : {}),
+				...(parentSessionPath ? { parentSessionPath } : {}),
+				...(sessionPath ? { sessionPath } : {}),
+			};
+		});
 	}
 
 	private async withSessionNameReservation<T>(
@@ -3042,8 +3167,9 @@ export class DaemonSupervisor {
 	private async assertSupervisorSessionNameAvailable(
 		target: Pick<SessionSummary, "sessionId" | "rlmDepth" | "parentSessionId" | "parentSessionPath">,
 		name: string,
+		sessionDir?: string,
 	): Promise<void> {
-		assertAgentSessionNameAvailable(await this.familyCatalogEntries(), {
+		assertAgentSessionNameAvailable(await this.familyCatalogEntries(sessionDir), {
 			name,
 			depth: target.rlmDepth ?? 0,
 			parentSessionId: target.parentSessionId,
@@ -3055,13 +3181,14 @@ export class DaemonSupervisor {
 	private async savedSessionNameReservationInput(
 		sessionPath: string,
 		name: string,
+		sessionDir?: string,
 	): Promise<{ name: string; depth: number; parentSessionId?: string; parentSessionPath?: string }> {
 		const targetPath = canonicalSessionPath(sessionPath);
 		const active = [...this.workers.values()]
 			.flatMap((worker) => [...worker.summaries.values()])
 			.find((summary) => summary.sessionFile && canonicalSessionPath(summary.sessionFile) === targetPath);
 		if (active) return this.summaryNameReservationInput(active, name);
-		const siblings = await this.catalog.siblings(sessionPath);
+		const siblings = await this.catalog.siblings(sessionPath, sessionDir ?? this.defaultSessionConfig.sessionDir);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		return {
@@ -3084,19 +3211,23 @@ export class DaemonSupervisor {
 		};
 	}
 
-	private async assertSupervisorSavedSessionNameAvailable(sessionPath: string, name: string): Promise<void> {
+	private async assertSupervisorSavedSessionNameAvailable(
+		sessionPath: string,
+		name: string,
+		sessionDir?: string,
+	): Promise<void> {
 		const targetPath = canonicalSessionPath(sessionPath);
 		const active = [...this.workers.values()]
 			.flatMap((worker) => [...worker.summaries.values()])
 			.find((summary) => summary.sessionFile && canonicalSessionPath(summary.sessionFile) === targetPath);
-		if (active) return this.assertSupervisorSessionNameAvailable(active, name);
-		const siblings = await this.catalog.siblings(sessionPath);
+		if (active) return this.assertSupervisorSessionNameAvailable(active, name, sessionDir);
+		const siblings = await this.catalog.siblings(sessionPath, sessionDir ?? this.defaultSessionConfig.sessionDir);
 		const saved = siblings.find((info) => canonicalSessionPath(info.path) === targetPath);
 		if (!saved) throw new Error(`Session not found: ${sessionPath}`);
 		if (saved.parentSessionPath && (saved.rlmDepth ?? 0) > 0) {
 			this.assertSavedSiblingNameAvailable(siblings, saved, name);
 		} else {
-			await this.assertSupervisorSessionNameAvailable(summaryForInactiveSession(saved), name);
+			await this.assertSupervisorSessionNameAvailable(summaryForInactiveSession(saved), name, sessionDir);
 		}
 	}
 
@@ -3192,6 +3323,16 @@ export class DaemonSupervisor {
 		return worker.client;
 	}
 
+	/** Resolve both authorization endpoints exclusively from one captured topology snapshot. */
+	private authoritativeFamilyCatalogEntry(
+		catalog: readonly AgentFamilyCatalogEntry[],
+		sessionId: string,
+	): AgentFamilyCatalogEntry {
+		const matches = catalog.filter((entry) => entry.id === sessionId);
+		if (matches.length !== 1) throw new Error("Agent reach is limited to parent, siblings, and children");
+		return matches[0]!;
+	}
+
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
 		const depth = summary.rlmDepth ?? (summary.parentSessionPath ? 1 : 0);
 		return {
@@ -3200,8 +3341,16 @@ export class DaemonSupervisor {
 			depth,
 			status: classifySessionRosterStatus(summary),
 			...(depth > 0 && summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
-			...(depth > 0 && summary.parentSessionPath
-				? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
+			...(depth > 0 && summary.parentSessionPath && (isAbsolute(summary.parentSessionPath) || summary.sessionFile)
+				? {
+						parentSessionPath: canonicalSessionPath(
+							isAbsolute(summary.parentSessionPath)
+								? summary.parentSessionPath
+								: summary.sessionFile
+									? resolve(dirname(summary.sessionFile), summary.parentSessionPath)
+									: summary.parentSessionPath,
+						),
+					}
 				: {}),
 			...(summary.sessionFile ? { sessionPath: canonicalSessionPath(summary.sessionFile) } : {}),
 		};
