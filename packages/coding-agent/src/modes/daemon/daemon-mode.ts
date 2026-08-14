@@ -5536,14 +5536,16 @@ export class AgentDaemon {
 	}
 
 	private runTombstonedCloseAttempt(record: FailedTombstonedRlmClose): void {
-		if (
-			this.shuttingDown ||
-			this.failedTombstonedRlmCloses.get(record.state.activeSessionId) !== record ||
-			(record.terminalizing && this.sessions.get(record.state.activeSessionId) !== record.state)
-		) {
-			if (this.failedTombstonedRlmCloses.get(record.state.activeSessionId) === record) {
-				this.failedTombstonedRlmCloses.delete(record.state.activeSessionId);
-			}
+		if (this.failedTombstonedRlmCloses.get(record.state.activeSessionId) !== record) return;
+		if (record.terminalizing && this.sessions.get(record.state.activeSessionId) !== record.state) {
+			this.failedTombstonedRlmCloses.delete(record.state.activeSessionId);
+			return;
+		}
+		if (this.shuttingDown) {
+			// Shutdown clears retry timers but retains terminalization authority for
+			// its synchronous original-reason attempt below.
+			if (record.terminalizing) return;
+			this.failedTombstonedRlmCloses.delete(record.state.activeSessionId);
 			return;
 		}
 		record.retryTimer = undefined;
@@ -5582,6 +5584,33 @@ export class AgentDaemon {
 		}
 	}
 
+	/**
+	 * A shutdown close normally preserves a resumable entry. That must never
+	 * supersede an exact resident that already failed its terminal archive: make
+	 * its one owned close attempt with the original reason before generic shutdown
+	 * teardown. A failure intentionally leaves the private record and lease live
+	 * until process exit rather than treating it as a resumable shutdown close.
+	 */
+	private async closeTerminalizingSessionsForShutdown(): Promise<void> {
+		for (const record of [...this.failedTombstonedRlmCloses.values()]) {
+			if (
+				!record.terminalizing ||
+				this.failedTombstonedRlmCloses.get(record.state.activeSessionId) !== record ||
+				this.sessions.get(record.state.activeSessionId) !== record.state
+			) {
+				continue;
+			}
+			try {
+				// Join a bounded in-flight attempt when present; otherwise make only
+				// this shutdown-owned attempt. Retrying remains disabled while stopping.
+				await (record.cleanup ?? this.closeSession(record.state, record.reason ?? "killed", false));
+			} catch (error) {
+				if (this.failedTombstonedRlmCloses.get(record.state.activeSessionId) === record) {
+					record.error = error;
+				}
+			}
+		}
+	}
 
 	// Half-bound sessions are hidden from other sessions' listings; the current
 	// session stays visible to itself (controllers run during its own bind).
@@ -7100,7 +7129,10 @@ export class AgentDaemon {
 			cleanup();
 		}
 		this.cronScheduler.stop();
+		await this.closeTerminalizingSessionsForShutdown();
 		for (const state of [...this.sessions.values()]) {
+			const failedTerminalization = this.failedTombstonedRlmCloses.get(state.activeSessionId);
+			if (failedTerminalization?.terminalizing && failedTerminalization.state === state) continue;
 			await this.closeSession(state, closingReason);
 		}
 		for (const client of this.clients) {

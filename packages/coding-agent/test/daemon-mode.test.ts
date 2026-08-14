@@ -11279,6 +11279,72 @@ describe("daemon tombstoned retirement", () => {
 		}
 	});
 
+	it.each([
+		["terminalizes after a one-shot archive recovery", false],
+		["preserves its private archive barrier after persistent failure", true],
+	] as const)("on shutdown %s", async (_name, persistentlyFails) => {
+		const daemon = new AgentDaemon(`/tmp/shutdown-terminalization-${persistentlyFails}.sock`, {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const state = makeState(`shutdown-terminalization-${persistentlyFails}`);
+		const archiveFailure = new Error("archive failed");
+		const appendSessionState = vi.fn(() => {
+			if (persistentlyFails || appendSessionState.mock.calls.length === 1) throw archiveFailure;
+		});
+		const dispose = vi.fn(async () => {});
+		const releaseSessionLease = vi.fn();
+		state.extensionUiRequests = new Map();
+		state.runtime = {
+			...state.runtime,
+			claimSessionLeaseReleaseForDaemon: () => true,
+			dispose,
+			releaseSessionLease,
+			session: {
+				sessionId: `session-${state.activeSessionId}`,
+				sessionFile: `/tmp/${state.activeSessionId}.jsonl`,
+				messages: ["content"],
+				isBashRunning: false,
+				abort: vi.fn(async () => {}),
+				sessionManager: { appendSessionState, hasUserContent: () => true },
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			failedTombstonedRlmCloses: Map<
+				string,
+				{ state: ActiveSessionState; terminalizing?: boolean; reason?: "killed" }
+			>;
+			closeSession(state: ActiveSessionState, reason: "killed"): Promise<void>;
+			shutdown(exitCode: number): Promise<never>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		await expect(internals.closeSession(state, "killed")).rejects.toBe(archiveFailure);
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
+		try {
+			await internals.shutdown(0);
+		} finally {
+			exit.mockRestore();
+		}
+
+		expect(appendSessionState).toHaveBeenCalledTimes(2);
+		if (persistentlyFails) {
+			expect(dispose).not.toHaveBeenCalled();
+			expect(releaseSessionLease).not.toHaveBeenCalled();
+			expect(internals.sessions.get(state.activeSessionId)).toBe(state);
+			expect(internals.failedTombstonedRlmCloses.get(state.activeSessionId)).toMatchObject({
+				state,
+				terminalizing: true,
+				reason: "killed",
+			});
+		} else {
+			expect(dispose).toHaveBeenCalledOnce();
+			expect(releaseSessionLease).toHaveBeenCalledOnce();
+			expect(internals.sessions.has(state.activeSessionId)).toBe(false);
+			expect(internals.failedTombstonedRlmCloses.has(state.activeSessionId)).toBe(false);
+		}
+	});
+
 	it("retains a failed close only for its exact tombstoned record", async () => {
 		const daemon = new AgentDaemon("/tmp/exact-tombstoned-close.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
@@ -11323,7 +11389,8 @@ describe("daemon tombstoned retirement", () => {
 
 		await expect(internals.closeSession(ordinary, "killed")).rejects.toBe(cleanupFailure);
 		expect(internals.sessions.get(ordinary.activeSessionId)).toBe(ordinary);
-		expect(internals.failedTerminalSessionCloses.get(ordinary.activeSessionId)?.state).toBe(ordinary);
+		expect(internals.failedTombstonedRlmCloses.get(ordinary.activeSessionId)?.state).toBe(ordinary);
+		expect(internals.failedTombstonedRlmCloses.get(ordinary.activeSessionId)?.terminalizing).toBe(true);
 		expect(releases.get(ordinary)).not.toHaveBeenCalled();
 
 		await expect(internals.closeSession(tombstoned, "killed")).rejects.toBe(cleanupFailure);
