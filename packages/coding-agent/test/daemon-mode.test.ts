@@ -11635,6 +11635,21 @@ describe("daemon tombstoned retirement", () => {
 				now: new Date("2026-01-01T12:00:03.000Z"),
 			});
 
+			const cancel = vi.spyOn(internals.cronStore, "cancel");
+			await expect(
+				internals.handleCommand(makeClient("unscoped-private-cron-cancel", "unloaded-session"), {
+					type: "cron_cancel",
+					jobId: privateCron.id,
+				}),
+			).rejects.toThrow(`No cron job found: ${privateCron.id}`);
+			expect(cancel).not.toHaveBeenCalled();
+			const cancelledGlobalCron = (await internals.handleCommand(
+				makeClient("unscoped-global-cron-cancel", "unloaded-session"),
+				{ type: "cron_cancel", jobId: globalCron.id },
+			)) as { data: { job: AgentCronJob } };
+			expect(cancelledGlobalCron.data.job).toMatchObject({ id: globalCron.id, status: "cancelled" });
+			expect(cancel).toHaveBeenCalledWith(globalCron.id);
+
 			const guardedMutations = [
 				{ type: "restore_next_turn", messages: [] },
 				{ type: "append_custom_message", message: { customType: "test", content: "private" } },
