@@ -3152,6 +3152,53 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("preserves a same-id retained replacement before passing it to host deletion", async () => {
+		const childId = "recycled-quarantine-incarnation";
+		const stale = createSession({ rlmSessionDir: join(tempDir, "stale-quarantine-incarnation") });
+		const replacement = createSession({ rlmSessionDir: join(tempDir, "replacement-quarantine-incarnation") });
+		const lease = {
+			rlm_child_id: childId,
+			active_session_id: null,
+			session_id: stale.sessionId,
+			...(stale.sessionFile ? { session_file: stale.sessionFile } : {}),
+			session_name: "stale-quarantine-incarnation",
+			session_dir: join(tempDir, "stale-quarantine-incarnation"),
+			status: "error" as const,
+		};
+		const deleteRuntime = vi.fn(async () => {
+			throw new Error("replacement must not be passed to host deletion");
+		});
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				resolveRlmSubagentDeletion: async () => "tombstoned",
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+		const internals = root as unknown as InspectableRlmSession;
+		internals._rlmChildDeletionQuarantines.set(childId, lease);
+		internals._rlmChildSessions.set(childId, replacement);
+		internals._deletedRlmChildIds.add(childId);
+
+		await expect(root.deleteRlmSubagent(childId)).resolves.toMatchObject({ outcome: "preserved_newer" });
+		expect(deleteRuntime).not.toHaveBeenCalled();
+		expect(internals._rlmChildDeletionQuarantines.has(childId)).toBe(false);
+		expect(internals._deletedRlmChildIds.has(childId)).toBe(false);
+		await expect(root.listRlmSubagents()).resolves.toEqual({
+			subagents: [
+				expect.objectContaining({
+					rlm_child_id: childId,
+					session_id: replacement.sessionId,
+					session_dir: join(tempDir, "replacement-quarantine-incarnation"),
+				}),
+			],
+		});
+		await stale.disposeAsync();
+		await replacement.disposeAsync();
+	});
+
 	it("keeps late startup cleanup retryable when release and fallback delete fail", async () => {
 		let releaseRuntimeCreation: () => void = () => {};
 		const runtimeCreationGate = new Promise<void>((resolve) => {

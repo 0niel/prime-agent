@@ -9677,6 +9677,18 @@ export class AgentSession {
 		authority?.assertCurrent();
 		if (this._rlmChildDeletionQuarantines.get(childId) !== lease) return "unknown";
 		const retained = this._rlmChildSessions.get(childId);
+		// A same-id retained runtime can have been republished while this old
+		// quarantine was hidden. Compare its concrete incarnation before asking the
+		// host to delete anything; an active run also owns a newer live incarnation.
+		if (
+			retained &&
+			(retained._rlmSessionDir !== lease.session_dir ||
+				retained.sessionFile !== lease.session_file ||
+				retained.sessionId !== lease.session_id ||
+				this._activeRlmChildRuns.has(childId))
+		) {
+			return this._preserveNewerRlmChild(childId, lease) ? "preserved_newer" : "unknown";
+		}
 		if (!retained && this._activeRlmChildRuns.has(childId)) {
 			return this._preserveNewerRlmChild(childId, lease) ? "preserved_newer" : "unknown";
 		}
