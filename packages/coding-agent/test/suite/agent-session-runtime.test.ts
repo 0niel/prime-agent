@@ -35,6 +35,10 @@ type RuntimeSubagentMapAccess = {
 	subagentRuntimes: Map<string, AgentSessionRuntime>;
 };
 
+type RuntimeSessionLeaseAccess = {
+	_sessionLease?: { release(): void };
+};
+
 type StrictDeletionAuthority = {
 	childId: string;
 	sessionDir: string;
@@ -284,6 +288,47 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(shutdownCount).toBe(2);
 		expect(disposeSession).toHaveBeenCalledTimes(2);
+	});
+
+	it("defers lease release when the daemon claims before direct disposal", async () => {
+		const { runtime } = createRuntimeWithFakeSession();
+		const release = vi.fn();
+		let finishShutdown: () => void;
+		const shutdown = new Promise<void>((resolve) => {
+			finishShutdown = resolve;
+		});
+		(runtime as unknown as RuntimeSessionLeaseAccess)._sessionLease = { release };
+		(runtime.session.extensionRunner as unknown as { emit(): Promise<void> }).emit = async () => shutdown;
+
+		expect(runtime.claimSessionLeaseReleaseForDaemon()).toBe(true);
+		const directDispose = runtime.dispose();
+		await vi.waitFor(() => expect(release).not.toHaveBeenCalled());
+		finishShutdown!();
+		await directDispose;
+		expect(release).not.toHaveBeenCalled();
+
+		runtime.releaseSessionLease();
+		runtime.releaseSessionLease();
+		expect(release).toHaveBeenCalledOnce();
+	});
+
+	it("fails closed when direct disposal starts before a daemon lease claim", async () => {
+		const { runtime } = createRuntimeWithFakeSession();
+		const release = vi.fn();
+		let finishShutdown: () => void;
+		const shutdown = new Promise<void>((resolve) => {
+			finishShutdown = resolve;
+		});
+		(runtime as unknown as RuntimeSessionLeaseAccess)._sessionLease = { release };
+		(runtime.session.extensionRunner as unknown as { emit(): Promise<void> }).emit = async () => shutdown;
+
+		const directDispose = runtime.dispose();
+		expect(runtime.claimSessionLeaseReleaseForDaemon()).toBe(false);
+		expect(release).not.toHaveBeenCalled();
+		finishShutdown!();
+		await directDispose;
+
+		expect(release).toHaveBeenCalledOnce();
 	});
 
 	it("continues disposing tracked subagents after one child dispose fails", async () => {

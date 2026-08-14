@@ -6427,6 +6427,9 @@ export class AgentDaemon {
 		if (!this.sessions.has(state.activeSessionId)) {
 			return;
 		}
+		// Claim before any close work can yield. A direct disposer that won this
+		// race retains ordinary release ownership; this close must not fabricate it.
+		const daemonOwnsSessionLeaseRelease = state.runtime.claimSessionLeaseReleaseForDaemon?.() ?? false;
 		let closeError: unknown;
 		const captureCloseError = (error: unknown): void => {
 			closeError ??= error;
@@ -6494,9 +6497,7 @@ export class AgentDaemon {
 		this.recordWorkerRecoveryState(state, `closed:${reason}`, false);
 		state.unsubscribe?.();
 		try {
-			// A tombstoned record must retain its lease until the daemon commits the
-			// whole close. Normal direct runtime disposal still releases its own lease.
-			await state.runtime.dispose({ releaseSessionLease: false });
+			await state.runtime.dispose();
 		} catch (error) {
 			captureCloseError(error);
 		}
@@ -6521,7 +6522,7 @@ export class AgentDaemon {
 				await deleteSessionFile(sessionFile).catch(() => undefined);
 			}
 		}
-		state.runtime.releaseSessionLease?.();
+		if (daemonOwnsSessionLeaseRelease) state.runtime.releaseSessionLease();
 		if (closeError) throw closeError;
 	}
 
