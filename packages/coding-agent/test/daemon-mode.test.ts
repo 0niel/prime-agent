@@ -11201,6 +11201,57 @@ describe("daemon tombstoned retirement", () => {
 		},
 	);
 
+	it("retains a failed close only for its exact tombstoned record", async () => {
+		const daemon = new AgentDaemon("/tmp/exact-tombstoned-close.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const cleanupFailure = new Error("archive failed");
+		const ordinary = makeState("ordinary-subagent-close");
+		const tombstoned = makeState("tombstoned-subagent-close");
+		const releases = new Map<ActiveSessionState, ReturnType<typeof vi.fn>>();
+		for (const state of [ordinary, tombstoned]) {
+			const releaseSessionLease = vi.fn();
+			releases.set(state, releaseSessionLease);
+			state.extensionUiRequests = new Map();
+			state.runtime = {
+				...state.runtime,
+				claimSessionLeaseReleaseForDaemon: () => true,
+				dispose: vi.fn(async () => {}),
+				releaseSessionLease,
+				session: {
+					sessionId: `session-${state.activeSessionId}`,
+					sessionFile: `/tmp/${state.activeSessionId}.jsonl`,
+					messages: ["content"],
+					isBashRunning: false,
+					abort: vi.fn(async () => {}),
+					sessionManager: {
+						appendSessionState: vi.fn(() => {
+							throw cleanupFailure;
+						}),
+						hasUserContent: () => true,
+					},
+				},
+			} as never;
+		}
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			failedTombstonedRlmCloses: Map<string, { state: ActiveSessionState }>;
+			closeSession(state: ActiveSessionState, reason: "killed"): Promise<void>;
+		};
+		internals.sessions.set(ordinary.activeSessionId, ordinary);
+		internals.sessions.set(tombstoned.activeSessionId, tombstoned);
+		internals.failedTombstonedRlmCloses.set(tombstoned.activeSessionId, { state: tombstoned });
+
+		await expect(internals.closeSession(ordinary, "killed")).rejects.toBe(cleanupFailure);
+		expect(internals.sessions.has(ordinary.activeSessionId)).toBe(false);
+		expect(releases.get(ordinary)).toHaveBeenCalledOnce();
+
+		await expect(internals.closeSession(tombstoned, "killed")).rejects.toBe(cleanupFailure);
+		expect(internals.sessions.get(tombstoned.activeSessionId)).toBe(tombstoned);
+		expect(releases.get(tombstoned)).not.toHaveBeenCalled();
+	});
+
 	it("keeps a tombstoned close lease until its full cleanup retry succeeds", async () => {
 		vi.useFakeTimers();
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-tombstone-lease-"));

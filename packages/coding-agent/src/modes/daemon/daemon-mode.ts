@@ -6435,7 +6435,7 @@ export class AgentDaemon {
 			closeError ??= error;
 		};
 		const retainsForTombstonedRetry =
-			this.failedTombstonedRlmCloses.has(state.activeSessionId) || this.isQuarantinedRlmState(state);
+			this.failedTombstonedRlmCloses.get(state.activeSessionId)?.state === state;
 		if (reason === "killed") {
 			try {
 				this.cancelScheduledJobsForSession(state);
