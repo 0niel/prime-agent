@@ -5467,11 +5467,8 @@ export class AgentDaemon {
 		const visited = new Set<string>();
 		while (child.runtime.metadata.kind === "subagent") {
 			if (visited.has(child.activeSessionId)) return false;
-			if (
-				this.closingSessions.has(child.activeSessionId) ||
-				this.failedTombstonedRlmCloses.has(child.activeSessionId)
-			)
-				return true;
+			const failedClose = this.failedTombstonedRlmCloses.get(child.activeSessionId);
+			if (this.closingSessions.has(child.activeSessionId) || failedClose?.state === child) return true;
 			visited.add(child.activeSessionId);
 			const { parentActiveSessionId, rlmChildId } = child.runtime.metadata;
 			if (!parentActiveSessionId || !rlmChildId) return false;
