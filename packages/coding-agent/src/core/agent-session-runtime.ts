@@ -795,10 +795,16 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async dispose(): Promise<void> {
-		if (!this.disposePromise) {
-			this.disposePromise = this.disposeOnce();
+		const disposePromise = this.disposePromise ?? this.disposeOnce();
+		this.disposePromise = disposePromise;
+		try {
+			await disposePromise;
+		} catch (error) {
+			if (this.disposePromise === disposePromise) {
+				this.disposePromise = undefined;
+			}
+			throw error;
 		}
-		await this.disposePromise;
 	}
 }
 

@@ -264,22 +264,26 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(beforeInvalidate).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not replay shutdown events when runtime disposal throws", async () => {
+	it("deduplicates concurrent disposal attempts and retries after rejection", async () => {
 		let shutdownCount = 0;
 		const { runtime, disposeSession } = createRuntimeWithFakeSession({
 			onShutdown: () => {
 				shutdownCount += 1;
 			},
 		});
+		let invalidateCount = 0;
 		runtime.setBeforeSessionInvalidate(() => {
-			throw new Error("invalidate failed");
+			invalidateCount += 1;
+			if (invalidateCount === 1) throw new Error("invalidate failed");
 		});
 
-		await expect(runtime.dispose()).rejects.toThrow("invalidate failed");
-		await expect(runtime.dispose()).rejects.toThrow("invalidate failed");
+		const firstAttempt = runtime.dispose();
+		await expect(Promise.all([firstAttempt, runtime.dispose()])).rejects.toThrow("invalidate failed");
+		await expect(runtime.dispose()).resolves.toBeUndefined();
+		await runtime.dispose();
 
-		expect(shutdownCount).toBe(1);
-		expect(disposeSession).toHaveBeenCalledTimes(1);
+		expect(shutdownCount).toBe(2);
+		expect(disposeSession).toHaveBeenCalledTimes(2);
 	});
 
 	it("continues disposing tracked subagents after one child dispose fails", async () => {

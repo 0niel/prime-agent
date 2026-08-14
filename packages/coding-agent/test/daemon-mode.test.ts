@@ -1304,7 +1304,7 @@ describe("daemon mode helpers", () => {
 			await expect(
 				host.deleteRlmSubagentRuntime(fixture.childId, replacement.runtime.session, currentAuthority),
 			).resolves.toEqual({ deletionDurability: "tombstoned" });
-			expect(close).toHaveBeenCalledOnce();
+			expect(close).toHaveBeenCalledTimes(2);
 			expect(cleanup).toHaveBeenCalledTimes(2);
 			expect(readFileSync(registryPath, "utf8").match(/"status":"deleted"/g)).toHaveLength(1);
 		} finally {
@@ -1921,17 +1921,17 @@ describe("daemon mode helpers", () => {
 		expect(listed.agents).not.toContainEqual(
 			expect.objectContaining({ activeSessionId: childState.activeSessionId }),
 		);
-		expect(() => internals.getBoundSessionState(childState.activeSessionId)).toThrow("is closing");
+		expect(() => internals.getBoundSessionState(childState.activeSessionId)).toThrow("unavailable");
 		await expect(
 			controller.sendAgentMessage({ target: childState.activeSessionId, message: "continue" }),
-		).rejects.toThrow("is closing");
+		).rejects.toThrow("unavailable");
 		const client = makeClient("client-1", childState.activeSessionId);
 		for (const command of [
 			{ id: "prompt", type: "prompt", activeSessionId: childState.activeSessionId, message: "continue" },
 			{ id: "steer", type: "steer", activeSessionId: childState.activeSessionId, message: "continue" },
 			{ id: "follow-up", type: "follow_up", activeSessionId: childState.activeSessionId, message: "continue" },
 		] as const) {
-			await expect(internals.handleCommand(client, command)).rejects.toThrow("is closing");
+			await expect(internals.handleCommand(client, command)).rejects.toThrow("unavailable");
 		}
 
 		internals.closingSessions.delete(childState.activeSessionId);
@@ -1948,7 +1948,7 @@ describe("daemon mode helpers", () => {
 		expect(sessionPrompt).not.toHaveBeenCalled();
 	});
 
-	it("removes a closing daemon session even when runtime disposal fails", async () => {
+	it("retains a closing daemon session when runtime disposal fails", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -1992,7 +1992,7 @@ describe("daemon mode helpers", () => {
 		await expect(internals.closeSession(state, "killed", false)).rejects.toThrow("dispose failed");
 
 		expect(dispose).toHaveBeenCalledOnce();
-		expect(internals.sessions.has(state.activeSessionId)).toBe(false);
+		expect(internals.sessions.get(state.activeSessionId)).toBe(state);
 		expect(internals.closingSessions.has(state.activeSessionId)).toBe(false);
 	});
 
@@ -7844,7 +7844,7 @@ describe("daemon mode helpers", () => {
 				childId: fixture.childId,
 			})) as { data: { deleted: boolean } };
 			expect(idle.data).toEqual({ deleted: true });
-			expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
+			await vi.waitFor(() => expect(internals.sessions.has(childState.activeSessionId)).toBe(false));
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -10716,6 +10716,15 @@ describe("daemon tombstoned retirement", () => {
 		expect(internals.isPublicRlmState(child)).toBe(false);
 		expect(internals.isPublicRlmState(grandchild)).toBe(false);
 		expect(internals.isPublicRlmState(sibling)).toBe(true);
+		for (const command of [
+			{ type: "get_state", activeSessionId: child.activeSessionId },
+			{ type: "get_connection_state", activeSessionId: child.activeSessionId },
+			{ type: "get_messages", activeSessionId: child.activeSessionId },
+		] as const) {
+			await expect(
+				internals.handleCommand(makeClient("private-read-client", root.activeSessionId), command),
+			).rejects.toThrow("unavailable");
+		}
 		const listed = (await internals.handleCommand(makeClient("list-client", root.activeSessionId), {
 			type: "list",
 		})) as { data: { sessions: SessionSummary[] } };
@@ -10740,38 +10749,156 @@ describe("daemon tombstoned retirement", () => {
 		).toBe(true);
 
 		internals.closingSessions.delete(child.activeSessionId);
-		internals.sessions.delete(child.activeSessionId);
 		internals.failedTombstonedRlmCloses.set(child.activeSessionId, { state: child });
 		expect(internals.isPublicRlmState(grandchild)).toBe(false);
+		await expect(
+			internals.handleCommand(makeClient("failed-private-read-client", root.activeSessionId), {
+				type: "get_messages",
+				activeSessionId: child.activeSessionId,
+			}),
+		).rejects.toThrow("unavailable");
 	});
 
-	it("retains a failed physical disposal and retries the exact runtime", async () => {
-		const daemon = new AgentDaemon("/tmp/retry-retirement.sock", {
+	it("retries a rejected runtime disposal through the exact full tombstoned close", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-retry-tombstoned-dispose-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				failedTombstonedRlmCloses: Map<string, { error?: unknown }>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				detachTombstonedClose(parent: ActiveSessionState, child: ActiveSessionState, id: string): void;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const child = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const disposeFailure = new Error("dispose failed");
+			fixture.runtimeSessions[1]!.disposeAsync = vi
+				.fn<() => Promise<void>>()
+				.mockRejectedValueOnce(disposeFailure)
+				.mockResolvedValue(undefined);
+
+			internals.detachTombstonedClose(parent, child, fixture.childId);
+			internals.detachTombstonedClose(parent, child, fixture.childId);
+			await vi.waitFor(() =>
+				expect(internals.failedTombstonedRlmCloses.get(child.activeSessionId)?.error).toBe(disposeFailure),
+			);
+			expect(internals.sessions.get(child.activeSessionId)).toBe(child);
+			expect(fixture.runtimeSessions[1]!.disposeAsync).toHaveBeenCalledOnce();
+
+			internals.detachTombstonedClose(parent, child, fixture.childId);
+			await vi.waitFor(() => {
+				expect(internals.failedTombstonedRlmCloses.has(child.activeSessionId)).toBe(false);
+				expect(internals.sessions.has(child.activeSessionId)).toBe(false);
+			});
+			expect(fixture.runtimeSessions[1]!.disposeAsync).toHaveBeenCalledTimes(2);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a failed tombstoned cascade private and retries its resident subtree", async () => {
+		const daemon = new AgentDaemon("/tmp/retry-tombstoned-cascade.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: vi.fn(),
 		});
-		const parent = makeState("retry-parent");
-		const child = makeState("retry-child", parent.activeSessionId);
-		const dispose = vi.fn(async () => {});
-		child.runtime.dispose = dispose;
-		const disposeFailure = new Error("dispose failed");
+		const root = makeState("cascade-root");
+		const parent = makeState("cascade-parent", root.activeSessionId);
+		const descendant = makeState("cascade-descendant", parent.activeSessionId);
+		Object.assign(parent.runtime.metadata, { kind: "subagent", rlmChildId: "parent" });
+		Object.assign(descendant.runtime.metadata, { kind: "subagent", rlmChildId: "descendant" });
+		const cascadeFailure = new Error("descendant dispose failed");
+		const descendantDispose = vi
+			.fn<() => Promise<void>>()
+			.mockRejectedValueOnce(cascadeFailure)
+			.mockResolvedValue(undefined);
+		for (const [state, dispose] of [
+			[parent, vi.fn(async () => {})],
+			[descendant, descendantDispose],
+		] as const) {
+			state.extensionUiRequests = new Map();
+			state.runtime = {
+				...state.runtime,
+				dispose,
+				session: {
+					sessionId: `session-${state.activeSessionId}`,
+					sessionFile: undefined,
+					isBashRunning: false,
+					abort: vi.fn(async () => {}),
+				},
+			} as unknown as ActiveSessionState["runtime"];
+		}
 		const internals = daemon as unknown as {
-			closeDisposeErrors: WeakMap<ActiveSessionState, unknown>;
+			sessions: Map<string, ActiveSessionState>;
 			failedTombstonedRlmCloses: Map<string, { error?: unknown }>;
-			detachTombstonedClose(parent: ActiveSessionState, child: ActiveSessionState, id: string): void;
-			closeSession: ReturnType<typeof vi.fn>;
+			detachTombstonedClose(root: ActiveSessionState, child: ActiveSessionState, id: string): void;
+			isPublicRlmState(state: ActiveSessionState): boolean;
+			cancelScheduledJobsForSession: ReturnType<typeof vi.fn>;
+			isEmptyDraftContent: ReturnType<typeof vi.fn>;
+			abortBashForClose: ReturnType<typeof vi.fn>;
+			recordWorkerRecoveryState: ReturnType<typeof vi.fn>;
+			broadcastToSession: ReturnType<typeof vi.fn>;
 		};
-		internals.closeSession = vi.fn(async () => {
-			internals.closeDisposeErrors.set(child, disposeFailure);
-			throw disposeFailure;
-		});
-		internals.detachTombstonedClose(parent, child, "child-1");
+		for (const state of [root, parent, descendant]) internals.sessions.set(state.activeSessionId, state);
+		internals.cancelScheduledJobsForSession = vi.fn();
+		internals.isEmptyDraftContent = vi.fn(() => true);
+		internals.abortBashForClose = vi.fn(async () => {});
+		internals.recordWorkerRecoveryState = vi.fn();
+		internals.broadcastToSession = vi.fn();
+
+		internals.detachTombstonedClose(root, parent, "parent");
 		await vi.waitFor(() =>
-			expect(internals.failedTombstonedRlmCloses.get(child.activeSessionId)?.error).toBe(disposeFailure),
+			expect(internals.failedTombstonedRlmCloses.get(parent.activeSessionId)?.error).toBe(cascadeFailure),
 		);
-		internals.detachTombstonedClose(parent, child, "child-1");
-		await vi.waitFor(() => expect(internals.failedTombstonedRlmCloses.has(child.activeSessionId)).toBe(false));
-		expect(dispose).toHaveBeenCalledOnce();
+		expect(internals.sessions.get(parent.activeSessionId)).toBe(parent);
+		expect(internals.sessions.get(descendant.activeSessionId)).toBe(descendant);
+		expect(internals.isPublicRlmState(parent)).toBe(false);
+		expect(internals.isPublicRlmState(descendant)).toBe(false);
+
+		internals.detachTombstonedClose(root, parent, "parent");
+		await vi.waitFor(() => {
+			expect(internals.failedTombstonedRlmCloses.has(parent.activeSessionId)).toBe(false);
+			expect(internals.sessions.has(parent.activeSessionId)).toBe(false);
+			expect(internals.sessions.has(descendant.activeSessionId)).toBe(false);
+		});
+		expect(descendantDispose).toHaveBeenCalledTimes(2);
+	});
+
+	it("retries a tombstoned close that failed before disposal", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-retry-tombstoned-pre-dispose-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				failedTombstonedRlmCloses: Map<string, { error?: unknown }>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				detachTombstonedClose(parent: ActiveSessionState, child: ActiveSessionState, id: string): void;
+				cancelScheduledJobsForSession: ReturnType<typeof vi.fn>;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const child = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const preDisposeFailure = new Error("pre-dispose close failed");
+			const cancelScheduledJobsForSession = vi.fn().mockImplementationOnce(() => {
+				throw preDisposeFailure;
+			});
+			internals.cancelScheduledJobsForSession = cancelScheduledJobsForSession;
+
+			internals.detachTombstonedClose(parent, child, fixture.childId);
+			await vi.waitFor(() =>
+				expect(internals.failedTombstonedRlmCloses.get(child.activeSessionId)?.error).toBe(preDisposeFailure),
+			);
+			expect(internals.sessions.get(child.activeSessionId)).toBe(child);
+			expect(fixture.runtimeSessions[1]!.disposeAsync).not.toHaveBeenCalled();
+
+			internals.detachTombstonedClose(parent, child, fixture.childId);
+			await vi.waitFor(() => {
+				expect(internals.failedTombstonedRlmCloses.has(child.activeSessionId)).toBe(false);
+				expect(internals.sessions.has(child.activeSessionId)).toBe(false);
+			});
+			expect(cancelScheduledJobsForSession).toHaveBeenCalledTimes(2);
+			expect(fixture.runtimeSessions[1]!.disposeAsync).toHaveBeenCalledOnce();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 });
 
