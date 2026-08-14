@@ -11236,7 +11236,7 @@ describe("daemon tombstoned retirement", () => {
 			} as never;
 			const internals = daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
-				failedTerminalSessionCloses: Map<string, { state: ActiveSessionState }>;
+				failedTombstonedRlmCloses: Map<string, { state: ActiveSessionState }>;
 				closeSession(state: ActiveSessionState, reason: "killed"): Promise<void>;
 				getOrCreateCronJobSession(job: AgentCronJob, persisted: boolean): Promise<ActiveSessionState | undefined>;
 			};
@@ -11248,7 +11248,7 @@ describe("daemon tombstoned retirement", () => {
 			expect(state.clients.has(client)).toBe(true);
 			expect(client.attachedActiveSessionIds.has(state.activeSessionId)).toBe(true);
 			expect(releaseSessionLease).not.toHaveBeenCalled();
-			expect(internals.failedTerminalSessionCloses.get(state.activeSessionId)?.state).toBe(state);
+			expect(internals.failedTombstonedRlmCloses.get(state.activeSessionId)?.state).toBe(state);
 			await expect(
 				internals.getOrCreateCronJobSession(
 					{
@@ -11315,7 +11315,6 @@ describe("daemon tombstoned retirement", () => {
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			failedTombstonedRlmCloses: Map<string, { state: ActiveSessionState }>;
-			failedTerminalSessionCloses: Map<string, { state: ActiveSessionState }>;
 			closeSession(state: ActiveSessionState, reason: "killed"): Promise<void>;
 		};
 		internals.sessions.set(ordinary.activeSessionId, ordinary);
