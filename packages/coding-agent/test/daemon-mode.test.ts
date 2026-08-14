@@ -11967,7 +11967,7 @@ describe("daemon tombstoned retirement", () => {
 			} as never;
 			const internals = daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
-				closeSession(state: ActiveSessionState, reason: typeof reason): Promise<void>;
+				closeSession(state: ActiveSessionState, reason: "completed" | "killed"): Promise<void>;
 				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 				createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
 			};
