@@ -324,6 +324,7 @@ describe("daemon supervisor resident workers", () => {
 						sessionName: fixture.sessionName,
 						sessionDir: fixture.childSessionDir,
 						sessionFile: fixture.sessionFile,
+						sessionId: fixture.manager.getSessionId(),
 						parentSessionId: parentManager.getSessionId(),
 						parentSessionFile,
 						rlmDepth: 1,

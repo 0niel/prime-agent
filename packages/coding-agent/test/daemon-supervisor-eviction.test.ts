@@ -111,6 +111,7 @@ function makeSupervisor(idleEvictionMinutes: number | "off" = 90): SupervisorInt
 	supervisor.stopWorker = vi.fn(async (worker: WorkerFixture) => {
 		supervisor.workers.delete(worker.descriptor.workerId);
 	});
+	supervisor.catalog.list = vi.fn(async () => []);
 	supervisor.log = vi.fn();
 	supervisors.push(supervisor);
 	return supervisor;
