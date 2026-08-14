@@ -19,7 +19,7 @@ import {
 	createDefaultRlmSubagentSessionName,
 	type SubagentRuntimeHost,
 } from "../src/core/rlm-runtime.js";
-import { canonicalSessionPath } from "../src/core/session-lease.js";
+import { acquireSessionLease, canonicalSessionPath } from "../src/core/session-lease.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
@@ -11146,6 +11146,96 @@ describe("daemon tombstoned retirement", () => {
 			expect(cancelScheduledJobsForSession).toHaveBeenCalledTimes(2);
 			expect(fixture.runtimeSessions[1]!.disposeAsync).toHaveBeenCalledOnce();
 		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each(["completed", "killed"] as const)(
+		"irrevocably retires a non-tombstoned %s close after cleanup failure",
+		async (reason) => {
+			const daemon = new AgentDaemon(`/tmp/retire-${reason}.sock`, {
+				defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+				createRuntime: vi.fn(),
+			});
+			const state = makeState(`retire-${reason}`);
+			const client = makeClient(`retire-client-${reason}`, state.activeSessionId);
+			state.clients.add(client);
+			const cleanupFailure = new Error(`${reason} archive failed`);
+			state.extensionUiRequests = new Map();
+			state.runtime = {
+				...state.runtime,
+				dispose: vi.fn(async () => {}),
+				releaseSessionLease: vi.fn(),
+				session: {
+					sessionId: `retire-session-${reason}`,
+					sessionFile: `/tmp/retire-${reason}.jsonl`,
+					messages: ["content"],
+					isBashRunning: false,
+					abort: vi.fn(async () => {}),
+					sessionManager: {
+						appendSessionState: vi.fn(() => {
+							throw cleanupFailure;
+						}),
+						hasUserContent: () => true,
+					},
+				},
+			} as never;
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				closeSession(state: ActiveSessionState, reason: typeof reason): Promise<void>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+				createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+
+			await expect(internals.closeSession(state, reason)).rejects.toBe(cleanupFailure);
+			expect(internals.sessions.has(state.activeSessionId)).toBe(false);
+			expect(state.clients.size).toBe(0);
+			expect(client.attachedActiveSessionIds.has(state.activeSessionId)).toBe(false);
+			const listed = (await internals.handleCommand(makeClient(`list-${reason}`, "other"), {
+				type: "list",
+			})) as { data: { sessions: SessionSummary[] } };
+			expect(listed.data.sessions.map((session) => session.activeSessionId)).not.toContain(state.activeSessionId);
+			const targets = await internals.createAgentMessageController(() => makeState("other")).listAgents();
+			expect(targets.agents.map((agent) => agent.activeSessionId)).not.toContain(state.activeSessionId);
+		},
+	);
+
+	it("keeps a tombstoned close lease until its full cleanup retry succeeds", async () => {
+		vi.useFakeTimers();
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-tombstone-lease-"));
+		try {
+			vi.stubEnv("PRIME_AGENT_INTERNAL_SESSION_LEASES", "1");
+			vi.stubEnv("PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID", "tombstone-lease");
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				failedTombstonedRlmCloses: Map<string, { error?: unknown }>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				detachTombstonedClose(parent: ActiveSessionState, child: ActiveSessionState, id: string): void;
+			};
+			const parent = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const child = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const archiveFailure = new Error("archive failed");
+			vi.spyOn(child.runtime.session.sessionManager, "appendSessionState")
+				.mockImplementationOnce(() => {
+					throw archiveFailure;
+				})
+				.mockImplementation(() => undefined as never);
+
+			internals.detachTombstonedClose(parent, child, fixture.childId);
+			await vi.waitFor(() =>
+				expect(internals.failedTombstonedRlmCloses.get(child.activeSessionId)?.error).toBe(archiveFailure),
+			);
+			expect(() => acquireSessionLease(fixture.childSessionFile, tempDir)).toThrow();
+			await vi.advanceTimersByTimeAsync(250);
+			await vi.waitFor(() => expect(internals.sessions.has(child.activeSessionId)).toBe(false));
+			const reopened = acquireSessionLease(fixture.childSessionFile, tempDir);
+			expect(reopened).toBeDefined();
+			reopened?.release();
+		} finally {
+			vi.unstubAllEnvs();
+			vi.useRealTimers();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
