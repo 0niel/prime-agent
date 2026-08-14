@@ -2644,6 +2644,27 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual(["queued before abort", "wake after abort"]);
 	});
 
+	it("preserves agent mail admitted during update-restart suspension", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("mail handled after restart")]);
+		const prompt = agentPromptText("agentmsg_update_restart", "hold for recovery");
+		harness.session.abortForUpdateRestart();
+
+		await expect(harness.session.queueAgentMessagePrompt(prompt, "followUp")).resolves.toBe(true);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		expect(getUserTexts(harness)).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([prompt]);
+		expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([
+			expect.objectContaining({ payload: expect.objectContaining({ text: prompt }) }),
+		]);
+
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual([prompt]);
+	});
+
 	it("waitForIdle resolves when the queue is cleared while the pump is suspended", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

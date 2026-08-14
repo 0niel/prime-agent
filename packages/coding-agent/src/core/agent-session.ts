@@ -1117,6 +1117,7 @@ export class AgentSession {
 	private _sessionInputArrivalEpoch = 0;
 	// Persists abort/restart suspension after the initiating call returns.
 	private _sessionInputPumpSuspended = false;
+	private _sessionInputPumpSuspensionReason: "abort" | "update_restart" | undefined;
 	// Branch mutation pause leases can overlap and must all release before dispatch resumes.
 	private readonly _queuedWorkPauses = new Set<symbol>();
 	private _sessionActionCommitTail: Promise<void> = Promise.resolve();
@@ -4602,7 +4603,7 @@ export class AgentSession {
 		message: CustomMessage,
 		options?: InternalPromptOptions & { executionPolicy?: TurnExecutionPolicy },
 	): Promise<void> {
-		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
+		if (!this.isStreaming && options?.resumeIfIdle) this._resumeSessionInputPumpFromIdleAdmission();
 		const admissionFence = await this._acquireDirectTurnAdmissionFence(options?.signal).catch((error: unknown) => {
 			throwIfPromptAdmissionCancelled(options?.signal);
 			throw error;
@@ -4674,7 +4675,10 @@ export class AgentSession {
 		// Preserve queued extension actions and admit this turn so the normal FIFO
 		// pump can drain them; other suspended admissions remain fail-closed.
 		if (!this.isStreaming) {
-			this._sessionInputPumpSuspended = false;
+			if (this._sessionInputPumpSuspensionReason === "update_restart") {
+				throw new Error("Cannot admit a prompt while the session is preparing for update restart.");
+			}
+			this._resumeSessionInputPumpFromIdleAdmission();
 		}
 		this._assertSessionActionAdmissionAvailable();
 		const commitFence = this.isStreaming
@@ -5368,6 +5372,12 @@ export class AgentSession {
 		}
 	}
 
+	private _resumeSessionInputPumpFromIdleAdmission(): void {
+		if (this._sessionInputPumpSuspensionReason === "update_restart") return;
+		this._sessionInputPumpSuspended = false;
+		this._sessionInputPumpSuspensionReason = undefined;
+	}
+
 	private _admitSessionInput(
 		action: QueuedSessionAction,
 		options: {
@@ -5417,7 +5427,9 @@ export class AgentSession {
 				action.payload.kind === "session_command" ||
 				action.wake === "immediate")
 		) {
-			if (action.payload.kind === "turn" && action.wake === "immediate") this._sessionInputPumpSuspended = false;
+			if (action.payload.kind === "turn" && action.wake === "immediate") {
+				this._resumeSessionInputPumpFromIdleAdmission();
+			}
 			this._scheduleSessionInputPump();
 		}
 		return { accepted: true, disposition, ticket: controller.ticket };
@@ -6584,6 +6596,7 @@ export class AgentSession {
 	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
 	resumeQueuedWork(): boolean {
 		this._sessionInputPumpSuspended = false;
+		this._sessionInputPumpSuspensionReason = undefined;
 		this._notifySessionInputCheckpointChange();
 		this._scheduleSessionInputPump();
 		return this._hasSelectableSessionInput();
@@ -6672,6 +6685,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._sessionInputPumpSuspensionReason = "abort";
 		this._cancelSessionActions(
 			(action) => action.payload.kind === "turn" && !action.payload.queueVisible,
 			new Error("Prompt aborted before delivery."),
@@ -6715,6 +6729,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._sessionInputPumpSuspensionReason = "update_restart";
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
