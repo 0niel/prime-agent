@@ -3822,7 +3822,7 @@ export class AgentSession {
 		}
 		this._asyncTeardownStarted = true;
 		this._beginClosing();
-		this._disposeAsyncPromise = (async () => {
+		const attempt = (async () => {
 			// Capture both operations before the first await. allSettled observes either
 			// rejection immediately while allowing the independent operation to finish.
 			const drain = this._drainPendingRefinementForDisposal();
@@ -3854,7 +3854,15 @@ export class AgentSession {
 			if (failures.length === 1) throw failures[0];
 			if (failures.length > 1) throw new AggregateError(failures, "Session disposal failed.");
 		})();
-		return this._disposeAsyncPromise;
+		this._disposeAsyncPromise = attempt;
+		try {
+			await attempt;
+		} catch (error) {
+			if (this._disposeAsyncPromise === attempt) {
+				this._disposeAsyncPromise = undefined;
+			}
+			throw error;
+		}
 	}
 
 	/**
