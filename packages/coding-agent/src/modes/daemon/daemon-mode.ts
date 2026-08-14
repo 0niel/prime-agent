@@ -450,6 +450,16 @@ interface FailedTombstonedRlmClose {
 	retryTimer?: ReturnType<typeof setTimeout>;
 }
 
+/** A pre-teardown archive failure retains its exact resident state and lease. */
+interface FailedTerminalSessionClose {
+	readonly state: ActiveSessionState;
+	readonly reason: DaemonSessionClosedReason;
+	cleanup?: Promise<void>;
+	error?: unknown;
+	retryAttempt: number;
+	retryTimer?: ReturnType<typeof setTimeout>;
+}
+
 export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
@@ -493,6 +503,7 @@ export class AgentDaemon {
 		}
 	>();
 	private readonly failedTombstonedRlmCloses = new Map<string, FailedTombstonedRlmClose>();
+	private readonly failedTerminalSessionCloses = new Map<string, FailedTerminalSessionClose>();
 	private readonly sideQuestionRuns = new Map<
 		string,
 		{
@@ -1508,6 +1519,9 @@ export class AgentDaemon {
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
 		const sessionKey = sessionPath ? resolve(sessionPath) : undefined;
+		if (sessionKey && this.findFailedTerminalizationBySessionFile(sessionKey)) {
+			throw new PrivateSessionUnavailableError("Session is terminalizing");
+		}
 		if (sessionKey && this.findPassivationBySessionFile(sessionKey)) {
 			await this.waitForPassivation(sessionKey);
 			return this.createRuntime(command, runtimeOpenGuard);
@@ -2180,6 +2194,10 @@ export class AgentDaemon {
 			return undefined;
 		}
 		const activeIdMatch = this.sessions.get(dueJob.activeSessionId);
+		const terminalizing = this.findFailedTerminalSessionCloseBySessionFile(dueJob.sessionFile);
+		if (terminalizing || this.failedTerminalSessionCloses.get(dueJob.activeSessionId)?.state === activeIdMatch) {
+			return undefined;
+		}
 		const current =
 			this.findSessionBySessionFile(dueJob.sessionFile) ??
 			(!requirePersistedJob || activeIdMatch?.runtime.session.sessionId === dueJob.sessionId
@@ -2329,6 +2347,15 @@ export class AgentDaemon {
 		return state === undefined || this.isPublicRlmState(state);
 	}
 
+	private findFailedTerminalSessionCloseBySessionFile(sessionFile: string | undefined): ActiveSessionState | undefined {
+		if (!sessionFile) return undefined;
+		const target = resolve(sessionFile);
+		return [...this.failedTerminalSessionCloses.values()].find((record) => {
+			const file = record.state.runtime.session.sessionFile;
+			return file !== undefined && resolve(file) === target;
+		})?.state;
+	}
+
 	private findSessionBySessionFile(sessionFile: string | undefined): ActiveSessionState | undefined {
 		if (!sessionFile) {
 			return undefined;
@@ -2354,7 +2381,7 @@ export class AgentDaemon {
 		if (this.bindingSessions.has(state.activeSessionId)) {
 			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is still initializing`);
 		}
-		if (this.closingSessions.has(state.activeSessionId) || this.isQuarantinedRlmState(state)) {
+		if (!this.isPublicRlmState(state)) {
 			throw new PrivateSessionUnavailableError(`Active session ${state.activeSessionId} is unavailable`);
 		}
 		return state;
@@ -5449,7 +5476,8 @@ export class AgentDaemon {
 			if (visited.has(child.activeSessionId)) return false;
 			if (
 				this.closingSessions.has(child.activeSessionId) ||
-				this.failedTombstonedRlmCloses.has(child.activeSessionId)
+				this.failedTombstonedRlmCloses.has(child.activeSessionId) ||
+				this.failedTerminalSessionCloses.get(child.activeSessionId)?.state === child
 			)
 				return true;
 			visited.add(child.activeSessionId);
@@ -5457,7 +5485,8 @@ export class AgentDaemon {
 			if (!parentActiveSessionId || !rlmChildId) return false;
 			const parent =
 				this.sessions.get(parentActiveSessionId) ??
-				this.failedTombstonedRlmCloses.get(parentActiveSessionId)?.state;
+				this.failedTombstonedRlmCloses.get(parentActiveSessionId)?.state ??
+				this.failedTerminalSessionCloses.get(parentActiveSessionId)?.state;
 			if (!parent) return false;
 			if (parent.runtime.session.isRlmChildDeletionQuarantined?.(rlmChildId) === true) return true;
 			child = parent;
@@ -5466,7 +5495,11 @@ export class AgentDaemon {
 	}
 
 	private isPublicRlmState(state: ActiveSessionState): boolean {
-		return !this.closingSessions.has(state.activeSessionId) && !this.isQuarantinedRlmState(state);
+		return (
+			!this.closingSessions.has(state.activeSessionId) &&
+			this.failedTerminalSessionCloses.get(state.activeSessionId)?.state !== state &&
+			!this.isQuarantinedRlmState(state)
+		);
 	}
 
 	private findExactRlmState(
@@ -5544,6 +5577,75 @@ export class AgentDaemon {
 
 	private clearTombstonedCloseRetries(): void {
 		for (const record of this.failedTombstonedRlmCloses.values()) {
+			if (record.retryTimer) clearTimeout(record.retryTimer);
+			record.retryTimer = undefined;
+		}
+	}
+
+	private retainFailedTerminalSessionClose(
+		state: ActiveSessionState,
+		reason: DaemonSessionClosedReason,
+		error: unknown,
+	): void {
+		const existing = this.failedTerminalSessionCloses.get(state.activeSessionId);
+		if (existing?.state === state) {
+			existing.error = error;
+			if (!existing.cleanup && !existing.retryTimer) this.scheduleTerminalSessionCloseRetry(existing);
+			return;
+		}
+		const record: FailedTerminalSessionClose = { state, reason, error, retryAttempt: 0 };
+		this.failedTerminalSessionCloses.set(state.activeSessionId, record);
+		this.scheduleTerminalSessionCloseRetry(record);
+	}
+
+	private runTerminalSessionCloseAttempt(record: FailedTerminalSessionClose): void {
+		if (
+			this.shuttingDown ||
+			this.failedTerminalSessionCloses.get(record.state.activeSessionId) !== record ||
+			this.sessions.get(record.state.activeSessionId) !== record.state
+		) {
+			if (this.failedTerminalSessionCloses.get(record.state.activeSessionId) === record) {
+				this.failedTerminalSessionCloses.delete(record.state.activeSessionId);
+			}
+			return;
+		}
+		record.retryTimer = undefined;
+		record.error = undefined;
+		const cleanup = Promise.resolve().then(() => this.closeSession(record.state, record.reason));
+		record.cleanup = cleanup;
+		void cleanup.then(
+			() => {
+				if (this.failedTerminalSessionCloses.get(record.state.activeSessionId) === record) {
+					this.failedTerminalSessionCloses.delete(record.state.activeSessionId);
+				}
+			},
+			(error: unknown) => {
+				if (this.failedTerminalSessionCloses.get(record.state.activeSessionId) !== record) return;
+				record.error = error;
+				record.cleanup = undefined;
+				// Errors after unmapping are irreversible and must not retry a replacement.
+				if (this.sessions.get(record.state.activeSessionId) !== record.state) {
+					this.failedTerminalSessionCloses.delete(record.state.activeSessionId);
+					return;
+				}
+				this.scheduleTerminalSessionCloseRetry(record);
+			},
+		);
+	}
+
+	private scheduleTerminalSessionCloseRetry(record: FailedTerminalSessionClose): void {
+		if (this.shuttingDown || record.retryTimer || record.cleanup) return;
+		const delayMs = Math.min(
+			TOMBSTONED_CLOSE_RETRY_BASE_MS * 2 ** record.retryAttempt,
+			TOMBSTONED_CLOSE_RETRY_MAX_MS,
+		);
+		record.retryAttempt++;
+		record.retryTimer = setTimeout(() => this.runTerminalSessionCloseAttempt(record), delayMs);
+		record.retryTimer.unref();
+	}
+
+	private clearTerminalSessionCloseRetries(): void {
+		for (const record of this.failedTerminalSessionCloses.values()) {
 			if (record.retryTimer) clearTimeout(record.retryTimer);
 			record.retryTimer = undefined;
 		}
@@ -6424,7 +6526,7 @@ export class AgentDaemon {
 		cascadeChildren: boolean,
 		descendants: Set<ActiveSessionState>,
 	): Promise<void> {
-		if (!this.sessions.has(state.activeSessionId)) {
+		if (this.sessions.get(state.activeSessionId) !== state) {
 			return;
 		}
 		// Claim before any close work can yield. A direct disposer that won this
@@ -6436,6 +6538,25 @@ export class AgentDaemon {
 		};
 		const retainsForTombstonedRetry =
 			this.failedTombstonedRlmCloses.get(state.activeSessionId)?.state === state;
+		// Empty draft (no messages, config, or jobs): discard rather than persist an
+		// empty session file. Mirrors the detach-time discard so a config-bearing
+		// draft closed via kill/completed is never wiped.
+		const keepsResumeEntry = this.closeKeepsResumeEntry(reason);
+		const isEmptyDraftSession = !keepsResumeEntry && this.isEmptyDraftContent(state);
+		// Establish the durable terminal boundary before changing any live ownership.
+		// An archive failure leaves this exact resident, including its clients and lease,
+		// intact for the private retry below.
+		if (!keepsResumeEntry && !isEmptyDraftSession) {
+			try {
+				this.archiveSession(state);
+			} catch (error) {
+				if (!retainsForTombstonedRetry) this.retainFailedTerminalSessionClose(state, reason, error);
+				throw error;
+			}
+		}
+		// Cancellation and cascading are now post-terminalization: if either fails,
+		// ordinary closes can still retire safely, while a deletion tombstone retains
+		// its established full-close retry behavior.
 		if (reason === "killed") {
 			try {
 				this.cancelScheduledJobsForSession(state);
@@ -6449,7 +6570,6 @@ export class AgentDaemon {
 				captureCloseError(error);
 			}
 		}
-		// A tombstoned close that failed before teardown is retried intact.
 		if (closeError && retainsForTombstonedRetry) throw closeError;
 		// Abort in-flight status work before any await/dispose so it can't write
 		// agent_status to a session being torn down.
@@ -6457,19 +6577,6 @@ export class AgentDaemon {
 		if (cascadeChildren) {
 			const cascadeError = await this.closeChildSessions(state, reason, waitForAbort, descendants);
 			if (cascadeError) captureCloseError(cascadeError);
-		}
-		// Empty draft (no messages, config, or jobs): discard rather than persist an
-		// empty session file. Mirrors the detach-time discard so a config-bearing
-		// draft closed via kill/completed is never wiped.
-		const keepsResumeEntry = this.closeKeepsResumeEntry(reason);
-		const isEmptyDraftSession = !keepsResumeEntry && this.isEmptyDraftContent(state);
-		// Clean shutdown leaves the session un-archived so it stays in the resume list.
-		if (!keepsResumeEntry && !isEmptyDraftSession) {
-			try {
-				this.archiveSession(state);
-			} catch (error) {
-				captureCloseError(error);
-			}
 		}
 		cancelPendingExtensionUiRequests(state);
 		if (reason === "killed" || reason === "shutdown" || reason === "replaced" || reason === "update") {
@@ -6515,6 +6622,9 @@ export class AgentDaemon {
 		}
 		// Failed non-tombstoned closes are irrevocable: never leave a disposed,
 		// targetable resident behind merely because persistence or cleanup failed.
+		if (this.failedTerminalSessionCloses.get(state.activeSessionId)?.state === state) {
+			this.failedTerminalSessionCloses.delete(state.activeSessionId);
+		}
 		this.sessions.delete(state.activeSessionId);
 		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
@@ -7021,6 +7131,7 @@ export class AgentDaemon {
 		}
 		this.shuttingDown = true;
 		this.clearTombstonedCloseRetries();
+		this.clearTerminalSessionCloseRetries();
 		if (this.supervisorMonitorTimer) {
 			clearTimeout(this.supervisorMonitorTimer);
 			this.supervisorMonitorTimer = undefined;
