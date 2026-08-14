@@ -2471,7 +2471,8 @@ export class AgentDaemon {
 						return { deletionDurability: "stale" };
 					}
 					authority?.assertCurrent();
-					const state = liveState ?? this.findExactRlmState(parentState.activeSessionId, options.id, runtime.session);
+					const state =
+						liveState ?? this.findExactRlmState(parentState.activeSessionId, options.id, runtime.session);
 					if (
 						!state ||
 						state.runtime.session !== runtime.session ||
@@ -2561,14 +2562,6 @@ export class AgentDaemon {
 						(persistedMatchesAuthority &&
 							(typeof authority?.sessionFile !== "string" || session.sessionFile === authority.sessionFile) &&
 							(typeof authority?.sessionId !== "string" || session.sessionId === authority.sessionId));
-					const residentMatchesAuthority =
-						state !== undefined &&
-						authority !== undefined &&
-						state.runtime.metadata.sessionDir === authority.sessionDir &&
-						typeof authority.sessionFile === "string" &&
-						state.runtime.session.sessionFile === authority.sessionFile &&
-						typeof authority.sessionId === "string" &&
-						state.runtime.session.sessionId === authority.sessionId;
 					if (
 						(state !== undefined && session !== undefined && state.runtime.session !== session) ||
 						(state !== undefined &&
