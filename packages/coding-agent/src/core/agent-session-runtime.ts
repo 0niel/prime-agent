@@ -96,6 +96,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
 	private disposePromise?: Promise<void>;
+	private disposeStarted = false;
+	private sessionLeaseReleaseDeferred = false;
 
 	constructor(
 		private _session: AgentSession,
@@ -256,6 +258,20 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (lease !== this._sessionLease) {
 			lease?.release();
 		}
+	}
+
+	/**
+	 * Atomically defer lease release to the daemon before teardown begins.
+	 *
+	 * A false result means another caller already began disposal (and therefore
+	 * owns its normal release) or there is no lease to defer. Callers must not
+	 * release after a false result.
+	 */
+	claimSessionLeaseReleaseForDaemon(): boolean {
+		if (this.sessionLeaseReleaseDeferred) return true;
+		if (this.disposeStarted || !this._sessionLease) return false;
+		this.sessionLeaseReleaseDeferred = true;
+		return true;
 	}
 
 	/** Release the runtime-owned session-file lease after its daemon has committed retirement. */
@@ -444,9 +460,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			}
 			authority.assertCurrent();
 			await session.disposeAsync();
-			// The supplied retained object was an old incarnation. Its disposal
-			// neither deletes nor proves absence of the newer map-resident child.
-			return { deletionDurability: "stale" };
+			return { deletionDurability: "absent" };
 		}
 		if (
 			authority &&
@@ -757,7 +771,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return { cancelled: false };
 	}
 
-	private async disposeOnce(releaseSessionLease = true): Promise<void> {
+	private async disposeOnce(): Promise<void> {
 		this.session.beginClosing();
 		let disposeError: unknown;
 		try {
@@ -794,13 +808,16 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				throw disposeError;
 			}
 		} finally {
-			if (releaseSessionLease) this.releaseSessionLease();
+			if (!this.sessionLeaseReleaseDeferred) this.releaseSessionLease();
 		}
 	}
 
-	async dispose(options: { releaseSessionLease?: boolean } = {}): Promise<void> {
-		const disposePromise = this.disposePromise ?? this.disposeOnce(options.releaseSessionLease !== false);
-		this.disposePromise = disposePromise;
+	async dispose(): Promise<void> {
+		if (!this.disposePromise) {
+			this.disposeStarted = true;
+			this.disposePromise = this.disposeOnce();
+		}
+		const disposePromise = this.disposePromise;
 		try {
 			await disposePromise;
 		} catch (error) {
