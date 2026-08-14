@@ -11283,7 +11283,9 @@ describe("daemon tombstoned retirement", () => {
 		["terminalizes after a one-shot archive recovery", false],
 		["preserves its private archive barrier after persistent failure", true],
 	] as const)("on shutdown %s", async (_name, persistentlyFails) => {
-		const daemon = new AgentDaemon(`/tmp/shutdown-terminalization-${persistentlyFails}.sock`, {
+		vi.useFakeTimers();
+		try {
+			const daemon = new AgentDaemon(`/tmp/shutdown-terminalization-${persistentlyFails}.sock`, {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: vi.fn(),
 		});
@@ -11320,28 +11322,32 @@ describe("daemon tombstoned retirement", () => {
 		};
 		internals.sessions.set(state.activeSessionId, state);
 		await expect(internals.closeSession(state, "killed")).rejects.toBe(archiveFailure);
-		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
-		try {
-			await internals.shutdown(0);
-		} finally {
-			exit.mockRestore();
-		}
+			const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
+			try {
+				await internals.shutdown(0);
+			} finally {
+				exit.mockRestore();
+			}
 
-		expect(appendSessionState).toHaveBeenCalledTimes(2);
-		if (persistentlyFails) {
-			expect(dispose).not.toHaveBeenCalled();
-			expect(releaseSessionLease).not.toHaveBeenCalled();
-			expect(internals.sessions.get(state.activeSessionId)).toBe(state);
-			expect(internals.failedTombstonedRlmCloses.get(state.activeSessionId)).toMatchObject({
-				state,
-				terminalizing: true,
-				reason: "killed",
-			});
-		} else {
-			expect(dispose).toHaveBeenCalledOnce();
-			expect(releaseSessionLease).toHaveBeenCalledOnce();
-			expect(internals.sessions.has(state.activeSessionId)).toBe(false);
-			expect(internals.failedTombstonedRlmCloses.has(state.activeSessionId)).toBe(false);
+			expect(appendSessionState).toHaveBeenCalledTimes(2);
+			if (persistentlyFails) {
+				expect(dispose).not.toHaveBeenCalled();
+				expect(releaseSessionLease).not.toHaveBeenCalled();
+				expect(internals.sessions.get(state.activeSessionId)).toBe(state);
+				expect(internals.failedTombstonedRlmCloses.get(state.activeSessionId)).toMatchObject({
+					state,
+					terminalizing: true,
+					reason: "killed",
+				});
+			} else {
+				expect(dispose).toHaveBeenCalledOnce();
+				expect(releaseSessionLease).toHaveBeenCalledOnce();
+				expect(internals.sessions.has(state.activeSessionId)).toBe(false);
+				expect(internals.failedTombstonedRlmCloses.has(state.activeSessionId)).toBe(false);
+			}
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
 		}
 	});
 

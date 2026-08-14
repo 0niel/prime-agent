@@ -2187,7 +2187,8 @@ export class AgentDaemon {
 		}
 		const activeIdMatch = this.sessions.get(dueJob.activeSessionId);
 		const terminalizing = this.findFailedTerminalizationBySessionFile(dueJob.sessionFile);
-		if (terminalizing || this.failedTombstonedRlmCloses.get(dueJob.activeSessionId)?.state === activeIdMatch) {
+		const failedClose = this.failedTombstonedRlmCloses.get(dueJob.activeSessionId);
+		if (terminalizing || (failedClose !== undefined && failedClose.state === activeIdMatch)) {
 			return undefined;
 		}
 		const current =
@@ -6374,6 +6375,15 @@ export class AgentDaemon {
 		cascadeChildren = true,
 		descendantCollector?: Set<ActiveSessionState>,
 	): Promise<void> {
+		const terminalizingClose = this.failedTombstonedRlmCloses.get(state.activeSessionId);
+		if (
+			terminalizingClose?.terminalizing &&
+			terminalizingClose.state === state &&
+			terminalizingClose.reason &&
+			this.isStrongerCloseReason(terminalizingClose.reason, reason)
+		) {
+			reason = terminalizingClose.reason;
+		}
 		this.abortWaitingPromptAdmissionsForSession(state.activeSessionId);
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
