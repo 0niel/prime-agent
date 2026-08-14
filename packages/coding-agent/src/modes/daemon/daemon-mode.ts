@@ -459,7 +459,6 @@ interface FailedTombstonedRlmClose {
 	readonly childId: string;
 	cleanup?: Promise<void>;
 	error?: unknown;
-	disposeError?: unknown;
 }
 
 export class AgentDaemon {
@@ -505,7 +504,6 @@ export class AgentDaemon {
 		}
 	>();
 	private readonly failedTombstonedRlmCloses = new Map<string, FailedTombstonedRlmClose>();
-	private readonly closeDisposeErrors = new WeakMap<ActiveSessionState, unknown>();
 	private readonly sideQuestionRuns = new Map<
 		string,
 		{
@@ -4441,17 +4439,17 @@ export class AgentDaemon {
 			}
 
 			case "get_state": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_state", summaryForActiveSession(state));
 			}
 
 			case "get_connection_state": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_connection_state", this.createConnectionState(state));
 			}
 
 			case "get_messages": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_messages", {
 					messages: state.runtime.session.messages,
 				});
@@ -5541,8 +5539,8 @@ export class AgentDaemon {
 	private detachTombstonedClose(parent: ActiveSessionState, state: ActiveSessionState, childId: string): void {
 		const existing = this.failedTombstonedRlmCloses.get(state.activeSessionId);
 		if (existing?.state === state) {
-			if (existing.error !== undefined && existing.disposeError !== undefined && !existing.cleanup) {
-				const cleanup = Promise.resolve().then(() => state.runtime.dispose());
+			if (existing.error !== undefined && !existing.cleanup) {
+				const cleanup = Promise.resolve().then(() => this.closeSession(state, "killed", false));
 				existing.cleanup = cleanup
 					.then(() => {
 						if (this.failedTombstonedRlmCloses.get(state.activeSessionId) === existing)
@@ -5550,7 +5548,6 @@ export class AgentDaemon {
 					})
 					.catch((error: unknown) => {
 						existing.error = error;
-						existing.disposeError = error;
 						existing.cleanup = undefined;
 					});
 			}
@@ -5558,16 +5555,16 @@ export class AgentDaemon {
 		}
 		const record: FailedTombstonedRlmClose = { state, parentActiveSessionId: parent.activeSessionId, childId };
 		this.failedTombstonedRlmCloses.set(state.activeSessionId, record);
-		void this.closeSession(state, "killed", false).then(
-			() => {
+		const cleanup = Promise.resolve().then(() => this.closeSession(state, "killed", false));
+		record.cleanup = cleanup
+			.then(() => {
 				if (this.failedTombstonedRlmCloses.get(state.activeSessionId) === record)
 					this.failedTombstonedRlmCloses.delete(state.activeSessionId);
-			},
-			(error: unknown) => {
+			})
+			.catch((error: unknown) => {
 				record.error = error;
-				record.disposeError = this.closeDisposeErrors.get(state);
-			},
-		);
+				record.cleanup = undefined;
+			});
 	}
 
 	// Half-bound sessions are hidden from other sessions' listings; the current
@@ -6784,10 +6781,8 @@ export class AgentDaemon {
 		let disposeError: unknown;
 		try {
 			await state.runtime.dispose();
-			this.closeDisposeErrors.delete(state);
 		} catch (error) {
 			disposeError = error;
-			this.closeDisposeErrors.set(state, error);
 		}
 		for (const client of state.clients) {
 			abortClientSnapshotStreaming(client, state.activeSessionId);
@@ -6798,21 +6793,21 @@ export class AgentDaemon {
 			removeDaemonClientSessionCapabilities(client, state.activeSessionId);
 		}
 		state.clients.clear();
+		if (disposeError) {
+			throw disposeError;
+		}
+		if (persistError) {
+			throw persistError;
+		}
+		if (cascadeError) {
+			throw cascadeError;
+		}
 		this.sessions.delete(state.activeSessionId);
 		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
 			if (sessionFile) {
 				await deleteSessionFile(sessionFile).catch(() => undefined);
 			}
-		}
-		if (disposeError) {
-			throw disposeError;
-		}
-		if (persistError && !keepsResumeEntry && reason !== "completed") {
-			throw persistError;
-		}
-		if (cascadeError && !keepsResumeEntry && reason !== "completed") {
-			throw cascadeError;
 		}
 	}
 
