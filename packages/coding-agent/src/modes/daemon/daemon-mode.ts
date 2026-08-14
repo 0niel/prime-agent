@@ -4519,6 +4519,10 @@ export class AgentDaemon {
 
 			case "cron_cancel": {
 				if (command.activeSessionId) this.getBoundSessionState(command.activeSessionId);
+				const existingJob = this.cronStore.list().find((job) => job.id === command.jobId);
+				if (!existingJob || !this.isPublicCronJob(existingJob)) {
+					throw new Error(`No cron job found: ${command.jobId}`);
+				}
 				const job = this.cronStore.cancel(command.jobId);
 				if (!job) {
 					throw new Error(`No cron job found: ${command.jobId}`);
