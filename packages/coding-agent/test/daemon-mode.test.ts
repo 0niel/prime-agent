@@ -875,79 +875,127 @@ describe("daemon mode helpers", () => {
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
 
-	it("fences stale same-id same-directory daemon release and delete by runtime identity", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-daemon-incarnation-test.sock", {
+	it("reports a stale old release after a same-id daemon republish without touching the replacement", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-daemon-stale-release-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: vi.fn(),
 		});
-		const parentState = makeState("parent-incarnation");
-		const oldState = makeState("old-incarnation", parentState.activeSessionId);
-		const newState = makeState("new-incarnation", parentState.activeSessionId);
-		const sessionDir = "/tmp/recycled-child-directory";
-		const oldSession = {
-			sessionFile: `${sessionDir}/old.jsonl`,
-			disposeAsync: vi.fn(async () => {}),
+		const parentState = makeState("parent-stale-release");
+		const replacementState = makeState("replacement-stale-release", parentState.activeSessionId);
+		const sessionDir = "/tmp/recycled-release-child-directory";
+		const oldSession = { sessionFile: `${sessionDir}/old.jsonl`, sessionId: "old-release-session" };
+		const replacementSession = {
+			sessionFile: `${sessionDir}/replacement.jsonl`,
+			sessionId: "replacement-release-session",
 		};
-		const newSession = {
-			sessionFile: `${sessionDir}/new.jsonl`,
-			disposeAsync: vi.fn(async () => {}),
+		replacementState.runtime = {
+			...replacementState.runtime,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: parentState.activeSessionId,
+				rlmChildId: "recycled-release-child",
+				sessionDir,
+			},
+			session: replacementSession,
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closeSession: ReturnType<typeof vi.fn>;
+			recordRlmSubagentDeletion: ReturnType<typeof vi.fn>;
+			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
 		};
-		for (const [state, session] of [
-			[oldState, oldSession],
-			[newState, newSession],
-		] as const) {
-			state.runtime = {
-				...state.runtime,
-				metadata: {
-					kind: "subagent",
-					createdAt: 1,
-					parentActiveSessionId: parentState.activeSessionId,
-					rlmChildId: "recycled-child",
-					sessionDir,
-				},
-				session,
-			} as never;
-		}
+		internals.sessions.set(parentState.activeSessionId, parentState);
+		internals.sessions.set(replacementState.activeSessionId, replacementState);
+		internals.closeSession = vi.fn(async () => {});
+		internals.recordRlmSubagentDeletion = vi.fn(async () => "tombstoned" as const);
+
+		await expect(
+			internals
+				.createSubagentRuntimeHost(parentState)
+				.releaseRlmSubagentRuntime?.(
+					{ session: oldSession } as never,
+					{ id: "recycled-release-child", sessionDir } as CreateRlmSubagentRuntimeOptions,
+					"cancelled",
+				),
+		).resolves.toEqual({ deletionDurability: "stale" });
+		expect(internals.recordRlmSubagentDeletion).not.toHaveBeenCalled();
+		expect(internals.closeSession).not.toHaveBeenCalled();
+		expect(internals.sessions.get(replacementState.activeSessionId)).toBe(replacementState);
+	});
+
+	it("reports a stale old delete before registry or job mutation, then deletes the exact replacement", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-daemon-stale-delete-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parentState = makeState("parent-stale-delete");
+		const replacementState = makeState("replacement-stale-delete", parentState.activeSessionId);
+		const sessionDir = "/tmp/recycled-delete-child-directory";
+		const oldSession = { sessionFile: `${sessionDir}/old.jsonl`, sessionId: "old-delete-session" };
+		const replacementSession = {
+			sessionFile: `${sessionDir}/replacement.jsonl`,
+			sessionId: "replacement-delete-session",
+		};
+		replacementState.runtime = {
+			...replacementState.runtime,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: parentState.activeSessionId,
+				rlmChildId: "recycled-delete-child",
+				sessionDir,
+			},
+			session: replacementSession,
+		} as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			closeSession: ReturnType<typeof vi.fn>;
 			recordRlmSubagentDeletion: ReturnType<typeof vi.fn>;
 			readLatestRlmSubagentRegistry: ReturnType<typeof vi.fn>;
+			cancelScheduledJobsForSessionFile: ReturnType<typeof vi.fn>;
 			createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
 		};
 		internals.sessions.set(parentState.activeSessionId, parentState);
-		// Model recreation: the old object is no longer resident, while the new
-		// object has exactly the same child id and directory.
-		internals.sessions.set(newState.activeSessionId, newState);
+		internals.sessions.set(replacementState.activeSessionId, replacementState);
 		internals.closeSession = vi.fn(async (state: ActiveSessionState) => {
 			internals.sessions.delete(state.activeSessionId);
 		});
 		internals.recordRlmSubagentDeletion = vi.fn(async () => "tombstoned" as const);
 		internals.readLatestRlmSubagentRegistry = vi.fn(async () => [
-			{ childId: "recycled-child", sessionDir, sessionFile: newSession.sessionFile },
+			{
+				childId: "recycled-delete-child",
+				sessionDir,
+				sessionFile: replacementSession.sessionFile,
+				sessionId: replacementSession.sessionId,
+			},
 		]);
+		internals.cancelScheduledJobsForSessionFile = vi.fn();
 		const host = internals.createSubagentRuntimeHost(parentState);
-		const options = { id: "recycled-child", sessionDir } as CreateRlmSubagentRuntimeOptions;
 
-		await expect(
-			host.releaseRlmSubagentRuntime?.({ session: oldSession } as never, options, "cancelled"),
-		).rejects.toMatchObject({ name: "RlmSubagentHostDeletionError", phase: "precommit" });
-		await expect(host.deleteRlmSubagentRuntime("recycled-child", oldSession as never)).rejects.toMatchObject({
-			name: "RlmSubagentHostDeletionError",
-			phase: "precommit",
+		await expect(host.deleteRlmSubagentRuntime("recycled-delete-child", oldSession as never)).resolves.toEqual({
+			deletionDurability: "stale",
 		});
+		expect(internals.readLatestRlmSubagentRegistry).not.toHaveBeenCalled();
 		expect(internals.recordRlmSubagentDeletion).not.toHaveBeenCalled();
 		expect(internals.closeSession).not.toHaveBeenCalled();
-		expect(oldSession.disposeAsync).not.toHaveBeenCalled();
-		expect(newSession.disposeAsync).not.toHaveBeenCalled();
-		expect(internals.sessions.get(newState.activeSessionId)).toBe(newState);
+		expect(internals.cancelScheduledJobsForSessionFile).not.toHaveBeenCalled();
+		expect(internals.sessions.get(replacementState.activeSessionId)).toBe(replacementState);
 
 		await expect(
-			host.releaseRlmSubagentRuntime?.({ session: newSession } as never, options, "cancelled"),
+			host.deleteRlmSubagentRuntime("recycled-delete-child", replacementSession as never, {
+				childId: "recycled-delete-child",
+				sessionDir,
+				sessionFile: replacementSession.sessionFile,
+				sessionId: replacementSession.sessionId,
+				generation: 1,
+				assertCurrent: vi.fn(),
+			}),
 		).resolves.toEqual({ deletionDurability: "tombstoned" });
 		expect(internals.recordRlmSubagentDeletion).toHaveBeenCalledOnce();
-		expect(internals.closeSession).toHaveBeenCalledOnce();
-		expect(internals.closeSession).toHaveBeenCalledWith(newState, "killed");
+		expect(internals.closeSession).toHaveBeenCalledWith(replacementState, "killed", false);
+		expect(internals.cancelScheduledJobsForSessionFile).toHaveBeenCalledWith(replacementSession.sessionFile);
+		expect(internals.sessions.has(replacementState.activeSessionId)).toBe(false);
 	});
 
 	it("classifies scheduler failure after a daemon tombstone as postcommit", async () => {

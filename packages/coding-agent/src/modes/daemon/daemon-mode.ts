@@ -2401,7 +2401,6 @@ export class AgentDaemon {
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status, authority) => {
 				try {
-					authority?.assertCurrent();
 					// Resolve the exact resident incarnation before any tombstone append. An
 					// older finalizer can share both child id and directory with its
 					// replacement, so neither field is an object-identity fence.
@@ -2411,6 +2410,12 @@ export class AgentDaemon {
 							candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 							candidate.runtime.metadata.rlmChildId === options.id,
 					);
+					// A same-id republish supersedes an older finalizer without giving it
+					// authority over the replacement.
+					if (state !== undefined && state.runtime.session !== runtime.session) {
+						return { deletionDurability: "stale" };
+					}
+					authority?.assertCurrent();
 					if (
 						!state ||
 						state.runtime.session !== runtime.session ||
@@ -2457,13 +2462,18 @@ export class AgentDaemon {
 				this.recordRlmSubagentDeletion(parentState, childId, authority),
 			deleteRlmSubagentRuntime: async (childId, session, authority) => {
 				try {
-					authority?.assertCurrent();
 					const state = [...this.sessions.values()].find(
 						(candidate) =>
 							candidate.runtime.metadata.kind === "subagent" &&
 							candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
 							candidate.runtime.metadata.rlmChildId === childId,
 					);
+					// A same-id republish supersedes an older deleter without letting it
+					// mutate the replacement's registry, jobs, or lifetime.
+					if (state !== undefined && session !== undefined && state.runtime.session !== session) {
+						return { deletionDurability: "stale" };
+					}
+					authority?.assertCurrent();
 					const persisted = (await this.readLatestRlmSubagentRegistry(parentState, true)).find(
 						(entry) => entry.childId === childId,
 					);
