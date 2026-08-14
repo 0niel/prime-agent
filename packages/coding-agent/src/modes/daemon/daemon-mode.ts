@@ -6803,37 +6803,61 @@ export class AgentDaemon {
 		if (!this.sessions.has(state.activeSessionId)) {
 			return;
 		}
+		let closeError: unknown;
+		const captureCloseError = (error: unknown): void => {
+			closeError ??= error;
+		};
+		const retainsForTombstonedRetry =
+			this.failedTombstonedRlmCloses.has(state.activeSessionId) || this.isQuarantinedRlmState(state);
 		if (reason === "killed") {
-			this.cancelScheduledJobsForSession(state);
+			try {
+				this.cancelScheduledJobsForSession(state);
+			} catch (error) {
+				captureCloseError(error);
+			}
 		} else if (reason !== "shutdown" && reason !== "update") {
-			this.cancelSubagentRlmHeartbeats(state);
+			try {
+				this.cancelSubagentRlmHeartbeats(state);
+			} catch (error) {
+				captureCloseError(error);
+			}
 		}
+		// A tombstoned close that failed before teardown is retried intact.
+		if (closeError && retainsForTombstonedRetry) throw closeError;
 		// Abort in-flight status work before any await/dispose so it can't write
 		// agent_status to a session being torn down.
 		this.summarizer.forget(state.activeSessionId);
-		const cascadeError = cascadeChildren
-			? await this.closeChildSessions(state, reason, waitForAbort, descendants)
-			: undefined;
+		if (cascadeChildren) {
+			const cascadeError = await this.closeChildSessions(state, reason, waitForAbort, descendants);
+			if (cascadeError) captureCloseError(cascadeError);
+		}
 		// Empty draft (no messages, config, or jobs): discard rather than persist an
 		// empty session file. Mirrors the detach-time discard so a config-bearing
 		// draft closed via kill/completed is never wiped.
 		const keepsResumeEntry = this.closeKeepsResumeEntry(reason);
 		const isEmptyDraftSession = !keepsResumeEntry && this.isEmptyDraftContent(state);
-		let persistError: unknown;
 		// Clean shutdown leaves the session un-archived so it stays in the resume list.
 		if (!keepsResumeEntry && !isEmptyDraftSession) {
 			try {
 				this.archiveSession(state);
 			} catch (error) {
-				persistError = error;
+				captureCloseError(error);
 			}
 		}
 		cancelPendingExtensionUiRequests(state);
 		if (reason === "killed" || reason === "shutdown" || reason === "replaced" || reason === "update") {
-			await this.abortBashForClose(state);
+			try {
+				await this.abortBashForClose(state);
+			} catch (error) {
+				captureCloseError(error);
+			}
 		}
 		if (reason === "update") {
-			state.runtime.session.abortForUpdateRestart();
+			try {
+				state.runtime.session.abortForUpdateRestart();
+			} catch (error) {
+				captureCloseError(error);
+			}
 		}
 		if (reason === "killed") {
 			const abort = state.runtime.session.abort().catch(() => undefined);
@@ -6845,11 +6869,12 @@ export class AgentDaemon {
 		}
 		this.recordWorkerRecoveryState(state, `closed:${reason}`, false);
 		state.unsubscribe?.();
-		let disposeError: unknown;
 		try {
-			await state.runtime.dispose();
+			// A tombstoned record must retain its lease until the daemon commits the
+			// whole close. Normal direct runtime disposal still releases its own lease.
+			await state.runtime.dispose({ releaseSessionLease: false });
 		} catch (error) {
-			disposeError = error;
+			captureCloseError(error);
 		}
 		for (const client of state.clients) {
 			abortClientSnapshotStreaming(client, state.activeSessionId);
@@ -6860,15 +6885,11 @@ export class AgentDaemon {
 			removeDaemonClientSessionCapabilities(client, state.activeSessionId);
 		}
 		state.clients.clear();
-		if (disposeError) {
-			throw disposeError;
+		if (closeError && retainsForTombstonedRetry) {
+			throw closeError;
 		}
-		if (persistError) {
-			throw persistError;
-		}
-		if (cascadeError) {
-			throw cascadeError;
-		}
+		// Failed non-tombstoned closes are irrevocable: never leave a disposed,
+		// targetable resident behind merely because persistence or cleanup failed.
 		this.sessions.delete(state.activeSessionId);
 		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
@@ -6876,6 +6897,8 @@ export class AgentDaemon {
 				await deleteSessionFile(sessionFile).catch(() => undefined);
 			}
 		}
+		state.runtime.releaseSessionLease?.();
+		if (closeError) throw closeError;
 	}
 
 	private async closeChildSessions(

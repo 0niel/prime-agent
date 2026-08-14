@@ -258,7 +258,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 	}
 
-	private releaseSessionLease(): void {
+	/** Release the runtime-owned session-file lease after its daemon has committed retirement. */
+	releaseSessionLease(): void {
 		this._sessionLease?.release();
 		this._sessionLease = undefined;
 	}
@@ -756,7 +757,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return { cancelled: false };
 	}
 
-	private async disposeOnce(): Promise<void> {
+	private async disposeOnce(releaseSessionLease = true): Promise<void> {
 		this.session.beginClosing();
 		let disposeError: unknown;
 		try {
@@ -793,12 +794,12 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				throw disposeError;
 			}
 		} finally {
-			this.releaseSessionLease();
+			if (releaseSessionLease) this.releaseSessionLease();
 		}
 	}
 
-	async dispose(): Promise<void> {
-		const disposePromise = this.disposePromise ?? this.disposeOnce();
+	async dispose(options: { releaseSessionLease?: boolean } = {}): Promise<void> {
+		const disposePromise = this.disposePromise ?? this.disposeOnce(options.releaseSessionLease !== false);
 		this.disposePromise = disposePromise;
 		try {
 			await disposePromise;
