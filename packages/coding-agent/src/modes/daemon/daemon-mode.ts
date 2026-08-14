@@ -344,6 +344,8 @@ const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SUPPORT
 const CLIENT_CATCHUP_RETRY_MS = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
 const SUPERVISOR_FENCE_POLL_MS = 250;
+const TOMBSTONED_CLOSE_RETRY_BASE_MS = 250;
+const TOMBSTONED_CLOSE_RETRY_MAX_MS = 30_000;
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
 	"Prime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been partially completed.\n" +
@@ -444,6 +446,8 @@ interface FailedTombstonedRlmClose {
 	readonly childId: string;
 	cleanup?: Promise<void>;
 	error?: unknown;
+	retryAttempt: number;
+	retryTimer?: ReturnType<typeof setTimeout>;
 }
 
 export class AgentDaemon {
@@ -1302,8 +1306,30 @@ export class AgentDaemon {
 		savedSessions: SessionInfo[],
 		scheduledJobs: AgentCronJob[],
 	): Promise<SessionSummary[]> {
-		const passiveByPath = await this.passiveRlmSubagentsByPath(savedSessions);
-		const savedByPath = new Map(savedSessions.map((session) => [resolve(session.path), session]));
+		const privatePaths = new Set(
+			[...this.sessions.values()]
+				.filter((state) => !this.isPublicRlmState(state))
+				.flatMap((state) =>
+					state.runtime.session.sessionFile ? [resolve(state.runtime.session.sessionFile)] : [],
+				),
+		);
+		let removedPrivateDescendant = true;
+		while (removedPrivateDescendant) {
+			removedPrivateDescendant = false;
+			for (const saved of savedSessions) {
+				if (
+					!privatePaths.has(resolve(saved.path)) &&
+					saved.parentSessionPath &&
+					privatePaths.has(resolve(saved.parentSessionPath))
+				) {
+					privatePaths.add(resolve(saved.path));
+					removedPrivateDescendant = true;
+				}
+			}
+		}
+		const publicSavedSessions = savedSessions.filter((session) => !privatePaths.has(resolve(session.path)));
+		const passiveByPath = await this.passiveRlmSubagentsByPath(publicSavedSessions);
+		const savedByPath = new Map(publicSavedSessions.map((session) => [resolve(session.path), session]));
 		for (const [path, passive] of passiveByPath) {
 			savedByPath.set(path, passive.info);
 		}
@@ -2034,10 +2060,16 @@ export class AgentDaemon {
 		return job;
 	}
 
-	private listHeartbeats(): AgentConnectionHeartbeat[] {
+	private listHeartbeats(activeSessionId?: string): AgentConnectionHeartbeat[] {
 		return this.cronStore
 			.list()
-			.filter((job) => isHeartbeatCronJob(job) && (job.status === "active" || job.status === "paused"))
+			.filter(
+				(job) =>
+					isHeartbeatCronJob(job) &&
+					(job.status === "active" || job.status === "paused") &&
+					(!activeSessionId || job.activeSessionId === activeSessionId) &&
+					this.isPublicCronJob(job),
+			)
 			.map((job) => {
 				const state = this.sessions.get(job.activeSessionId);
 				const summary = state ? summaryForActiveSession(state) : undefined;
@@ -2289,6 +2321,12 @@ export class AgentDaemon {
 			sessionFile !== undefined &&
 			resolve(current.sessionFile) === resolve(sessionFile)
 		);
+	}
+
+	private isPublicCronJob(job: AgentCronJob): boolean {
+		const state =
+			this.sessions.get(job.activeSessionId) ?? this.failedTombstonedRlmCloses.get(job.activeSessionId)?.state;
+		return state === undefined || this.isPublicRlmState(state);
 	}
 
 	private findSessionBySessionFile(sessionFile: string | undefined): ActiveSessionState | undefined {
@@ -3734,7 +3772,7 @@ export class AgentDaemon {
 				let sessionDir: string | undefined;
 				if ("activeSessionId" in command) {
 					activeSessionId = command.activeSessionId;
-					const sessionManager = this.getSessionState(activeSessionId).runtime.session.sessionManager;
+					const sessionManager = this.getBoundSessionState(activeSessionId).runtime.session.sessionManager;
 					cwd = sessionManager.getCwd();
 					sessionDir = sessionManager.getSessionDir();
 				} else {
@@ -3889,7 +3927,7 @@ export class AgentDaemon {
 
 			case "detach": {
 				if (command.activeSessionId) {
-					const state = this.getSessionState(command.activeSessionId);
+					const state = this.getBoundSessionState(command.activeSessionId);
 					this.detachClientFromSession(client, state);
 				} else {
 					this.detachClient(client);
@@ -3904,7 +3942,7 @@ export class AgentDaemon {
 			}
 
 			case "rename": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const name = command.name.trim();
 				if (!name) {
 					throw new Error("Session name cannot be empty");
@@ -3915,7 +3953,7 @@ export class AgentDaemon {
 
 			case "rename_saved_session": {
 				if (command.activeSessionId) {
-					this.getSessionState(command.activeSessionId);
+					this.getBoundSessionState(command.activeSessionId);
 				}
 				const state = this.findActiveSessionByFile(command.sessionPath);
 				const name = command.name.trim();
@@ -3956,7 +3994,7 @@ export class AgentDaemon {
 
 			case "delete_saved_session": {
 				if (command.activeSessionId) {
-					this.getSessionState(command.activeSessionId);
+					this.getBoundSessionState(command.activeSessionId);
 				}
 				if (this.findActiveSessionByFile(command.sessionPath)) {
 					throw new Error("Cannot delete the currently active session");
@@ -4142,26 +4180,26 @@ export class AgentDaemon {
 			}
 
 			case "restore_next_turn": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.restorePendingNextTurnMessages(command.messages);
 				return success(command.id, "restore_next_turn");
 			}
 
 			case "restore_actions": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const restored = await state.runtime.session.restoreSessionActions(command.snapshot);
 				if (restored > 0) this.recordWorkerRecoveryState(state, "actions_restored", true);
 				return success(command.id, "restore_actions", { restored });
 			}
 
 			case "append_custom_message": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				await state.runtime.session.sendCustomMessage(command.message);
 				return success(command.id, "append_custom_message");
 			}
 
 			case "resume_queue": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				if (!state.runtime.session.resumeQueuedWork()) {
 					const error = new Error("No queued work to resume");
 					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
@@ -4171,7 +4209,7 @@ export class AgentDaemon {
 
 			case "send_message": {
 				const fromState = command.fromActiveSessionId
-					? this.getSessionState(command.fromActiveSessionId)
+					? this.getBoundSessionState(command.fromActiveSessionId)
 					: undefined;
 				const receipt = await this.sendAgentSessionMessage({
 					targetSelector: command.targetActiveSessionId,
@@ -4201,7 +4239,7 @@ export class AgentDaemon {
 			}
 
 			case "agent_messages_clear": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const cleared = await this.withAgentMessageTargetLock(state.activeSessionId, async () => {
 					this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
 					return state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt);
@@ -4210,13 +4248,13 @@ export class AgentDaemon {
 			}
 
 			case "abort": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort");
 			}
 
 			case "start_side_question": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				if (this.sideQuestionRuns.has(command.sideQuestionId)) {
 					throw new Error(`Side question already exists: ${command.sideQuestionId}`);
 				}
@@ -4254,7 +4292,7 @@ export class AgentDaemon {
 			}
 
 			case "abort_side_question": {
-				this.getSessionState(command.activeSessionId);
+				this.getBoundSessionState(command.activeSessionId);
 				const entry = this.sideQuestionRuns.get(command.sideQuestionId);
 				if (!entry || entry.client !== client || entry.activeSessionId !== command.activeSessionId) {
 					return success(command.id, "abort_side_question", { aborted: false });
@@ -4264,7 +4302,7 @@ export class AgentDaemon {
 			}
 
 			case "execute_bash": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				if (state.runtime.session.isBashRunning) {
 					throw new Error("A bash command is already running");
 				}
@@ -4286,7 +4324,7 @@ export class AgentDaemon {
 			}
 
 			case "execute_bash_and_wait": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(
 					command.id,
 					"execute_bash_and_wait",
@@ -4295,19 +4333,19 @@ export class AgentDaemon {
 			}
 
 			case "abort_bash": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.abortBash();
 				return success(command.id, "abort_bash");
 			}
 
 			case "cancel_rlm_child": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const cancelled = state.runtime.session.cancelRlmChildRun(command.childId);
 				return success(command.id, "cancel_rlm_child", { cancelled });
 			}
 
 			case "delete_rlm_subagent": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const isResidentChildRunning = () => {
 					const childState = [...this.sessions.values()].find(
 						(candidate) =>
@@ -4329,13 +4367,13 @@ export class AgentDaemon {
 			}
 
 			case "wait_for_idle": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				await state.runtime.session.waitForIdle();
 				return success(command.id, "wait_for_idle");
 			}
 
 			case "wait_for_headless_completion": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(
 					command.id,
 					"wait_for_headless_completion",
@@ -4344,7 +4382,7 @@ export class AgentDaemon {
 			}
 
 			case "get_session_header": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_session_header", {
 					header: state.runtime.session.sessionManager.getHeader(),
 				});
@@ -4368,25 +4406,25 @@ export class AgentDaemon {
 			}
 
 			case "get_session_stats": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const stats: SessionStats = state.runtime.session.getSessionStats();
 				return success(command.id, "get_session_stats", stats);
 			}
 
 			case "get_context_tree": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_context_tree", state.runtime.session.getContextTree());
 			}
 
 			case "get_commands": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_commands", {
 					commands: createAgentConnectionCommands(state.runtime.session),
 				});
 			}
 
 			case "get_resource_snapshot": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(
 					command.id,
 					"get_resource_snapshot",
@@ -4395,14 +4433,14 @@ export class AgentDaemon {
 			}
 
 			case "get_available_models": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_available_models", {
 					models: await state.runtime.session.modelRegistry.refreshAvailableModels(),
 				});
 			}
 
 			case "get_model_catalog": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(
 					command.id,
 					"get_model_catalog",
@@ -4411,7 +4449,7 @@ export class AgentDaemon {
 			}
 
 			case "get_queue": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_queue", {
 					steering: [...state.runtime.session.getSteeringMessagePreviews()],
 					followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
@@ -4419,7 +4457,7 @@ export class AgentDaemon {
 			}
 
 			case "mutate_queued_message": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const status = state.runtime.session.mutateQueuedMessage(
 					command.lane,
 					command.index,
@@ -4430,19 +4468,23 @@ export class AgentDaemon {
 			}
 
 			case "clear_queue": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "clear_queue", state.runtime.session.clearQueue());
 			}
 
 			case "abort_and_clear_queue": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const queue = state.runtime.session.clearQueue();
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort_and_clear_queue", queue);
 			}
 
 			case "cron_list": {
+				if (command.activeSessionId) this.getBoundSessionState(command.activeSessionId);
 				const jobs = this.cronStore.list().filter((job) => {
+					if (!this.isPublicCronJob(job)) {
+						return false;
+					}
 					if (!command.includeInactive && job.status !== "active" && job.status !== "paused") {
 						return false;
 					}
@@ -4455,11 +4497,13 @@ export class AgentDaemon {
 			}
 
 			case "heartbeats_list":
+				if (command.activeSessionId) this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "heartbeats_list", {
-					heartbeats: this.listHeartbeats(),
+					heartbeats: this.listHeartbeats(command.activeSessionId),
 				});
 
 			case "heartbeat_manage": {
+				if (this.sessions.has(command.activeSessionId)) this.getBoundSessionState(command.activeSessionId);
 				const heartbeat = this.manageHeartbeat(command.activeSessionId, command.jobId, command.action);
 				if (!heartbeat) {
 					throw new Error(`No active heartbeat found: ${command.jobId}`);
@@ -4468,12 +4512,13 @@ export class AgentDaemon {
 			}
 
 			case "cron_add": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const job = this.createCronJobForState(state, command.schedule, command.prompt);
 				return success(command.id, "cron_add", { job });
 			}
 
 			case "cron_cancel": {
+				if (command.activeSessionId) this.getBoundSessionState(command.activeSessionId);
 				const job = this.cronStore.cancel(command.jobId);
 				if (!job) {
 					throw new Error(`No cron job found: ${command.jobId}`);
@@ -4487,7 +4532,7 @@ export class AgentDaemon {
 			}
 
 			case "heartbeat_get": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const heartbeat = this.cronStore.getHeartbeat(state.activeSessionId);
 				return success(command.id, "heartbeat_get", {
 					heartbeat: heartbeat ?? null,
@@ -4495,14 +4540,14 @@ export class AgentDaemon {
 			}
 
 			case "heartbeat_set": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const deliveryMode = normalizeHeartbeatDeliveryMode(command.deliveryMode);
 				const heartbeat = this.createHeartbeatForState(state, command.schedule, command.prompt, deliveryMode);
 				return success(command.id, "heartbeat_set", { heartbeat });
 			}
 
 			case "heartbeat_update": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const heartbeat = this.updateHeartbeatForState(state, command.action);
 				return success(command.id, "heartbeat_update", {
 					heartbeat: heartbeat ?? null,
@@ -4510,7 +4555,7 @@ export class AgentDaemon {
 			}
 
 			case "set_model": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const session = state.runtime.session;
 				const availableModels = await session.modelRegistry.refreshAvailableModels();
 				const model = availableModels.find((candidate) => {
@@ -4526,7 +4571,7 @@ export class AgentDaemon {
 			}
 
 			case "cycle_model": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const session = state.runtime.session;
 				const result = await session.cycleModel(command.direction, {
 					waitForExtensions: !(session.isStreaming || session.isCompacting),
@@ -4535,68 +4580,68 @@ export class AgentDaemon {
 			}
 
 			case "set_scoped_models": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.setScopedModels(command.scopedModels);
 				return success(command.id, "set_scoped_models");
 			}
 
 			case "set_thinking_level": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.setThinkingLevel(command.level);
 				return success(command.id, "set_thinking_level");
 			}
 
 			case "set_service_tier": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.setServiceTier(command.serviceTier);
 				return success(command.id, "set_service_tier");
 			}
 
 			case "cycle_thinking_level": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const level = state.runtime.session.cycleThinkingLevel();
 				return success(command.id, "cycle_thinking_level", level ? { level } : null);
 			}
 
 			case "set_transport": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.settingsManager.setTransport(command.transport);
 				state.runtime.session.agent.transport = command.transport;
 				return success(command.id, "set_transport");
 			}
 
 			case "set_steering_mode": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.setSteeringMode(command.mode);
 				return success(command.id, "set_steering_mode");
 			}
 
 			case "set_follow_up_mode": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.setFollowUpMode(command.mode);
 				return success(command.id, "set_follow_up_mode");
 			}
 
 			case "set_auto_compaction": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.setAutoCompactionEnabled(command.enabled);
 				return success(command.id, "set_auto_compaction");
 			}
 
 			case "set_auto_retry": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.setAutoRetryEnabled(command.enabled);
 				return success(command.id, "set_auto_retry");
 			}
 
 			case "compact": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const result = await state.runtime.session.compact(command.customInstructions);
 				return success(command.id, "compact", result);
 			}
 
 			case "refine": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const result = await state.runtime.session.refine({
 					instructions: command.instructions,
 					rollbackId: command.rollbackId,
@@ -4606,25 +4651,25 @@ export class AgentDaemon {
 			}
 
 			case "abort_compaction": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.abortCompaction();
 				return success(command.id, "abort_compaction");
 			}
 
 			case "abort_branch_summary": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.abortBranchSummary();
 				return success(command.id, "abort_branch_summary");
 			}
 
 			case "abort_retry": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.abortRetry();
 				return success(command.id, "abort_retry");
 			}
 
 			case "reload": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				// Reload re-evaluates extension modules, which capture client env
 				// (e.g. herdr pane identity) synchronously at load.
 				await withClientEnv(state.clientEnv, () => state.runtime.session.reload());
@@ -4632,7 +4677,7 @@ export class AgentDaemon {
 			}
 
 			case "new_session": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
 				const result = await state.runtime.newSession(options);
 				this.rebindCronJobsToState(state);
@@ -4640,7 +4685,7 @@ export class AgentDaemon {
 			}
 
 			case "switch_session": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const result = await state.runtime.switchSession(command.sessionPath, {
 					cwdOverride: command.cwdOverride,
 				});
@@ -4649,7 +4694,7 @@ export class AgentDaemon {
 			}
 
 			case "fork": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const result = await state.runtime.fork(command.entryId, {
 					position: command.position,
 				});
@@ -4658,7 +4703,7 @@ export class AgentDaemon {
 			}
 
 			case "navigate_tree": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const result = await state.runtime.session.navigateTree(command.targetId, {
 					summarize: command.summarize,
 					customInstructions: command.customInstructions,
@@ -4669,25 +4714,25 @@ export class AgentDaemon {
 			}
 
 			case "import_jsonl": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const result = await state.runtime.importFromJsonl(command.inputPath, command.cwdOverride);
 				return success(command.id, "import_jsonl", result);
 			}
 
 			case "export_html": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const path = await state.runtime.session.exportToHtml(command.outputPath);
 				return success(command.id, "export_html", { path });
 			}
 
 			case "export_jsonl": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const path = state.runtime.session.exportToJsonl(command.outputPath);
 				return success(command.id, "export_jsonl", { path });
 			}
 
 			case "set_session_name": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const name = command.name.trim();
 				if (!name) {
 					throw new Error("Session name cannot be empty");
@@ -4697,25 +4742,25 @@ export class AgentDaemon {
 			}
 
 			case "get_rlm_max_depth_status": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_rlm_max_depth_status", state.runtime.session.getRlmMaxDepthStatus());
 			}
 
 			case "set_rlm_max_depth": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const result = await state.runtime.session.setRlmMaxDepth(command.maxDepth, { global: command.global });
 				return success(command.id, "set_rlm_max_depth", result);
 			}
 
 			case "get_session_context": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_session_context", {
 					context: state.runtime.session.buildSessionContext(),
 				});
 			}
 
 			case "get_session_tree": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_session_tree", {
 					flatNodes: state.runtime.session.sessionManager.getFlatTree(),
 					leafId: state.runtime.session.sessionManager.getLeafId(),
@@ -4723,28 +4768,28 @@ export class AgentDaemon {
 			}
 
 			case "get_user_messages_for_forking": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_user_messages_for_forking", {
 					messages: state.runtime.session.getUserMessagesForForking(),
 				});
 			}
 
 			case "get_last_assistant_text": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_last_assistant_text", {
 					text: state.runtime.session.getLastAssistantText(),
 				});
 			}
 
 			case "get_system_prompt": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_system_prompt", {
 					systemPrompt: state.runtime.session.systemPrompt,
 				});
 			}
 
 			case "get_tool_definition": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				return success(command.id, "get_tool_definition", {
 					toolDefinition: createAgentConnectionToolDefinition(
 						state.runtime.session.getToolDefinition(command.name),
@@ -4753,13 +4798,13 @@ export class AgentDaemon {
 			}
 
 			case "set_session_entry_label": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				state.runtime.session.sessionManager.appendLabelChange(command.entryId, command.label);
 				return success(command.id, "set_session_entry_label");
 			}
 
 			case "extension_ui_response": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				const pending = state.extensionUiRequests.get(command.requestId);
 				if (!pending) {
 					throw new Error(`Unknown extension UI request: ${command.requestId}`);
@@ -5447,32 +5492,57 @@ export class AgentDaemon {
 	private detachTombstonedClose(parent: ActiveSessionState, state: ActiveSessionState, childId: string): void {
 		const existing = this.failedTombstonedRlmCloses.get(state.activeSessionId);
 		if (existing?.state === state) {
-			if (existing.error !== undefined && !existing.cleanup) {
-				const cleanup = Promise.resolve().then(() => this.closeSession(state, "killed", false));
-				existing.cleanup = cleanup
-					.then(() => {
-						if (this.failedTombstonedRlmCloses.get(state.activeSessionId) === existing)
-							this.failedTombstonedRlmCloses.delete(state.activeSessionId);
-					})
-					.catch((error: unknown) => {
-						existing.error = error;
-						existing.cleanup = undefined;
-					});
+			if (existing.error !== undefined && !existing.cleanup && !existing.retryTimer) {
+				this.scheduleTombstonedCloseRetry(existing);
 			}
 			return;
 		}
-		const record: FailedTombstonedRlmClose = { state, parentActiveSessionId: parent.activeSessionId, childId };
+		const record: FailedTombstonedRlmClose = {
+			state,
+			parentActiveSessionId: parent.activeSessionId,
+			childId,
+			retryAttempt: 0,
+		};
 		this.failedTombstonedRlmCloses.set(state.activeSessionId, record);
-		const cleanup = Promise.resolve().then(() => this.closeSession(state, "killed", false));
-		record.cleanup = cleanup
-			.then(() => {
-				if (this.failedTombstonedRlmCloses.get(state.activeSessionId) === record)
-					this.failedTombstonedRlmCloses.delete(state.activeSessionId);
-			})
-			.catch((error: unknown) => {
+		this.runTombstonedCloseAttempt(record);
+	}
+
+	private runTombstonedCloseAttempt(record: FailedTombstonedRlmClose): void {
+		if (this.shuttingDown || this.failedTombstonedRlmCloses.get(record.state.activeSessionId) !== record) return;
+		record.retryTimer = undefined;
+		record.error = undefined;
+		const cleanup = Promise.resolve().then(() => this.closeSession(record.state, "killed", false));
+		record.cleanup = cleanup;
+		void cleanup.then(
+			() => {
+				if (this.failedTombstonedRlmCloses.get(record.state.activeSessionId) !== record) return;
+				this.failedTombstonedRlmCloses.delete(record.state.activeSessionId);
+			},
+			(error: unknown) => {
+				if (this.failedTombstonedRlmCloses.get(record.state.activeSessionId) !== record) return;
 				record.error = error;
 				record.cleanup = undefined;
-			});
+				this.scheduleTombstonedCloseRetry(record);
+			},
+		);
+	}
+
+	private scheduleTombstonedCloseRetry(record: FailedTombstonedRlmClose): void {
+		if (this.shuttingDown || record.retryTimer || record.cleanup) return;
+		const delayMs = Math.min(
+			TOMBSTONED_CLOSE_RETRY_BASE_MS * 2 ** record.retryAttempt,
+			TOMBSTONED_CLOSE_RETRY_MAX_MS,
+		);
+		record.retryAttempt++;
+		record.retryTimer = setTimeout(() => this.runTombstonedCloseAttempt(record), delayMs);
+		record.retryTimer.unref();
+	}
+
+	private clearTombstonedCloseRetries(): void {
+		for (const record of this.failedTombstonedRlmCloses.values()) {
+			if (record.retryTimer) clearTimeout(record.retryTimer);
+			record.retryTimer = undefined;
+		}
 	}
 
 	// Half-bound sessions are hidden from other sessions' listings; the current
@@ -6545,7 +6615,7 @@ export class AgentDaemon {
 			type: "attach",
 			activeSessionId: state.activeSessionId,
 		});
-		if (this.sessions.get(state.activeSessionId) !== state) {
+		if (this.sessions.get(state.activeSessionId) !== state || !this.isPublicRlmState(state)) {
 			finishClientSnapshotStreaming(client, state.activeSessionId);
 			if (!client.snapshotStreaming && client.catchupActiveSessionIds?.size) {
 				void this.catchUpBackpressuredClient(client).catch((catchupError) =>
@@ -6922,6 +6992,7 @@ export class AgentDaemon {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		this.clearTombstonedCloseRetries();
 		if (this.supervisorMonitorTimer) {
 			clearTimeout(this.supervisorMonitorTimer);
 			this.supervisorMonitorTimer = undefined;

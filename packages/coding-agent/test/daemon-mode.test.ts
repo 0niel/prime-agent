@@ -5329,7 +5329,10 @@ describe("daemon mode helpers", () => {
 			messages: [],
 		} as unknown as DaemonOutbound);
 		client.catchupActiveSessionIds = new Set([otherState.activeSessionId]);
-		internals.sessions.delete(state.activeSessionId);
+		(internals as unknown as { closingSessions: Map<string, unknown> }).closingSessions.set(
+			state.activeSessionId,
+			{},
+		);
 		resolveAttach({
 			activeSessionId: state.activeSessionId,
 			snapshot: { summary: {}, state: {}, messages: [] },
@@ -10757,6 +10760,237 @@ describe("daemon tombstoned retirement", () => {
 				activeSessionId: child.activeSessionId,
 			}),
 		).rejects.toThrow("unavailable");
+	});
+
+	it("keeps private session reads and scheduled-job catalogs unpublished", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-private-publications-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+			});
+			const privateState = makeState("private-session");
+			privateState.runtime = {
+				...privateState.runtime,
+				metadata: { kind: "top-level", createdAt: 1 },
+				session: {
+					sessionId: "private-stable-id",
+					sessionFile: join(tempDir, "private.jsonl"),
+					sessionManager: {
+						getCwd: () => tempDir,
+						getSessionDir: () => tempDir,
+					},
+				},
+			} as never;
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				closingSessions: Map<string, unknown>;
+				cronStore: AgentCronJobStore;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+				buildSessionListWithPassiveRlmSubagents(
+					activeSessions: ActiveSessionState[],
+					savedSessions: SessionInfo[],
+					scheduledJobs: AgentCronJob[],
+				): Promise<SessionSummary[]>;
+			};
+			internals.sessions.set(privateState.activeSessionId, privateState);
+			internals.closingSessions.set(privateState.activeSessionId, {});
+			const savedInfo = (path: string, id: string, parentSessionPath?: string): SessionInfo => ({
+				path,
+				id,
+				cwd: tempDir,
+				parentSessionPath,
+				rlmDepth: parentSessionPath ? 1 : 0,
+				created: new Date(0),
+				modified: new Date(0),
+				messageCount: 1,
+				firstMessage: id,
+				allMessagesText: id,
+			});
+			const privateSaved = savedInfo(join(tempDir, "private.jsonl"), "private-stable-id");
+			const privateDescendant = savedInfo(
+				join(tempDir, "private-descendant.jsonl"),
+				"private-descendant",
+				privateSaved.path,
+			);
+			const publicSaved = savedInfo(join(tempDir, "public.jsonl"), "public-stable-id");
+			const savedList = await internals.buildSessionListWithPassiveRlmSubagents(
+				[],
+				[privateSaved, privateDescendant, publicSaved],
+				[],
+			);
+			expect(savedList.map((session) => session.sessionId)).toEqual([publicSaved.id]);
+
+			const privateCron = internals.cronStore.create({
+				activeSessionId: privateState.activeSessionId,
+				sessionId: "private-stable-id",
+				sessionFile: join(tempDir, "private.jsonl"),
+				cwd: tempDir,
+				scheduleText: "in 1m",
+				prompt: "private cron",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+			internals.cronStore.cancel(privateCron.id, new Date("2026-01-01T12:00:01.000Z"));
+			const privateHeartbeat = internals.cronStore.createHeartbeat({
+				activeSessionId: privateState.activeSessionId,
+				sessionId: "private-stable-id",
+				sessionFile: join(tempDir, "private.jsonl"),
+				cwd: tempDir,
+				scheduleText: "every 5m",
+				prompt: "private heartbeat",
+				now: new Date("2026-01-01T12:00:02.000Z"),
+			});
+			const globalCron = internals.cronStore.create({
+				activeSessionId: "unloaded-session",
+				sessionId: "unloaded-stable-id",
+				sessionFile: join(tempDir, "unloaded.jsonl"),
+				cwd: tempDir,
+				scheduleText: "in 2m",
+				prompt: "unloaded cron",
+				now: new Date("2026-01-01T12:00:03.000Z"),
+			});
+
+			const guardedMutations = [
+				{ type: "restore_next_turn", messages: [] },
+				{ type: "append_custom_message", message: { customType: "test", content: "private" } },
+				{ type: "resume_queue" },
+				{ type: "agent_messages_clear" },
+				{ type: "abort" },
+				{ type: "abort_side_question", sideQuestionId: "side" },
+				{ type: "execute_bash", command: "echo private" },
+				{ type: "execute_bash_and_wait", command: "echo private" },
+				{ type: "abort_bash" },
+				{ type: "cancel_rlm_child", childId: "child" },
+				{ type: "delete_rlm_subagent", childId: "child" },
+				{ type: "clear_queue" },
+				{ type: "abort_and_clear_queue" },
+				{ type: "cron_add", schedule: "in 1m", prompt: "private" },
+				{ type: "cron_cancel", jobId: privateCron.id },
+				{ type: "heartbeat_set", schedule: "every 5m", prompt: "private" },
+				{ type: "set_thinking_level", level: "medium" },
+				{ type: "set_auto_compaction", enabled: true },
+				{ type: "set_auto_retry", enabled: true },
+				{ type: "abort_compaction" },
+				{ type: "abort_branch_summary" },
+				{ type: "abort_retry" },
+				{ type: "reload" },
+				{ type: "export_html" },
+				{ type: "export_jsonl" },
+				{ type: "set_session_name", name: "private" },
+				{ type: "set_session_entry_label", entryId: "entry", label: "private" },
+			] as const;
+			for (const command of guardedMutations) {
+				await expect(
+					internals.handleCommand(makeClient(`private-${command.type}`, "unloaded-session"), {
+						...command,
+						activeSessionId: privateState.activeSessionId,
+					} as DaemonCommand),
+				).rejects.toThrow("unavailable");
+			}
+
+			const reads = [
+				"get_session_header",
+				"get_state",
+				"get_connection_state",
+				"get_messages",
+				"get_session_stats",
+				"get_context_tree",
+				"get_commands",
+				"get_resource_snapshot",
+				"get_model_catalog",
+				"get_available_models",
+				"get_queue",
+				"heartbeat_get",
+				"get_session_context",
+				"get_session_tree",
+				"get_user_messages_for_forking",
+				"get_last_assistant_text",
+				"get_system_prompt",
+				"get_rlm_max_depth_status",
+			] as const;
+			for (const type of reads) {
+				await expect(
+					internals.handleCommand(makeClient(`private-${type}`, "unloaded-session"), {
+						type,
+						activeSessionId: privateState.activeSessionId,
+					} as DaemonCommand),
+				).rejects.toThrow("unavailable");
+			}
+			await expect(
+				internals.handleCommand(makeClient("private-tool", "unloaded-session"), {
+					type: "get_tool_definition",
+					activeSessionId: privateState.activeSessionId,
+					name: "bash",
+				}),
+			).rejects.toThrow("unavailable");
+			await expect(
+				internals.handleCommand(makeClient("private-saved", "unloaded-session"), {
+					type: "list_saved_sessions",
+					activeSessionId: privateState.activeSessionId,
+					scope: "current",
+				}),
+			).rejects.toThrow("unavailable");
+
+			for (const type of ["cron_list", "heartbeats_list"] as const) {
+				await expect(
+					internals.handleCommand(makeClient(`private-${type}`, "unloaded-session"), {
+						type,
+						activeSessionId: privateState.activeSessionId,
+					}),
+				).rejects.toThrow("unavailable");
+			}
+
+			const cronList = (await internals.handleCommand(makeClient("cron-list", "unloaded-session"), {
+				type: "cron_list",
+				includeInactive: true,
+			})) as { data: { jobs: AgentCronJob[] } };
+			expect(cronList.data.jobs.map((job) => job.id)).toEqual([globalCron.id]);
+			const heartbeatList = (await internals.handleCommand(makeClient("heartbeat-list", "unloaded-session"), {
+				type: "heartbeats_list",
+			})) as { data: { heartbeats: Array<{ job: AgentCronJob }> } };
+			expect(heartbeatList.data.heartbeats.map(({ job }) => job.id)).not.toContain(privateHeartbeat.id);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reconciles a detached tombstoned close on bounded timer backoff", async () => {
+		vi.useFakeTimers();
+		try {
+			const daemon = new AgentDaemon("/tmp/tombstoned-close-reconcile.sock", {
+				defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+				createRuntime: vi.fn(),
+			});
+			const parent = makeState("retry-parent");
+			const child = makeState("retry-child", parent.activeSessionId);
+			Object.assign(child.runtime.metadata, { kind: "subagent", rlmChildId: "child" });
+			const closeSession = vi
+				.fn<(state: ActiveSessionState, reason: "killed", notify: false) => Promise<void>>()
+				.mockRejectedValueOnce(new Error("one-shot close failure"))
+				.mockResolvedValue(undefined);
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				failedTombstonedRlmCloses: Map<string, { error?: unknown }>;
+				detachTombstonedClose(parent: ActiveSessionState, child: ActiveSessionState, id: string): void;
+				closeSession: typeof closeSession;
+			};
+			internals.sessions.set(parent.activeSessionId, parent);
+			internals.sessions.set(child.activeSessionId, child);
+			internals.closeSession = closeSession;
+
+			internals.detachTombstonedClose(parent, child, "child");
+			await vi.runAllTicks();
+			await Promise.resolve();
+			expect(closeSession).toHaveBeenCalledOnce();
+			expect(internals.failedTombstonedRlmCloses.has(child.activeSessionId)).toBe(true);
+			await vi.advanceTimersByTimeAsync(249);
+			expect(closeSession).toHaveBeenCalledOnce();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(closeSession).toHaveBeenCalledTimes(2);
+			expect(internals.failedTombstonedRlmCloses.has(child.activeSessionId)).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("retries a rejected runtime disposal through the exact full tombstoned close", async () => {

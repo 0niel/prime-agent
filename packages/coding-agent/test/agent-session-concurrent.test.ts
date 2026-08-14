@@ -151,6 +151,24 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(disposed).toBe(true);
 	});
 
+	it("retries disposeAsync after a one-shot teardown failure", async () => {
+		createSession();
+		const internals = session as unknown as {
+			_disposeAsyncOnce: () => Promise<void>;
+		};
+		const disposeOnce = vi
+			.spyOn(internals, "_disposeAsyncOnce")
+			.mockRejectedValueOnce(new Error("one-shot dispose failure"))
+			.mockImplementationOnce(async () => session.dispose());
+
+		const first = session.disposeAsync();
+		const concurrent = session.disposeAsync();
+		await expect(first).rejects.toThrow("one-shot dispose failure");
+		await expect(concurrent).rejects.toThrow("one-shot dispose failure");
+		await expect(session.disposeAsync()).resolves.toBeUndefined();
+		expect(disposeOnce).toHaveBeenCalledTimes(2);
+	});
+
 	it("awaits dispose callbacks when synchronous disposal wins during the refinement drain", async () => {
 		createSession();
 		let releaseDrain: () => void = () => {};

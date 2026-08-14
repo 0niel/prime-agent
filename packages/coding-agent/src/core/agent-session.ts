@@ -3796,7 +3796,7 @@ export class AgentSession {
 		if (this._disposeAsyncPromise) {
 			return this._disposeAsyncPromise;
 		}
-		this._disposeAsyncPromise = (async () => {
+		const attempt = (async () => {
 			// Drain before marking _disposing so a refine triggered at the final
 			// agent_end completes instead of being aborted by dispose().
 			await this._drainPendingRefinementForDisposal();
@@ -3807,7 +3807,15 @@ export class AgentSession {
 			this._sessionActionCommitDisposeAbortController.abort();
 			await this._disposeAsyncOnce();
 		})();
-		return this._disposeAsyncPromise;
+		this._disposeAsyncPromise = attempt;
+		try {
+			await attempt;
+		} catch (error) {
+			if (this._disposeAsyncPromise === attempt) {
+				this._disposeAsyncPromise = undefined;
+			}
+			throw error;
+		}
 	}
 
 	/**
