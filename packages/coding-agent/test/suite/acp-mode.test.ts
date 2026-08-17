@@ -690,6 +690,38 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("closes update admission before an in-flight prompt can finish", async () => {
+		let entered!: () => void;
+		let release!: () => void;
+		const promptStarted = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const promptRelease = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const connection = fakeAcpConnection({
+			onPromptAndWait: async () => {
+				entered();
+				await promptRelease;
+			},
+		});
+		const { client, updates, close } = connectAcpClient(connection);
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		const pending = client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "finish after close" }],
+		});
+		await promptStarted;
+		await expect(client.request("session/close", { sessionId: session.sessionId })).resolves.toEqual({});
+		const updatesAtClose = updates.length;
+		release();
+		await expect(pending).resolves.toMatchObject({ stopReason: "cancelled" });
+		await Promise.resolve();
+		expect(updates).toHaveLength(updatesAtClose);
+		close();
+	});
+
 	it("cancels after prompt completion without emitting a result or terminal boundary", async () => {
 		let entered!: () => void;
 		let release!: () => void;

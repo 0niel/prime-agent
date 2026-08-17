@@ -222,6 +222,7 @@ class AcpUpdateProducer {
 		phase: "event" | "responseBoundary" | "terminalQuiescence",
 		outcome?: "result" | "error",
 	): Promise<boolean> {
+		if (this.admissionClosed) return false;
 		const eventSequence = ++this.eventSequence;
 		const priorMeta = (update._meta && typeof update._meta === "object" ? update._meta : {}) as Record<
 			string,
@@ -250,8 +251,9 @@ class AcpUpdateProducer {
 		this.tail = this.tail.then(async () => {
 			try {
 				await this.admissionReady;
-				if (!this.admissionOpen) return;
+				if (!this.admissionOpen || this.admissionClosed) return;
 				await this.beforePublish?.(correlatedUpdate);
+				if (this.admissionClosed) return;
 				await this.client.notify(acp.methods.client.session.update, {
 					sessionId: this.sessionId,
 					update: correlatedUpdate,
@@ -267,6 +269,13 @@ class AcpUpdateProducer {
 
 	drain(): Promise<void> {
 		return this.tail;
+	}
+
+	async close(): Promise<void> {
+		this.admissionClosed = true;
+		this.admissionOpen = false;
+		this.releaseAdmission();
+		await this.tail;
 	}
 }
 
@@ -721,9 +730,9 @@ export async function runAcpModeWithConnection(
 				closing.abort.abort();
 				await connection.abort().catch(() => undefined);
 			}
-			// Settle queued notifications before returning the close response, so no
-			// update can arrive after the client observes this session as closed.
-			await closing.producer.drain();
+			// Close update admission before draining so an in-flight prompt cannot
+			// enqueue a new boundary after the client observes this session as closed.
+			await closing.producer.close();
 			return {};
 		})
 		.onNotification("session/cancel", async (ctx: any) => {
