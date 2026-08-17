@@ -205,7 +205,7 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 }
 
 /** Non-secret launch settings allowed to persist in resident worker descriptors. */
-export const DAEMON_PERSISTED_LAUNCH_ENV_KEYS = [
+const DAEMON_PERSISTED_LAUNCH_ENV_KEYS = [
 	"HOME",
 	"PATH",
 	"TMPDIR",
