@@ -1,10 +1,14 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Box, type Component, Container, Spacer, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.js";
-import { expandCollapseHint } from "../../modes/interactive/components/keybinding-hints.js";
+import {
+	countChangedLines,
+	FILE_CHANGE_DIFF_INDENT,
+	formatFileChangeSummaryLine,
+} from "../../modes/interactive/components/edit-summary.js";
 import type { ToolDefinition } from "../extensions/types.js";
 import {
 	applyEditsToNormalizedContent,
@@ -141,7 +145,6 @@ type EditCallRenderComponent = Box & {
 	previewArgsKey?: string;
 	previewPending?: boolean;
 	settledError?: boolean;
-	resultSettled?: boolean;
 };
 
 function createEditCallRenderComponent(): EditCallRenderComponent {
@@ -150,7 +153,6 @@ function createEditCallRenderComponent(): EditCallRenderComponent {
 		previewArgsKey: undefined as string | undefined,
 		previewPending: false,
 		settledError: false,
-		resultSettled: false,
 	});
 }
 
@@ -238,16 +240,42 @@ function getEditHeaderBg(
 	settledError: boolean | undefined,
 	theme: typeof import("../../modes/interactive/theme/theme.js").theme,
 ): (text: string) => string {
-	if (preview) {
-		if ("error" in preview) {
-			return (text: string) => theme.bg("toolErrorBg", text);
-		}
-		return (text: string) => theme.bg("toolSuccessBg", text);
-	}
-	if (settledError) {
+	if (settledError || (preview && "error" in preview)) {
 		return (text: string) => theme.bg("toolErrorBg", text);
 	}
+	if (preview) {
+		return (text: string) => theme.bg("toolSuccessBg", text);
+	}
 	return (text: string) => theme.bg("toolPendingBg", text);
+}
+
+// Width-aware `╰─ <path> +N -M` summary plus optional indented diff rows: the
+// summary truncates to one row and wrapped diff lines keep the indent column.
+class EditChangeSummaryComponent implements Component {
+	constructor(
+		private readonly rawPath: string,
+		private readonly cwd: string,
+		private readonly change: { added: number; removed: number },
+		private readonly diffsExpanded: boolean | undefined,
+		private readonly diffLines: readonly string[] | undefined,
+	) {}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const lines = [formatFileChangeSummaryLine(this.rawPath, this.cwd, this.change, this.diffsExpanded, safeWidth)];
+		if (this.diffLines !== undefined) {
+			const indent = FILE_CHANGE_DIFF_INDENT.slice(0, Math.max(0, safeWidth - 1));
+			const contentWidth = Math.max(1, safeWidth - indent.length);
+			for (const line of this.diffLines) {
+				for (const row of wrapTextWithAnsi(line, contentWidth)) {
+					lines.push(`${indent}${row}`);
+				}
+			}
+		}
+		return lines;
+	}
+
+	invalidate(): void {}
 }
 
 function buildEditCallComponent(
@@ -255,33 +283,39 @@ function buildEditCallComponent(
 	args: RenderableEditArgs | undefined,
 	theme: typeof import("../../modes/interactive/theme/theme.js").theme,
 	expanded: boolean,
-	showExpandHint: boolean,
+	cwd: string,
 ): EditCallRenderComponent {
 	component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
 	component.clear();
-	const canExpand = component.preview !== undefined && !("error" in component.preview);
-	// Collapsed rows normally carry the ctrl+j hint on the `╰─ path +N -M`
-	// summary line instead of the header — but that summary only mounts after a
-	// settled successful result. Until then (preview-only) and on error rows the
-	// header keeps the hint, so an expandable diff always advertises the key.
-	const hasSummaryLine = component.resultSettled === true;
-	const expandHint =
-		canExpand && showExpandHint && (expanded || !hasSummaryLine)
-			? `${theme.fg("dim", " · ")}${expandCollapseHint("app.edits.expand", expanded)}`
-			: "";
-	component.addChild(new Text(`${formatEditCall(args, theme)}${expandHint}`, 0, 0));
+	component.addChild(new Text(formatEditCall(args, theme), 0, 0));
 
-	const body =
-		component.preview &&
-		("error" in component.preview
-			? theme.fg("error", component.preview.error)
-			: expanded
-				? renderDiff(component.preview.diff)
-				: undefined);
-	if (body) {
+	if (component.preview && "error" in component.preview) {
 		component.addChild(new Spacer(1));
-		component.addChild(new Text(body, 0, 0));
+		component.addChild(new Text(theme.fg("error", component.preview.error), 0, 0));
+		return component;
 	}
+	// A failed execution must not present the predicted diff as applied changes.
+	if (!component.preview || component.settledError) {
+		return component;
+	}
+
+	// The `╰─ <path> +N -M` summary line renders in both states; ctrl+j only
+	// attaches or removes the indented diff lines underneath it.
+	const rawPath = str(args?.file_path ?? args?.path);
+	const change = countChangedLines(component.preview.diff);
+	component.addChild(new Spacer(1));
+	component.addChild(
+		new EditChangeSummaryComponent(
+			rawPath ?? "...",
+			cwd,
+			change,
+			// The ctrl+j hint renders on every edit summary row (unlike the ctrl+o
+			// hint, which the latest tool row owns), matching thinking and
+			// agent-message hints.
+			expanded,
+			expanded ? renderDiff(component.preview.diff).split("\n") : undefined,
+		),
+	);
 	return component;
 }
 
@@ -456,7 +490,7 @@ export function createEditToolDefinition(
 				});
 			}
 
-			return buildEditCallComponent(component, args, theme, context.expanded, context.showExpandHint !== false);
+			return buildEditCallComponent(component, args, theme, context.expanded, context.cwd);
 		},
 		renderResult(result, _options, theme, context) {
 			const callComponent = context.state.callComponent;
@@ -480,20 +514,13 @@ export function createEditToolDefinition(
 					callComponent.settledError = context.isError;
 					changed = true;
 				}
-				// Mirrors the FileChangeSummaryComponent mount condition: any result
-				// with a countable diff and no error mounts the summary line.
-				const summaryMounts = !context.isError && typeof resultDiff === "string";
-				if (callComponent.resultSettled !== summaryMounts) {
-					callComponent.resultSettled = summaryMounts;
-					changed = true;
-				}
 				if (changed) {
 					buildEditCallComponent(
 						callComponent,
 						context.args as RenderableEditArgs | undefined,
 						theme,
 						context.expanded,
-						context.showExpandHint !== false,
+						context.cwd,
 					);
 				}
 			}
