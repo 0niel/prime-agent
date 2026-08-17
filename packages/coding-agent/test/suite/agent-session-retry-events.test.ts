@@ -41,6 +41,7 @@ type SessionRetryCompactionInternals = {
 	_retryAttempt: number;
 	_retryPromise: Promise<void> | undefined;
 	_retryResolve: (() => void) | undefined;
+	_retryAuthFailureSources: unknown[];
 	_autoCompactionAbortController: AbortController | undefined;
 	_postCompactionContinuationScheduled: boolean;
 	_processAgentEvent: (event: AgentEvent) => Promise<void>;
@@ -267,6 +268,10 @@ describe("AgentSession retry and event characterization", () => {
 
 			expect(harness.faux.state.callCount).toBe(1);
 			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+			expect(harness.session.isRetrying).toBe(false);
+			const internals = harness.session as unknown as SessionRetryCompactionInternals;
+			expect(internals._retryPromise).toBeUndefined();
+			expect(internals._retryAuthFailureSources).toEqual([]);
 			expect(continueSpy).not.toHaveBeenCalled();
 		},
 	);

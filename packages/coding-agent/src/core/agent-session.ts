@@ -3387,10 +3387,11 @@ export class AgentSession {
 
 		const lastAssistant = this._findLastAssistantInMessages(event.messages);
 		const concreteAuthFailure = lastAssistant ? this._isConcreteProviderAuthFailure(lastAssistant) : false;
-		if (!lastAssistant || (!this._isRetryableError(lastAssistant) && !concreteAuthFailure)) {
+		const retryConcreteAuthFailure = lastAssistant?.provider !== "intercept" && concreteAuthFailure;
+		if (!lastAssistant || (!this._isRetryableError(lastAssistant) && !retryConcreteAuthFailure)) {
 			return;
 		}
-		if (concreteAuthFailure) {
+		if (retryConcreteAuthFailure) {
 			this._captureRetryAuthFailureSource(lastAssistant);
 		}
 
@@ -3524,7 +3525,7 @@ export class AgentSession {
 				if (assistantMsg.stopReason !== "error") {
 					this._overflowRecovery = "idle";
 				}
-				if (this._isConcreteProviderAuthFailure(assistantMsg)) {
+				if (assistantMsg.provider !== "intercept" && this._isConcreteProviderAuthFailure(assistantMsg)) {
 					this._captureRetryAuthFailureSource(assistantMsg);
 				}
 
