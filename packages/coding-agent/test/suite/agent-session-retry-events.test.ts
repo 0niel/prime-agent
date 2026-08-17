@@ -249,27 +249,27 @@ describe("AgentSession retry and event characterization", () => {
 		});
 	}
 
-	it.each([
-		"unknown after provider",
-		"401 status code: unauthorized API key",
-	])("does not outer-retry intercept provider error: %s", async (errorMessage) => {
-		const harness = await createHarness({
-			provider: "intercept",
-			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
-		});
-		harnesses.push(harness);
-		const continueSpy = vi.spyOn(harness.session.agent, "continue");
-		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage }),
-			fauxAssistantMessage("must not make a second logical request"),
-		]);
+	it.each(["unknown after provider", "401 status code: unauthorized API key"])(
+		"does not outer-retry intercept provider error: %s",
+		async (errorMessage) => {
+			const harness = await createHarness({
+				provider: "intercept",
+				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			});
+			harnesses.push(harness);
+			const continueSpy = vi.spyOn(harness.session.agent, "continue");
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage }),
+				fauxAssistantMessage("must not make a second logical request"),
+			]);
 
-		await harness.session.prompt("test");
+			await harness.session.prompt("test");
 
-		expect(harness.faux.state.callCount).toBe(1);
-		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
-		expect(continueSpy).not.toHaveBeenCalled();
-	});
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+			expect(continueSpy).not.toHaveBeenCalled();
+		},
+	);
 
 	it("retries generic errors from non-intercept providers", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });

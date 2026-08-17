@@ -9,14 +9,7 @@ import {
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.js";
-import type {
-	AgentContext,
-	AgentEvent,
-	AgentLoopConfig,
-	AgentMessage,
-	AgentTool,
-	StreamFn,
-} from "../src/types.js";
+import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, StreamFn } from "../src/types.js";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
