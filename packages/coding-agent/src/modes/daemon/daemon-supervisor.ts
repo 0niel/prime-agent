@@ -2423,9 +2423,9 @@ export class DaemonSupervisor {
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
 		} catch (error) {
-			// A replacement never passed its startup gate, so require another fresh
-			// client resume instead of retaining its transient credentials.
-			if (existing) {
+			// A standalone replacement failure consumes its one-shot credentials.
+			// An active recovery loop retains them until its remaining retries finish.
+			if (existing && !existing.recovery) {
 				existing.recoveryLaunchEnv = undefined;
 				existing.recoveryCreateCommand = undefined;
 			}
@@ -2492,9 +2492,12 @@ export class DaemonSupervisor {
 			worker.recoveryCreateCommand = undefined;
 			return worker;
 		} catch (error) {
-			// Every launch or persistence failure consumes the one-shot capability.
-			worker.recoveryLaunchEnv = undefined;
-			worker.recoveryCreateCommand = undefined;
+			// Preserve credentials only while the owning recovery loop can retry.
+			// Its `finally` consumes them after success, exhaustion, or cancellation.
+			if (!worker.recovery) {
+				worker.recoveryLaunchEnv = undefined;
+				worker.recoveryCreateCommand = undefined;
+			}
 			if (isSupervisorGenerationStale(error)) {
 				throw error;
 			}
