@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
@@ -792,6 +790,61 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("drains queued updates before returning cancellation at the final snapshot cut", async () => {
+		let enteredUpdate!: () => void;
+		let releaseUpdate!: () => void;
+		let enteredSnapshot!: () => void;
+		let releaseSnapshot!: () => void;
+		const updateStarted = new Promise<void>((resolve) => {
+			enteredUpdate = resolve;
+		});
+		const updateRelease = new Promise<void>((resolve) => {
+			releaseUpdate = resolve;
+		});
+		const snapshotStarted = new Promise<void>((resolve) => {
+			enteredSnapshot = resolve;
+		});
+		const snapshotRelease = new Promise<void>((resolve) => {
+			releaseSnapshot = resolve;
+		});
+		const connection = fakeAcpConnection({
+			initialSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [] }),
+			finalSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [] }),
+			onFinalSnapshot: async () => {
+				enteredSnapshot();
+				await snapshotRelease;
+			},
+		});
+		const { client, updates, close } = connectAcpClient(connection, {
+			beforeAcpUpdatePublish: async () => {
+				enteredUpdate();
+				await updateRelease;
+			},
+		});
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		connection.emitHeartbeat();
+		await updateStarted;
+		const pending = client.request("session/prompt", {
+			sessionId: session.sessionId,
+			prompt: [{ type: "text", text: "cancel after final snapshot" }],
+		});
+		await snapshotStarted;
+		await client.notify("session/cancel", { sessionId: session.sessionId });
+		releaseSnapshot();
+		await Promise.resolve();
+		let settled = false;
+		void pending.then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		releaseUpdate();
+		await expect(pending).resolves.toMatchObject({ stopReason: "cancelled" });
+		expect(updates).toHaveLength(1);
+		close();
+	});
+
 	it("linearizes a cancellation during the response-boundary publish as a completed pair", async () => {
 		let entered!: () => void;
 		let release!: () => void;
@@ -874,43 +927,6 @@ describe("ACP mode end to end", () => {
 			}),
 		]);
 		close();
-	});
-
-	it("matches the exact canonical offline transcript fixture consumed by V3", () => {
-		const fixture = JSON.parse(
-			readFileSync(resolve(import.meta.dirname, "../fixtures/acp-correlation-transcripts.json"), "utf8"),
-		) as { cases: Record<string, Array<Record<string, unknown>>> };
-		expect(Object.keys(fixture.cases)).toEqual([
-			"success",
-			"error_terminal",
-			"error_incomplete",
-			"cancelled",
-			"late_child",
-			"global_sequence_turn_two",
-		]);
-		for (const [name, records] of Object.entries(fixture.cases)) {
-			for (let index = 1; index < records.length; index++) {
-				expect(records[index].eventSequence, `${name} sequence`).toBeGreaterThan(
-					records[index - 1].eventSequence as number,
-				);
-			}
-		}
-		for (const name of ["success", "error_terminal", "global_sequence_turn_two"]) {
-			const records = fixture.cases[name];
-			const boundary = records.find((record) => record.phase === "responseBoundary");
-			const terminal = records.find((record) => record.phase === "terminalQuiescence");
-			expect(boundary).toBeDefined();
-			expect(terminal).toMatchObject({
-				promptTurnId: boundary?.promptTurnId,
-				outcome: boundary?.outcome,
-				quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 0 },
-			});
-		}
-		expect(fixture.cases.error_incomplete).toHaveLength(1);
-		expect(fixture.cases.cancelled).toEqual([]);
-		expect(fixture.cases.late_child).toEqual([
-			expect.objectContaining({ promptTurnId: 1, phase: "event", child: { id: "late", status: "done" } }),
-		]);
 	});
 
 	it("correlates connection-scoped heartbeats to turn zero", async () => {

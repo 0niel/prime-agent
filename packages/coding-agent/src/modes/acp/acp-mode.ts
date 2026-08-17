@@ -171,6 +171,9 @@ class AcpUpdateProducer {
 
 	finishPrompt(turnId: number): void {
 		if (this.activePromptTurnId === turnId) this.activePromptTurnId = 0;
+		if (![...this.childOriginTurnIds.values()].some((originTurnId) => originTurnId === turnId)) {
+			this.terminalTurns.delete(turnId);
+		}
 	}
 
 	/**
@@ -180,7 +183,7 @@ class AcpUpdateProducer {
 	 */
 	sealTerminal(turnId: number): void {
 		this.terminalTurns.add(turnId);
-		this.finishPrompt(turnId);
+		if (this.activePromptTurnId === turnId) this.activePromptTurnId = 0;
 	}
 
 	isTerminalSealed(turnId: number): boolean {
@@ -190,12 +193,20 @@ class AcpUpdateProducer {
 	turnForEvent(event: AgentConnectionSessionEvent): number {
 		if (event.type === "rlm_child_update") {
 			const known = this.childOriginTurnIds.get(event.child.id);
-			if (known !== undefined) return this.terminalTurns.has(known) ? 0 : known;
-			// Remember its initial origin, including connection scope, so a later
-			// child update cannot be relabelled by a subsequent prompt.
-			const originTurnId = this.activePromptTurnId !== 0 ? this.activePromptTurnId : 0;
-			this.childOriginTurnIds.set(event.child.id, originTurnId);
-			return originTurnId;
+			const originTurnId = known ?? this.activePromptTurnId;
+			const turnId = this.terminalTurns.has(originTurnId) ? 0 : originTurnId;
+			const childFinished = ["done", "error", "cancelled"].includes(event.child.status);
+			if (childFinished) {
+				this.childOriginTurnIds.delete(event.child.id);
+				if (![...this.childOriginTurnIds.values()].some((origin) => origin === originTurnId)) {
+					this.terminalTurns.delete(originTurnId);
+				}
+			} else if (known === undefined) {
+				// Remember its initial origin, including connection scope, so a later
+				// child update cannot be relabelled by a subsequent prompt.
+				this.childOriginTurnIds.set(event.child.id, originTurnId);
+			}
+			return turnId;
 		}
 		return this.activePromptTurnId;
 	}
@@ -634,7 +645,10 @@ export async function runAcpModeWithConnection(
 				// notification is queued. A cancellation before this cut produces no
 				// boundary/terminal; a cancellation after it cannot relabel a durable
 				// response+terminal pair as a cancelled prompt.
-				if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
+				if (abort.signal.aborted) {
+					await entry.producer.drain();
+					return { stopReason: "cancelled" satisfies AcpStopReason };
+				}
 				if (terminal) entry.producer.sealTerminal(promptTurnId);
 				responseBoundaryEmitted = await entry.producer.publish(
 					{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
