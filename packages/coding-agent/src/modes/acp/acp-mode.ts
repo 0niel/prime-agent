@@ -132,7 +132,8 @@ class AcpUpdateProducer {
 	private activePromptTurnId = 0;
 	private tail: Promise<void> = Promise.resolve();
 	private readonly childOriginTurnIds = new Map<string, number>();
-	private readonly terminalTurns = new Set<number>();
+	private readonly terminalChildOriginTurns = new Set<number>();
+	private readonly sealedPromptTurns = new Set<number>();
 	private readonly admissionReady: Promise<void>;
 	private releaseAdmission!: () => void;
 	private admissionOpen = false;
@@ -171,8 +172,9 @@ class AcpUpdateProducer {
 
 	finishPrompt(turnId: number): void {
 		if (this.activePromptTurnId === turnId) this.activePromptTurnId = 0;
+		this.sealedPromptTurns.delete(turnId);
 		if (![...this.childOriginTurnIds.values()].some((originTurnId) => originTurnId === turnId)) {
-			this.terminalTurns.delete(turnId);
+			this.terminalChildOriginTurns.delete(turnId);
 		}
 	}
 
@@ -182,24 +184,27 @@ class AcpUpdateProducer {
 	 * that an evaluator may treat as terminal.
 	 */
 	sealTerminal(turnId: number): void {
-		this.terminalTurns.add(turnId);
+		this.sealedPromptTurns.add(turnId);
+		if ([...this.childOriginTurnIds.values()].some((originTurnId) => originTurnId === turnId)) {
+			this.terminalChildOriginTurns.add(turnId);
+		}
 		if (this.activePromptTurnId === turnId) this.activePromptTurnId = 0;
 	}
 
 	isTerminalSealed(turnId: number): boolean {
-		return this.terminalTurns.has(turnId);
+		return this.sealedPromptTurns.has(turnId);
 	}
 
 	turnForEvent(event: AgentConnectionSessionEvent): number {
 		if (event.type === "rlm_child_update") {
 			const known = this.childOriginTurnIds.get(event.child.id);
 			const originTurnId = known ?? this.activePromptTurnId;
-			const turnId = this.terminalTurns.has(originTurnId) ? 0 : originTurnId;
+			const turnId = this.terminalChildOriginTurns.has(originTurnId) ? 0 : originTurnId;
 			const childFinished = ["done", "error", "cancelled"].includes(event.child.status);
 			if (childFinished) {
 				this.childOriginTurnIds.delete(event.child.id);
 				if (![...this.childOriginTurnIds.values()].some((origin) => origin === originTurnId)) {
-					this.terminalTurns.delete(originTurnId);
+					this.terminalChildOriginTurns.delete(originTurnId);
 				}
 			} else if (known === undefined) {
 				// Remember its initial origin, including connection scope, so a later

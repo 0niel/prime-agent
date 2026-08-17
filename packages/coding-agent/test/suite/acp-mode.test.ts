@@ -887,7 +887,7 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
-	it("linearizes a cancellation during terminal publish as a completed pair", async () => {
+	it("keeps a terminal publish sealed when its last originated child finishes", async () => {
 		let entered!: () => void;
 		let release!: () => void;
 		const enteredTerminal = new Promise<void>((resolve) => {
@@ -896,7 +896,11 @@ describe("ACP mode end to end", () => {
 		const releaseTerminal = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const connection = fakeAcpConnection();
+		const child = { id: "terminal-race-child", label: "child", status: "running", sessionDir: "/tmp/child" };
+		let connection: any;
+		connection = fakeAcpConnection({
+			onPromptAndWait: () => connection.emitChild(child),
+		});
 		const { client, updates, close } = connectAcpClient(connection, {
 			beforeAcpUpdatePublish: async (update: any) => {
 				if (update._meta?.[PRIME_AGENT_META_NAMESPACE]?.phase === "terminalQuiescence") {
@@ -912,6 +916,7 @@ describe("ACP mode end to end", () => {
 			prompt: [{ type: "text", text: "gate terminal" }],
 		});
 		await enteredTerminal;
+		connection.emitChild({ ...child, status: "done" });
 		await client.notify("session/cancel", { sessionId: session.sessionId });
 		release();
 		const result = await pending;
@@ -926,6 +931,8 @@ describe("ACP mode end to end", () => {
 				quiescence: { outstandingSubagents: 0, remainingAutonomousContinuations: 0 },
 			}),
 		]);
+		const childUpdates = meta.filter((item) => item.subagents?.[0]?.id === child.id);
+		expect(childUpdates.map((item) => item.promptTurnId)).toEqual([1, 0]);
 		close();
 	});
 
