@@ -141,6 +141,7 @@ type EditCallRenderComponent = Box & {
 	previewArgsKey?: string;
 	previewPending?: boolean;
 	settledError?: boolean;
+	resultSettled?: boolean;
 };
 
 function createEditCallRenderComponent(): EditCallRenderComponent {
@@ -149,6 +150,7 @@ function createEditCallRenderComponent(): EditCallRenderComponent {
 		previewArgsKey: undefined as string | undefined,
 		previewPending: false,
 		settledError: false,
+		resultSettled: false,
 	});
 }
 
@@ -258,8 +260,15 @@ function buildEditCallComponent(
 	component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
 	component.clear();
 	const canExpand = component.preview !== undefined && !("error" in component.preview);
+	// Collapsed rows normally carry the ctrl+j hint on the `╰─ path +N -M`
+	// summary line instead of the header — but that summary only mounts after a
+	// settled successful result. Until then (preview-only) and on error rows the
+	// header keeps the hint, so an expandable diff always advertises the key.
+	const hasSummaryLine = component.resultSettled === true;
 	const expandHint =
-		canExpand && showExpandHint ? `${theme.fg("dim", " · ")}${expandCollapseHint("app.tools.expand", expanded)}` : "";
+		canExpand && showExpandHint && (expanded || !hasSummaryLine)
+			? `${theme.fg("dim", " · ")}${expandCollapseHint("app.edits.expand", expanded)}`
+			: "";
 	component.addChild(new Text(`${formatEditCall(args, theme)}${expandHint}`, 0, 0));
 
 	const body =
@@ -469,6 +478,13 @@ export function createEditToolDefinition(
 				}
 				if (callComponent.settledError !== context.isError) {
 					callComponent.settledError = context.isError;
+					changed = true;
+				}
+				// Mirrors the FileChangeSummaryComponent mount condition: any result
+				// with a countable diff and no error mounts the summary line.
+				const summaryMounts = !context.isError && typeof resultDiff === "string";
+				if (callComponent.resultSettled !== summaryMounts) {
+					callComponent.resultSettled = summaryMounts;
 					changed = true;
 				}
 				if (changed) {

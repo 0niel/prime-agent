@@ -1,7 +1,10 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Container, resetCapabilitiesCache, setCapabilities, Text, TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { Type } from "typebox";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
 import type { ToolDefinition } from "../src/core/extensions/types.js";
 import { type BashOperations, createBashTool, createBashToolDefinition } from "../src/core/tools/bash.js";
@@ -428,6 +431,79 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered.match(/\bedit\b/g)?.length ?? 0).toBe(1);
 	});
 
+	test("shows the built-in edit diff on collapsed tool calls when edit diffs are expanded", () => {
+		const component = new ToolExecutionComponent(
+			"edit",
+			"tool-4e",
+			{ path: "README.md", oldText: "before", newText: "after" },
+			{},
+			createEditToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult(
+			{ content: [], details: { diff: "-1 before\n+1 after", firstChangedLine: 1 }, isError: false },
+			false,
+		);
+
+		const collapsed = stripAnsi(component.render(120).join("\n"));
+		expect(collapsed).not.toContain("-1 before");
+		expect(collapsed).toContain("+1 -1");
+		// The collapsed `╰─ path +N -M` summary line carries the ctrl+j hint —
+		// and it is the only carrier: the header must not duplicate it.
+		expect(collapsed.split("\n").find((line) => line.includes("╰─"))).toContain("to expand");
+		expect(collapsed.split("to expand").length - 1).toBe(1);
+
+		component.setEditDiffsExpanded(true);
+		const withDiffs = stripAnsi(component.render(120).join("\n"));
+		expect(withDiffs).toContain("-1 before");
+		expect(withDiffs).toContain("+1 after");
+		expect(withDiffs).not.toContain("+1 -1");
+
+		component.setEditDiffsExpanded(false);
+		const collapsedAgain = stripAnsi(component.render(120).join("\n"));
+		expect(collapsedAgain).not.toContain("-1 before");
+		expect(collapsedAgain).toContain("+1 -1");
+	});
+
+	test("keeps the ctrl+j hint on the header while no summary line renders", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "edit-hint-"));
+		const filePath = join(dir, "sample.txt");
+		writeFileSync(filePath, "before\n");
+		try {
+			const component = new ToolExecutionComponent(
+				"edit",
+				"tool-4h",
+				{ path: filePath, oldText: "before", newText: "after" },
+				{},
+				createEditToolDefinition(dir),
+				createFakeTui(),
+				dir,
+			);
+			component.setArgsComplete();
+			component.render(120);
+			// The preview computes asynchronously; poll until it lands.
+			await vi.waitFor(() => {
+				expect(stripAnsi(component.render(120).join("\n"))).toContain("to expand");
+			});
+			// Pre-result: no summary line exists yet, so the header carries the hint.
+			const preResult = stripAnsi(component.render(120).join("\n"));
+			expect(preResult).not.toContain("╰─");
+			expect(preResult.split("to expand").length - 1).toBe(1);
+
+			// Once a successful result lands, the summary line takes over the hint.
+			component.updateResult(
+				{ content: [], details: { diff: "-1 before\n+1 after", firstChangedLine: 1 }, isError: false },
+				false,
+			);
+			const settled = stripAnsi(component.render(120).join("\n"));
+			expect(settled.split("\n").find((line) => line.includes("╰─"))).toContain("to expand");
+			expect(settled.split("to expand").length - 1).toBe(1);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("uses the generic result fallback for legacy-named custom tools", () => {
 		const overrideDefinition: ToolDefinition = {
 			...createBaseToolDefinition("bash"),
@@ -694,14 +770,19 @@ describe("ToolExecutionComponent parity", () => {
 		expect(collapsed).not.toMatch(/1 - before/);
 		expect(collapsed).not.toMatch(/1 \+ after/);
 
+		// Tool expansion shows the full source but never the diff; that belongs to ctrl+j.
 		component.setExpanded(true);
 		const expanded = stripAnsi(component.render(120).join("\n"));
 		expect(expanded).toContain('hidden_side_effect = "only in full source"');
-		expect(expanded).toContain("before");
-		expect(expanded).toContain("after");
-		const expandedLines = expanded.split("\n");
-		expect(expandedLines.findIndex((line) => line.includes("hidden_side_effect ="))).toBeLessThan(
-			expandedLines.findIndex((line) => /✓ README\.md\s+\+1 -1/.test(line)),
+		expect(expanded).toContain("╰─ README.md +1 -1");
+		expect(expanded).not.toMatch(/1 - before/);
+
+		component.setEditDiffsExpanded(true);
+		const withDiffs = stripAnsi(component.render(120).join("\n"));
+		const withDiffLines = withDiffs.split("\n");
+		expect(withDiffLines.findIndex((line) => line.includes("hidden_side_effect ="))).toBeLessThan(
+			withDiffLines.findIndex((line) => /✓ README\.md\s+\+1 -1/.test(line)),
 		);
+		expect(withDiffs).not.toContain("╰─ README.md +1 -1");
 	});
 });

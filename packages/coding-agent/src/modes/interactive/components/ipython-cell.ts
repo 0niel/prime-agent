@@ -33,6 +33,7 @@ export interface IPythonCellState {
 	isError?: boolean;
 	expanded?: boolean;
 	agentMessagesExpanded?: boolean;
+	editDiffsExpanded?: boolean;
 	showExpandHint?: boolean;
 	executionStarted?: boolean;
 	argsComplete?: boolean;
@@ -383,7 +384,7 @@ export class IPythonCellComponent implements Component {
 		const lines = [truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "")];
 
 		const hasCode = this.state.expanded ? this.renderCode(lines, safeWidth) : false;
-		if ((details.diffs?.length ?? 0) > 0 && this.state.expanded) {
+		if ((details.diffs?.length ?? 0) > 0 && this.state.editDiffsExpanded) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], this.marker(details));
 		}
 		if ((details.sentAgentMessages?.length ?? 0) > 0) {
@@ -428,6 +429,11 @@ export class IPythonCellComponent implements Component {
 
 		if (this.state.showExpandHint !== false) {
 			parts.push(expandCollapseHint("app.tools.expand", this.state.expanded === true));
+			// Expanded diffs replace the summary line that normally carries the
+			// ctrl+j cue, so the header advertises the collapse key instead.
+			if (this.state.editDiffsExpanded && (details.diffs?.length ?? 0) > 0) {
+				parts.push(expandCollapseHint("app.edits.expand", true));
+			}
 		}
 		return parts.join(theme.fg("dim", " · "));
 	}
