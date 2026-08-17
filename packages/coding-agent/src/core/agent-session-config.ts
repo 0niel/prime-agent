@@ -59,7 +59,7 @@ export function sanitizeAgentSessionRuntimeConfigForDurableStorage(
 	return redactRuntimeConfigValue(config, new WeakMap()) as AgentSessionRuntimeConfig;
 }
 
-function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>, parentKey?: string): unknown {
+function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>): unknown {
 	if (!value || typeof value !== "object") {
 		return value;
 	}
@@ -71,7 +71,7 @@ function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>
 		const result: unknown[] = [];
 		seen.set(value, result);
 		for (const entry of value) {
-			result.push(redactRuntimeConfigValue(entry, seen, parentKey));
+			result.push(redactRuntimeConfigValue(entry, seen));
 		}
 		return result;
 	}
@@ -84,7 +84,7 @@ function redactRuntimeConfigValue(value: unknown, seen: WeakMap<object, unknown>
 		if (normalizedKey.endsWith("headers") || isSecretBearingRuntimeConfigField(normalizedKey)) {
 			continue;
 		}
-		result[key] = redactRuntimeConfigValue(entry, seen, key);
+		result[key] = redactRuntimeConfigValue(entry, seen);
 	}
 	return result;
 }

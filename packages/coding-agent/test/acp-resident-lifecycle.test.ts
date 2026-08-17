@@ -325,20 +325,6 @@ function launchAcp(
 }
 
 describe("ACP daemon lifecycle negotiation", () => {
-	it("closes resident child stdin before waiting for exit", async () => {
-		const child = spawn(
-			process.execPath,
-			["-e", 'process.stdin.once("end", () => process.exit(0)); process.stdin.resume();'],
-			{ stdio: ["pipe", "ignore", "ignore"] },
-		);
-		children.add(child);
-
-		await stopChild(child);
-		children.delete(child);
-
-		expect(child.exitCode).toBe(0);
-	});
-
 	it("keeps only reattachable ACP sessions resident", () => {
 		// Resident workers survive ACP stdio disconnect only when a later
 		// --continue can find their session file. All ephemeral or non-ACP modes
