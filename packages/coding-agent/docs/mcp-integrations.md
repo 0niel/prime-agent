@@ -16,6 +16,9 @@ The MCP connection runs inside the kernel via the official `mcp` Python SDK. The
 host's only jobs are interactive login (browser OAuth) and minting/refreshing
 credentials in `auth.json`.
 
+A [generic MCP connections design](generic-mcp-connections-design.md) proposes
+removing the package-per-service requirement. It is a plan, not current behavior.
+
 ## Table of Contents
 
 - [Using a built-in integration](#using-a-built-in-integration)
