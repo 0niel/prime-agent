@@ -630,6 +630,32 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
+	it("reports a failed response-boundary publish instead of completing without an envelope", async () => {
+		let rejectBoundary = true;
+		const connection = fakeAcpConnection();
+		const { client, updates, close } = connectAcpClient(connection, {
+			beforeAcpUpdatePublish: (update: any) => {
+				if (!rejectBoundary || update._meta?.[PRIME_AGENT_META_NAMESPACE]?.phase !== "responseBoundary") return;
+				rejectBoundary = false;
+				throw new Error("drop response boundary");
+			},
+		});
+		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
+		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		await expect(
+			client.request("session/prompt", {
+				sessionId: session.sessionId,
+				prompt: [{ type: "text", text: "finish" }],
+			}),
+		).rejects.toThrow("Internal error");
+		const metadata = updates.map((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]).filter(Boolean);
+		expect(metadata.filter((meta) => meta.phase === "responseBoundary")).toEqual([
+			expect.objectContaining({ outcome: "error" }),
+		]);
+		expect(metadata.find((meta) => meta.phase === "terminalQuiescence")).toBeUndefined();
+		close();
+	});
+
 	it("settles queued updates before close resolves without a post-close notification", async () => {
 		let entered!: () => void;
 		let release!: () => void;

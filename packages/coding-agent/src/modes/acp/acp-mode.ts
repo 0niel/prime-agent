@@ -200,12 +200,12 @@ class AcpUpdateProducer {
 		return this.activePromptTurnId;
 	}
 
-	publish(
+	async publish(
 		update: Record<string, unknown>,
 		turnId: number,
 		phase: "event" | "responseBoundary" | "terminalQuiescence",
 		outcome?: "result" | "error",
-	): Promise<void> {
+	): Promise<boolean> {
 		const eventSequence = ++this.eventSequence;
 		const priorMeta = (update._meta && typeof update._meta === "object" ? update._meta : {}) as Record<
 			string,
@@ -230,6 +230,7 @@ class AcpUpdateProducer {
 		};
 		// Keep the chain alive after a failed hook or notification, while preserving
 		// the order of every later notification and allowing callers to await its drain.
+		let published = false;
 		this.tail = this.tail.then(async () => {
 			try {
 				await this.admissionReady;
@@ -239,11 +240,13 @@ class AcpUpdateProducer {
 					sessionId: this.sessionId,
 					update: correlatedUpdate,
 				});
+				published = true;
 			} catch {
 				// Drop only this update; a rejected queue tail would strand later updates.
 			}
 		});
-		return this.tail;
+		await this.tail;
+		return published;
 	}
 
 	drain(): Promise<void> {
@@ -633,14 +636,14 @@ export async function runAcpModeWithConnection(
 				// response+terminal pair as a cancelled prompt.
 				if (abort.signal.aborted) return { stopReason: "cancelled" satisfies AcpStopReason };
 				if (terminal) entry.producer.sealTerminal(promptTurnId);
-				await entry.producer.publish(
+				responseBoundaryEmitted = await entry.producer.publish(
 					{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
 					promptTurnId,
 					"responseBoundary",
 					outcome,
 				);
-				responseBoundaryEmitted = true;
-				await entry.producer.publish(
+				if (!responseBoundaryEmitted) throw new Error("Failed to publish ACP response boundary");
+				const completionUpdateEmitted = await entry.producer.publish(
 					{
 						sessionUpdate: "session_info_update",
 						_meta: primeAgentMeta({ ...(autonomous ? { autonomous } : {}), quiescence: terminalQuiescence }),
@@ -649,6 +652,7 @@ export async function runAcpModeWithConnection(
 					terminal ? "terminalQuiescence" : "event",
 					terminal ? outcome : undefined,
 				);
+				if (!completionUpdateEmitted) throw new Error("Failed to publish ACP completion update");
 				await entry.producer.drain();
 				if (failure) throw new Error(`prime-agent turn failed: ${failure}`);
 				// A cancellation after the zero-terminal cut cannot relabel the durable
