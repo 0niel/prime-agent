@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed caller-provided empty system prompts falling back to the built-in prompt during session rebuilds.
+
 ## [0.7.3] - 2026-08-17
 
 - Fixed assistant rendering when provider payloads contain null or sparse content blocks.

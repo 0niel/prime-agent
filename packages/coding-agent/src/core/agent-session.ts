@@ -1066,7 +1066,7 @@ function waitForPromiseOrAbort<T>(
 	});
 }
 
-function resolveLegacySystemPromptSource(
+function resolveSystemPromptSourceFromValue(
 	systemPrompt: string | undefined,
 ): BuildSystemPromptOptions["systemPromptSource"] {
 	return systemPrompt === undefined ? { provenance: "built_in" } : { provenance: "custom", content: systemPrompt };
@@ -4359,8 +4359,8 @@ export class AgentSession {
 		}
 
 		const loaderSystemPromptSource =
-			this._resourceLoader.getSystemPromptSource?.().source ??
-			resolveLegacySystemPromptSource(this._resourceLoader.getSystemPrompt());
+			this._resourceLoader.getSystemPromptSource?.() ??
+			resolveSystemPromptSourceFromValue(this._resourceLoader.getSystemPrompt());
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
 		const appendSystemPrompt =
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;

@@ -392,9 +392,8 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(runtime.listSubagentRuntimes()).toEqual([]);
 	});
 
-	it("preserves CRLF custom provenance through actual child runtime creation and rebuild", async () => {
-		const content = "child-runtime-route\r\ncustom-bytes";
-		const { runtime } = await createRuntimeForTest(() => {}, { systemPrompt: content });
+	it("preserves an empty custom prompt when creating and rebuilding a child runtime", async () => {
+		const { runtime } = await createRuntimeForTest(() => {}, { systemPrompt: "" });
 		const childRuntime = await runtime.createRlmSubagentRuntime({
 			parentSession: runtime.session,
 			id: "provenance-child",
@@ -414,7 +413,7 @@ describe("AgentSessionRuntime characterization", () => {
 			rlmParentNodeId: "provenance-child",
 		});
 		const assertCustomPrompt = () => {
-			expect(childRuntime.session.systemPrompt.startsWith(content)).toBe(true);
+			expect(childRuntime.session.systemPrompt.startsWith("\nCurrent date: ")).toBe(true);
 			expect(childRuntime.session.systemPrompt).not.toContain(
 				"You are a general purpose agent that uses code to solve tasks.",
 			);

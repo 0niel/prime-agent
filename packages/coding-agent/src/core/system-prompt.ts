@@ -17,10 +17,7 @@ export interface BuildSystemPromptOptions {
 	 * Unknown provenance fails closed rather than assembling a default prompt.
 	 */
 	systemPromptSource?: SystemPromptSource;
-	/**
-	 * Legacy custom prompt input. Prefer systemPromptSource for callers that
-	 * retain source presence independently from prompt content.
-	 */
+	/** Custom prompt input when separate provenance is unavailable. */
 	customPrompt?: string;
 	/** Active tools. Tool schemas carry tool descriptions outside the prompt body. */
 	selectedTools?: string[];

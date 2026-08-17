@@ -11,27 +11,6 @@ export interface RlmPromptOptions {
 	activeTools?: string[];
 }
 
-const DEFAULT_CONTROL_LOOP_PROMPT = [
-	"Use a nonblocking control loop for slow or asynchronous work: start the work, record its handle or output location, then end your turn. Check its result only on a later turn or when a reply arrives.",
-	"Do not use blocking polling loops or long blocking sleeps to await background work. Short, legitimate asynchronous waits that are needed to complete the current operation are allowed.",
-	"If a runtime offers `follow_up` or `steer`, use its documented contract when appropriate; this prompt neither implements nor guarantees callback delivery, follow-up scheduling, or user-input priority.",
-].join("\n");
-
-const CLEAR_DIRECT_PROSE_PROMPT = [
-	"### Clear direct prose",
-	"When you write short direct prose for the user, use clear and direct English.",
-	"Prefer short sentences. Use common words and concrete verbs. State one main",
-	"action or fact in each sentence when practical. Use a list when it makes",
-	"steps or conditions easier to scan. Keep needed technical terms, names,",
-	"commands, code, paths, and exact quoted text unchanged. If a detail is",
-	"uncertain, say that it is uncertain. Do not claim that text is ASD-STE100",
-	"compliant, certified, approved, or guaranteed.",
-	"",
-	"This is writing guidance, not a compliance check. Do not invent a rule,",
-	"measurement, warning, or refusal solely to enforce this guidance. Preserve",
-	"the user's requested format, tone, terminology, and necessary precision.",
-].join("\n");
-
 const IPYTHON_CONTROL_PROMPT = [
 	"IPython is the agent's long-lived notebook: a persistent control environment for reasoning, context management, state, tool orchestration, and recursive subcalls. Use it to keep intermediate variables, inspect and transform outputs, write small helper functions, and preserve useful state across turns or compaction.",
 	"",
@@ -46,8 +25,6 @@ const IPYTHON_CONTROL_PROMPT = [
 	"Each `%%bash` cell runs in a throw-away subshell, so shell-level state (`cd`, `export`, `source`, shell variables) does NOT carry to later cells. Keep dependent shell steps inside one `%%bash` cell when they need shared shell state, or use kernel-level equivalents that survive across calls: `%cd <dir>` for the working directory and `os.environ['VAR'] = '...'` (or `%env VAR=...`) for environment variables — these apply to all subsequent `%%bash` calls.",
 	"",
 	"Python state in the kernel, by contrast, persists across cells: named variables, helper functions, classes, imports, notes, parsed outputs, and helper data structures all remain available in every later turn. Tool calls are themselves Python `await` expressions, so their return values can be bound to variables and composed into program logic just like any other call.",
-	"",
-	"Do not poll slow external work from the kernel with `time.sleep()` loops. Use the nonblocking control loop in the default guidance instead.",
 	"",
 	"Continual harness state is available as `rlm.harness` and `rlm.get_harness_state()`. CRUD calls are local to this Prime Agent session by default: `rlm.harness.create_memory(...)`, `rlm.harness.update_memory(...)`, `rlm.harness.delete_memory(...)`, `rlm.harness.create_skill(...)`, `rlm.harness.update_skill(...)`, `rlm.harness.delete_skill(...)`, `rlm.harness.create_subagent(...)`, `rlm.harness.update_subagent(...)`, `rlm.harness.delete_subagent(...)`, `rlm.harness.create_prompt_note(...)`, `rlm.harness.update_prompt_note(...)`, `rlm.harness.delete_prompt_note(...)`, plus `rlm.harness.record_refinement(...)` and `rlm.harness.overview()`. Use `global_=True` only for stable cross-session lessons; Python reserves `global`, so literal `global=True` is invalid syntax.",
 	"",
@@ -94,10 +71,6 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		"You are a general purpose agent that uses code to solve tasks.",
 		"You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
 		"When you are done, stop calling tools and state your final answer.",
-		"",
-		DEFAULT_CONTROL_LOOP_PROMPT,
-		"",
-		CLEAR_DIRECT_PROSE_PROMPT,
 		"",
 		`Working directory: ${cwd}`,
 		`Conversation log: ${messagesPath}`,

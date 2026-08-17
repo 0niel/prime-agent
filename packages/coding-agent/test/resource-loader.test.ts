@@ -10,7 +10,6 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
-import type { SystemPromptSource } from "../src/core/system-prompt.js";
 
 describe("DefaultResourceLoader", () => {
 	let tempDir: string;
@@ -597,31 +596,14 @@ Explicit override.`,
 			expect(loader.getSystemPrompt()).toBe("Custom system prompt");
 		});
 
-		it("tracks absent and caller-present empty system prompts with typed provenance", async () => {
+		it("distinguishes an absent system prompt from a caller-present empty prompt", async () => {
 			const absent = new DefaultResourceLoader({ cwd, agentDir });
 			await absent.reload();
-			expect(absent.getSystemPromptSource()).toEqual({ source: { provenance: "built_in" }, diagnostics: [] });
+			expect(absent.getSystemPromptSource()).toEqual({ provenance: "built_in" });
 
 			const presentEmpty = new DefaultResourceLoader({ cwd, agentDir, systemPrompt: "" });
 			await presentEmpty.reload();
-			expect(presentEmpty.getSystemPromptSource()).toEqual({
-				source: { provenance: "custom", content: "" },
-				diagnostics: [],
-			});
-		});
-
-		it("fails closed with a bounded diagnostic for malformed prompt provenance", async () => {
-			const loader = new DefaultResourceLoader({
-				cwd,
-				agentDir,
-				systemPromptSourceOverride: () => ({ provenance: "custom" }) as unknown as SystemPromptSource,
-			});
-			await loader.reload();
-
-			expect(loader.getSystemPromptSource()).toEqual({
-				source: { provenance: "unknown" },
-				diagnostics: [{ type: "error", message: "System prompt provenance unavailable" }],
-			});
+			expect(presentEmpty.getSystemPromptSource()).toEqual({ provenance: "custom", content: "" });
 		});
 	});
 

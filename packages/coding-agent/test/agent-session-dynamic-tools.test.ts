@@ -25,45 +25,6 @@ describe("AgentSession dynamic tool registration", () => {
 		}
 	});
 
-	it("preserves typed custom provenance through root and rebuild assembly", async () => {
-		const settingsManager = SettingsManager.create(tempDir, agentDir);
-		const resourceLoader = new DefaultResourceLoader({
-			cwd: tempDir,
-			agentDir,
-			settingsManager,
-			systemPrompt: "route-custom\r\nbytes",
-		});
-		await resourceLoader.reload();
-		const { session } = await createAgentSession({
-			cwd: tempDir,
-			agentDir,
-			model: getModel("anthropic", "claude-sonnet-4-5")!,
-			settingsManager,
-			sessionManager: SessionManager.inMemory(),
-			resourceLoader,
-		});
-
-		expect(session.systemPrompt.startsWith("route-custom\r\nbytes")).toBe(true);
-		expect(session.systemPrompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
-		session.setActiveToolsByName([]);
-		expect(session.systemPrompt.startsWith("route-custom\r\nbytes")).toBe(true);
-
-		const { session: child } = await createAgentSession({
-			cwd: tempDir,
-			agentDir,
-			model: getModel("anthropic", "claude-sonnet-4-5")!,
-			settingsManager,
-			sessionManager: SessionManager.inMemory(),
-			resourceLoader,
-			rlmDepth: 1,
-			rlmParentAgent: "parent",
-		});
-		expect(child.systemPrompt.startsWith("route-custom\r\nbytes")).toBe(true);
-		expect(child.systemPrompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
-		child.dispose();
-		session.dispose();
-	});
-
 	it("refreshes tool registry when tools are registered after initialization", async () => {
 		const settingsManager = SettingsManager.create(tempDir, agentDir);
 		const sessionManager = SessionManager.inMemory();

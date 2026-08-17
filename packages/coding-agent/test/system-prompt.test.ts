@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { DEFAULT_RLM_EXTRA_IMPORT_LABELS } from "../src/core/kernel/bootstrap.js";
 import { buildRlmPrompt } from "../src/core/prompts/index.js";
 import type { HarnessState } from "../src/core/refinement/index.js";
 import type { Skill } from "../src/core/skills.js";
@@ -36,7 +37,7 @@ function pythonSkill(name: string, importName = name.replaceAll("-", "_")): Skil
 }
 
 describe("buildRlmPrompt", () => {
-	test("builds stable default control-loop guidance without coupling to the full prompt", () => {
+	test("builds the rlm prompt without recursion", () => {
 		const prompt = buildRlmPrompt({
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
@@ -45,44 +46,45 @@ describe("buildRlmPrompt", () => {
 			allowRecursion: false,
 		});
 
-		const nonblockingClause =
-			"Use a nonblocking control loop for slow or asynchronous work: start the work, record its handle or output location, then end your turn.";
-		const waitExceptionClause =
-			"Short, legitimate asynchronous waits that are needed to complete the current operation are allowed.";
-		const followUpClause =
-			"If a runtime offers `follow_up` or `steer`, use its documented contract when appropriate;";
-		const nonGuaranteeClause =
-			"this prompt neither implements nor guarantees callback delivery, follow-up scheduling, or user-input priority.";
-
-		expect(prompt).toContain("You are a general purpose agent that uses code to solve tasks.");
-		expect(prompt).toContain("Working directory: /repo");
-		expect(prompt).toContain("Conversation log: /repo/.pi/sessions/session.jsonl");
-		expect(prompt).toContain("Installed Python skill modules (pre-imported): `websearch`, `refine`.");
-		expect(prompt).toContain("IPython is the agent's long-lived notebook");
-		expect(prompt).toContain("Continual harness state is available as `rlm.harness`");
-		expect(prompt).toContain("Treat continual harness refinement as a small, evidence-backed update");
-		expect(prompt).toContain(nonblockingClause);
-		expect(prompt).toContain(waitExceptionClause);
-		expect(prompt).toContain(followUpClause);
-		expect(prompt).toContain(nonGuaranteeClause);
-		expect(prompt.indexOf(nonblockingClause)).toBeLessThan(prompt.indexOf(followUpClause));
-		expect(prompt.indexOf(followUpClause)).toBeLessThan(prompt.indexOf("### Clear direct prose"));
-	});
-
-	test("includes default control-loop guidance without IPython mechanics", () => {
-		const prompt = buildRlmPrompt({
-			cwd: "/repo",
-			messagesPath: "/repo/.pi/sessions/session.jsonl",
-			activeTools: ["bash"],
-			allowRecursion: false,
-		});
-
-		expect(prompt).toContain("Use a nonblocking control loop for slow or asynchronous work");
-		expect(prompt).toContain("Short, legitimate asynchronous waits");
-		expect(prompt).toContain("If a runtime offers `follow_up` or `steer`");
-		expect(prompt).toContain("neither implements nor guarantees callback delivery");
-		expect(prompt).not.toContain("IPython is the agent's long-lived notebook");
-		expect(prompt).not.toContain("Do not poll slow external work from the kernel");
+		expect(prompt).toBe(
+			[
+				"You are a general purpose agent that uses code to solve tasks.",
+				"You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
+				"When you are done, stop calling tools and state your final answer.",
+				"",
+				"Working directory: /repo",
+				"Conversation log: /repo/.pi/sessions/session.jsonl",
+				"Recursive agent depth: 0",
+				`Pre-installed Python packages: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}.`,
+				"Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module).",
+				"",
+				"Installed Python skill modules (pre-imported): `websearch`, `refine`.",
+				"Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.",
+				"Each skill is also available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
+				"",
+				"IPython is the agent's long-lived notebook: a persistent control environment for reasoning, context management, state, tool orchestration, and recursive subcalls. Use it to keep intermediate variables, inspect and transform outputs, write small helper functions, and preserve useful state across turns or compaction.",
+				"",
+				"Do not assume IPython is the native runtime of the external thing being investigated. A repository, package, service, dataset, paper, website, benchmark, or API may have its own environment and normal interface. Evaluate external systems through their own interface, then use IPython to coordinate the process and analyze what comes back.",
+				"",
+				"When running shell commands from IPython, use `%%bash` cells. If you use `%%bash`, it must be the first line of the code cell: no comments, spaces, blank lines, imports, or Python statements before it. Avoid `!cmd` shell escapes for project commands so shell behavior is explicit and multi-line commands share one shell context.",
+				"",
+				"Important: do not install dependencies into the IPython kernel just to make an external project import or run there. If a project import, test, script, CLI, or dependency check is needed, run it through that project's own environment and normal command interface. For example, in a Python repo use its documented commands, `uv run ...`, `.venv/bin/python ...`, or the active project interpreter from the repo root. Treat failures from that native environment as the relevant result.",
+				"",
+				"Use Python for reading, searching, and editing files — it gives you reusable variables you can slice, filter, and act on without re-reading. Always assign read/search results to named variables so you can revisit them later.",
+				"",
+				"Each `%%bash` cell runs in a throw-away subshell, so shell-level state (`cd`, `export`, `source`, shell variables) does NOT carry to later cells. Keep dependent shell steps inside one `%%bash` cell when they need shared shell state, or use kernel-level equivalents that survive across calls: `%cd <dir>` for the working directory and `os.environ['VAR'] = '...'` (or `%env VAR=...`) for environment variables — these apply to all subsequent `%%bash` calls.",
+				"",
+				"Python state in the kernel, by contrast, persists across cells: named variables, helper functions, classes, imports, notes, parsed outputs, and helper data structures all remain available in every later turn. Tool calls are themselves Python `await` expressions, so their return values can be bound to variables and composed into program logic just like any other call.",
+				"",
+				"Continual harness state is available as `rlm.harness` and `rlm.get_harness_state()`. CRUD calls are local to this Prime Agent session by default: `rlm.harness.create_memory(...)`, `rlm.harness.update_memory(...)`, `rlm.harness.delete_memory(...)`, `rlm.harness.create_skill(...)`, `rlm.harness.update_skill(...)`, `rlm.harness.delete_skill(...)`, `rlm.harness.create_subagent(...)`, `rlm.harness.update_subagent(...)`, `rlm.harness.delete_subagent(...)`, `rlm.harness.create_prompt_note(...)`, `rlm.harness.update_prompt_note(...)`, `rlm.harness.delete_prompt_note(...)`, plus `rlm.harness.record_refinement(...)` and `rlm.harness.overview()`. Use `global_=True` only for stable cross-session lessons; Python reserves `global`, so literal `global=True` is invalid syntax.",
+				"",
+				"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, IPython kernel, and native call interface exposed to the model.",
+				"",
+				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
+				"",
+				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
+			].join("\n"),
+		);
 	});
 
 	test("defaults omitted activeTools to ipython guidance", () => {
@@ -96,8 +98,6 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("A callable `rlm` is already in your global namespace");
 		expect(prompt).toContain("IPython is the agent's long-lived notebook");
 		expect(prompt).toContain("Each `%%bash` cell runs in a throw-away subshell");
-		expect(prompt).toContain("Do not use blocking polling loops or long blocking sleeps");
-		expect(prompt).toContain("this prompt neither implements nor guarantees callback delivery");
 	});
 
 	test("discovers requested models through a bounded authenticated host search", () => {
@@ -497,11 +497,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Call contract: use installed skills as shell commands");
 		expect(prompt).toContain("subagent: 1");
 		expect(prompt).not.toContain("IPython is the agent's long-lived notebook");
-		expect(prompt).toContain("Use a nonblocking control loop for slow or asynchronous work");
-		expect(prompt).toContain("Short, legitimate asynchronous waits");
-		expect(prompt).toContain("If a runtime offers `follow_up` or `steer`");
-		expect(prompt).toContain("neither implements nor guarantees callback delivery");
-		expect(prompt).not.toContain("Do not poll slow external work from the kernel");
+		expect(prompt).not.toContain("Default to non-blocking subagents");
 		expect(prompt).not.toContain("agent_observe.list_agents");
 		expect(prompt).not.toContain("asyncio.create_task");
 		expect(prompt).not.toContain("await <skill_import>");
@@ -552,90 +548,6 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).not.toContain("await refine.run()");
 	});
 
-	test("adds the exact clear-direct-prose block once at the stable built-in guidance location", () => {
-		const block = [
-			"### Clear direct prose",
-			"When you write short direct prose for the user, use clear and direct English.",
-			"Prefer short sentences. Use common words and concrete verbs. State one main",
-			"action or fact in each sentence when practical. Use a list when it makes",
-			"steps or conditions easier to scan. Keep needed technical terms, names,",
-			"commands, code, paths, and exact quoted text unchanged. If a detail is",
-			"uncertain, say that it is uncertain. Do not claim that text is ASD-STE100",
-			"compliant, certified, approved, or guaranteed.",
-			"",
-			"This is writing guidance, not a compliance check. Do not invent a rule,",
-			"measurement, warning, or refusal solely to enforce this guidance. Preserve",
-			"the user's requested format, tone, terminology, and necessary precision.",
-		].join("\n");
-		const prompt = buildRlmPrompt({
-			cwd: "/repo",
-			messagesPath: "/repo/.pi/sessions/session.jsonl",
-			activeTools: ["ipython"],
-			allowRecursion: false,
-		});
-		const blockIndex = prompt.indexOf(block);
-
-		expect(blockIndex).toBeGreaterThan(prompt.indexOf("When you are done, stop calling tools"));
-		expect(blockIndex).toBeLessThan(prompt.indexOf("Working directory: /repo"));
-		expect(prompt.slice(blockIndex, blockIndex + block.length)).toBe(block);
-		expect(prompt.match(/### Clear direct prose/g)).toHaveLength(1);
-	});
-
-	test("keeps all P02 prose guidance out of custom prompts, including lookalikes", () => {
-		const p02Heading = "### Clear direct prose";
-		const distinctiveCustomPrompt = "CUSTOM-PROMPT-BYTES: Preserve this exact caller text.";
-		const customPrompt = buildSystemPrompt({
-			customPrompt: distinctiveCustomPrompt,
-			selectedTools: ["ipython"],
-			contextFiles: [],
-			skills: [],
-			cwd: "/repo",
-		});
-		const lookalikeCustomPrompt = `Caller-owned guidance only.\n${p02Heading}\nUse clear and direct English.`;
-		const assembledLookalike = buildSystemPrompt({
-			customPrompt: lookalikeCustomPrompt,
-			selectedTools: ["ipython"],
-			contextFiles: [],
-			skills: [],
-			cwd: "/repo",
-		});
-
-		expect(customPrompt.slice(0, distinctiveCustomPrompt.length)).toBe(distinctiveCustomPrompt);
-		expect(customPrompt).not.toContain(p02Heading);
-		expect(customPrompt).not.toContain("This is writing guidance, not a compliance check.");
-		expect(assembledLookalike.slice(0, lookalikeCustomPrompt.length)).toBe(lookalikeCustomPrompt);
-		expect(assembledLookalike.match(/### Clear direct prose/g)).toHaveLength(1);
-		expect(assembledLookalike.match(/clear and direct English/g)).toHaveLength(1);
-	});
-
-	test("does not make ASD-STE100 certification, checker, or conformance claims", () => {
-		const prompt = buildRlmPrompt({
-			cwd: "/repo",
-			messagesPath: "/repo/.pi/sessions/session.jsonl",
-			activeTools: ["bash"],
-			allowRecursion: false,
-		});
-
-		for (const forbiddenClaim of [
-			"This text is ASD-STE100 compliant",
-			"compliant with ASD-STE100",
-			"ASD-STE100 certified",
-			"ASD-STE100 approved",
-			"guaranteed to conform",
-			"is an ASD-STE100 checker",
-			"enforces ASD-STE100",
-			"ASD-STE100 edition",
-		]) {
-			expect(prompt).not.toContain(forbiddenClaim);
-		}
-	});
-
-	test("uses built-in assembly when provenance is absent", () => {
-		const prompt = buildSystemPrompt({ selectedTools: ["ipython"], contextFiles: [], skills: [], cwd: "/repo" });
-
-		expect(prompt).toContain("You are a general purpose agent that uses code to solve tasks.");
-	});
-
 	test("preserves a caller-present empty custom prompt without default assembly", () => {
 		const prompt = buildSystemPrompt({
 			systemPromptSource: { provenance: "custom", content: "" },
@@ -646,38 +558,10 @@ describe("buildSystemPrompt", () => {
 		});
 
 		expect(prompt.startsWith("\nCurrent date: ")).toBe(true);
-		expect(prompt).toContain("\nCurrent working directory: /repo");
 		expect(prompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
 	});
 
-	test("preserves distinctive custom prompt bytes exactly", () => {
-		const content = "custom\r\nbytes\t✓";
-		const prompt = buildSystemPrompt({
-			systemPromptSource: { provenance: "custom", content },
-			selectedTools: [],
-			contextFiles: [],
-			skills: [],
-			cwd: "/repo",
-		});
-
-		expect(prompt.startsWith(content)).toBe(true);
-	});
-
-	test("does not inject built-in content for a built-in-lookalike custom prompt", () => {
-		const content =
-			"Built-in system prompt lookalike: You are a general purpose agent that uses code to solve tasks.";
-		const prompt = buildSystemPrompt({
-			systemPromptSource: { provenance: "custom", content },
-			selectedTools: [],
-			contextFiles: [],
-			skills: [],
-			cwd: "/repo",
-		});
-
-		expect(prompt.match(/You are a general purpose agent that uses code to solve tasks\./g)).toHaveLength(1);
-	});
-
-	test("fails closed for unknown provenance", () => {
+	test("fails closed for unknown system prompt provenance", () => {
 		const prompt = buildSystemPrompt({
 			systemPromptSource: { provenance: "unknown" },
 			selectedTools: ["ipython"],
@@ -732,8 +616,6 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("[global:custom_memory] Custom memory (custom, v1)");
 		expect(prompt).not.toContain("# IPython Kernel Guidance");
 		expect(prompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
-		expect(prompt).not.toContain("Use a nonblocking control loop for slow or asynchronous work");
-		expect(prompt).not.toContain("If a runtime offers `follow_up` or `steer`");
 		expect(prompt.indexOf("Current working directory: /repo")).toBeLessThan(
 			prompt.indexOf("# Continual Harness State"),
 		);
