@@ -222,6 +222,8 @@ class AcpUpdateProducer {
 		phase: "event" | "responseBoundary" | "terminalQuiescence",
 		outcome?: "result" | "error",
 	): Promise<boolean> {
+		// Admission is synchronous through the tail assignment below: close either
+		// rejects this call here or drains the update after it joins the queue.
 		if (this.admissionClosed) return false;
 		const eventSequence = ++this.eventSequence;
 		const priorMeta = (update._meta && typeof update._meta === "object" ? update._meta : {}) as Record<
@@ -251,9 +253,8 @@ class AcpUpdateProducer {
 		this.tail = this.tail.then(async () => {
 			try {
 				await this.admissionReady;
-				if (!this.admissionOpen || this.admissionClosed) return;
+				if (!this.admissionOpen) return;
 				await this.beforePublish?.(correlatedUpdate);
-				if (this.admissionClosed) return;
 				await this.client.notify(acp.methods.client.session.update, {
 					sessionId: this.sessionId,
 					update: correlatedUpdate,
