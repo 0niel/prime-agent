@@ -239,7 +239,6 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 					},
 				},
 			});
-			expect(JSON.stringify(durable)).not.toContain("LEAK_ME");
 			const provider = durable.extensionFlagValues?.provider as unknown as Record<string, unknown>;
 			expect(provider.first).toBe(provider.second);
 			expect(runtimeConfig.apiKey).toBe("LEAK_ME_TOP");

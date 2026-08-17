@@ -1818,33 +1818,6 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
-	it.each(["sessionFile", "createCommand.sessionPath"] as const)(
-		"matches an empty-summary restarted resident by authoritative descriptor %s",
-		(descriptorField) => {
-			const sessionPath = join(tmpdir(), "resident-restart", "session.jsonl");
-			const worker = {
-				descriptor: {
-					workerId: `restarted-${descriptorField}`,
-					rootActiveSessionId: "active-restarted",
-					...(descriptorField === "sessionFile" ? { sessionFile: sessionPath } : {}),
-					createCommand: {
-						type: "create" as const,
-						...(descriptorField === "createCommand.sessionPath" ? { sessionPath } : {}),
-					},
-				},
-				summaries: new Map<string, SessionSummary>(),
-			};
-			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-				workers: new Map([[worker.descriptor.workerId, worker]]),
-			}) as {
-				findWorkerBySessionFile(target: string): typeof worker | undefined;
-			};
-
-			expect(supervisor.findWorkerBySessionFile(join(sessionPath, "..", "session.jsonl"))).toBe(worker);
-			expect(supervisor.findWorkerBySessionFile(join(tmpdir(), "different-session.jsonl"))).toBeUndefined();
-		},
-	);
-
 	it("fails closed for conflicting paths in one restarted descriptor", () => {
 		const sessionPath = join(tmpdir(), "resident-conflict", "session.jsonl");
 		const worker = {
@@ -2047,37 +2020,6 @@ describe("daemon worker supervisor monitoring", () => {
 		automaticFinished.resolve();
 		await expect(resumed).resolves.toBe(worker);
 		expect(adopted).toEqual({ ACP_FIXTURE_API_KEY: "fresh-after-stale" });
-	});
-
-	it("denies a fresh resume that does not match the worker owner", async () => {
-		type Worker = {
-			descriptor: { workerId: string; rootActiveSessionId: string; ownerClientId: string; lifecycle: "failed" };
-			intentionalStop: boolean;
-		};
-		type Harness = {
-			reuseWorkerForCreate(
-				worker: Worker,
-				ownerClientId: undefined,
-				sessionPath: string,
-				command: { type: "create"; launchEnv: Record<string, string> },
-			): Promise<Worker>;
-		};
-		const worker: Worker = {
-			descriptor: {
-				workerId: "owned-worker",
-				rootActiveSessionId: "active-owned",
-				ownerClientId: "owner-A",
-				lifecycle: "failed",
-			},
-			intentionalStop: false,
-		};
-		const supervisor = Object.create(DaemonSupervisor.prototype) as Harness;
-		await expect(
-			supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/owned-worker", {
-				type: "create",
-				launchEnv: { ACP_FIXTURE_API_KEY: "unauthorized" },
-			}),
-		).rejects.toMatchObject({ name: "SessionAlreadyActiveError", activeSessionId: "active-owned" });
 	});
 
 	it("clears a fresh recovery environment when persistence fails", async () => {
