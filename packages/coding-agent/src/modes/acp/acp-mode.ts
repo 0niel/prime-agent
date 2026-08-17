@@ -660,10 +660,6 @@ export async function runAcpModeWithConnection(
 				// notification is queued. A cancellation before this cut produces no
 				// boundary/terminal; a cancellation after it cannot relabel a durable
 				// response+terminal pair as a cancelled prompt.
-				if (abort.signal.aborted) {
-					await entry.producer.drain();
-					return { stopReason: "cancelled" satisfies AcpStopReason };
-				}
 				if (terminal) entry.producer.sealTerminal(promptTurnId);
 				responseBoundaryEmitted = await entry.producer.publish(
 					{ sessionUpdate: "session_info_update", _meta: primeAgentMeta({}) },
@@ -684,8 +680,6 @@ export async function runAcpModeWithConnection(
 				if (!completionUpdateEmitted) throw new Error("Failed to publish ACP completion update");
 				await entry.producer.drain();
 				if (failure) throw new Error(`prime-agent turn failed: ${failure}`);
-				// A cancellation after the zero-terminal cut cannot relabel the durable
-				// boundary/terminal pair as cancellation.
 				return {
 					stopReason: acpStopReason({
 						cancelled: abort.signal.aborted && !entry.producer.isTerminalSealed(promptTurnId),

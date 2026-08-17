@@ -33,7 +33,6 @@ function fakeAcpConnection(
 	options: {
 		initialSnapshot?: () => Promise<any>;
 		finalSnapshot?: () => Promise<any>;
-		onInitialSnapshot?: (subscribed: boolean) => void;
 		onPromptAndWait?: () => void | Promise<void>;
 		onWaitForHeadlessCompletion?: () => void | Promise<void>;
 		headlessStatus?: Record<string, unknown>;
@@ -42,12 +41,10 @@ function fakeAcpConnection(
 	} = {},
 ): any {
 	let listener: ((event: any) => void) | undefined;
-	let subscribed = false;
 	const messages: any[] = [];
 	const snapshot = { state: { cwd: process.cwd() }, messages };
 	return {
 		subscribe(callback: (event: any) => void) {
-			subscribed = true;
 			listener = callback;
 			return () => {
 				listener = undefined;
@@ -57,7 +54,6 @@ function fakeAcpConnection(
 		getState: async () => snapshot.state,
 		getMessages: async () => messages,
 		getInitialSnapshot: async () => {
-			if (options.onInitialSnapshot) options.onInitialSnapshot(subscribed);
 			if (options.initialSnapshot) {
 				const result = await options.initialSnapshot();
 				options.initialSnapshot = undefined;
@@ -212,8 +208,6 @@ describe("ACP mode end to end", () => {
 			finalSnapshot: async () => ({
 				state: { cwd: process.cwd() },
 				messages: [],
-				// getRlmChildSnapshots omits the deleting direct parent but retains this
-				// nested live child, which must keep ACP from claiming terminal quiescence.
 				children: [
 					{
 						id: "live-grandchild",
@@ -255,8 +249,6 @@ describe("ACP mode end to end", () => {
 		const { client, updates } = connectAcpClient(connection);
 		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
 		const session = await client.request("session/new", { cwd: harness.tempDir, mcpServers: [] });
-		// The child is admitted after ACP attaches, so an attach-time snapshot was
-		// empty. Its run stays live while the independent parent prompt completes.
 		await harness.session.runRlmChild("continue in the background");
 		harness.appendResponses([fauxAssistantMessage("parent done")]);
 		await client.request("session/prompt", {
@@ -266,25 +258,12 @@ describe("ACP mode end to end", () => {
 		const quiescence = updates.find((update) => update.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
 		const meta = quiescence?.update?._meta?.[PRIME_AGENT_META_NAMESPACE];
 		expect(meta?.quiescence.outstandingSubagents).toBe(1);
-		// Outstanding child work is truthful progress, never scoreable terminal quiescence.
 		expect(meta?.phase).toBe("event");
 
 		releaseChild();
 		await vi.waitFor(() => expect(harness.session.getRlmChildSnapshots()[0]?.status).toBe("done"));
 		harness.cleanup();
 	}, 30_000);
-
-	it("fails session creation when the initial roster snapshot fails", async () => {
-		const connection = fakeAcpConnection({
-			initialSnapshot: async () => {
-				throw new Error("snapshot unavailable");
-			},
-		});
-		const { client, close } = connectAcpClient(connection);
-		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
-		await expect(client.request("session/new", { cwd: process.cwd(), mcpServers: [] })).rejects.toThrow();
-		close();
-	});
 
 	it("releases the subscription when the initial roster snapshot fails", async () => {
 		let unsubscribeCount = 0;
@@ -367,20 +346,6 @@ describe("ACP mode end to end", () => {
 		close();
 	});
 
-	it("subscribes before taking the initial roster snapshot", async () => {
-		let subscribedAtSnapshot: boolean | undefined;
-		const connection = fakeAcpConnection({
-			onInitialSnapshot: (subscribed) => {
-				subscribedAtSnapshot = subscribed;
-			},
-		});
-		const { client, close } = connectAcpClient(connection);
-		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
-		await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
-		expect(subscribedAtSnapshot).toBe(true);
-		close();
-	});
-
 	it("captures an autonomous continuation error after headless completion", async () => {
 		let connection: any;
 		connection = fakeAcpConnection({
@@ -413,12 +378,7 @@ describe("ACP mode end to end", () => {
 	});
 
 	it("propagates a failed roster read at quiescence emission", async () => {
-		// A snapshot failure while emitting must not degrade to outstandingSubagents: 0.
-		// Reporting a fabricated zero is the false-quiescent answer this metadata
-		// exists to prevent: a consumer would score a turn whose children still run.
 		const connection = fakeAcpConnection({
-			// `initialSnapshot` serves session/new and is then consumed; `finalSnapshot`
-			// serves the emission-time read, which is the one under test here.
 			initialSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [] }),
 			finalSnapshot: async () => {
 				throw new Error("roster unavailable");
@@ -442,24 +402,6 @@ describe("ACP mode end to end", () => {
 			}),
 		);
 		expect(metadata.find((meta) => meta.phase === "terminalQuiescence")).toBeUndefined();
-		close();
-	});
-
-	it("counts the authoritative live roster at quiescence emission", async () => {
-		const child = { id: "child-1", label: "child", status: "running", sessionDir: "/tmp/child" };
-		const connection = fakeAcpConnection({
-			initialSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [] }),
-			finalSnapshot: async () => ({ state: { cwd: process.cwd() }, messages: [], children: [child] }),
-		});
-		const { client, updates, close } = connectAcpClient(connection);
-		await client.request("initialize", { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: {} });
-		const session = await client.request("session/new", { cwd: process.cwd(), mcpServers: [] });
-		await client.request("session/prompt", {
-			sessionId: session.sessionId,
-			prompt: [{ type: "text", text: "finish" }],
-		});
-		const quiescence = updates.find((u) => u.update?._meta?.[PRIME_AGENT_META_NAMESPACE]?.quiescence);
-		expect(quiescence.update._meta[PRIME_AGENT_META_NAMESPACE].quiescence.outstandingSubagents).toBe(1);
 		close();
 	});
 

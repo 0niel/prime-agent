@@ -8,7 +8,6 @@ const mocks = vi.hoisted(() => ({
 	reapCalls: [] as Array<[boolean, boolean]>,
 	shutdownCalls: [] as Array<[boolean, boolean]>,
 	exactShutdownCalls: [] as string[],
-	exactShutdownResult: true,
 }));
 
 vi.mock("../src/cli/daemon-command.js", () => ({
@@ -21,7 +20,7 @@ vi.mock("../src/cli/daemon-command.js", () => ({
 vi.mock("../src/cli/daemon-launch.js", () => ({
 	shutdownExactDaemonAndWait: async (socketPath: string) => {
 		mocks.exactShutdownCalls.push(socketPath);
-		return mocks.exactShutdownResult;
+		return true;
 	},
 }));
 
@@ -58,7 +57,6 @@ describe("public command routing", () => {
 		mocks.reapCalls.length = 0;
 		mocks.shutdownCalls.length = 0;
 		mocks.exactShutdownCalls.length = 0;
-		mocks.exactShutdownResult = true;
 		process.exitCode = undefined;
 		vi.spyOn(console, "log").mockImplementation(() => {});
 		vi.spyOn(console, "error").mockImplementation(() => {});

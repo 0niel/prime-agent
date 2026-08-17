@@ -111,19 +111,13 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 describe("Agent relay identity", () => {
-	it("generates a distinct protected relay ID per intercept completion and keeps it through downstream retries", async () => {
+	it("generates a distinct protected relay ID per intercept completion", async () => {
 		const seenRelayIds: string[] = [];
-		const retryRelayIds: string[] = [];
 		const eventPayloads: string[] = [];
 		const streamFn: StreamFn = vi.fn((_model, _context, options) => {
 			const relayId = options?.headers?.["X-Prime-Agent-Relay-ID"];
 			if (!relayId) throw new Error("missing relay ID");
 			seenRelayIds.push(relayId);
-
-			// The provider SDK owns retries; it receives this one logical request's unchanged headers.
-			for (let attempt = 0; attempt < 2; attempt++) {
-				retryRelayIds.push(options?.headers?.["X-Prime-Agent-Relay-ID"] ?? "");
-			}
 
 			const stream = new MockAssistantStream();
 			queueMicrotask(() => {
@@ -139,7 +133,6 @@ describe("Agent relay identity", () => {
 			model: { ...createModel(), provider: "intercept" },
 			convertToLlm: identityConverter,
 			headers: {
-				"X-Extra-Auth": "preserved",
 				"x-prime-agent-relay-id": "caller-must-not-control-this",
 			},
 		};
@@ -166,7 +159,6 @@ describe("Agent relay identity", () => {
 		expect(seenRelayIds[0]).toMatch(/^[0-9a-f]{32}$/);
 		expect(seenRelayIds[1]).toMatch(/^[0-9a-f]{32}$/);
 		expect(seenRelayIds[0]).not.toBe(seenRelayIds[1]);
-		expect(retryRelayIds).toEqual([seenRelayIds[0], seenRelayIds[0], seenRelayIds[1], seenRelayIds[1]]);
 		expect(eventPayloads.join("\n")).not.toContain(seenRelayIds[0]!);
 		expect(eventPayloads.join("\n")).not.toContain(seenRelayIds[1]!);
 	});

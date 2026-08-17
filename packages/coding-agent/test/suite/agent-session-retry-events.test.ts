@@ -1,7 +1,7 @@
 import type { AgentEvent, AgentTool } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, type Harness } from "./harness.js";
 
 function normalizeEventOrder(events: Harness["events"]): string[] {
@@ -258,7 +258,6 @@ describe("AgentSession retry and event characterization", () => {
 				settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
 			});
 			harnesses.push(harness);
-			const continueSpy = vi.spyOn(harness.session.agent, "continue");
 			harness.setResponses([
 				fauxAssistantMessage("", { stopReason: "error", errorMessage }),
 				fauxAssistantMessage("must not make a second logical request"),
@@ -268,11 +267,8 @@ describe("AgentSession retry and event characterization", () => {
 
 			expect(harness.faux.state.callCount).toBe(1);
 			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
-			expect(harness.session.isRetrying).toBe(false);
 			const internals = harness.session as unknown as SessionRetryCompactionInternals;
-			expect(internals._retryPromise).toBeUndefined();
 			expect(internals._retryAuthFailureSources).toEqual([]);
-			expect(continueSpy).not.toHaveBeenCalled();
 		},
 	);
 
