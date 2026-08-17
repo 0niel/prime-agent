@@ -1751,7 +1751,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.recoveryLaunchEnv).toBeUndefined();
 	});
 
-	it("consumes a fresh recovery environment after failed replacement launch", async () => {
+	it("consumes a fresh recovery environment after replacement retries are exhausted", async () => {
 		vi.useFakeTimers();
 		type Worker = {
 			descriptor: {
