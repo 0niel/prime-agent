@@ -48,6 +48,7 @@ class FakeDaemonClient {
 	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	abortBashUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
+	resumeQueueOutcome: "success" | "empty" | "error" = "success";
 	cronAddGate: Promise<void> | undefined;
 	promptGate: Promise<void> | undefined;
 	promptError: Error | undefined;
@@ -269,6 +270,15 @@ class FakeDaemonClient {
 					success: true,
 					data: { steering: ["aborted"], followUp: ["cleared"] },
 				};
+			case "resume_queue":
+				return this.resumeQueueOutcome === "success"
+					? { type: "response", command: command.type, success: true }
+					: {
+							type: "response",
+							command: command.type,
+							success: false,
+							error: this.resumeQueueOutcome === "empty" ? "No queued work to resume" : "session worker crashed",
+						};
 			case "heartbeats_list":
 				return this.serverCapabilities.has("heartbeat_catalog")
 					? { type: "response", command: command.type, success: true, data: { heartbeats: [] } }
@@ -2259,6 +2269,21 @@ describe("DaemonAgentConnection", () => {
 		await expect(connection.abortAndClearQueue()).rejects.toThrow(
 			"the daemon is running an older build; restart the daemon and try again",
 		);
+	});
+
+	it("maps resume_queue outcomes: drained, empty queue, and real errors", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.resumeQueuedWork()).resolves.toBe(true);
+		expect(fakeClient.requests[1]).toMatchObject({ type: "resume_queue", activeSessionId: "active-1" });
+
+		fakeClient.resumeQueueOutcome = "empty";
+		await expect(connection.resumeQueuedWork()).resolves.toBe(false);
+
+		fakeClient.resumeQueueOutcome = "error";
+		await expect(connection.resumeQueuedWork()).rejects.toThrow("session worker crashed");
 	});
 
 	it("cancels rlm child runs through the daemon protocol", async () => {
