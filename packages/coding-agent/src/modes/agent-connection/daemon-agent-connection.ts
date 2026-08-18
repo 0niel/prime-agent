@@ -88,6 +88,9 @@ import { AgentConnectionPromptAdmissionError } from "./types.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
+
+/** Error from a reattach whose daemon-side attach succeeded but whose snapshot transfer failed. */
+type ReattachSnapshotError = Error & { reattachedActiveSessionId?: string };
 type DaemonSnapshotBegin = Extract<DaemonOutbound, { type: "session_snapshot_begin" }>;
 
 interface DaemonSnapshotAssembly {
@@ -1106,6 +1109,15 @@ export class DaemonAgentConnection implements AgentConnection {
 		sessionPath: string,
 		options?: AgentConnectionSwitchSessionOptions,
 	): Promise<{ cancelled: boolean }> {
+		// Serialized with fork(): a switch landing mid-fork would otherwise be
+		// overwritten when the fork's reattach resumes with its captured source id.
+		return this.withSessionTransition(() => this.performSwitchSession(sessionPath, options));
+	}
+
+	private async performSwitchSession(
+		sessionPath: string,
+		options?: AgentConnectionSwitchSessionOptions,
+	): Promise<{ cancelled: boolean }> {
 		const sourceActiveSessionId = this.activeSessionId;
 		try {
 			return await this.requestData<{ cancelled: boolean }>({
@@ -1199,6 +1211,10 @@ export class DaemonAgentConnection implements AgentConnection {
 				for (const generation of previousState.retiredEventGenerations) {
 					this.retiredEventGenerations.add(generation);
 				}
+			} else if (error instanceof Error) {
+				// The daemon accepted the reattach; only the snapshot transfer failed.
+				// Callers may recover by reattaching elsewhere before cleaning up.
+				(error as ReattachSnapshotError).reattachedActiveSessionId = this.activeSessionId;
 			}
 			throw error;
 		} finally {
@@ -1262,6 +1278,19 @@ export class DaemonAgentConnection implements AgentConnection {
 		try {
 			await this.reattachSession(sourceActiveSessionId, forkActiveSessionId);
 		} catch (error) {
+			const attachedToFork =
+				error instanceof Error &&
+				(error as ReattachSnapshotError).reattachedActiveSessionId === forkActiveSessionId;
+			if (attachedToFork) {
+				// The daemon moved this client onto the fork but the snapshot failed.
+				// Return to the source before cleanup; if that also fails, keep the
+				// live fork attachment rather than killing the session under us.
+				try {
+					await this.reattachSession(forkActiveSessionId, sourceActiveSessionId);
+				} catch {
+					throw error;
+				}
+			}
 			// The fork worker is resident but unattached; stop it best-effort.
 			await this.requestOk({ type: "kill", activeSessionId: forkActiveSessionId }).catch(() => undefined);
 			throw error;

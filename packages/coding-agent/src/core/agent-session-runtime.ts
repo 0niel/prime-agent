@@ -664,6 +664,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			sessionManager.flushNow();
 			return { cancelled: false, sessionPath: sessionPath ?? null, selectedText };
 		}
+		// The live manager defers writes until the first assistant message, so the
+		// on-disk file may lack the fork target. Flush it before reopening.
+		this.session.sessionManager.flushNow();
 		const sourceManager = SessionManager.open(currentSessionFile, sessionDir);
 		const forkedSessionPath = sourceManager.createBranchedSession(targetLeafId);
 		if (!forkedSessionPath) {

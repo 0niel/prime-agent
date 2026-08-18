@@ -780,6 +780,27 @@ describe("AgentSessionRuntime characterization", () => {
 		).toEqual(["Say one", "assistant"]);
 	});
 
+	it("exports a fork branch whose target entry has not been flushed to disk yet", async () => {
+		const { runtime, tempDir } = await createRuntimeForTest(() => {});
+		// A fresh persisted session defers user-message writes until the first
+		// assistant message, so the fork target exists only in the live manager.
+		runtime.session.sessionManager.appendMessage({ role: "user", content: "unflushed", timestamp: Date.now() });
+		const userMessages = runtime.session.getUserMessagesForForking();
+		expect(userMessages.length).toBeGreaterThan(0);
+
+		const result = await runtime.exportForkBranch(userMessages[0]!.entryId);
+
+		expect(result.cancelled).toBe(false);
+		expect(result.sessionPath).toBeDefined();
+		const exported = SessionManager.open(result.sessionPath!, join(tempDir, "sessions"));
+		expect(
+			exported
+				.buildSessionContext()
+				.messages.filter((message) => message.role === "user")
+				.map((message) => getMessageText(message)),
+		).toEqual([]);
+	});
+
 	it("honors session_before_fork cancellation without writing a branch file", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest((pi: ExtensionAPI) => {
 			pi.on("session_before_fork", () => ({ cancel: true }));

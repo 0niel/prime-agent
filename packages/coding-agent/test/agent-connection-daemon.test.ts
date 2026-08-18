@@ -63,6 +63,10 @@ class FakeDaemonClient {
 	createGate: Promise<void> | undefined;
 	createCount = 0;
 	reattachResponseError: string | undefined;
+	/** Targets whose reattach succeeds with a chunked snapshot stream (test emits the outcome). */
+	reattachSnapshotStreamFor = new Set<string>();
+	/** Targets whose reattach request fails at the response level. */
+	reattachErrorFor = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
 	hello: DaemonHello | undefined = {
 		type: "daemon_hello",
@@ -502,8 +506,30 @@ class FakeDaemonClient {
 				};
 			}
 			case "reattach":
-				if (this.reattachResponseError) {
-					return { type: "response", command: command.type, success: false, error: this.reattachResponseError };
+				if (this.reattachResponseError || this.reattachErrorFor.has(command.targetActiveSessionId)) {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: this.reattachResponseError ?? "reattach failed",
+					};
+				}
+				if (this.reattachSnapshotStreamFor.has(command.targetActiveSessionId)) {
+					return {
+						type: "response",
+						command: command.type,
+						success: true,
+						data: {
+							...createAttachResult(command.targetActiveSessionId, command.clientId, command.capabilities, 1, {
+								state: createConnectionState(command.targetActiveSessionId, "session-fork"),
+							}),
+							snapshotStream: {
+								id: `snap-${command.targetActiveSessionId}`,
+								messageCount: 1,
+								targetChunkBytes: 1024,
+							},
+						},
+					};
 				}
 				return {
 					type: "response",
@@ -1174,6 +1200,95 @@ describe("DaemonAgentConnection", () => {
 
 		await connection.getQueue();
 		expect(fakeClient.requests.at(-1)).toMatchObject({ type: "get_queue", activeSessionId: "active-original" });
+	});
+
+	it("returns to the source session when the fork reattach fails after the daemon accepted it", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("fork_export");
+		fakeClient.reattachSnapshotStreamFor.add("active-fork-1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+
+		const fork = connection.fork("entry-1");
+		await vi.waitFor(() => {
+			expect(fakeClient.requests.filter((request) => request.type === "reattach")).toHaveLength(1);
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_failed",
+			activeSessionId: "active-fork-1",
+			snapshotId: "snap-active-fork-1",
+			error: "snapshot transfer failed",
+		} as DaemonOutbound);
+		await expect(fork).rejects.toThrow("snapshot transfer failed");
+
+		// The client reattached back to the source before stopping the fork.
+		const reattaches = fakeClient.requests.filter((request) => request.type === "reattach");
+		expect(reattaches).toHaveLength(2);
+		expect(reattaches[1]).toMatchObject({
+			type: "reattach",
+			activeSessionId: "active-fork-1",
+			targetActiveSessionId: "active-original",
+		});
+		expect(fakeClient.requests.at(-1)).toMatchObject({ type: "kill", activeSessionId: "active-fork-1" });
+
+		await connection.getQueue();
+		expect(fakeClient.requests.at(-1)).toMatchObject({ type: "get_queue", activeSessionId: "active-original" });
+	});
+
+	it("keeps the fork attachment alive when the recovery reattach to the source also fails", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("fork_export");
+		fakeClient.reattachSnapshotStreamFor.add("active-fork-1");
+		fakeClient.reattachErrorFor.add("active-original");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+
+		const fork = connection.fork("entry-1");
+		await vi.waitFor(() => {
+			expect(fakeClient.requests.filter((request) => request.type === "reattach")).toHaveLength(1);
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_failed",
+			activeSessionId: "active-fork-1",
+			snapshotId: "snap-active-fork-1",
+			error: "snapshot transfer failed",
+		} as DaemonOutbound);
+		await expect(fork).rejects.toThrow("snapshot transfer failed");
+
+		// The daemon still has this client on the fork; killing it would strand the
+		// client on a dead session, so no kill is issued.
+		expect(fakeClient.requests.filter((request) => request.type === "kill")).toHaveLength(0);
+		await connection.getQueue();
+		expect(fakeClient.requests.at(-1)).toMatchObject({ type: "get_queue", activeSessionId: "active-fork-1" });
+	});
+
+	it("queues a session switch behind an in-flight fork instead of interleaving", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("fork_export");
+		let releaseCreate!: () => void;
+		fakeClient.createGate = new Promise<void>((resolve) => {
+			releaseCreate = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+
+		const fork = connection.fork("entry-1");
+		await vi.waitFor(() => {
+			expect(fakeClient.requests.map((request) => request.type)).toEqual(["fork_export", "create"]);
+		});
+		const switched = connection.switchSession("/tmp/other-session.jsonl").catch((error) => error);
+		// The switch must not reach the daemon while the fork transition is in flight.
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["fork_export", "create"]);
+
+		releaseCreate();
+		await fork;
+		await switched;
+		const types = fakeClient.requests.map((request) => request.type);
+		// The switch ran only after the fork completed its reattach.
+		expect(types.indexOf("switch_session")).toBeGreaterThan(types.indexOf("reattach"));
+		// And it targeted the fork session the transition left active.
+		expect(fakeClient.requests[types.indexOf("switch_session")]).toMatchObject({
+			type: "switch_session",
+			activeSessionId: "active-fork-1",
+		});
 	});
 
 	it("serializes overlapping forks so the second fork starts from the first fork's session", async () => {
