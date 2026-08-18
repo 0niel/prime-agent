@@ -342,9 +342,7 @@ describe("detectDaemonOwnershipLost", () => {
 	});
 
 	it("never flags a hello without a supervisor generation", async () => {
-		// A supervisor writes its owner record before it ever listens, so any
-		// daemon still starting up (or an old/foreign build) has no generation
-		// in its hello and is skipped instead of falsely flagged.
+		// A starting daemon has no generation in its hello yet and is skipped.
 		const paths = await acquireTestOwnership("young-owner");
 		rmSync(paths.ownerDir, { recursive: true, force: true });
 		const probe: ProbeResult = { ...paths.probe };
@@ -353,8 +351,7 @@ describe("detectDaemonOwnershipLost", () => {
 	});
 
 	it("never flags a supervisor whose process identity no longer matches", async () => {
-		// Covers the clean-shutdown race: the record disappears only after the
-		// daemon stops, so a dead/replaced process identity means no flag.
+		// Clean-shutdown race: a dead/replaced process identity means no flag.
 		const paths = await acquireTestOwnership("stopping-owner");
 		rmSync(paths.ownerDir, { recursive: true, force: true });
 		const probe: ProbeResult = { ...paths.probe, supervisorProcessStartId: "stale-start-id" };
@@ -434,11 +431,6 @@ describe("repairOwnershipLostDaemon", () => {
 	}
 
 	it("holds admission across kill, cleanup, and fence wait, releasing only right before the relaunch", async () => {
-		// Mirrors runDaemonUpdateRestartCoordinator: the admission blocks any
-		// concurrent launch from binding the socket until the wedged supervisor
-		// is confirmed dead and its socket/fence are cleared; after release the
-		// relaunch may race a client autostart and ensureDaemonRunning converges
-		// on whichever launcher wins.
 		const { hooks, calls } = makeHooks();
 		const outcome = await repairOwnershipLostDaemon(makeLostDaemon(), hooks);
 		expect(outcome).toEqual({
@@ -499,8 +491,7 @@ describe("repairOwnershipLostDaemon", () => {
 	});
 
 	it("declines to restart a daemon whose state lives under a different agent dir", async () => {
-		// A relaunch inherits this process's agent dir; killing a foreign
-		// daemon and starting a successor here would silently drop its workers.
+		// Killing a foreign daemon would silently drop its workers on relaunch.
 		const { hooks, calls } = makeHooks({
 			ownsSupervisorState: () => false,
 		});

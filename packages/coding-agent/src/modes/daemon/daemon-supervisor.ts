@@ -515,12 +515,10 @@ export function defaultWorkerDescriptorDir(agentDir: string, socketPath: string)
 }
 
 /**
- * Purely local proof that the supervisor instance identified by
- * supervisorGeneration keeps its state (worker descriptors, persisted config)
- * under agentDir: start() creates snapshot-cache/<generation> in the
- * descriptor dir derived from the launch agent dir, and only shutdown removes
- * it. Doctor --fix uses this before repairing an ownership-lost daemon; a
- * match guarantees a relaunch under agentDir re-adopts the same workers.
+ * Whether the supervisor generation keeps its state under agentDir: start()
+ * creates snapshot-cache/<generation> in the descriptor dir and only shutdown
+ * removes it, so a match proves a relaunch under agentDir re-adopts the same
+ * workers.
  */
 export function supervisorStateDirMatches(agentDir: string, socketPath: string, supervisorGeneration: string): boolean {
 	return existsSync(join(defaultWorkerDescriptorDir(agentDir, socketPath), "snapshot-cache", supervisorGeneration));

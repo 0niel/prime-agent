@@ -353,17 +353,11 @@ export function verifyHelloSupervisorPid(
 }
 
 /**
- * Detect a listening supervisor that lost its durable ownership record. Purely
- * local reads: the hello identity (already captured by the probe) is cross-
- * checked against the ownership registry on disk, never via daemon commands —
- * a wedged supervisor cannot serve them.
- *
- * Sound against startup/shutdown races without any age heuristic: the owner
- * record is written before the supervisor ever listens, so a hello carrying a
- * supervisorGeneration proves the record existed; and a supervisor stops
- * listening before releasing its record, so the final liveness re-check (pid +
- * processStartId at registry-read time) rejects a daemon that exited or was
- * replaced between the probe and the registry read.
+ * Cross-checks the probed hello identity against the on-disk ownership
+ * registry; no daemon commands (a wedged supervisor cannot serve them). Race-
+ * free without age heuristics: the record is written before listen() and
+ * released only after the socket closes, and the final pid+startId liveness
+ * check rejects daemons that exited or were replaced since the probe.
  */
 export async function detectDaemonOwnershipLost(
 	socketPath: string,
@@ -390,15 +384,12 @@ export async function detectDaemonOwnershipLost(
 		);
 		return false;
 	} catch (error) {
-		// Only the specific ownership-lost error counts: an unexpected registry
-		// read/runtime error must never classify a healthy daemon as lost (this
-		// result gates a kill in doctor --fix).
+		// This result gates a kill: an unexpected registry error must never
+		// classify a healthy daemon as lost.
 		if ((error as { code?: unknown }).code !== "supervisor_generation_stale") {
 			return false;
 		}
-		// Ownership record missing or mismatched; only flag it if the probed
-		// supervisor process is still alive (a stopping daemon releases its
-		// record after it stops listening).
+		// Flag only a live process: a stopping daemon releases its record late.
 		return verifyHelloSupervisorPid(pid, probe.supervisorProcessStartId) !== undefined;
 	}
 }
@@ -519,8 +510,7 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAc
 		if (daemon.status === "orphan-file") {
 			return { kind: "remove-file", daemon };
 		}
-		// An ownership-lost supervisor is wedged (it rejects every command) and
-		// can only be repaired by a restart, so this outranks the default guard.
+		// Wedged supervisors reject every command; only a restart repairs them.
 		if (daemon.status === "ownership-lost") {
 			return { kind: "restart", daemon };
 		}
@@ -1169,31 +1159,22 @@ const defaultRepairHooks: RepairHooks = {
 };
 
 /**
- * Repair an ownership-lost supervisor by killing it and relaunching a daemon
- * on the same socket, mirroring the update-restart coordinator's handoff: the
- * shutdown admission is held across the kill, socket cleanup, and startup-
- * fence wait, so no concurrent launch can bind the socket while the wedged
- * supervisor is being stopped — doctor wins the stop deterministically. The
- * admission must be released before relaunching (a successor cannot acquire
- * ownership while it is active), so a concurrent client autostart may win the
- * relaunch; ensureDaemonRunning converges on whichever launcher wins and the
- * outcome is a healthy daemon on the same socket either way.
- *
- * The relaunch inherits this doctor process's environment (including its
- * agent dir), so it only re-adopts the wedged daemon's workers when that
- * daemon's state lives under the same agent dir. Doctor discovers daemons from
- * every agent dir on the machine, so repair first proves the wedged
- * supervisor's state dir (keyed by its hello generation) exists under this
- * process's agent dir and declines otherwise — never guessing a foreign
- * daemon's agent dir, and never killing what it cannot correctly relaunch.
+ * Kill the wedged supervisor and relaunch on the same socket, mirroring the
+ * update-restart coordinator's handoff: shutdown admission is held across
+ * kill, socket cleanup, and fence wait (no concurrent launch can bind the
+ * socket mid-stop), then released before relaunch since a successor cannot
+ * acquire ownership under it — if a client autostart wins that relaunch race,
+ * ensureDaemonRunning converges on the same healthy outcome. Repair first
+ * proves the daemon's state dir lives under this process's agent dir and
+ * declines otherwise: the relaunch inherits this environment, so a foreign
+ * agent dir's workers could not be re-adopted.
  */
 export async function repairOwnershipLostDaemon(
 	daemon: DaemonInfo,
 	hooks: RepairHooks = defaultRepairHooks,
 ): Promise<ReapOutcome> {
 	const { socketPath } = daemon;
-	// Re-verify right before acting: discovery and repair happen at different
-	// moments, and a replaced daemon must never be killed for its predecessor.
+	// A replaced daemon must never be killed for its predecessor.
 	const probe = await hooks.probe(socketPath);
 	if (!probe.reachable) {
 		return { skipped: "no longer reachable; not restarting" };
@@ -1215,9 +1196,8 @@ export async function repairOwnershipLostDaemon(
 	let pid: number | undefined;
 	let killedPid: number | undefined;
 	try {
-		// Revalidate under the admission: acquiring it may have waited, and a
-		// replacement daemon could have taken the socket meanwhile. Only a pid
-		// verified from this fresh hello is ever signaled — never a stale one.
+		// Acquiring the admission may have waited; only a pid verified from a
+		// fresh hello under it is ever signaled.
 		const recheck = await hooks.probe(socketPath);
 		pid =
 			recheck.reachable && recheck.supervisorGeneration === probe.supervisorGeneration
