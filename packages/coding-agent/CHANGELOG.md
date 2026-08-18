@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `doctor` detection of daemons that lost their supervisor ownership record (status `ownership-lost`); `doctor --fix` now restarts only the affected daemon on the same socket and agent dir, preserving sessions (declining daemons whose state lives under a different agent dir), and ownership and socket-lock errors name the cause and the incumbent owner.
 - Changed RLM guidance to orchestrate independent workers in parallel, use available async shell helpers safely, end the turn instead of sleeping, polling, or blocking on long awaits, provide proactive outcome-focused progress updates from root agents, and use simplified technical English for user-facing prose.
 - Fixed new top-level daemon sessions inheriting an RLM child depth from the supervisor process.
 

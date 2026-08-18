@@ -12,9 +12,15 @@ import {
 	type DaemonRuntimeIdentity,
 } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
-import { acquireDaemonShutdownAdmission } from "../modes/daemon/daemon-supervisor-ownership.js";
+import { supervisorStateDirMatches } from "../modes/daemon/daemon-supervisor.js";
+import {
+	acquireDaemonShutdownAdmission,
+	assertDaemonSupervisorOwnerCurrent,
+	waitForDaemonStartupFence,
+} from "../modes/daemon/daemon-supervisor-ownership.js";
 import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
 import { signalProcessGroupOrProcess } from "../utils/child-process.js";
+import { ensureInteractiveDaemonRunning } from "./daemon-launch.js";
 import { formatDaemonListTable } from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
 
@@ -36,7 +42,7 @@ import { promptYesNo } from "./daemon-stop-confirm.js";
  * older build (a new protocol command would not).
  */
 
-export type DaemonStatus = "current" | "stale" | "unreachable" | "orphan-file";
+export type DaemonStatus = "current" | "stale" | "ownership-lost" | "unreachable" | "orphan-file";
 
 export interface DiscoveredDaemonProcess {
 	pid: number;
@@ -63,8 +69,9 @@ export interface DaemonInfo {
 const STATUS_ORDER: Record<DaemonStatus, number> = {
 	current: 0,
 	stale: 1,
-	unreachable: 2,
-	"orphan-file": 3,
+	"ownership-lost": 2,
+	unreachable: 3,
+	"orphan-file": 4,
 };
 const SHUTDOWN_QUIET_PERIOD_MS = 1000;
 const SHUTDOWN_CONVERGENCE_TIMEOUT_MS = 10_000;
@@ -241,12 +248,13 @@ function scanSocketDir(): string[] {
 	return sockets;
 }
 
-interface ProbeResult {
+export interface ProbeResult {
 	version?: string;
 	protocolVersion?: number;
 	schemaId?: string;
 	runtime?: DaemonRuntimeIdentity;
 	sessionCount?: number;
+	supervisorGeneration?: string;
 	supervisorPid?: number;
 	supervisorProcessStartId?: string;
 	reachable: boolean;
@@ -265,6 +273,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		let protocolVersion: number | undefined;
 		let schemaId: string | undefined;
 		let runtime: DaemonRuntimeIdentity | undefined;
+		let supervisorGeneration: string | undefined;
 		let supervisorPid: number | undefined;
 		let supervisorProcessStartId: string | undefined;
 		let greeted = false;
@@ -274,6 +283,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			protocolVersion = hello.protocol.version;
 			schemaId = hello.schemaId;
 			runtime = hello.runtime;
+			supervisorGeneration = hello.supervisorGeneration;
 			supervisorPid = hello.supervisorPid;
 			supervisorProcessStartId = hello.supervisorProcessStartId;
 			greeted = true;
@@ -298,6 +308,7 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 			schemaId,
 			runtime,
 			sessionCount,
+			supervisorGeneration,
 			supervisorPid,
 			supervisorProcessStartId,
 			reachable: true,
@@ -341,6 +352,57 @@ export function verifyHelloSupervisorPid(
 	return pid;
 }
 
+/**
+ * Detect a listening supervisor that lost its durable ownership record. Purely
+ * local reads: the hello identity (already captured by the probe) is cross-
+ * checked against the ownership registry on disk, never via daemon commands —
+ * a wedged supervisor cannot serve them.
+ *
+ * Sound against startup/shutdown races without any age heuristic: the owner
+ * record is written before the supervisor ever listens, so a hello carrying a
+ * supervisorGeneration proves the record existed; and a supervisor stops
+ * listening before releasing its record, so the final liveness re-check (pid +
+ * processStartId at registry-read time) rejects a daemon that exited or was
+ * replaced between the probe and the registry read.
+ */
+export async function detectDaemonOwnershipLost(
+	socketPath: string,
+	probe: ProbeResult,
+	registryDir?: string,
+): Promise<boolean> {
+	if (!probe.reachable || !probe.supervisorGeneration) {
+		return false;
+	}
+	const pid = verifyHelloSupervisorPid(probe.supervisorPid, probe.supervisorProcessStartId);
+	if (pid === undefined) {
+		return false;
+	}
+	try {
+		await assertDaemonSupervisorOwnerCurrent(
+			{
+				generation: probe.supervisorGeneration,
+				pid,
+				...(probe.supervisorProcessStartId ? { processStartId: probe.supervisorProcessStartId } : {}),
+				socketPath,
+			},
+			undefined,
+			registryDir,
+		);
+		return false;
+	} catch (error) {
+		// Only the specific ownership-lost error counts: an unexpected registry
+		// read/runtime error must never classify a healthy daemon as lost (this
+		// result gates a kill in doctor --fix).
+		if ((error as { code?: unknown }).code !== "supervisor_generation_stale") {
+			return false;
+		}
+		// Ownership record missing or mismatched; only flag it if the probed
+		// supervisor process is still alive (a stopping daemon releases its
+		// record after it stops listening).
+		return verifyHelloSupervisorPid(pid, probe.supervisorProcessStartId) !== undefined;
+	}
+}
+
 /** Discover every daemon on the machine and probe each for version + session count. */
 export async function discoverDaemons(): Promise<DaemonInfo[]> {
 	const processBySocket = new Map<string, DiscoveredDaemonProcess>();
@@ -367,11 +429,14 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 			const probe = await probeDaemon(socketPath);
 			const pid = proc?.pid ?? verifyHelloSupervisorPid(probe.supervisorPid, probe.supervisorProcessStartId);
 			const hasTrackedWorkers = workerSockets.has(socketPath);
-			const status: DaemonStatus = probe.reachable
+			let status: DaemonStatus = probe.reachable
 				? classifyReachable(probe)
 				: proc || hasTrackedWorkers
 					? "unreachable"
 					: "orphan-file";
+			if (status === "current" && (await detectDaemonOwnershipLost(socketPath, probe))) {
+				status = "ownership-lost";
+			}
 			return {
 				socketPath,
 				pid,
@@ -420,6 +485,7 @@ export async function runPs(json: boolean): Promise<void> {
 export type ReapAction =
 	| { kind: "remove-file"; daemon: DaemonInfo }
 	| { kind: "kill"; daemon: DaemonInfo }
+	| { kind: "restart"; daemon: DaemonInfo }
 	| { kind: "shutdown"; daemon: DaemonInfo }
 	| { kind: "skip"; daemon: DaemonInfo; reason: string };
 
@@ -452,6 +518,11 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAc
 		// before the default guard so a dead default socket still gets cleaned up.
 		if (daemon.status === "orphan-file") {
 			return { kind: "remove-file", daemon };
+		}
+		// An ownership-lost supervisor is wedged (it rejects every command) and
+		// can only be repaired by a restart, so this outranks the default guard.
+		if (daemon.status === "ownership-lost") {
+			return { kind: "restart", daemon };
 		}
 		if (daemon.isDefault) {
 			return { kind: "skip", daemon, reason: "default background service" };
@@ -497,7 +568,8 @@ const SHUTDOWN_ALL_ACTION_ORDER: Record<ReapAction["kind"], number> = {
 	shutdown: 0,
 	"remove-file": 1,
 	kill: 2,
-	skip: 3,
+	restart: 3,
+	skip: 4,
 };
 
 export type ShutdownConfirmationPlan = "none" | "prompt" | "json-error" | "tty-error";
@@ -1075,6 +1147,121 @@ async function stopTrackedProcess(
 	return !isProcessAlive(pid);
 }
 
+export interface RepairHooks {
+	probe: (socketPath: string) => Promise<ProbeResult>;
+	detectLost: (socketPath: string, probe: ProbeResult) => Promise<boolean>;
+	ownsSupervisorState: (socketPath: string, supervisorGeneration: string) => boolean;
+	acquireAdmission: () => Promise<{ assertOrRenew: () => Promise<void>; release: () => Promise<void> }>;
+	killDaemon: (pid: number) => Promise<boolean>;
+	waitStartupFence: (socketPath: string) => Promise<void>;
+	ensureDaemonRunning: (socketPath: string) => Promise<void>;
+}
+
+const defaultRepairHooks: RepairHooks = {
+	probe: probeDaemon,
+	detectLost: detectDaemonOwnershipLost,
+	ownsSupervisorState: (socketPath, supervisorGeneration) =>
+		supervisorStateDirMatches(getAgentDir(), socketPath, supervisorGeneration),
+	acquireAdmission: acquireDaemonShutdownAdmission,
+	killDaemon: forceKillDaemon,
+	waitStartupFence: waitForDaemonStartupFence,
+	ensureDaemonRunning: ensureInteractiveDaemonRunning,
+};
+
+/**
+ * Repair an ownership-lost supervisor by killing it and relaunching a daemon
+ * on the same socket, mirroring the update-restart coordinator's handoff: the
+ * shutdown admission is held across the kill, socket cleanup, and startup-
+ * fence wait, so no concurrent launch can bind the socket while the wedged
+ * supervisor is being stopped — doctor wins the stop deterministically. The
+ * admission must be released before relaunching (a successor cannot acquire
+ * ownership while it is active), so a concurrent client autostart may win the
+ * relaunch; ensureDaemonRunning converges on whichever launcher wins and the
+ * outcome is a healthy daemon on the same socket either way.
+ *
+ * The relaunch inherits this doctor process's environment (including its
+ * agent dir), so it only re-adopts the wedged daemon's workers when that
+ * daemon's state lives under the same agent dir. Doctor discovers daemons from
+ * every agent dir on the machine, so repair first proves the wedged
+ * supervisor's state dir (keyed by its hello generation) exists under this
+ * process's agent dir and declines otherwise — never guessing a foreign
+ * daemon's agent dir, and never killing what it cannot correctly relaunch.
+ */
+export async function repairOwnershipLostDaemon(
+	daemon: DaemonInfo,
+	hooks: RepairHooks = defaultRepairHooks,
+): Promise<ReapOutcome> {
+	const { socketPath } = daemon;
+	// Re-verify right before acting: discovery and repair happen at different
+	// moments, and a replaced daemon must never be killed for its predecessor.
+	const probe = await hooks.probe(socketPath);
+	if (!probe.reachable) {
+		return { skipped: "no longer reachable; not restarting" };
+	}
+	if (!(await hooks.detectLost(socketPath, probe))) {
+		return { skipped: "no longer ownership-lost; not restarting" };
+	}
+	if (verifyHelloSupervisorPid(probe.supervisorPid, probe.supervisorProcessStartId) === undefined) {
+		return { skipped: "ownership-lost but no verified pid to restart" };
+	}
+	if (!probe.supervisorGeneration || !hooks.ownsSupervisorState(socketPath, probe.supervisorGeneration)) {
+		return {
+			skipped:
+				"daemon belongs to a different agent dir; not restarting " +
+				`(rerun "${APP_NAME} doctor --fix" with that daemon's agent dir configured)`,
+		};
+	}
+	const admission = await hooks.acquireAdmission();
+	let pid: number | undefined;
+	let killedPid: number | undefined;
+	try {
+		// Revalidate under the admission: acquiring it may have waited, and a
+		// replacement daemon could have taken the socket meanwhile. Only a pid
+		// verified from this fresh hello is ever signaled — never a stale one.
+		const recheck = await hooks.probe(socketPath);
+		pid =
+			recheck.reachable && recheck.supervisorGeneration === probe.supervisorGeneration
+				? verifyHelloSupervisorPid(recheck.supervisorPid, recheck.supervisorProcessStartId)
+				: undefined;
+		if (pid === undefined || !(await hooks.detectLost(socketPath, recheck))) {
+			return { skipped: "no longer ownership-lost; not restarting" };
+		}
+		let killed: boolean;
+		try {
+			await admission.assertOrRenew();
+			killed = await hooks.killDaemon(pid);
+		} catch (error) {
+			return { skipped: `could not stop wedged supervisor (pid ${pid}): ${String(error)}` };
+		}
+		if (!killed) {
+			return { skipped: `wedged supervisor (pid ${pid}) did not exit after SIGKILL; not touching its socket` };
+		}
+		killedPid = pid;
+		removeSocketFile(socketPath);
+		await hooks.waitStartupFence(socketPath);
+		await admission.assertOrRenew();
+	} catch (error) {
+		return { skipped: relaunchFailureReason(killedPid, error) };
+	} finally {
+		await admission.release();
+	}
+	try {
+		await hooks.ensureDaemonRunning(socketPath);
+	} catch (error) {
+		return { skipped: relaunchFailureReason(killedPid, error) };
+	}
+	return {
+		reaped: `restarted background service after ownership loss (killed pid ${pid}, relaunched on same socket)`,
+	};
+}
+
+function relaunchFailureReason(killedPid: number | undefined, error: unknown): string {
+	return killedPid === undefined
+		? `could not repair ownership-lost supervisor: ${String(error)}`
+		: `killed wedged supervisor (pid ${killedPid}) but relaunch failed: ${String(error)}; ` +
+				"run any prime-agent command to autostart it";
+}
+
 export async function runReap(json: boolean, force: boolean): Promise<void> {
 	const daemons = await discoverDaemons();
 	const reaped: Array<{ socketPath: string; action: string }> = [];
@@ -1114,6 +1301,9 @@ export async function runReap(json: boolean, force: boolean): Promise<void> {
 				}
 				break;
 			}
+			case "restart":
+				apply(await repairOwnershipLostDaemon(action.daemon), socketPath, reaped, skipped);
+				break;
 			case "shutdown":
 				apply(await reapReachableDaemon(socketPath, pid), socketPath, reaped, skipped);
 				break;
@@ -1136,7 +1326,7 @@ export async function runReap(json: boolean, force: boolean): Promise<void> {
 	}
 }
 
-type ReapOutcome = { reaped: string } | { skipped: string };
+export type ReapOutcome = { reaped: string } | { skipped: string };
 
 function apply(
 	outcome: ReapOutcome,
@@ -1188,12 +1378,13 @@ function killDaemon(pid: number): void {
 	}
 }
 
-async function forceKillDaemon(pid: number): Promise<void> {
+/** SIGTERM, then SIGKILL; resolves true only once the process is confirmed gone. */
+async function forceKillDaemon(pid: number): Promise<boolean> {
 	killDaemon(pid);
-	const deadline = Date.now() + 1000;
+	let deadline = Date.now() + 1000;
 	while (Date.now() < deadline) {
 		if (!isProcessAlive(pid)) {
-			return;
+			return true;
 		}
 		await delay(50);
 	}
@@ -1202,6 +1393,11 @@ async function forceKillDaemon(pid: number): Promise<void> {
 	} catch {
 		// Process already exited between the liveness check and the kill.
 	}
+	deadline = Date.now() + 2000;
+	while (isProcessAlive(pid) && Date.now() < deadline) {
+		await delay(50);
+	}
+	return !isProcessAlive(pid);
 }
 
 function isProcessAlive(pid: number): boolean {

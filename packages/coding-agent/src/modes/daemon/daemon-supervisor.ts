@@ -1,6 +1,15 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -99,6 +108,7 @@ import {
 } from "./daemon-socket.js";
 import {
 	acquireDaemonSupervisorOwnership,
+	findDaemonSupervisorOwnerForSocket,
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
@@ -500,8 +510,20 @@ function descriptorKey(socketPath: string): string {
 	return createHash("sha256").update(socketPath).digest("hex").slice(0, 12);
 }
 
-function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): string {
+export function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): string {
 	return join(agentDir, "daemon-workers", descriptorKey(socketPath));
+}
+
+/**
+ * Purely local proof that the supervisor instance identified by
+ * supervisorGeneration keeps its state (worker descriptors, persisted config)
+ * under agentDir: start() creates snapshot-cache/<generation> in the
+ * descriptor dir derived from the launch agent dir, and only shutdown removes
+ * it. Doctor --fix uses this before repairing an ownership-lost daemon; a
+ * match guarantees a relaunch under agentDir re-adopts the same workers.
+ */
+export function supervisorStateDirMatches(agentDir: string, socketPath: string, supervisorGeneration: string): boolean {
+	return existsSync(join(defaultWorkerDescriptorDir(agentDir, socketPath), "snapshot-cache", supervisorGeneration));
 }
 
 export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMinutes): number {
@@ -647,7 +669,19 @@ export class DaemonSupervisor {
 			if (!agentDir) {
 				throw new Error("Daemon supervisor config is missing agentDir");
 			}
-			this.socketLease = await acquireDaemonSocketPathLease(this.socketPath);
+			try {
+				this.socketLease = await acquireDaemonSocketPathLease(this.socketPath);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ELOCKED") {
+					throw error;
+				}
+				const owner = findDaemonSupervisorOwnerForSocket(this.socketPath);
+				throw new Error(
+					`Daemon socket ${this.socketPath} is locked by another supervisor` +
+						`${owner ? ` (pid ${owner.pid}, generation ${owner.generation})` : ""}; ` +
+						"a concurrent daemon launch won the socket",
+				);
+			}
 			await waitForDaemonStartupFence(this.socketPath);
 			this.ownership = await acquireDaemonSupervisorOwnership({
 				socketPath: this.socketPath,
