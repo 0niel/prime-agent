@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed queued messages staying parked after Escape or Ctrl+C interrupted a turn: pressing Enter on an empty editor now sends the parked queue, and the queued-messages footer shows `enter to send` while the session is idle ([#1476](https://github.com/PrimeIntellect-ai/prime-agent/discussions/1476)).
 - Changed RLM guidance to orchestrate independent workers in parallel, use available async shell helpers safely, end the turn instead of sleeping, polling, or blocking on long awaits, provide proactive outcome-focused progress updates from root agents, and use simplified technical English for user-facing prose.
 - Fixed new top-level daemon sessions inheriting an RLM child depth from the supervisor process.
 

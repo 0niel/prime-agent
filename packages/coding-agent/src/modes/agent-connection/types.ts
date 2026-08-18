@@ -653,6 +653,8 @@ export interface AgentConnection {
 	): Promise<AgentConnectionQueuedMessageMutationStatus>;
 	clearQueue(): Promise<AgentConnectionQueueState>;
 	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
+	/** Resume draining queued session input after an abort suspended it. Returns false when nothing was suspended. */
+	resumeQueuedWork(): Promise<boolean>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
 	listHeartbeats(): Promise<AgentConnectionHeartbeat[]>;
 	manageHeartbeat(

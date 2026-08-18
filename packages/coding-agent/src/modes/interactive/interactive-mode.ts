@@ -2744,6 +2744,20 @@ export class InteractiveMode {
 		return this.connectionState?.sessionActions.queuedCount ?? 0;
 	}
 
+	/**
+	 * Enter on an empty editor while messages wait in a queue that an interrupt
+	 * suspended: send the parked queue instead of doing nothing.
+	 */
+	private async resumeParkedQueueIfIdle(): Promise<boolean> {
+		if (this.isAgentStreaming() || this.getQueuedActionCount() === 0) return false;
+		try {
+			return await this.agentConnection.resumeQueuedWork();
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return false;
+		}
+	}
+
 	private getGoalState(): GoalState {
 		return this.connectionState?.goal ?? emptyGoalState();
 	}
@@ -4526,7 +4540,10 @@ export class InteractiveMode {
 				}
 			}
 			text = text.trim();
-			if (!text) return;
+			if (!text) {
+				await this.resumeParkedQueueIfIdle();
+				return;
+			}
 			const submissionGeneration = ++this.inputSubmissionGeneration;
 			this.inputSubmissionsPending++;
 			this.clearShortcutGuide();
@@ -5520,6 +5537,9 @@ export class InteractiveMode {
 				this.flushPendingBashComponents();
 				this.resetPendingToolState();
 				this.renderRecap();
+				// The queued-messages footer offers Enter-to-send only while idle, so
+				// refresh it on the streaming -> idle transition.
+				this.updatePendingMessagesDisplay();
 
 				this.applyOptimisticContextUsage();
 				// Auto-compaction can start server-side while this event is being handled.
@@ -7339,7 +7359,9 @@ export class InteractiveMode {
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.navigateOlder");
-			const hintText = theme.fg("dim", `╰─ ${dequeueHint} to browse and edit queued messages`);
+			// While idle the queue is parked (an interrupt suspended it); tell the user Enter sends it.
+			const sendHint = this.isAgentStreaming() ? "" : "enter to send · ";
+			const hintText = theme.fg("dim", `╰─ ${sendHint}${dequeueHint} to browse and edit queued messages`);
 			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 		}
 		if (hasQueuedMessages && !this.featureHintSuppressedByQueue) {

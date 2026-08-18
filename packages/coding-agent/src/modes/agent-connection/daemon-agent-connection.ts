@@ -570,6 +570,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	async resumeQueuedWork(): Promise<boolean> {
+		const response = await this.client.request({
+			type: "resume_queue",
+			activeSessionId: this.activeSessionId,
+		});
+		return response.success;
+	}
+
 	async listCronJobs(options: { includeInactive?: boolean } = {}): Promise<AgentCronJob[]> {
 		const data = await this.requestData<{ jobs: AgentCronJob[] }>({
 			type: "cron_list",
