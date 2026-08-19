@@ -62,7 +62,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
 // Revision 17 adds the sweep_empty_sessions command.
 export const DAEMON_SCHEMA_REVISION = 17;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-1bcb9e7f1a49";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-89941bf71da6";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
