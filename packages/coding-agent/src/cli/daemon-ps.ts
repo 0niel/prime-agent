@@ -17,6 +17,13 @@ import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-proto
 import { signalProcessGroupOrProcess } from "../utils/child-process.js";
 import { formatDaemonListTable } from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
+import {
+	formatKernelFixResult,
+	formatKernelReport,
+	type KernelFindings,
+	type KernelFixResult,
+	kernelJsonSummary,
+} from "./doctor-kernel-reap.js";
 
 /**
  * `daemon ps` discovers every prime-agent daemon on the machine, not just the
@@ -396,17 +403,21 @@ export function sortDaemons(infos: DaemonInfo[]): DaemonInfo[] {
 	});
 }
 
-export async function runPs(json: boolean): Promise<void> {
+export async function runPs(json: boolean, kernels?: KernelFindings): Promise<void> {
 	const daemons = await discoverDaemons();
 	if (json) {
-		console.log(JSON.stringify(daemons, null, 2));
+		console.log(JSON.stringify(kernels ? { daemons, kernels: kernelJsonSummary(kernels) } : daemons, null, 2));
 		return;
 	}
 	if (daemons.length === 0) {
 		console.log("No background services found.");
-		return;
+	} else {
+		console.log(formatDaemonListTable(daemons));
 	}
-	console.log(formatDaemonListTable(daemons));
+	const kernelReport = kernels ? formatKernelReport(kernels) : undefined;
+	if (kernelReport) {
+		console.log(kernelReport);
+	}
 }
 
 export type ReapAction =
@@ -1067,7 +1078,7 @@ async function stopTrackedProcess(
 	return !isProcessAlive(pid);
 }
 
-export async function runReap(json: boolean, force: boolean): Promise<void> {
+export async function runReap(json: boolean, force: boolean, kernelFix?: KernelFixResult): Promise<void> {
 	const daemons = await discoverDaemons();
 	const reaped: Array<{ socketPath: string; action: string }> = [];
 	const skipped: Array<{ socketPath: string; reason: string }> = [];
@@ -1113,10 +1124,11 @@ export async function runReap(json: boolean, force: boolean): Promise<void> {
 	}
 
 	if (json) {
-		console.log(JSON.stringify({ reaped, skipped }, null, 2));
+		console.log(JSON.stringify(kernelFix ? { reaped, skipped, kernels: kernelFix } : { reaped, skipped }, null, 2));
 		return;
 	}
-	if (reaped.length === 0 && skipped.length === 0) {
+	const kernelReport = kernelFix ? formatKernelFixResult(kernelFix) : undefined;
+	if (reaped.length === 0 && skipped.length === 0 && kernelReport === undefined) {
 		console.log("No background services found.");
 		return;
 	}
@@ -1125,6 +1137,9 @@ export async function runReap(json: boolean, force: boolean): Promise<void> {
 	}
 	for (const entry of skipped) {
 		console.log(chalk.dim(`kept   ${entry.socketPath}: ${entry.reason}`));
+	}
+	if (kernelReport) {
+		console.log(kernelReport);
 	}
 }
 

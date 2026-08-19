@@ -15,6 +15,7 @@ import {
 import { handleDaemonCommand } from "./daemon-command.js";
 import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
+import { reapKernelFindings, scanKernelFindings } from "./doctor-kernel-reap.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -250,10 +251,12 @@ async function runStatus(args: string[]): Promise<PublicCommandResult> {
 async function runDoctor(args: string[]): Promise<PublicCommandResult> {
 	const options = parseBooleanOptions(args, new Set(["--fix", "--json"]), "doctor");
 	if (!options) return HANDLED;
+	const kernels = await scanKernelFindings();
 	if (options.has("--fix")) {
-		await runReap(options.has("--json"), false);
+		const result = await reapKernelFindings(kernels);
+		await runReap(options.has("--json"), false, result);
 	} else {
-		await runPs(options.has("--json"));
+		await runPs(options.has("--json"), kernels);
 	}
 	return HANDLED;
 }

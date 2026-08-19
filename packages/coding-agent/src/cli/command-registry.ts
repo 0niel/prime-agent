@@ -83,7 +83,10 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		path: ["doctor"],
 		usage: "doctor [--fix] [--json]",
 		summary: "Inspect and safely clean up background services",
-		options: ["--fix   Remove stale sockets and stop idle orphaned services", "--json  Print JSON"],
+		options: [
+			"--fix   Remove stale sockets, stop idle orphaned services, kill stray IPython kernels, and remove stale kernel temp dirs",
+			"--json  Print JSON",
+		],
 	},
 	{
 		path: ["shutdown"],

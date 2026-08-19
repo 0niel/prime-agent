@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `doctor` reporting of stray IPython kernels (orphaned to init), stale `prime-agent-kernel-*` temp dirs, and leaked eng-4600 test-daemon fixtures (warning only); `doctor --fix` kills the orphaned kernels and removes the stale dirs, and `doctor --json` gains a `kernels` section.
 - Fixed large IPython variables repeatedly slowing later turns by excluding them from persistent snapshots and removing them when context is compacted.
 - Fixed daemon socket paths being used verbatim in identity derivations: on supported platforms, `--daemon-socket` spellings differing only by duplicate or trailing slashes now normalize to one canonical path, so worker-descriptor namespaces, daemon log files, and persisted descriptors agree.
 - Added a `thinking` option to `rlm.run` for spawning subagents with an explicit reasoning level; invalid levels for the resolved child model fail spawn.
