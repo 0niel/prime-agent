@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +24,7 @@ import {
 } from "../src/cli/daemon-ps.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
-import { supervisorStateDir, supervisorStateDirMatches } from "../src/modes/daemon/daemon-supervisor.js";
+import { supervisorStateDirMatches } from "../src/modes/daemon/daemon-supervisor.js";
 import { acquireDaemonSupervisorOwnership } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 
 describe("worker socket classification", () => {
@@ -375,7 +376,16 @@ describe("supervisorStateDirMatches", () => {
 		cleanupDirs.push(agentDir);
 		const socketPath = "/tmp/state-dir.sock";
 		// Created by DaemonSupervisor.start() before it ever listens.
-		mkdirSync(supervisorStateDir(agentDir, socketPath, "gen-a"), { recursive: true });
+		// Mirrors defaultWorkerDescriptorDir's key rule; the positive assertion below
+		// fails if production's path derivation ever drifts from this.
+		const stateDir = join(
+			agentDir,
+			"daemon-workers",
+			createHash("sha256").update(socketPath).digest("hex").slice(0, 12),
+			"snapshot-cache",
+			"gen-a",
+		);
+		mkdirSync(stateDir, { recursive: true });
 		expect(supervisorStateDirMatches(agentDir, socketPath, "gen-a")).toBe(true);
 		expect(supervisorStateDirMatches(agentDir, socketPath, "gen-b")).toBe(false);
 		expect(supervisorStateDirMatches(agentDir, "/tmp/other.sock", "gen-a")).toBe(false);

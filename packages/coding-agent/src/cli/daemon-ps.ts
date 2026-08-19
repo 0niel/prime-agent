@@ -1359,9 +1359,15 @@ function killDaemon(pid: number): void {
  * whose process identity changed since verification is treated as exited.
  */
 async function forceKillDaemon(pid: number, expectedProcessStartId?: string): Promise<boolean> {
-	const identityCurrent = () =>
-		expectedProcessStartId === undefined || getProcessStartId(pid) === expectedProcessStartId;
-	if (!identityCurrent()) {
+	// Only a PROVEN identity change counts as exited: an unreadable start id
+	// (transient ps failure) must neither signal a possibly-recycled pid nor
+	// report the supervisor gone while it may still hold the socket.
+	const identityChanged = () => {
+		if (expectedProcessStartId === undefined) return false;
+		const observed = getProcessStartId(pid);
+		return observed !== undefined && observed !== expectedProcessStartId;
+	};
+	if (identityChanged()) {
 		return true;
 	}
 	killDaemon(pid);
@@ -1372,7 +1378,7 @@ async function forceKillDaemon(pid: number, expectedProcessStartId?: string): Pr
 		}
 		await delay(50);
 	}
-	if (!identityCurrent()) {
+	if (identityChanged()) {
 		return true;
 	}
 	try {
@@ -1382,12 +1388,12 @@ async function forceKillDaemon(pid: number, expectedProcessStartId?: string): Pr
 	}
 	deadline = Date.now() + 2000;
 	while (isProcessAlive(pid) && Date.now() < deadline) {
-		if (!identityCurrent()) {
+		if (identityChanged()) {
 			return true;
 		}
 		await delay(50);
 	}
-	return !isProcessAlive(pid) || !identityCurrent();
+	return !isProcessAlive(pid) || identityChanged();
 }
 
 function isProcessAlive(pid: number): boolean {

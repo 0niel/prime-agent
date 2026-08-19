@@ -517,7 +517,7 @@ function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): strin
 }
 
 /** Per-generation supervisor state dir under agentDir; exists from start() until shutdown. */
-export function supervisorStateDir(agentDir: string, socketPath: string, supervisorGeneration: string): string {
+function supervisorStateDir(agentDir: string, socketPath: string, supervisorGeneration: string): string {
 	return join(defaultWorkerDescriptorDir(agentDir, socketPath), "snapshot-cache", supervisorGeneration);
 }
 
