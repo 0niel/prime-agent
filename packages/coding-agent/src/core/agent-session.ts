@@ -6408,6 +6408,7 @@ export class AgentSession {
 
 	async waitForIdle(): Promise<void> {
 		while (true) {
+			const postCompactionContinuation = this._postCompactionContinuationCompletion;
 			if (this._actionStore.queuedActions().length > 0) {
 				if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) {
 					await new Promise<void>((resolve) => this._sessionInputCheckpointWaiters.add(resolve));
@@ -6420,18 +6421,11 @@ export class AgentSession {
 			await this.agent.waitForIdle();
 			const agentEventQueue = this._agentEventQueue;
 			await agentEventQueue;
-			const postCompactionContinuation = this._postCompactionContinuationCompletion;
 			if (postCompactionContinuation) {
-				try {
-					await postCompactionContinuation.promise;
-				} finally {
-					if (
-						this._postCompactionContinuationCompletion === postCompactionContinuation &&
-						postCompactionContinuation.settled
-					) {
-						this._postCompactionContinuationCompletion = undefined;
-					}
-				}
+				await postCompactionContinuation.promise;
+				continue;
+			}
+			if (this._postCompactionContinuationCompletion) {
 				continue;
 			}
 			if (
@@ -7222,6 +7216,7 @@ export class AgentSession {
 		const completion = this._postCompactionContinuationCompletion;
 		if (!completion || completion.settled) return;
 		completion.settled = true;
+		this._postCompactionContinuationCompletion = undefined;
 		if (error) completion.reject(error);
 		else completion.resolve();
 	}
