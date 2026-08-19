@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
 	chmodSync,
@@ -8414,6 +8415,84 @@ describe("daemon mode helpers", () => {
 				status: "cancelled",
 			});
 			expect(internals.cronStore.list().find((job) => job.id === unrelated.id)).toMatchObject({ status: "active" });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("sweeps empty session files but keeps active, leased, and job-bound ones", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-empty-sweep-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			mkdirSync(sessionDir, { recursive: true });
+			const ghostEntries = [
+				{ type: "session", id: "s1", timestamp: new Date(0).toISOString(), cwd: tempDir },
+				{ type: "session_state", state: { status: "active" } },
+			];
+			const writeSession = (name: string, entries: object[]): string => {
+				const path = join(sessionDir, name);
+				writeFileSync(path, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+				return path;
+			};
+			const ghost = writeSession("ghost.jsonl", ghostEntries);
+			const active = writeSession("active.jsonl", ghostEntries);
+			const leased = writeSession("leased.jsonl", ghostEntries);
+			const scheduled = writeSession("scheduled.jsonl", ghostEntries);
+			const real = writeSession("real.jsonl", [
+				...ghostEntries,
+				{ type: "message", message: { role: "user", content: "hi" } },
+			]);
+			const leaseKey = createHash("sha256").update(canonicalSessionPath(leased)).digest("hex");
+			const leaseDir = join(tempDir, "session-leases", `${leaseKey}.lock`);
+			mkdirSync(leaseDir, { recursive: true });
+			writeFileSync(
+				join(leaseDir, "owner.json"),
+				JSON.stringify({
+					version: 1,
+					token: "t",
+					pid: process.pid,
+					sessionPath: leased,
+					createdAt: new Date(0).toISOString(),
+				}),
+			);
+
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const state = makeState("active-1");
+			state.runtime = {
+				metadata: { kind: "subagent", createdAt: 1 },
+				session: { sessionFile: active },
+			} as never;
+			internals.sessions.set(state.activeSessionId, state);
+			internals.cronStore.create({
+				activeSessionId: "active-2",
+				sessionId: "session-2",
+				sessionFile: scheduled,
+				cwd: tempDir,
+				scheduleText: "in 1h",
+				prompt: "keep scheduled session",
+			});
+
+			const response = (await internals.handleCommand(makeClient("client-1", "detached"), {
+				id: "sweep-1",
+				type: "sweep_empty_sessions",
+			})) as { data: { removed: string[] } };
+
+			expect(response.data.removed).toEqual([ghost]);
+			expect(existsSync(ghost)).toBe(false);
+			expect(existsSync(active)).toBe(true);
+			expect(existsSync(leased)).toBe(true);
+			expect(existsSync(scheduled)).toBe(true);
+			expect(existsSync(real)).toBe(true);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

@@ -11,6 +11,7 @@ import type {
 	DaemonDeleteSavedSessionResult,
 	DaemonSavedSessionInfo,
 	DaemonSavedSessionListCommand,
+	DaemonSweepEmptySessionsResult,
 } from "./daemon-protocol.js";
 import { deserializeSavedSessionInfo } from "./saved-session-info.js";
 
@@ -42,6 +43,18 @@ export async function listDaemonSavedSessions(
 	}
 	const data = response.data as { sessions: DaemonSavedSessionInfo[] };
 	return data.sessions.map(deserializeSavedSessionInfo);
+}
+
+export async function sweepDaemonEmptySessions(client: DaemonClient, sessionDir?: string): Promise<string[]> {
+	const command: Extract<DaemonCommand, { type: "sweep_empty_sessions" }> = {
+		type: "sweep_empty_sessions",
+		...(sessionDir ? { sessionDir } : {}),
+	};
+	const response = await client.request(command);
+	if (!response.success) {
+		throw deserializeDaemonError(response);
+	}
+	return (response.data as DaemonSweepEmptySessionsResult).removed;
 }
 
 export async function renameDaemonSavedSession(

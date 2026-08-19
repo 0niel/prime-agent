@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { rm, unlink } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
@@ -71,4 +71,65 @@ export async function deleteSessionFile(
 		await deleteSessionArtifacts(sessionPath);
 	}
 	return result;
+}
+
+// Entry types present from session bootstrap alone; a file holding only these
+// plus session_state never received a message or user configuration.
+const EMPTY_SESSION_ENTRY_TYPES = new Set([
+	"session",
+	"model_change",
+	"thinking_level_change",
+	"service_tier_change",
+	"session_state",
+]);
+
+/**
+ * True when a session file is an abandoned empty draft: no messages and no
+ * user content, only bootstrap entries and daemon-written session_state.
+ */
+export function isEmptySessionFile(sessionPath: string): boolean {
+	let content: string;
+	try {
+		content = readFileSync(sessionPath, "utf8");
+	} catch {
+		return false;
+	}
+	let sawHeader = false;
+	for (const line of content.split("\n")) {
+		if (!line.trim()) continue;
+		let entry: { type?: unknown };
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			return false;
+		}
+		if (typeof entry.type !== "string" || !EMPTY_SESSION_ENTRY_TYPES.has(entry.type)) {
+			return false;
+		}
+		if (entry.type === "session") sawHeader = true;
+	}
+	return sawHeader;
+}
+
+/**
+ * Delete abandoned empty session files from a session directory. `shouldSkip`
+ * lets the caller exclude files that are live in some other way (open in the
+ * daemon, leased by a live process, or bound to scheduled jobs).
+ */
+export async function sweepEmptySessionFiles(
+	sessionDir: string,
+	shouldSkip: (sessionPath: string) => boolean,
+): Promise<string[]> {
+	if (!existsSync(sessionDir)) return [];
+	const removed: string[] = [];
+	for (const entry of readdirSync(sessionDir)) {
+		if (!entry.endsWith(".jsonl")) continue;
+		const sessionPath = join(sessionDir, entry);
+		if (!isEmptySessionFile(sessionPath) || shouldSkip(sessionPath)) continue;
+		const result = await deleteSessionFile(sessionPath).catch(() => undefined);
+		if (result?.ok) {
+			removed.push(sessionPath);
+		}
+	}
+	return removed;
 }

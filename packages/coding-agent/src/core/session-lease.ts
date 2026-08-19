@@ -229,6 +229,23 @@ function reclaimStaleLease(directory: string): boolean {
 	return true;
 }
 
+/**
+ * True when another live process holds a lease on this session. A lease whose
+ * owner is dead is reclaimed on the spot so it stops blocking deletion.
+ */
+export function hasLiveSessionLease(sessionPath: string, agentDir: string): boolean {
+	const directory = leaseDirectory(agentDir, canonicalSessionPath(sessionPath));
+	if (!existsSync(directory)) {
+		return false;
+	}
+	const owner = readLeaseOwner(directory);
+	if (owner && isLeaseOwnerAlive(owner)) {
+		return true;
+	}
+	reclaimStaleLease(directory);
+	return false;
+}
+
 export function acquireSessionLease(
 	sessionPath: string | undefined,
 	agentDir: string,

@@ -96,8 +96,13 @@ import {
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
-import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import { deleteSessionArtifacts, deleteSessionFile, sweepEmptySessionFiles } from "../../core/session-file-actions.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	hasLiveSessionLease,
+	type SessionLease,
+} from "../../core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
 	readSessionInfo,
@@ -257,6 +262,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"restore_actions",
 	"append_custom_message",
 	"resume_queue",
+	"sweep_empty_sessions",
 	"send_message",
 	"agent_messages_status",
 	"agent_messages_pause",
@@ -4225,6 +4231,31 @@ export class AgentDaemon {
 					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
 				}
 				return success(command.id, "resume_queue");
+			}
+
+			case "sweep_empty_sessions": {
+				const sessionDir =
+					command.sessionDir ?? this.options.defaultSessionConfig.sessionDir ?? getSessionsDir(this.agentDir);
+				const hasJobsForFile = (sessionPath: string) => {
+					const target = resolve(sessionPath);
+					return this.cronStore
+						.list()
+						.some(
+							(job) =>
+								resolve(job.sessionFile) === target && job.status !== "cancelled" && job.status !== "completed",
+						);
+				};
+				const removed = await sweepEmptySessionFiles(
+					sessionDir,
+					(sessionPath) =>
+						this.findActiveSessionByFile(sessionPath) !== undefined ||
+						hasLiveSessionLease(sessionPath, this.agentDir) ||
+						hasJobsForFile(sessionPath),
+				);
+				if (removed.length > 0) {
+					this.log(`swept ${removed.length} empty session file(s)`);
+				}
+				return success(command.id, "sweep_empty_sessions", { removed });
 			}
 
 			case "send_message": {

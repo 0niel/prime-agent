@@ -43,6 +43,7 @@ import {
 	deleteDaemonSavedSession,
 	listDaemonSavedSessions,
 	renameDaemonSavedSession,
+	sweepDaemonEmptySessions,
 } from "../daemon/saved-session-catalog.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
@@ -861,7 +862,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.resolveRun = resolve;
 		});
 		void this.refreshSessions();
-		void this.refreshSavedSessions();
+		void this.sweepEmptySessionsThenRefreshSaved();
 		void this.refreshHeartbeats();
 		this.loadStartupNotices();
 		this.pollTimer = setInterval(() => this.pollSessions(), POLL_INTERVAL_MS);
@@ -2177,6 +2178,21 @@ export class AgentsViewMode implements Component, Focusable {
 			this.refreshSavedSessions({ preserveStatusOnError: true }),
 		]);
 		return results.every(Boolean);
+	}
+
+	/**
+	 * Entry-time cleanup: delete abandoned empty session files (the "(no
+	 * messages)" ghost rows) before loading the saved-session catalog. The
+	 * daemon skips sessions that are open, leased by a live process, or bound
+	 * to scheduled jobs. Best-effort: sweep failures never block the catalog.
+	 */
+	private async sweepEmptySessionsThenRefreshSaved(): Promise<void> {
+		try {
+			await sweepDaemonEmptySessions(this.requireClient());
+		} catch {
+			// Older daemons without the command or transient failures: just load the catalog.
+		}
+		await this.refreshSavedSessions();
 	}
 
 	private async refreshSavedSessions(
