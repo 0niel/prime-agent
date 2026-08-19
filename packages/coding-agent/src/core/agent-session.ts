@@ -814,6 +814,14 @@ function createAgentMessageDeferred(): AgentMessageDeferred {
 	return deferred;
 }
 
+interface PostCompactionContinuationCompletion extends AgentMessageDeferred {
+	settled: boolean;
+}
+
+function createPostCompactionContinuationCompletion(): PostCompactionContinuationCompletion {
+	return { ...createAgentMessageDeferred(), settled: false };
+}
+
 export interface ModelCycleResult {
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
@@ -1149,6 +1157,7 @@ export class AgentSession {
 	private _turnIntervalAutoRefinePending = false;
 	private _postCompactionContinuationScheduled = false;
 	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
+	private _postCompactionContinuationCompletion: PostCompactionContinuationCompletion | undefined;
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
 	private _scheduledPostCompactionContinuationMessages: AgentMessage[] = [];
 	private _queuedAutonomousThresholdContinuations = new WeakMap<AssistantMessage, AgentMessage>();
@@ -6411,10 +6420,25 @@ export class AgentSession {
 			await this.agent.waitForIdle();
 			const agentEventQueue = this._agentEventQueue;
 			await agentEventQueue;
+			const postCompactionContinuation = this._postCompactionContinuationCompletion;
+			if (postCompactionContinuation) {
+				try {
+					await postCompactionContinuation.promise;
+				} finally {
+					if (
+						this._postCompactionContinuationCompletion === postCompactionContinuation &&
+						postCompactionContinuation.settled
+					) {
+						this._postCompactionContinuationCompletion = undefined;
+					}
+				}
+				continue;
+			}
 			if (
 				pump === this._sessionInputPump &&
 				agentEventQueue === this._agentEventQueue &&
 				!this._sessionInputPumpRequested &&
+				!this._postCompactionContinuationScheduled &&
 				!this.agent.state.isStreaming &&
 				this.unfinishedActionCount === 0
 			) {
@@ -7086,6 +7110,7 @@ export class AgentSession {
 		}
 		this._postCompactionContinuationScheduled = false;
 		this._scheduledPostCompactionContinuationMessages = [];
+		this._settlePostCompactionContinuation();
 	}
 
 	private _discardPendingAutoRefine(options: { cancelPostCompactionContinue?: boolean } = {}): void {
@@ -7183,11 +7208,22 @@ export class AgentSession {
 			return;
 		}
 		this._postCompactionContinuationScheduled = true;
+		if (!this._postCompactionContinuationCompletion || this._postCompactionContinuationCompletion.settled) {
+			this._postCompactionContinuationCompletion = createPostCompactionContinuationCompletion();
+		}
 		this._scheduledPostCompactionContinuationMessages = [...this._postCompactionContinuationMessages];
 		this._postCompactionContinuationTimer = setTimeout(() => {
 			this._postCompactionContinuationTimer = undefined;
 			void this._runScheduledPostCompactionContinue();
 		}, 100);
+	}
+
+	private _settlePostCompactionContinuation(error?: Error): void {
+		const completion = this._postCompactionContinuationCompletion;
+		if (!completion || completion.settled) return;
+		completion.settled = true;
+		if (error) completion.reject(error);
+		else completion.resolve();
 	}
 
 	private _sessionOwnsScheduledContinuations(continuationMessages: AgentMessage[]): boolean {
@@ -7226,6 +7262,7 @@ export class AgentSession {
 				} else {
 					this._scheduledPostCompactionContinuationMessages = [];
 					this._scheduleAutoRefineAfterAgentEnd();
+					this._settlePostCompactionContinuation();
 				}
 			}
 			return;
@@ -7239,6 +7276,12 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			if (message.includes("already processing")) {
 				this._schedulePostCompactionContinue();
+			} else {
+				this._settlePostCompactionContinuation(this._asError(error));
+			}
+		} finally {
+			if (!this._postCompactionContinuationScheduled) {
+				this._settlePostCompactionContinuation();
 			}
 		}
 	}
