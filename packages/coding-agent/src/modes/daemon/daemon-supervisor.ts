@@ -510,8 +510,13 @@ function descriptorKey(socketPath: string): string {
 	return createHash("sha256").update(socketPath).digest("hex").slice(0, 12);
 }
 
-export function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): string {
+function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): string {
 	return join(agentDir, "daemon-workers", descriptorKey(socketPath));
+}
+
+/** Per-generation supervisor state dir under agentDir; exists from start() until shutdown. */
+export function supervisorStateDir(agentDir: string, socketPath: string, supervisorGeneration: string): string {
+	return join(defaultWorkerDescriptorDir(agentDir, socketPath), "snapshot-cache", supervisorGeneration);
 }
 
 /**
@@ -521,7 +526,7 @@ export function defaultWorkerDescriptorDir(agentDir: string, socketPath: string)
  * workers.
  */
 export function supervisorStateDirMatches(agentDir: string, socketPath: string, supervisorGeneration: string): boolean {
-	return existsSync(join(defaultWorkerDescriptorDir(agentDir, socketPath), "snapshot-cache", supervisorGeneration));
+	return existsSync(supervisorStateDir(agentDir, socketPath, supervisorGeneration));
 }
 
 export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMinutes): number {

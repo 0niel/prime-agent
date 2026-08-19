@@ -425,7 +425,10 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 				: proc || hasTrackedWorkers
 					? "unreachable"
 					: "orphan-file";
-			if (status === "current" && (await detectDaemonOwnershipLost(socketPath, probe))) {
+			// Stale daemons wedge the same way — an upgraded CLI probing a pre-upgrade
+			// supervisor is the incident-report case, so version mismatch must not
+			// mask ownership loss.
+			if ((status === "current" || status === "stale") && (await detectDaemonOwnershipLost(socketPath, probe))) {
 				status = "ownership-lost";
 			}
 			return {
@@ -1142,7 +1145,7 @@ export interface RepairHooks {
 	detectLost: (socketPath: string, probe: ProbeResult) => Promise<boolean>;
 	ownsSupervisorState: (socketPath: string, supervisorGeneration: string) => boolean;
 	acquireAdmission: () => Promise<{ assertOrRenew: () => Promise<void>; release: () => Promise<void> }>;
-	killDaemon: (pid: number) => Promise<boolean>;
+	killDaemon: (pid: number, expectedProcessStartId: string | undefined) => Promise<boolean>;
 	waitStartupFence: (socketPath: string) => Promise<void>;
 	ensureDaemonRunning: (socketPath: string) => Promise<void>;
 }
@@ -1209,7 +1212,7 @@ export async function repairOwnershipLostDaemon(
 		let killed: boolean;
 		try {
 			await admission.assertOrRenew();
-			killed = await hooks.killDaemon(pid);
+			killed = await hooks.killDaemon(pid, recheck.supervisorProcessStartId);
 		} catch (error) {
 			return { skipped: `could not stop wedged supervisor (pid ${pid}): ${String(error)}` };
 		}
@@ -1358,8 +1361,17 @@ function killDaemon(pid: number): void {
 	}
 }
 
-/** SIGTERM, then SIGKILL; resolves true only once the process is confirmed gone. */
-async function forceKillDaemon(pid: number): Promise<boolean> {
+/**
+ * SIGTERM, then SIGKILL; resolves true only once the process is confirmed gone.
+ * With an expected start id, each signal is fenced against PID reuse: a pid
+ * whose process identity changed since verification is treated as exited.
+ */
+async function forceKillDaemon(pid: number, expectedProcessStartId?: string): Promise<boolean> {
+	const identityCurrent = () =>
+		expectedProcessStartId === undefined || getProcessStartId(pid) === expectedProcessStartId;
+	if (!identityCurrent()) {
+		return true;
+	}
 	killDaemon(pid);
 	let deadline = Date.now() + 1000;
 	while (Date.now() < deadline) {
@@ -1368,6 +1380,9 @@ async function forceKillDaemon(pid: number): Promise<boolean> {
 		}
 		await delay(50);
 	}
+	if (!identityCurrent()) {
+		return true;
+	}
 	try {
 		process.kill(pid, "SIGKILL");
 	} catch {
@@ -1375,9 +1390,12 @@ async function forceKillDaemon(pid: number): Promise<boolean> {
 	}
 	deadline = Date.now() + 2000;
 	while (isProcessAlive(pid) && Date.now() < deadline) {
+		if (!identityCurrent()) {
+			return true;
+		}
 		await delay(50);
 	}
-	return !isProcessAlive(pid);
+	return !isProcessAlive(pid) || !identityCurrent();
 }
 
 function isProcessAlive(pid: number): boolean {

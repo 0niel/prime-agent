@@ -23,7 +23,7 @@ import {
 } from "../src/cli/daemon-ps.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
-import { defaultWorkerDescriptorDir, supervisorStateDirMatches } from "../src/modes/daemon/daemon-supervisor.js";
+import { supervisorStateDir, supervisorStateDirMatches } from "../src/modes/daemon/daemon-supervisor.js";
 import { acquireDaemonSupervisorOwnership } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 
 describe("worker socket classification", () => {
@@ -322,6 +322,16 @@ async function acquireTestOwnership(generation: string): Promise<{
 }
 
 describe("detectDaemonOwnershipLost", () => {
+	it("flags a stale-version supervisor whose owner record was deleted", async () => {
+		// The incident case: the CLI was upgraded because the daemon wedged, so the
+		// wedged supervisor answers with a pre-upgrade version. Version mismatch
+		// must not mask ownership loss.
+		const paths = await acquireTestOwnership("stale-lost-owner");
+		rmSync(paths.ownerDir, { recursive: true, force: true });
+		const probe: ProbeResult = { ...paths.probe, version: "0.0.1-old" };
+		await expect(detectDaemonOwnershipLost(paths.socketPath, probe, paths.registryDir)).resolves.toBe(true);
+	});
+
 	it("does not flag a supervisor whose owner record is current", async () => {
 		const paths = await acquireTestOwnership("healthy-owner");
 		await expect(detectDaemonOwnershipLost(paths.socketPath, paths.probe, paths.registryDir)).resolves.toBe(false);
@@ -365,9 +375,7 @@ describe("supervisorStateDirMatches", () => {
 		cleanupDirs.push(agentDir);
 		const socketPath = "/tmp/state-dir.sock";
 		// Created by DaemonSupervisor.start() before it ever listens.
-		mkdirSync(join(defaultWorkerDescriptorDir(agentDir, socketPath), "snapshot-cache", "gen-a"), {
-			recursive: true,
-		});
+		mkdirSync(supervisorStateDir(agentDir, socketPath, "gen-a"), { recursive: true });
 		expect(supervisorStateDirMatches(agentDir, socketPath, "gen-a")).toBe(true);
 		expect(supervisorStateDirMatches(agentDir, socketPath, "gen-b")).toBe(false);
 		expect(supervisorStateDirMatches(agentDir, "/tmp/other.sock", "gen-a")).toBe(false);
@@ -415,8 +423,8 @@ describe("repairOwnershipLostDaemon", () => {
 					},
 				};
 			},
-			killDaemon: async (pid) => {
-				calls.push(`kill:${pid}`);
+			killDaemon: async (pid, expectedProcessStartId) => {
+				calls.push(`kill:${pid}:${expectedProcessStartId ?? "no-start-id"}`);
 				return true;
 			},
 			waitStartupFence: async (socketPath) => {
@@ -444,7 +452,9 @@ describe("repairOwnershipLostDaemon", () => {
 			"probe:/tmp/lost.sock",
 			"detectLost",
 			"assertAdmission",
-			`kill:${process.pid}`,
+			// The start id from the fresh under-admission probe fences the kill
+			// against PID reuse.
+			`kill:${process.pid}:${getProcessStartId(process.pid) ?? "no-start-id"}`,
 			"fence:/tmp/lost.sock",
 			"assertAdmission",
 			"releaseAdmission",
