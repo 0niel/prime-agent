@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed Qwen3 Max prompt caching through Prime Inference and OpenRouter, including five-minute cache controls and Prime cache-cost estimates.
+
 ## [0.7.3] - 2026-08-17
 
 - Added provider-derived reasoning levels for OpenRouter and Prime Inference models, including sparse, mandatory, toggle-only, and explicit-off capabilities.

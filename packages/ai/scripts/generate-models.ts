@@ -120,6 +120,11 @@ const PRIME_INFERENCE_COMPAT: OpenAICompletionsCompat = {
 	maxTokensField: "max_tokens",
 	supportsStrictMode: false,
 };
+const QWEN3_MAX_ID = "qwen/qwen3-max";
+const QWEN3_MAX_CACHE_COMPAT: OpenAICompletionsCompat = {
+	cacheControlFormat: "anthropic",
+	supportsLongCacheRetention: false,
+};
 interface PrimeInferenceCatalogEntry {
 	id: string;
 	input: number;
@@ -417,9 +422,18 @@ function getPrimeInferenceHeaders(apiKey: string | undefined, teamId: string | u
 }
 
 function getPrimeInferenceCacheCosts(modelId: string, inputCost: number): { cacheRead: number; cacheWrite: number } {
-	return modelId.toLowerCase().startsWith("anthropic/")
-		? getAnthropicCacheCosts(inputCost, "5m")
-		: { cacheRead: 0, cacheWrite: 0 };
+	const id = modelId.toLowerCase();
+	if (id.startsWith("anthropic/")) {
+		return getAnthropicCacheCosts(inputCost, "5m");
+	}
+	if (id === QWEN3_MAX_ID) {
+		return { cacheRead: inputCost * 0.1, cacheWrite: inputCost * 1.25 };
+	}
+	return { cacheRead: 0, cacheWrite: 0 };
+}
+
+function getQwen3MaxCacheCompat(modelId: string): OpenAICompletionsCompat | undefined {
+	return modelId.toLowerCase() === QWEN3_MAX_ID ? QWEN3_MAX_CACHE_COMPAT : undefined;
 }
 
 function getExistingPrimeInferenceModels(): Model<"openai-completions">[] {
@@ -433,7 +447,9 @@ function getExistingPrimeInferenceModels(): Model<"openai-completions">[] {
 				...model.cost,
 				...getPrimeInferenceCacheCosts(model.id, model.cost.input),
 			},
-			...(model.compat ? { compat: { ...model.compat } } : {}),
+			...(model.compat || getQwen3MaxCacheCompat(model.id)
+				? { compat: { ...model.compat, ...getQwen3MaxCacheCompat(model.id) } }
+				: {}),
 			...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
 			...(model.headers ? { headers: { ...model.headers } } : {}),
 		}));
@@ -542,6 +558,12 @@ function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: bool
 
 function getPrimeInferenceCompat(modelId: string): OpenAICompletionsCompat {
 	const id = modelId.toLowerCase();
+	if (id === QWEN3_MAX_ID) {
+		return {
+			...PRIME_INFERENCE_COMPAT,
+			...QWEN3_MAX_CACHE_COMPAT,
+		};
+	}
 	if (id.includes("deepseek-v4")) {
 		return {
 			...PRIME_INFERENCE_COMPAT,
@@ -774,6 +796,7 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 			const cacheReadCost = Math.max(0, parseFloat(model.pricing?.input_cache_read || "0")) * 1_000_000;
 			const cacheWriteCost = Math.max(0, parseFloat(model.pricing?.input_cache_write || "0")) * 1_000_000;
 			const reasoningCapabilities = getOpenRouterReasoningCapabilities(model);
+			const qwen3MaxCacheCompat = getQwen3MaxCacheCompat(modelKey);
 
 			const normalizedModel: Model<any> = {
 				id: modelKey,
@@ -785,8 +808,15 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 				...(reasoningCapabilities?.thinkingLevelMap
 					? { thinkingLevelMap: reasoningCapabilities.thinkingLevelMap }
 					: {}),
-				...(reasoningCapabilities?.supportsReasoningEffort === false
-					? { compat: { supportsReasoningEffort: false } }
+				...(reasoningCapabilities?.supportsReasoningEffort === false || qwen3MaxCacheCompat
+					? {
+							compat: {
+								...(reasoningCapabilities?.supportsReasoningEffort === false
+									? { supportsReasoningEffort: false }
+									: {}),
+								...qwen3MaxCacheCompat,
+							},
+						}
 					: {}),
 				input,
 				cost: {

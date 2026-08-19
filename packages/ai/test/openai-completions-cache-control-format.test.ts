@@ -226,6 +226,24 @@ describe("openai-completions cacheControlFormat", () => {
 		expect(result.usage.cost.cacheWrite).toBeCloseTo((80 * model.cost.input * 1.25) / 1_000_000);
 	});
 
+	it("applies five-minute cache markers and pricing for Prime Inference Qwen3 Max", async () => {
+		const model = getModel("prime-inference", "qwen/qwen3-max");
+		expect(model.cost.cacheRead).toBeCloseTo(model.cost.input * 0.1);
+		expect(model.cost.cacheWrite).toBeCloseTo(model.cost.input * 1.25);
+
+		const { params, result } = await runCompletion(model, { cacheRetention: "long" });
+		expectAnthropicCacheMarkers(params);
+		expect(result.usage.cost.cacheWrite).toBeCloseTo((80 * model.cost.input * 1.25) / 1_000_000);
+	});
+
+	it("applies five-minute cache markers for OpenRouter Qwen3 Max", async () => {
+		const model = getModel("openrouter", "qwen/qwen3-max");
+		const { params, result } = await runCompletion(model, { cacheRetention: "long" });
+
+		expectAnthropicCacheMarkers(params);
+		expect(result.usage.cost.cacheWrite).toBeCloseTo((80 * model.cost.cacheWrite) / 1_000_000);
+	});
+
 	it("does not apply Anthropic-style cache markers to other Prime Inference models", async () => {
 		const model = getModel("prime-inference", "openai/gpt-5.6-sol");
 		const params = await capturePayload(model);
