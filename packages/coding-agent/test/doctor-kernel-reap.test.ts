@@ -3,9 +3,11 @@ import {
 	classifyStaleTempDirs,
 	classifyStrayKernels,
 	confirmsStrayKernel,
+	forceKillKernel,
 	type KernelFindings,
 	type KernelProcess,
 	type KernelReapHooks,
+	parseForkedKernelRows,
 	parseKernelProcesses,
 	parseLeakedTestDaemons,
 	reapKernelFindings,
@@ -19,8 +21,20 @@ function kernel(pid: number, ppid: number, tempDir: string): KernelProcess {
 }
 
 function findings(partial: Partial<KernelFindings>): KernelFindings {
-	return { strays: [], owned: [], staleTempDirs: [], leakedTestDaemons: [], psUnavailable: false, ...partial };
+	return {
+		strays: [],
+		owned: [],
+		staleTempDirs: [],
+		leakedTestDaemons: [],
+		forkedKernelsPresent: 0,
+		orphanedForkedKernels: [],
+		psUnavailable: false,
+		...partial,
+	};
 }
+
+const FORK_SERVER_ROW = (pid: number, ppid: number): string =>
+	`  ${pid}   ${ppid} /home/u/.prime/agent/kernel-venv/bin/python -c import gc,os,sys /tmp/prime-agent-forkserver-ab12/control.sock`;
 
 describe("parseKernelProcesses", () => {
 	const stdout = [
@@ -63,6 +77,18 @@ describe("parseLeakedTestDaemons", () => {
 			"",
 		].join("\n");
 		expect(parseLeakedTestDaemons(stdout)).toEqual([555]);
+	});
+});
+
+describe("parseForkedKernelRows", () => {
+	it("matches only rows referencing a forkserver socket dir", () => {
+		const stdout = [
+			FORK_SERVER_ROW(900, 1),
+			"  111     1 /home/u/.venv/bin/python -m ipykernel_launcher -f /tmp/prime-agent-kernel-abc/connection.json",
+			"  333     1 node unrelated.js",
+			"",
+		].join("\n");
+		expect(parseForkedKernelRows(stdout)).toEqual([{ pid: 900, ppid: 1 }]);
 	});
 });
 
@@ -139,6 +165,34 @@ describe("scanKernelFindings", () => {
 		expect(result.psUnavailable).toBe(false);
 	});
 
+	it("skips stale temp dir classification entirely while forkserver-backed kernels run", async () => {
+		const withForkServer = await scanKernelFindings({
+			runPs: () => `${FORK_SERVER_ROW(900, 800)}\n`,
+			listTempDirs: () => [{ path: "/tmp/prime-agent-kernel-old", mtimeMs: 0 }],
+			now: () => 10 * HOUR_MS,
+		});
+		expect(withForkServer.staleTempDirs).toEqual([]);
+		expect(withForkServer.forkedKernelsPresent).toBe(1);
+		const control = await scanKernelFindings({
+			runPs: () => "  900   800 /usr/bin/python3 unrelated.py\n",
+			listTempDirs: () => [{ path: "/tmp/prime-agent-kernel-old", mtimeMs: 0 }],
+			now: () => 10 * HOUR_MS,
+		});
+		expect(control.staleTempDirs).toEqual(["/tmp/prime-agent-kernel-old"]);
+		expect(control.forkedKernelsPresent).toBe(0);
+	});
+
+	it("reports orphaned forkserver-backed kernels without ever classifying them as strays", async () => {
+		const result = await scanKernelFindings({
+			runPs: () => `${FORK_SERVER_ROW(901, 1)}\n${FORK_SERVER_ROW(902, 800)}\n`,
+			listTempDirs: () => [],
+			now: () => 10 * HOUR_MS,
+		});
+		expect(result.strays).toEqual([]);
+		expect(result.forkedKernelsPresent).toBe(2);
+		expect(result.orphanedForkedKernels).toEqual([901]);
+	});
+
 	it("protects an old dir referenced by a live command the kill classifier rejects", async () => {
 		const result = await scanKernelFindings({
 			runPs: () =>
@@ -185,8 +239,8 @@ describe("reapKernelFindings", () => {
 		return {
 			hooks: {
 				recheckStray: recheck,
-				killProcess: async (pid) => {
-					killed.push(pid);
+				killProcess: async (target) => {
+					killed.push(target.pid);
 					return killOutcome;
 				},
 				removeDir: (path) => {
@@ -215,6 +269,8 @@ describe("reapKernelFindings", () => {
 			removedTempDirs: 2,
 			skipped: [],
 			leakedTestDaemons: [],
+			forkedKernelsPresent: 0,
+			orphanedForkedKernels: [],
 			psUnavailable: false,
 		});
 	});
@@ -257,6 +313,31 @@ describe("reapKernelFindings", () => {
 		]);
 	});
 
+	it("keeps the dir and records a skip when the pre-SIGKILL identity recheck shows a different command", async () => {
+		const stray = kernel(111, 1, "/tmp/prime-agent-kernel-a");
+		const signals: NodeJS.Signals[] = [];
+		const removed: string[] = [];
+		const result = await reapKernelFindings(findings({ strays: [stray] }), {
+			recheckStray: () => true,
+			killProcess: (target) =>
+				forceKillKernel(target, {
+					kill: (_pid, signal) => {
+						signals.push(signal);
+					},
+					pidIdentity: () => "other",
+					waitForExit: async () => false,
+				}),
+			removeDir: (path) => {
+				removed.push(path);
+			},
+			tempRoot: "/tmp",
+		});
+		expect(signals).toEqual(["SIGTERM"]);
+		expect(removed).toEqual([]);
+		expect(result.killedStrays).toEqual([]);
+		expect(result.skipped).toEqual([{ pid: 111, reason: "could not confirm kernel exit; keeping its temp dir" }]);
+	});
+
 	it("never touches owned kernels and passes leaked test daemons through for reporting", async () => {
 		const { hooks, killed, removed } = fakeHooks(() => true);
 		const result = await reapKernelFindings(
@@ -266,5 +347,50 @@ describe("reapKernelFindings", () => {
 		expect(killed).toEqual([]);
 		expect(removed).toEqual([]);
 		expect(result.leakedTestDaemons).toEqual([555]);
+	});
+});
+
+describe("forceKillKernel", () => {
+	const stray = kernel(111, 1, "/tmp/prime-agent-kernel-a");
+
+	it("does not send SIGKILL when the pid now belongs to a different process", async () => {
+		const signals: NodeJS.Signals[] = [];
+		const confirmed = await forceKillKernel(stray, {
+			kill: (_pid, signal) => {
+				signals.push(signal);
+			},
+			// Survives SIGTERM, but by SIGKILL time the pid shows a different command.
+			pidIdentity: () => "other",
+			waitForExit: async () => false,
+		});
+		expect(signals).toEqual(["SIGTERM"]);
+		expect(confirmed).toBe(false);
+	});
+
+	it("treats a pid that vanished after SIGTERM as a confirmed exit", async () => {
+		const signals: NodeJS.Signals[] = [];
+		const confirmed = await forceKillKernel(stray, {
+			kill: (_pid, signal) => {
+				signals.push(signal);
+			},
+			pidIdentity: () => "gone",
+			waitForExit: async () => false,
+		});
+		expect(signals).toEqual(["SIGTERM"]);
+		expect(confirmed).toBe(true);
+	});
+
+	it("escalates to SIGKILL only when the pid still shows the same orphaned kernel", async () => {
+		const signals: NodeJS.Signals[] = [];
+		let waits = 0;
+		const confirmed = await forceKillKernel(stray, {
+			kill: (_pid, signal) => {
+				signals.push(signal);
+			},
+			pidIdentity: () => "stray-kernel",
+			waitForExit: async () => ++waits > 1,
+		});
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(confirmed).toBe(true);
 	});
 });

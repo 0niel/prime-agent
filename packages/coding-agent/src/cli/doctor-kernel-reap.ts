@@ -16,6 +16,10 @@ export interface KernelFindings {
 	owned: KernelProcess[];
 	staleTempDirs: string[];
 	leakedTestDaemons: number[];
+	/** ps rows referencing a forkserver socket: the template or its forked kernels. */
+	forkedKernelsPresent: number;
+	/** Report-only: forkserver-backed kernels orphaned to init (see ENG-5310). */
+	orphanedForkedKernels: number[];
 	psUnavailable: boolean;
 }
 
@@ -24,15 +28,21 @@ export interface KernelFixResult {
 	removedTempDirs: number;
 	skipped: Array<{ pid?: number; path?: string; reason: string }>;
 	leakedTestDaemons: number[];
+	forkedKernelsPresent: number;
+	orphanedForkedKernels: number[];
 	psUnavailable: boolean;
 }
 
 const KERNEL_TEMP_DIR_PREFIX = "prime-agent-kernel-";
+// Forked kernels keep the template's argv (fork-server.ts), so this socket-dir marker is their only ps signature.
+const FORK_SERVER_MARKER = "prime-agent-forkserver-";
 // Anchored full-argv match so wrappers merely mentioning ipykernel_launcher are never treated as kernels.
 const KERNEL_COMMAND_PATTERN = /^(\S+) -m ipykernel_launcher -f (\S+\/connection\.json)$/;
 const PYTHON_BINARY_PATTERN = /^python[\d.]*$/;
 // Below this age a missing live reference may just be a kernel mid-startup.
 const STALE_TEMP_DIR_AGE_MS = 60 * 60 * 1000;
+// Huge process tables overflow spawnSync's 1MiB default, which would silently disable all checks.
+const PS_MAX_BUFFER = 10 * 1024 * 1024;
 
 function parseKernelCommand(command: string): { connectionPath: string; tempDir: string } | undefined {
 	const match = command.match(KERNEL_COMMAND_PATTERN);
@@ -81,6 +91,18 @@ export function parseLeakedTestDaemons(stdout: string): number[] {
 	return pids;
 }
 
+/** ps rows referencing a forkserver socket dir: the template process or kernels forked from it. */
+export function parseForkedKernelRows(stdout: string): Array<{ pid: number; ppid: number }> {
+	const rows: Array<{ pid: number; ppid: number }> = [];
+	for (const line of stdout.split("\n")) {
+		const fields = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+		if (fields?.[3]?.includes(FORK_SERVER_MARKER)) {
+			rows.push({ pid: Number.parseInt(fields[1]!, 10), ppid: Number.parseInt(fields[2]!, 10) });
+		}
+	}
+	return rows;
+}
+
 /** A kernel is stray only when orphaned to init; any live parent means owned. */
 export function classifyStrayKernels(kernels: KernelProcess[]): { strays: KernelProcess[]; owned: KernelProcess[] } {
 	const strays: KernelProcess[] = [];
@@ -113,7 +135,7 @@ export interface KernelScanProbes {
 
 const defaultScanProbes: KernelScanProbes = {
 	runPs: () => {
-		const ps = spawnSync("ps", ["-axo", "pid=,ppid=,args="], { encoding: "utf8" });
+		const ps = spawnSync("ps", ["-axo", "pid=,ppid=,args="], { encoding: "utf8", maxBuffer: PS_MAX_BUFFER });
 		return !ps.error && ps.status === 0 && typeof ps.stdout === "string" ? ps.stdout : undefined;
 	},
 	listTempDirs: scanKernelTempDirs,
@@ -126,6 +148,8 @@ export async function scanKernelFindings(probes: KernelScanProbes = defaultScanP
 		owned: [],
 		staleTempDirs: [],
 		leakedTestDaemons: [],
+		forkedKernelsPresent: 0,
+		orphanedForkedKernels: [],
 		psUnavailable: false,
 	};
 	if (process.platform === "win32") {
@@ -137,11 +161,15 @@ export async function scanKernelFindings(probes: KernelScanProbes = defaultScanP
 		return { ...empty, psUnavailable: true };
 	}
 	const { strays, owned } = classifyStrayKernels(parseKernelProcesses(stdout));
+	const forkedRows = parseForkedKernelRows(stdout);
 	return {
 		strays,
 		owned,
-		staleTempDirs: classifyStaleTempDirs(probes.listTempDirs(), stdout, probes.now()),
+		// Forked kernels lack their connection path in argv, so their live dirs would look unreferenced; fail closed.
+		staleTempDirs: forkedRows.length > 0 ? [] : classifyStaleTempDirs(probes.listTempDirs(), stdout, probes.now()),
 		leakedTestDaemons: parseLeakedTestDaemons(stdout),
+		forkedKernelsPresent: forkedRows.length,
+		orphanedForkedKernels: forkedRows.filter((row) => row.ppid === 1).map((row) => row.pid),
 		psUnavailable: false,
 	};
 }
@@ -174,7 +202,7 @@ function scanKernelTempDirs(): Array<{ path: string; mtimeMs: number }> {
 export interface KernelReapHooks {
 	recheckStray: (kernel: KernelProcess) => boolean;
 	/** Resolves true only when the process is confirmed gone. */
-	killProcess: (pid: number) => Promise<boolean>;
+	killProcess: (kernel: KernelProcess) => Promise<boolean>;
 	removeDir: (path: string) => void;
 	/** Only direct prime-agent-kernel-* children of this root may be removed. */
 	tempRoot: string;
@@ -190,31 +218,63 @@ export function confirmsStrayKernel(psLine: string, kernel: KernelProcess): bool
 	return Number.parseInt(fields[1]!, 10) === 1 && command?.connectionPath === kernel.connectionPath;
 }
 
-// Guards pid reuse between scan and kill: the pid must still show the same orphaned kernel command.
-function recheckStrayKernel(kernel: KernelProcess): boolean {
-	const ps = spawnSync("ps", ["-o", "ppid=,args=", "-p", String(kernel.pid)], { encoding: "utf8" });
-	if (ps.error || ps.status !== 0 || typeof ps.stdout !== "string") {
-		return false;
+export type PidIdentity = "stray-kernel" | "gone" | "other";
+
+// Guards pid reuse: distinguishes the original orphaned kernel from an exited pid or a new owner.
+function checkPidIdentity(kernel: KernelProcess): PidIdentity {
+	const ps = spawnSync("ps", ["-o", "ppid=,args=", "-p", String(kernel.pid)], {
+		encoding: "utf8",
+		maxBuffer: PS_MAX_BUFFER,
+	});
+	if (ps.error || typeof ps.stdout !== "string") {
+		// ps itself failed; fail closed as if another process owned the pid.
+		return "other";
 	}
-	return confirmsStrayKernel(ps.stdout, kernel);
+	if (ps.status !== 0 || ps.stdout.trim() === "") {
+		return "gone";
+	}
+	return confirmsStrayKernel(ps.stdout, kernel) ? "stray-kernel" : "other";
 }
 
-async function forceKillKernel(pid: number): Promise<boolean> {
+export interface KernelKillProbes {
+	kill: (pid: number, signal: NodeJS.Signals) => void;
+	pidIdentity: (kernel: KernelProcess) => PidIdentity;
+	waitForExit: (pid: number, timeoutMs: number) => Promise<boolean>;
+}
+
+const defaultKillProbes: KernelKillProbes = {
+	kill: (pid, signal) => process.kill(pid, signal),
+	pidIdentity: checkPidIdentity,
+	waitForExit,
+};
+
+export async function forceKillKernel(
+	kernel: KernelProcess,
+	probes: KernelKillProbes = defaultKillProbes,
+): Promise<boolean> {
 	try {
-		process.kill(pid, "SIGTERM");
+		probes.kill(kernel.pid, "SIGTERM");
 	} catch (error) {
 		// ESRCH means already gone; anything else (e.g. EPERM) is a failure.
 		return (error as NodeJS.ErrnoException).code === "ESRCH";
 	}
-	if (await waitForExit(pid, 1000)) {
+	if (await probes.waitForExit(kernel.pid, 1000)) {
 		return true;
 	}
+	// The pid may have been reused since SIGTERM; only escalate if it still shows the same kernel.
+	const identity = probes.pidIdentity(kernel);
+	if (identity === "gone") {
+		return true;
+	}
+	if (identity === "other") {
+		return false;
+	}
 	try {
-		process.kill(pid, "SIGKILL");
+		probes.kill(kernel.pid, "SIGKILL");
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ESRCH";
 	}
-	return waitForExit(pid, 1000);
+	return probes.waitForExit(kernel.pid, 1000);
 }
 
 async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
@@ -242,7 +302,7 @@ function delay(ms: number): Promise<void> {
 }
 
 const defaultReapHooks: KernelReapHooks = {
-	recheckStray: recheckStrayKernel,
+	recheckStray: (kernel) => checkPidIdentity(kernel) === "stray-kernel",
 	killProcess: forceKillKernel,
 	removeDir: (path) => rmSync(path, { recursive: true, force: true }),
 	tempRoot: tmpdir(),
@@ -273,7 +333,7 @@ export async function reapKernelFindings(
 			skipped.push({ pid: kernel.pid, reason: "no longer an orphaned kernel; not killing" });
 			continue;
 		}
-		if (!(await hooks.killProcess(kernel.pid))) {
+		if (!(await hooks.killProcess(kernel))) {
 			// Keep the temp dir: the kernel may still be alive and using it.
 			skipped.push({ pid: kernel.pid, reason: "could not confirm kernel exit; keeping its temp dir" });
 			continue;
@@ -289,6 +349,8 @@ export async function reapKernelFindings(
 		removedTempDirs,
 		skipped,
 		leakedTestDaemons: findings.leakedTestDaemons,
+		forkedKernelsPresent: findings.forkedKernelsPresent,
+		orphanedForkedKernels: findings.orphanedForkedKernels,
 		psUnavailable: findings.psUnavailable,
 	};
 }
@@ -313,10 +375,29 @@ export function formatKernelReport(findings: KernelFindings): string | undefined
 			),
 		);
 	}
+	if (findings.forkedKernelsPresent > 0) {
+		lines.push(formatForkedKernelNotes(findings));
+	}
 	if (findings.leakedTestDaemons.length > 0) {
 		lines.push(formatLeakedTestDaemonWarning(findings.leakedTestDaemons));
 	}
 	return lines.length > 0 ? lines.join("\n") : undefined;
+}
+
+function formatForkedKernelNotes(findings: KernelFindings | KernelFixResult): string {
+	const lines = [
+		chalk.dim(
+			`! ${findings.forkedKernelsPresent} forkserver-backed kernel process(es) running; skipping stale temp dir checks`,
+		),
+	];
+	if (findings.orphanedForkedKernels.length > 0) {
+		lines.push(
+			chalk.dim(
+				`! ${findings.orphanedForkedKernels.length} orphaned forkserver-backed kernel(s) (pids ${findings.orphanedForkedKernels.join(", ")}) — not auto-fixed (see ENG-5310)`,
+			),
+		);
+	}
+	return lines.join("\n");
 }
 
 function formatLeakedTestDaemonWarning(pids: number[]): string {
@@ -342,6 +423,9 @@ export function formatKernelFixResult(result: KernelFixResult): string | undefin
 	for (const skip of result.skipped) {
 		lines.push(chalk.dim(`kept   ${skip.pid !== undefined ? `pid ${skip.pid}` : skip.path}: ${skip.reason}`));
 	}
+	if (result.forkedKernelsPresent > 0) {
+		lines.push(formatForkedKernelNotes(result));
+	}
 	if (result.leakedTestDaemons.length > 0) {
 		lines.push(formatLeakedTestDaemonWarning(result.leakedTestDaemons));
 	}
@@ -352,12 +436,16 @@ export function kernelJsonSummary(findings: KernelFindings): {
 	strays: number;
 	staleTempDirs: number;
 	leakedTestDaemons: number;
+	forkedKernelsPresent: number;
+	orphanedForkedKernels: number;
 	psUnavailable: boolean;
 } {
 	return {
 		strays: findings.strays.length,
 		staleTempDirs: findings.staleTempDirs.length,
 		leakedTestDaemons: findings.leakedTestDaemons.length,
+		forkedKernelsPresent: findings.forkedKernelsPresent,
+		orphanedForkedKernels: findings.orphanedForkedKernels.length,
 		psUnavailable: findings.psUnavailable,
 	};
 }
