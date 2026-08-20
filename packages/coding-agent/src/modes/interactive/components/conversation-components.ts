@@ -37,6 +37,8 @@ export interface ConversationComponentsOptions {
 	hideThinkingBlock?: boolean;
 	hiddenThinkingLabel?: string;
 	toolsExpanded?: boolean;
+	agentMessagesExpanded?: boolean;
+	editDiffsExpanded?: boolean;
 	isRecognizedSlashCommand?: (name: string) => boolean;
 }
 
@@ -69,6 +71,8 @@ export function buildConversationComponents(
 	const components: Component[] = [];
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	const expanded = options.toolsExpanded ?? false;
+	const agentMessagesExpanded = options.agentMessagesExpanded ?? false;
+	const editDiffsExpanded = options.editDiffsExpanded ?? false;
 
 	for (const message of messages) {
 		if (message.role === "assistant") {
@@ -100,6 +104,8 @@ export function buildConversationComponents(
 					options.cwd,
 				);
 				tool.setExpanded(expanded);
+				tool.setAgentMessagesExpanded(agentMessagesExpanded);
+				tool.setEditDiffsExpanded(editDiffsExpanded);
 				tool.markExecutionStarted();
 				tool.setArgsComplete();
 				selectLatestToolExpandHint(components, tool);
@@ -140,7 +146,7 @@ export function buildConversationComponents(
 			const component = new AgentMessageComponent(message, options.markdownTheme, {
 				suppressLeadingSpace: isCompactAgentMessageNeighbor(components.at(-1)),
 			});
-			component.setExpanded(expanded);
+			component.setExpanded(agentMessagesExpanded);
 			components.push(component);
 		} else if (isInjectedPromptMessage(message) && message.display) {
 			const component = new InjectedPromptMessageComponent(message, options.markdownTheme);

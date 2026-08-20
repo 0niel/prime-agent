@@ -23,6 +23,7 @@ import { emptyGoalState, type GoalState } from "../src/core/goals.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import { emptyUsage } from "../src/core/usage.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type {
@@ -42,12 +43,14 @@ import type {
 import { AgentConnectionPromptAdmissionError } from "../src/modes/agent-connection/types.js";
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.js";
+import { AgentMessageComponent } from "../src/modes/interactive/components/agent-message.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
+import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 function renderLastLine(container: Container, width = 120): string {
@@ -621,6 +624,7 @@ type SubmitHandlerHarness = {
 	isBashRunning: () => boolean;
 	patchConnectionState: (patch: Record<string, unknown>) => void;
 	requestAgentsView: () => Promise<void>;
+	handleResumeCommand: (args: string) => Promise<void>;
 	agentConnection: {
 		prompt: (message: string) => Promise<void>;
 		executeBash: (command: string, options?: { excludeFromContext?: boolean }) => Promise<void>;
@@ -640,6 +644,7 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		patchConnectionState: vi.fn(),
 		promptStashState: {},
 		requestAgentsView: vi.fn(async () => {}),
+		handleResumeCommand: vi.fn(async () => {}),
 		promptStash: undefined,
 		pastedImages: new Map(),
 		getPromptStashImages: vi.fn(() => []),
@@ -961,9 +966,15 @@ describe("InteractiveMode submit handling", () => {
 describe("InteractiveMode MCP command", () => {
 	type McpCommandHarness = {
 		modelRegistry: { authStorage: { get(providerId: string): unknown } };
-		settingsManager: { getMcpServers(): Record<string, unknown> };
+		settingsManager: SettingsManager;
 		showConfigurationMenu(tab: "mcp-connections"): Promise<void>;
 		showStatus(message: string): void;
+		showError(message: string): void;
+		showWarning(message: string): void;
+		handleReloadCommand(): Promise<boolean>;
+		reloadAfterMcpChange(message: string, successMessage?: string): Promise<void>;
+		isAgentStreaming(): boolean;
+		isAgentCompacting(): boolean;
 		handleMcpCommand(args: string | undefined): Promise<void>;
 	};
 	const handleMcpCommand = (InteractiveMode.prototype as unknown as McpCommandHarness).handleMcpCommand;
@@ -981,15 +992,110 @@ describe("InteractiveMode MCP command", () => {
 	test("preserves the explicit /mcp list status output", async () => {
 		const fakeThis = {
 			modelRegistry: { authStorage: { get: vi.fn(() => undefined) } },
-			settingsManager: { getMcpServers: vi.fn(() => ({})) },
+			settingsManager: SettingsManager.inMemory({}),
 			showConfigurationMenu: vi.fn(async () => {}),
 			showStatus: vi.fn(),
+			showError: vi.fn(),
 		} as unknown as McpCommandHarness;
 
 		await handleMcpCommand.call(fakeThis, "list");
 
 		expect(fakeThis.showConfigurationMenu).not.toHaveBeenCalled();
-		expect(fakeThis.showStatus).toHaveBeenCalledWith(expect.stringContaining("MCP integrations:"));
+		expect(fakeThis.showStatus).toHaveBeenCalledWith(expect.stringContaining("Built-in MCP integrations:"));
+	});
+
+	function createRenderedMcpHarness(manager: SettingsManager) {
+		const chatContainer = new Container();
+		const ui = { requestRender: vi.fn() };
+		const showStatus = (InteractiveMode.prototype as unknown as { showStatus(message: string): void }).showStatus;
+		return {
+			modelRegistry: { authStorage: { get: vi.fn(() => undefined), removeVerified: vi.fn() } },
+			settingsManager: manager,
+			chatContainer,
+			ui,
+			showStatus,
+			showError: InteractiveMode.prototype.showError,
+			showWarning: InteractiveMode.prototype.showWarning,
+			reloadAfterMcpChange: (
+				InteractiveMode.prototype as unknown as {
+					reloadAfterMcpChange(message: string, successMessage?: string): Promise<void>;
+				}
+			).reloadAfterMcpChange,
+			isAgentStreaming: vi.fn(() => false),
+			isAgentCompacting: vi.fn(() => false),
+		} as unknown as McpCommandHarness & { chatContainer: Container };
+	}
+
+	test("renders safe add and remove confirmations after resource reload", async () => {
+		const manager = SettingsManager.inMemory({});
+		const fakeThis = createRenderedMcpHarness(manager);
+		fakeThis.handleReloadCommand = vi.fn(async () => {
+			fakeThis.chatContainer.clear();
+			return true;
+		});
+
+		await handleMcpCommand.call(fakeThis, "add fetch -- uvx mcp-server-fetch --token secret");
+
+		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toContain(
+			'Added MCP server "fetch" (stdio). Available next turn through mcp.',
+		);
+		expect(normalizeRenderedOutput(fakeThis.chatContainer)).not.toContain("uvx");
+		expect(normalizeRenderedOutput(fakeThis.chatContainer)).not.toContain("secret");
+
+		await handleMcpCommand.call(fakeThis, "remove fetch");
+
+		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toContain(
+			'Removed MCP server "fetch" (stdio). It is no longer available through mcp.',
+		);
+		expect(manager.getGlobalMcpServers()).toEqual({});
+	});
+
+	test("keeps persisted mutation honest when MCP reload fails", async () => {
+		const manager = SettingsManager.inMemory({});
+		const fakeThis = createRenderedMcpHarness(manager);
+		fakeThis.handleReloadCommand = vi.fn(async () => {
+			fakeThis.chatContainer.clear();
+			fakeThis.showError("Reload failed: broken resource");
+			return false;
+		});
+
+		await handleMcpCommand.call(fakeThis, "add fetch -- uvx mcp-server-fetch");
+
+		const rendered = normalizeRenderedOutput(fakeThis.chatContainer);
+		expect(rendered).toContain("Reload failed: broken resource");
+		expect(rendered).toContain("change remains saved");
+		expect(rendered).toContain("not active in this session");
+		expect(rendered).not.toContain("Available next turn through mcp");
+		expect(manager.getGlobalMcpServers()).toHaveProperty("fetch");
+	});
+
+	test("renders inspectable redacted list and get output", async () => {
+		const manager = SettingsManager.inMemory({
+			mcpServers: {
+				fetch: {
+					type: "stdio",
+					command: "secret-command",
+					args: ["secret-argument"],
+					env: { TOKEN: { env: "SECRET_TOKEN" } },
+				},
+			},
+		});
+		const fakeThis = createRenderedMcpHarness(manager);
+
+		await handleMcpCommand.call(fakeThis, "list");
+		const listOutput = normalizeRenderedOutput(fakeThis.chatContainer);
+		expect(listOutput).toContain("User-configured MCP servers:");
+		expect(listOutput).toContain("fetch: stdio");
+
+		fakeThis.chatContainer.clear();
+		await handleMcpCommand.call(fakeThis, "get fetch");
+		const getOutput = normalizeRenderedOutput(fakeThis.chatContainer);
+		expect(getOutput).toContain("fetch: stdio");
+		for (const output of [listOutput, getOutput]) {
+			expect(output).not.toContain("secret-command");
+			expect(output).not.toContain("secret-argument");
+			expect(output).not.toContain("SECRET_TOKEN");
+		}
 	});
 });
 
@@ -1124,8 +1230,11 @@ describe("InteractiveMode pending bash components", () => {
 
 		const editorStub = { clearHistory: vi.fn(), setText: vi.fn() };
 		const endFeatureHintRun = vi.fn();
+		const queueSelection = new QueueSelection();
+		queueSelection.move({ steering: ["s1"], followUp: [] }, "draft", -1);
 		const fakeThis = {
 			endFeatureHintRun,
+			queueSelection,
 			chatContainer: new Container(),
 			shortcutGuideContainer: new Container(),
 			pendingMessagesContainer: new Container(),
@@ -1158,6 +1267,10 @@ describe("InteractiveMode pending bash components", () => {
 		expect(loader.intervalId).toBeNull();
 		expect(endFeatureHintRun).toHaveBeenCalledOnce();
 		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBeUndefined();
+		// Queue browsing is session-scoped: Enter in the next session must be a
+		// fresh prompt, and the previous session's stashed draft is discarded.
+		expect(queueSelection.isBrowsing).toBe(false);
+		expect(queueSelection.reset()).toBe("");
 	});
 });
 
@@ -1529,13 +1642,14 @@ describe("InteractiveMode connection events", () => {
 		expect(flushPendingBashComponents).toHaveBeenCalledOnce();
 	});
 
-	test("sends /resume as plain prompt text now that the command is retired", async () => {
+	test("routes /resume to the resume command handler", async () => {
 		const fakeThis = createSubmitHandlerHarness();
 
-		await fakeThis.defaultEditor.onSubmit?.("/resume unexpected");
+		await fakeThis.defaultEditor.onSubmit?.("/resume abc123");
 
+		expect(fakeThis.handleResumeCommand).toHaveBeenCalledWith("abc123");
 		expect(fakeThis.showError).not.toHaveBeenCalled();
-		expect(fakeThis.requestAgentsView).not.toHaveBeenCalled();
+		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
 	});
 
 	test("renderCurrentSessionState waits for replacement handling before rendering", async () => {
@@ -2989,6 +3103,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 	): Record<string, unknown> & { getUserInput: ReturnType<typeof vi.fn> } {
 		return {
 			init: vi.fn(async () => {}),
+			restorePromptStashOnOpen: vi.fn(),
 			options: { agentsViewOwnsStartupNotices: true, ...options },
 			modelRegistry: { getError: vi.fn(() => undefined) },
 			runStartupOnboarding: vi.fn(async () => true),
@@ -4193,28 +4308,87 @@ describe("truncatePathMiddle", () => {
 });
 
 describe("InteractiveMode.setToolsExpanded", () => {
-	test("applies expansion state to the active header and chat entries", () => {
-		const header = { setExpanded: vi.fn() };
-		const chatChild = { setExpanded: vi.fn() };
+	function createExpansionFakeThis(chatChildren: unknown[]): any {
 		const fakeThis: any = {
 			toolOutputExpanded: false,
+			agentMessagesExpanded: false,
+			editDiffsExpanded: false,
 			customHeader: undefined,
-			builtInHeader: header,
-			chatContainer: { children: [chatChild] },
+			builtInHeader: { setExpanded: vi.fn() },
+			chatContainer: { children: chatChildren },
 			ui: {
 				requestRender: vi.fn(),
 				requestRenderPreservingViewport: vi.fn(),
 				isFullscreen: vi.fn().mockReturnValue(false),
 			},
 		};
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+		return fakeThis;
+	}
 
-		(InteractiveMode as any).prototype.setToolsExpanded.call(fakeThis, true);
+	test("applies expansion state to the active header and chat entries", () => {
+		const chatChild = { setExpanded: vi.fn() };
+		const fakeThis = createExpansionFakeThis([chatChild]);
+
+		fakeThis.setToolsExpanded(true);
 
 		expect(fakeThis.toolOutputExpanded).toBe(true);
-		expect(header.setExpanded).toHaveBeenCalledWith(true);
+		expect(fakeThis.builtInHeader.setExpanded).toHaveBeenCalledWith(true);
 		expect(chatChild.setExpanded).toHaveBeenCalledWith(true);
 		// Expansion keeps the user anchored, so it uses the viewport-preserving path.
 		expect(fakeThis.ui.requestRenderPreservingViewport).toHaveBeenCalledTimes(1);
+	});
+
+	test("toggles agent messages separately from tools", () => {
+		const toolChild = { setExpanded: vi.fn() };
+		const ipythonChild = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
+		const messageChild = new AgentMessageComponent({
+			role: "custom",
+			customType: "agent_message",
+			content: "Ping.",
+			display: true,
+			details: { id: "agentmsg_split", message: "Ping.", from: null },
+			timestamp: 123,
+		} as any);
+		const messageSetExpanded = vi.spyOn(messageChild, "setExpanded");
+		const fakeThis = createExpansionFakeThis([toolChild, ipythonChild, messageChild]);
+
+		fakeThis.toggleAgentMessageExpansion();
+
+		expect(fakeThis.agentMessagesExpanded).toBe(true);
+		expect(fakeThis.toolOutputExpanded).toBe(false);
+		expect(messageSetExpanded).toHaveBeenCalledWith(true);
+		expect(toolChild.setExpanded).toHaveBeenCalledWith(false);
+		expect(ipythonChild.setExpanded).toHaveBeenCalledWith(false);
+		expect(ipythonChild.setAgentMessagesExpanded).toHaveBeenCalledWith(true);
+
+		fakeThis.setToolsExpanded(true);
+
+		expect(toolChild.setExpanded).toHaveBeenCalledWith(true);
+		expect(messageSetExpanded).toHaveBeenLastCalledWith(true);
+		expect(ipythonChild.setExpanded).toHaveBeenCalledWith(true);
+		expect(ipythonChild.setAgentMessagesExpanded).toHaveBeenLastCalledWith(true);
+		expect(fakeThis.agentMessagesExpanded).toBe(true);
+	});
+
+	test("toggles edit diffs separately from tools and agent messages", () => {
+		const child = { setExpanded: vi.fn(), setAgentMessagesExpanded: vi.fn(), setEditDiffsExpanded: vi.fn() };
+		const fakeThis = createExpansionFakeThis([child]);
+
+		fakeThis.toggleEditDiffExpansion();
+
+		expect(fakeThis.editDiffsExpanded).toBe(true);
+		expect(fakeThis.toolOutputExpanded).toBe(false);
+		expect(fakeThis.agentMessagesExpanded).toBe(false);
+		expect(child.setEditDiffsExpanded).toHaveBeenCalledWith(true);
+		expect(child.setExpanded).toHaveBeenCalledWith(false);
+		expect(child.setAgentMessagesExpanded).toHaveBeenCalledWith(false);
+
+		fakeThis.setToolsExpanded(true);
+
+		expect(fakeThis.editDiffsExpanded).toBe(true);
+		expect(child.setEditDiffsExpanded).toHaveBeenLastCalledWith(true);
+		expect(child.setExpanded).toHaveBeenLastCalledWith(true);
 	});
 });
 
