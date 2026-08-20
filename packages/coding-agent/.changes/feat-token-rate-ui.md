@@ -1,0 +1,1 @@
+- Added tokens/sec to the working loader message, showing output throughput alongside the token count.
