@@ -799,7 +799,10 @@ export async function runAcpModeWithConnection(
 			await entry.pendingTerminal?.task;
 			if (session !== entry) throw new Error(`Unknown ACP session: ${params.sessionId}`);
 			if (sessionCloseInFlight) throw new Error(`ACP session is closing: ${params.sessionId}`);
-			if (entry.cancelling) throw new Error(`ACP session is cancelling: ${params.sessionId}`);
+			// This prompt was admitted before the cancellation started; it is dropped
+			// by the cancel rather than malformed, so report the protocol stop reason
+			// instead of a request error.
+			if (entry.cancelling) return { stopReason: "cancelled" satisfies AcpStopReason };
 			if (entry.stopFailure) throw new Error(`ACP session stop failed: ${entry.stopFailure}`);
 			if (entry.pendingTerminal?.failure) {
 				throw new Error(`ACP lifecycle reconciliation failed: ${entry.pendingTerminal.failure}`);
@@ -825,7 +828,16 @@ export async function runAcpModeWithConnection(
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
 				}
-				await connection.promptAndWait(text, images.length > 0 ? { images } : undefined);
+				// A follow-up prompt can arrive while injected work (subagent replies,
+				// heartbeats) keeps the resident session busy. ACP has no native queue
+				// field, so queue the host turn behind that work with follow-up
+				// semantics instead of rejecting it as "Agent is already processing".
+				await connection.promptAndWait(text, {
+					...(images.length > 0 ? { images } : {}),
+					streamingBehavior: "followUp",
+					queueIfBusy: true,
+					signal: abort.signal,
+				});
 				if (abort.signal.aborted) {
 					await entry.producer.drain();
 					return { stopReason: "cancelled" satisfies AcpStopReason };
