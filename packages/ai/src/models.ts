@@ -3,7 +3,6 @@ import type { Api, KnownProvider, Model, ModelThinkingLevel, Usage } from "./typ
 
 const modelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
 
-// Initialize registry from MODELS on module load
 for (const [provider, models] of Object.entries(MODELS)) {
 	const providerModels = new Map<string, Model<Api>>();
 	for (const [id, model] of Object.entries(models)) {
@@ -36,11 +35,27 @@ export function getModels<TProvider extends KnownProvider>(
 	return models ? (Array.from(models.values()) as Model<ModelApi<TProvider, keyof (typeof MODELS)[TProvider]>>[]) : [];
 }
 
-export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
+export function supportsFastMode<TApi extends Api>(model: Model<TApi>): boolean {
+	return (
+		model.provider === "openai-codex" &&
+		model.api === "openai-codex-responses" &&
+		(model.id === "gpt-5.4" || model.id === "gpt-5.5" || model.id === "gpt-5.6" || model.id.startsWith("gpt-5.6-"))
+	);
+}
+
+export interface CostOverrides {
+	cacheWrite?: number;
+}
+
+export function calculateCost<TApi extends Api>(
+	model: Model<TApi>,
+	usage: Usage,
+	overrides?: CostOverrides,
+): Usage["cost"] {
 	usage.cost.input = (model.cost.input / 1000000) * usage.input;
 	usage.cost.output = (model.cost.output / 1000000) * usage.output;
 	usage.cost.cacheRead = (model.cost.cacheRead / 1000000) * usage.cacheRead;
-	usage.cost.cacheWrite = (model.cost.cacheWrite / 1000000) * usage.cacheWrite;
+	usage.cost.cacheWrite = ((overrides?.cacheWrite ?? model.cost.cacheWrite) / 1000000) * usage.cacheWrite;
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 	return usage.cost;
 }
@@ -79,10 +94,6 @@ export function clampThinkingLevel<TApi extends Api>(
 	return availableLevels[0] ?? "off";
 }
 
-/**
- * Check if two models are equal by comparing both their id and provider.
- * Returns false if either model is null or undefined.
- */
 export function modelsAreEqual<TApi extends Api>(
 	a: Model<TApi> | null | undefined,
 	b: Model<TApi> | null | undefined,

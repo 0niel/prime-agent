@@ -1,13 +1,14 @@
 import { isAbsolute } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
-import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { EditToolDetails } from "../../../core/tools/edit.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import type { IpythonToolDetails } from "../../../core/tools/ipython.js";
 import { resolveToCwd } from "../../../core/tools/path-utils.js";
 import { canonicalizePath, formatPathRelativeToCwdOrAbsolute } from "../../../utils/paths.js";
 import { theme } from "../theme/theme.js";
+import { expandCollapseHint } from "./keybinding-hints.js";
 
 export interface FileChangeSummary {
 	path: string;
@@ -15,9 +16,7 @@ export interface FileChangeSummary {
 	removed: number;
 }
 
-const FILE_SUMMARY_LIMIT = 5;
-
-function countChangedLines(diff: string): { added: number; removed: number } {
+export function countChangedLines(diff: string): { added: number; removed: number } {
 	let added = 0;
 	let removed = 0;
 	for (const line of diff.split("\n")) {
@@ -37,15 +36,6 @@ function mergeFileChange(target: Map<string, FileChangeSummary>, change: FileCha
 	} else {
 		target.set(key, { ...change });
 	}
-}
-
-function formatFileChangePath(path: string, cwd: string): string {
-	const resolvedPath = resolveToCwd(path, cwd);
-	const lexicalPath = formatPathRelativeToCwdOrAbsolute(resolvedPath, cwd);
-	if (!isAbsolute(lexicalPath)) {
-		return lexicalPath;
-	}
-	return formatPathRelativeToCwdOrAbsolute(canonicalizePath(resolvedPath), canonicalizePath(cwd));
 }
 
 export function getToolFileChanges(
@@ -90,44 +80,49 @@ export function mergeTurnFileChanges(
 	}
 }
 
-function counts(change: Pick<FileChangeSummary, "added" | "removed">): string {
+/** Dim gutter that anchors every per-file change summary line. */
+const FILE_CHANGE_SUMMARY_PREFIX = "    ╰─ ";
+/** Indent that aligns diff rows with the summary line's text column. */
+export const FILE_CHANGE_DIFF_INDENT = " ".repeat(visibleWidth(FILE_CHANGE_SUMMARY_PREFIX));
+
+function formatChangeCounts(change: Pick<FileChangeSummary, "added" | "removed">): string {
 	return `${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `-${change.removed}`)}`;
 }
 
-export class FileChangeSummaryComponent implements Component {
-	constructor(
-		private readonly changes: readonly FileChangeSummary[],
-		private readonly cwd: string,
-	) {}
+function formatFileChangePath(path: string, cwd: string): string {
+	const resolvedPath = resolveToCwd(path, cwd);
+	const lexicalPath = formatPathRelativeToCwdOrAbsolute(resolvedPath, cwd);
+	if (!isAbsolute(lexicalPath)) return lexicalPath;
+	return formatPathRelativeToCwdOrAbsolute(canonicalizePath(resolvedPath), canonicalizePath(cwd));
+}
 
-	render(width: number): string[] {
-		const safeWidth = Math.max(1, width);
-		const prefix = theme.fg("dim", "    ╰─ ");
-		const shown = this.changes.slice(0, FILE_SUMMARY_LIMIT).map((change) => {
-			const suffix = `${theme.fg("dim", " ")}${counts(change)}`;
-			const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(suffix));
-			const path = truncateToWidth(formatFileChangePath(change.path, this.cwd), available, "…");
-			return truncateToWidth(`${prefix}${theme.fg("muted", path)}${suffix}`, safeWidth, "");
-		});
-		if (this.changes.length > FILE_SUMMARY_LIMIT) {
-			const hidden = this.changes.slice(FILE_SUMMARY_LIMIT);
-			const hiddenTotals = hidden.reduce(
-				(sum, change) => ({ added: sum.added + change.added, removed: sum.removed + change.removed }),
-				{ added: 0, removed: 0 },
-			);
-			const files = `${hidden.length} more file${hidden.length === 1 ? "" : "s"}`;
-			shown.push(
-				truncateToWidth(
-					`${prefix}${theme.fg("muted", `[${files}`)}${theme.fg("dim", " ")}${counts(hiddenTotals)}${theme.fg("muted", "]")}`,
-					safeWidth,
-					"",
-				),
-			);
-		}
-		return shown;
-	}
-
-	invalidate(): void {}
+/**
+ * One `    ╰─ <path> +N -M` row, truncated to width; the path renders relative
+ * to cwd where possible and the hint renders only when diffsExpanded is defined.
+ */
+export function formatFileChangeSummaryLine(
+	rawPath: string,
+	cwd: string | undefined,
+	change: Pick<FileChangeSummary, "added" | "removed">,
+	diffsExpanded: boolean | undefined,
+	width: number,
+): string {
+	const prefix = theme.fg("dim", FILE_CHANGE_SUMMARY_PREFIX);
+	const hint =
+		diffsExpanded === undefined
+			? ""
+			: `${theme.fg("dim", " · ")}${expandCollapseHint("app.edits.expand", diffsExpanded)}`;
+	// Size the path against the wider hint variant ("to collapse") so toggling
+	// ctrl+j never re-truncates it — the summary line is a stable anchor.
+	const widestHint =
+		diffsExpanded === undefined ? "" : `${theme.fg("dim", " · ")}${expandCollapseHint("app.edits.expand", true)}`;
+	const counts = `${theme.fg("dim", " ")}${formatChangeCounts(change)}`;
+	const suffix = `${counts}${hint}`;
+	const safeWidth = Math.max(1, width);
+	const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(counts) - visibleWidth(widestHint));
+	const displayPath = cwd === undefined ? rawPath : formatFileChangePath(rawPath, cwd);
+	const path = truncateToWidth(displayPath, available, "…");
+	return truncateToWidth(`${prefix}${theme.fg("muted", path)}${suffix}`, safeWidth, "");
 }
 
 export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]): string {
@@ -136,5 +131,5 @@ export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]):
 		{ added: 0, removed: 0 },
 	);
 	const files = `${changes.length} file${changes.length === 1 ? "" : "s"} changed`;
-	return `${theme.fg("muted", files)}${theme.fg("dim", " | ")}${counts(totals)}`;
+	return `${theme.fg("muted", files)}${theme.fg("dim", " | ")}${formatChangeCounts(totals)}`;
 }

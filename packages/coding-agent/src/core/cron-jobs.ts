@@ -11,14 +11,14 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
-import { Type } from "typebox";
-import type { ToolDefinition } from "./extensions/types.js";
+import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 export type AgentCronJobStatus = "active" | "paused" | "completed" | "cancelled";
 export type AgentCronScheduleKind = "once" | "cron" | "interval";
 export type AgentCronJobSource = "cron" | "heartbeat" | "rlm_heartbeat";
 export type AgentCronJobRuntimeKind = "top-level" | "subagent";
 export type AgentHeartbeatUpdateAction = "pause" | "resume" | "clear";
+export type AgentHeartbeatManagementAction = "pause" | "resume" | "stop";
 export type AgentRlmHeartbeatStatusUpdate = "pause" | "resume";
 /**
  * How a scheduled heartbeat prompt is delivered when the target session is busy:
@@ -78,6 +78,7 @@ export interface AgentCronDispatch {
 
 export interface AgentCronSchedulerHooks {
 	runJob: (job: AgentCronJob) => Promise<AgentCronJobRunResult | undefined>;
+	beginDispatch?: (dispatch: AgentCronDispatch) => (() => void) | undefined;
 	now?: () => Date;
 	onError?: (job: AgentCronJob, error: unknown) => void;
 }
@@ -87,8 +88,8 @@ export interface HeartbeatCronSessionActivity {
 	isCompacting?: boolean;
 	isRetrying?: boolean;
 	isBashRunning: boolean;
-	hasAcceptedPromptInFlight?: boolean;
-	pendingMessageCount: number;
+	hasPendingSessionWork: boolean;
+	unfinishedActionCount: number;
 }
 
 interface CronJobsFile {
@@ -123,10 +124,6 @@ export type ParsedHeartbeatCommand =
 	| { type: "clear" }
 	| { type: "set"; schedule: string; instruction: string; deliveryMode?: AgentHeartbeatDeliveryMode };
 
-export interface AgentCronToolController {
-	getHeartbeat(): AgentCronJob | undefined;
-}
-
 export interface AgentRlmHeartbeatController {
 	listRlmHeartbeats(options?: { includeInactive?: boolean }): AgentCronJob[];
 	createRlmHeartbeat(input: {
@@ -146,8 +143,32 @@ export interface AgentRlmHeartbeatController {
 	deleteRlmHeartbeat(id: string): AgentCronJob | undefined;
 }
 
+function heartbeatCatalogSignature(jobs: readonly AgentCronJob[]): string {
+	return JSON.stringify(
+		jobs
+			.filter((job) => isHeartbeatCronJob(job) && (job.status === "active" || job.status === "paused"))
+			.sort((left, right) => left.id.localeCompare(right.id))
+			.map((job) => ({
+				id: job.id,
+				status: job.status,
+				source: job.source,
+				runtimeKind: job.runtimeKind,
+				deliveryMode: job.deliveryMode,
+				activeSessionId: job.activeSessionId,
+				sessionId: job.sessionId,
+				sessionFile: job.sessionFile,
+				cwd: job.cwd,
+				label: job.label,
+				prompt: job.prompt,
+				schedule: job.schedule,
+				createdAt: job.createdAt,
+			})),
+	);
+}
+
 export class AgentCronJobStore {
 	private readonly sessionArtifactFiles = new Map<string, string>();
+	private readonly heartbeatChangeListeners = new Set<() => void>();
 
 	constructor(
 		private readonly filePath?: string,
@@ -160,6 +181,11 @@ export class AgentCronJobStore {
 
 	static forSessionArtifacts(): AgentCronJobStore {
 		return new AgentCronJobStore(undefined, true);
+	}
+
+	onHeartbeatChange(listener: () => void): () => void {
+		this.heartbeatChangeListeners.add(listener);
+		return () => this.heartbeatChangeListeners.delete(listener);
 	}
 
 	registerSessionArtifact(sessionId: string, artifactDir: string): boolean {
@@ -553,6 +579,46 @@ export class AgentCronJobStore {
 		return cleared;
 	}
 
+	manageHeartbeat(
+		activeSessionId: string,
+		id: string,
+		action: AgentHeartbeatManagementAction,
+		now = new Date(),
+	): AgentCronJob | undefined {
+		let updated: AgentCronJob | undefined;
+		const jobs = this.readJobs().map((job) => {
+			if (job.id !== id || job.activeSessionId !== activeSessionId || !isHeartbeatCronJob(job)) {
+				return job;
+			}
+			if (job.status === "cancelled" || job.status === "completed") {
+				return job;
+			}
+			if (action === "pause") {
+				updated = withoutNextRunAt({ ...job, status: "paused", updatedAt: now.toISOString() });
+				return updated;
+			}
+			if (action === "stop") {
+				updated = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+				return updated;
+			}
+			const nextRunAt = nextRunAtForSchedule(job.schedule, now);
+			if (!nextRunAt) {
+				throw new Error("Heartbeat schedule must be recurring");
+			}
+			updated = {
+				...job,
+				status: "active",
+				nextRunAt: nextRunAt.toISOString(),
+				updatedAt: now.toISOString(),
+			};
+			return updated;
+		});
+		if (updated) {
+			this.writeJobs(jobs);
+		}
+		return updated;
+	}
+
 	cancel(id: string, now = new Date()): AgentCronJob | undefined {
 		let cancelled: AgentCronJob | undefined;
 		const jobs = this.readJobs().map((job) => {
@@ -698,6 +764,16 @@ export class AgentCronJobStore {
 		return recovered;
 	}
 
+	recoverInterruptedDispatchesById(dispatchIds: readonly string[], now = new Date()): AgentCronJob[] {
+		const recovered: AgentCronJob[] = [];
+		const interruptedDispatchIds = new Set(dispatchIds);
+		this.mutateStates((state) => {
+			recoverInterruptedInState(state, now, recovered, interruptedDispatchIds);
+			return [];
+		});
+		return recovered;
+	}
+
 	getDueJob(id: string, now = new Date()): AgentCronJob | undefined {
 		return this.readJobs().find((job) => job.id === id && isDueJob(job, now));
 	}
@@ -724,7 +800,9 @@ export class AgentCronJobStore {
 
 	private mutateStates(mutator: (state: CronJobsState) => AgentCronDispatch[]): AgentCronDispatch[] {
 		const paths = this.sessionArtifactMode ? [...this.sessionArtifactFiles.values()] : [this.requireFilePath()];
-		return withCronJobsStateLocks(paths, () => {
+		const previousHeartbeats = heartbeatCatalogSignature(this.readJobs());
+		let changed = false;
+		const dispatches = withCronJobsStateLocks(paths, () => {
 			const dispatches: AgentCronDispatch[] = [];
 			for (const path of paths) {
 				const state = readJobsState(path);
@@ -732,13 +810,19 @@ export class AgentCronJobStore {
 				dispatches.push(...mutator(state));
 				if (JSON.stringify(state) !== before) {
 					writeJobsState(path, state);
+					changed = true;
 				}
 			}
 			return dispatches;
 		});
+		if (changed && heartbeatCatalogSignature(this.readJobs()) !== previousHeartbeats) {
+			this.notifyHeartbeatChange();
+		}
+		return dispatches;
 	}
 
 	private writeJobs(jobs: readonly AgentCronJob[]): void {
+		const previousHeartbeats = heartbeatCatalogSignature(this.readJobs());
 		if (this.sessionArtifactMode) {
 			const registeredSessionIds = new Set(this.sessionArtifactFiles.keys());
 			const unregistered = jobs.find((job) => !registeredSessionIds.has(job.sessionId));
@@ -782,10 +866,22 @@ export class AgentCronJobStore {
 					}
 				}
 			});
+			if (heartbeatCatalogSignature(this.readJobs()) !== previousHeartbeats) {
+				this.notifyHeartbeatChange();
+			}
 			return;
 		}
 		const path = this.requireFilePath();
 		withCronJobsStateLocks([path], () => writeJobsFile(path, jobs, true));
+		if (heartbeatCatalogSignature(this.readJobs()) !== previousHeartbeats) {
+			this.notifyHeartbeatChange();
+		}
+	}
+
+	private notifyHeartbeatChange(): void {
+		for (const listener of this.heartbeatChangeListeners) {
+			listener();
+		}
 	}
 
 	private requireFilePath(): string {
@@ -819,9 +915,7 @@ export function migrateLegacyCronJobsToSessionArtifacts(
 	const jobsByArtifact = new Map<string, AgentCronJob[]>();
 	for (const job of jobs) {
 		const artifactPath = join(
-			dirname(dirname(resolve(job.sessionFile))),
-			"session-artifacts",
-			job.sessionId,
+			getSessionArtifactPathForFile(resolve(job.sessionFile), job.sessionId),
 			SESSION_SCHEDULED_JOBS_FILENAME,
 		);
 		const grouped = jobsByArtifact.get(artifactPath) ?? [];
@@ -872,48 +966,70 @@ export class AgentCronScheduler {
 	}
 
 	async runDue(now = this.now()): Promise<number> {
-		if (this.running) {
+		if (this.running || (this.stopped && this.hasStarted)) {
 			return 0;
 		}
 		this.running = true;
-		let dispatches: AgentCronDispatch[] = [];
+		const dispatches: Array<{ dispatch: AgentCronDispatch; endDispatch?: () => void }> = [];
+		let claimedDispatches: AgentCronDispatch[] | undefined;
 		try {
-			dispatches = this.store.claimDue(now, this.now());
+			claimedDispatches = this.store.claimDue(now, this.now());
+			for (const dispatch of claimedDispatches) {
+				dispatches.push({ dispatch, endDispatch: this.hooks.beginDispatch?.(dispatch) });
+			}
+		} catch (error) {
+			for (const claimed of dispatches) claimed.endDispatch?.();
+			if (claimedDispatches) {
+				this.store.recoverInterruptedDispatchesById(
+					claimedDispatches.map((dispatch) => dispatch.id),
+					this.now(),
+				);
+			}
+			throw error;
 		} finally {
 			this.running = false;
 			if (!this.stopped) {
 				this.scheduleNext();
 			}
 		}
-		const results = await Promise.all(dispatches.map((dispatch) => this.queueDispatch(dispatch)));
+		const results = await Promise.all(
+			dispatches.map(({ dispatch, endDispatch }) => this.queueDispatch(dispatch, endDispatch)),
+		);
 		return results.filter((result) => result !== "skipped").length;
 	}
 
-	private queueDispatch(dispatch: AgentCronDispatch): Promise<AgentCronJobRunResult | undefined> {
+	private queueDispatch(
+		dispatch: AgentCronDispatch,
+		endDispatch?: () => void,
+	): Promise<AgentCronJobRunResult | undefined> {
 		const laneKey = dispatch.job.activeSessionId;
 		const previous = this.dispatchLanes.get(laneKey) ?? Promise.resolve();
 		const task = previous
 			.catch(() => undefined)
 			.then(async (): Promise<AgentCronJobRunResult | undefined> => {
-				const job = this.store.getClaimedJob(dispatch.job.id);
-				if (!job) {
-					this.store.recordDispatchResult(dispatch.id, { now: this.now(), outcome: "skipped" });
-					return "skipped";
-				}
-				let runResult: AgentCronJobRunResult | undefined;
-				let error: unknown;
 				try {
-					runResult = await this.hooks.runJob(job);
-				} catch (runError) {
-					error = runError;
-					this.hooks.onError?.(job, runError);
+					const job = this.store.getClaimedJob(dispatch.job.id);
+					if (!job) {
+						this.store.recordDispatchResult(dispatch.id, { now: this.now(), outcome: "skipped" });
+						return "skipped";
+					}
+					let runResult: AgentCronJobRunResult | undefined;
+					let error: unknown;
+					try {
+						runResult = await this.hooks.runJob(job);
+					} catch (runError) {
+						error = runError;
+						this.hooks.onError?.(job, runError);
+					}
+					this.store.recordDispatchResult(dispatch.id, {
+						now: this.now(),
+						outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
+						error,
+					});
+					return runResult;
+				} finally {
+					endDispatch?.();
 				}
-				this.store.recordDispatchResult(dispatch.id, {
-					now: this.now(),
-					outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
-					error,
-				});
-				return runResult;
 			});
 		const lane = task.then(
 			() => undefined,
@@ -1132,27 +1248,6 @@ export function formatAgentCronJob(job: AgentCronJob): string {
 	return `${job.id} ${job.status}${label} next=${next} last=${last}${skipped} runs=${job.runCount} schedule="${job.schedule.expression}" prompt="${preview}"${error}`;
 }
 
-export function createAgentHeartbeatToolDefinitions(controller: AgentCronToolController): ToolDefinition[] {
-	return [
-		{
-			name: "get_heartbeat",
-			label: "Get Heartbeat",
-			description: "Get the persistent heartbeat configured for this daemon-backed session, if one exists.",
-			promptGuidelines: [
-				"Use get_heartbeat to inspect the current heartbeat before changing it, or when the user asks about heartbeat status.",
-			],
-			parameters: Type.Object({}, { additionalProperties: false }),
-			execute: async () => {
-				const job = controller.getHeartbeat();
-				return {
-					content: [{ type: "text", text: JSON.stringify({ heartbeat: job ?? null }, null, 2) }],
-					details: job ?? null,
-				};
-			},
-		},
-	];
-}
-
 function consumeDeliveryOption(text: string): { deliveryMode: AgentHeartbeatDeliveryMode | undefined; rest: string } {
 	let rest = text.trim();
 	if (/(?:^|\s)--deliver=?$/i.test(rest)) {
@@ -1262,8 +1357,8 @@ export function shouldDeferHeartbeatCronJob(job: AgentCronJob, activity: Heartbe
 		activity.isCompacting === true ||
 		activity.isRetrying === true ||
 		activity.isBashRunning ||
-		activity.hasAcceptedPromptInFlight === true ||
-		activity.pendingMessageCount > 0;
+		activity.hasPendingSessionWork ||
+		(!activity.isStreaming && activity.unfinishedActionCount > 0);
 	if (busyBesidesStreaming) {
 		return true;
 	}
@@ -1503,12 +1598,20 @@ function claimDueInState(state: CronJobsState, dueAt: Date, claimedAt: Date): Ag
 	return dispatches;
 }
 
-function recoverInterruptedInState(state: CronJobsState, now: Date, recovered: AgentCronJob[]): void {
-	if (state.dispatches.length === 0) {
+function recoverInterruptedInState(
+	state: CronJobsState,
+	now: Date,
+	recovered: AgentCronJob[],
+	dispatchIds?: ReadonlySet<string>,
+): void {
+	const interrupted = dispatchIds
+		? state.dispatches.filter((dispatch) => dispatchIds.has(dispatch.id))
+		: state.dispatches;
+	if (interrupted.length === 0) {
 		return;
 	}
-	const interruptedIds = new Set(state.dispatches.map((dispatch) => dispatch.jobId));
-	state.dispatches = [];
+	const interruptedIds = new Set(interrupted.map((dispatch) => dispatch.jobId));
+	state.dispatches = dispatchIds ? state.dispatches.filter((dispatch) => !dispatchIds.has(dispatch.id)) : [];
 	state.jobs = state.jobs.map((job) => {
 		if (!interruptedIds.has(job.id) || job.status !== "active") {
 			return job;

@@ -2,7 +2,6 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Transport } from "@earendil-works/pi-ai";
 import {
 	Container,
-	getCapabilities,
 	type SelectItem,
 	SelectList,
 	type SelectListLayoutOptions,
@@ -11,6 +10,7 @@ import {
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
+import type { IdleEvictionMinutes } from "../../../core/session-action-store.js";
 import type { WarningSettings } from "../../../core/settings-manager.js";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
@@ -22,18 +22,18 @@ const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
-	minimal: "Very brief reasoning (~1k tokens)",
-	low: "Light reasoning (~2k tokens)",
-	medium: "Moderate reasoning (~8k tokens)",
-	high: "Deep reasoning (~16k tokens)",
-	xhigh: "Very deep reasoning (~32k tokens)",
-	max: "Maximum reasoning (unconstrained)",
+	minimal: "Very brief reasoning",
+	low: "Light reasoning",
+	medium: "Moderate reasoning",
+	high: "Deep reasoning",
+	xhigh: "Very deep reasoning",
+	max: "Maximum reasoning",
 };
 
 export interface SettingsConfig {
 	autoCompact: boolean;
+	idleEvictionMinutes: IdleEvictionMinutes;
 	showImages: boolean;
-	imageWidthCells: number;
 	autoResizeImages: boolean;
 	blockImages: boolean;
 	enableSkillCommands: boolean;
@@ -59,8 +59,8 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
+	onIdleEvictionMinutesChange: (value: IdleEvictionMinutes) => void;
 	onShowImagesChange: (enabled: boolean) => void;
-	onImageWidthCellsChange: (width: number) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
 	onBlockImagesChange: (blocked: boolean) => void;
 	onEnableSkillCommandsChange: (enabled: boolean) => void;
@@ -84,9 +84,6 @@ export interface SettingsCallbacks {
 	onCancel: () => void;
 }
 
-/**
- * A submenu component for selecting from a list of options.
- */
 class WarningSettingsSubmenu extends Container {
 	private settingsList: SettingsList;
 	private state: WarningSettings;
@@ -143,19 +140,15 @@ class SelectSubmenu extends Container {
 	) {
 		super();
 
-		// Title
 		this.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
 
-		// Description
 		if (description) {
 			this.addChild(new Spacer(1));
 			this.addChild(new Text(theme.fg("muted", description), 0, 0));
 		}
 
-		// Spacer
 		this.addChild(new Spacer(1));
 
-		// Select list
 		this.selectList = new SelectList(
 			options,
 			Math.min(options.length, 10),
@@ -163,7 +156,6 @@ class SelectSubmenu extends Container {
 			SETTINGS_SUBMENU_SELECT_LIST_LAYOUT,
 		);
 
-		// Pre-select current value
 		const currentIndex = options.findIndex((o) => o.value === currentValue);
 		if (currentIndex !== -1) {
 			this.selectList.setSelectedIndex(currentIndex);
@@ -183,7 +175,6 @@ class SelectSubmenu extends Container {
 
 		this.addChild(this.selectList);
 
-		// Hint
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(theme.fg("dim", "  Enter to select · esc to go back"), 0, 0));
 	}
@@ -193,17 +184,18 @@ class SelectSubmenu extends Container {
 	}
 }
 
-/**
- * Main settings selector component.
- */
 export class SettingsSelectorComponent extends Container {
 	private settingsList: SettingsList;
 
 	constructor(config: SettingsConfig, callbacks: SettingsCallbacks) {
 		super();
 
-		const supportsImages = getCapabilities().images;
 		let currentWarnings = { ...config.warnings };
+		const idleEvictionValues = [30, 60, 90, 180, 360];
+		if (typeof config.idleEvictionMinutes === "number" && !idleEvictionValues.includes(config.idleEvictionMinutes)) {
+			idleEvictionValues.push(config.idleEvictionMinutes);
+			idleEvictionValues.sort((a, b) => a - b);
+		}
 
 		const items: SettingItem[] = [
 			{
@@ -212,6 +204,13 @@ export class SettingsSelectorComponent extends Container {
 				description: "Automatically compact context when it gets too large",
 				currentValue: config.autoCompact ? "true" : "false",
 				values: ["true", "false"],
+			},
+			{
+				id: "idle-eviction-minutes",
+				label: "Idle worker eviction",
+				description: "Stop fully idle agent trees after this many minutes (global daemon policy)",
+				currentValue: String(config.idleEvictionMinutes),
+				values: ["off", ...idleEvictionValues.map(String)],
 			},
 			{
 				id: "steering-mode",
@@ -325,27 +324,16 @@ export class SettingsSelectorComponent extends Container {
 			},
 		];
 
-		// Only show image toggle if terminal supports it
-		if (supportsImages) {
-			// Insert after autocompact
-			items.splice(1, 0, {
-				id: "show-images",
-				label: "Show images",
-				description: "Render images inline in terminal",
-				currentValue: config.showImages ? "true" : "false",
-				values: ["true", "false"],
-			});
-			items.splice(2, 0, {
-				id: "image-width-cells",
-				label: "Image width",
-				description: "Preferred inline image width in terminal cells",
-				currentValue: String(config.imageWidthCells),
-				values: ["60", "80", "120"],
-			});
-		}
+		items.splice(1, 0, {
+			id: "show-images",
+			label: "Show image metadata",
+			description: "Show image type and dimensions in terminal",
+			currentValue: config.showImages ? "true" : "false",
+			values: ["true", "false"],
+		});
 
 		// Image auto-resize toggle (always available, affects both attached and read images)
-		items.splice(supportsImages ? 3 : 1, 0, {
+		items.splice(2, 0, {
 			id: "auto-resize-images",
 			label: "Auto-resize images",
 			description: "Resize large images to 2000x2000 max for better model compatibility",
@@ -443,7 +431,6 @@ export class SettingsSelectorComponent extends Container {
 			values: ["true", "false"],
 		});
 
-		// Add borders
 		this.addChild(new DynamicBorder());
 
 		this.settingsList = new SettingsList(
@@ -455,11 +442,11 @@ export class SettingsSelectorComponent extends Container {
 					case "autocompact":
 						callbacks.onAutoCompactChange(newValue === "true");
 						break;
+					case "idle-eviction-minutes":
+						callbacks.onIdleEvictionMinutesChange(newValue === "off" ? "off" : Number(newValue));
+						break;
 					case "show-images":
 						callbacks.onShowImagesChange(newValue === "true");
-						break;
-					case "image-width-cells":
-						callbacks.onImageWidthCellsChange(parseInt(newValue, 10));
 						break;
 					case "auto-resize-images":
 						callbacks.onAutoResizeImagesChange(newValue === "true");

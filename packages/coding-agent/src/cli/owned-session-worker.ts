@@ -13,6 +13,7 @@ import {
 } from "../core/orphan-process-journal.js";
 import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../modes/rpc/jsonl.js";
+import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { type CliSubprocessLaunchSpec, createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 const OWNED_WORKER_ENV = "PRIME_AGENT_INTERNAL_OWNED_WORKER";
@@ -22,6 +23,10 @@ const OWNED_PROFILE_ENV = "PRIME_AGENT_INTERNAL_OWNED_PROFILE";
 let closeOwnerWatch: (() => void) | undefined;
 
 export type OwnedSessionWorkerProfile = "print" | "json" | "rpc" | "interactive-ephemeral";
+
+export function isOwnedSessionWorkerProcess(environment: NodeJS.ProcessEnv = process.env): boolean {
+	return environment[OWNED_WORKER_ENV] === "1";
+}
 
 interface OwnedSessionRecoveryDescriptor {
 	version: 1;
@@ -34,17 +39,7 @@ interface OwnedSessionRecoveryDescriptor {
 
 const NON_SESSION_FLAGS = new Set(["--help", "-h", "--version", "-v", "--list-models", "--export"]);
 
-const NON_SESSION_COMMANDS = new Set([
-	"agents",
-	"manage",
-	"daemon",
-	"install",
-	"remove",
-	"uninstall",
-	"update",
-	"list",
-	"config",
-]);
+const NON_SESSION_COMMANDS = new Set([...PUBLIC_COMMAND_NAMES, ...REMOVED_COMMAND_NAMES]);
 
 function valueAfter(args: readonly string[], flag: string): string | undefined {
 	const index = args.indexOf(flag);
@@ -56,6 +51,9 @@ function hasNonSessionOperation(args: readonly string[]): boolean {
 		return true;
 	}
 	const first = args[0];
+	if (first === "help") {
+		return isHelpCommandRequest(args.slice(1));
+	}
 	return first !== undefined && NON_SESSION_COMMANDS.has(first);
 }
 
@@ -69,7 +67,7 @@ export function classifyOwnedSessionWorkerInvocation(
 	stdinIsTTY: boolean | undefined,
 	environment: NodeJS.ProcessEnv = process.env,
 ): OwnedSessionWorkerProfile | undefined {
-	if (environment[OWNED_WORKER_ENV] === "1" || hasNonSessionOperation(args)) {
+	if (isOwnedSessionWorkerProcess(environment) || hasNonSessionOperation(args)) {
 		return undefined;
 	}
 
@@ -478,7 +476,13 @@ export async function runOwnedSessionWorkerFrontend(
 	}
 }
 
-export async function maybeRunOwnedSessionWorkerFrontend(args: readonly string[]): Promise<boolean> {
+export async function maybeRunOwnedSessionWorkerFrontend(
+	args: readonly string[],
+	forceLegacyFrontend = false,
+): Promise<boolean> {
+	if (!forceLegacyFrontend && process.env.PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND !== "1") {
+		return false;
+	}
 	const profile = classifyOwnedSessionWorkerInvocation(args, process.stdin.isTTY);
 	if (!profile) {
 		return false;
@@ -488,7 +492,7 @@ export async function maybeRunOwnedSessionWorkerFrontend(args: readonly string[]
 }
 
 export function installOwnedSessionWorkerOwnerWatch(): void {
-	if (process.env[OWNED_WORKER_ENV] !== "1") {
+	if (!isOwnedSessionWorkerProcess()) {
 		return;
 	}
 	if (!process.channel) {

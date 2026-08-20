@@ -42,7 +42,7 @@ export class EarendilAnnouncementComponent extends Container {
 					imageBase64,
 					"image/png",
 					{ fallbackColor: (text) => theme.fg("muted", text) },
-					{ maxWidthCells: 56, filename: IMAGE_FILENAME },
+					{ maxWidthCells: 56, filename: IMAGE_FILENAME, fallbackOnly: true },
 				),
 			);
 			this.addChild(new Spacer(1));

@@ -1,18 +1,32 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { probeRunningDaemonSessions, shutdownDaemonAndWait } from "../src/cli/daemon-launch.js";
+import {
+	ensureInteractiveDaemonRunning,
+	probeDaemonVersion,
+	probeRunningDaemonSessions,
+	shouldStartDaemonEarly,
+	shutdownDaemonAndWait,
+} from "../src/cli/daemon-launch.js";
+import { ENV_AGENT_DIR, getDaemonLogPath, VERSION } from "../src/config.js";
+import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 
 interface FakeDaemonOptions {
 	/** Sessions returned for a `list` command. */
 	sessions?: Array<Record<string, unknown>>;
+	busyClientOwnedSessionCount?: number;
 	/** When true, the `list` command responds with a failure. */
 	failList?: boolean;
 	/** When false, the server ignores `shutdown` and stays up. */
 	respondToShutdown?: boolean;
+	protocolVersion?: number;
+	appVersion?: string;
+	schemaId?: string;
+	serverCapabilities?: string[];
+	onCommand?: (command: { type: string }) => void;
 }
 
 interface FakeDaemon {
@@ -28,7 +42,16 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 	const dir = mkdtempSync(join(tmpdir(), "pa-launch-"));
 	const socketPath = join(dir, "d.sock");
 	const server: Server = createServer((socket) => {
-		send(socket, { type: "daemon_hello", socketPath, protocol: { name: "prime-agent-daemon", version: 1 } });
+		socket.on("error", () => undefined);
+		send(socket, {
+			type: "daemon_hello",
+			socketPath,
+			protocol: { name: "prime-agent.daemon", version: options.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
+			appVersion: options.appVersion,
+			schemaId: options.schemaId ?? DAEMON_SCHEMA_ID,
+			clientId: "fake-client",
+			serverCapabilities: options.serverCapabilities ?? [],
+		});
 		let buffer = "";
 		socket.on("data", (chunk) => {
 			buffer += chunk.toString();
@@ -40,21 +63,33 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 				if (!line.trim()) {
 					continue;
 				}
-				const command = JSON.parse(line) as { type: string; id: string };
+				const wire = JSON.parse(line) as {
+					type: string;
+					id: string;
+					command?: { type: string; id: string };
+				};
+				const command = wire.type === "command" && wire.command ? wire.command : wire;
+				options.onCommand?.(command);
 				if (command.type === "list") {
 					send(socket, {
 						type: "response",
 						command: "list",
-						id: command.id,
+						id: wire.id,
 						...(options.failList
 							? { success: false, error: "list failed" }
-							: { success: true, data: { sessions: options.sessions ?? [] } }),
+							: {
+									success: true,
+									data: {
+										sessions: options.sessions ?? [],
+										busyClientOwnedSessionCount: options.busyClientOwnedSessionCount ?? 0,
+									},
+								}),
 					});
 				} else if (command.type === "shutdown") {
 					if (options.respondToShutdown === false) {
 						continue;
 					}
-					send(socket, { type: "response", command: "shutdown", id: command.id, success: true });
+					send(socket, { type: "response", command: "shutdown", id: wire.id, success: true });
 					server.close();
 					socket.end();
 				}
@@ -83,15 +118,21 @@ async function startCrashingDaemon(): Promise<FakeDaemon> {
 const socketPath = process.argv[1];
 const send = (socket, message) => socket.write(JSON.stringify(message) + "\\n");
 const server = createServer((socket) => {
-	send(socket, { type: "daemon_hello", socketPath, protocol: { name: "prime-agent-daemon", version: 1 } });
+	send(socket, {
+		type: "daemon_hello",
+		socketPath,
+		protocol: { name: "prime-agent.daemon", version: ${DAEMON_PROTOCOL_VERSION} },
+		schemaId: ${JSON.stringify(DAEMON_SCHEMA_ID)},
+	});
 	let buffer = "";
 	socket.on("data", (chunk) => {
 		buffer += chunk.toString();
 		const newline = buffer.indexOf("\\n");
 		if (newline === -1) return;
-		const command = JSON.parse(buffer.slice(0, newline));
+		const wire = JSON.parse(buffer.slice(0, newline));
+		const command = wire.command ?? wire;
 		if (command.type !== "shutdown") return;
-		send(socket, { type: "response", command: "shutdown", id: command.id, success: true });
+		send(socket, { type: "response", command: "shutdown", id: wire.id ?? command.id, success: true });
 		socket.end(() => process.kill(process.pid, "SIGKILL"));
 	});
 });
@@ -155,6 +196,210 @@ describe("probeRunningDaemonSessions", () => {
 		const daemon = await startFakeDaemon({ failList: true });
 		cleanups.push(daemon.close);
 		expect(await probeRunningDaemonSessions(daemon.socketPath)).toEqual({ reachable: true });
+	});
+});
+
+describe("shouldStartDaemonEarly", () => {
+	it.each([
+		["interactive", []],
+		["print", ["--print", "hello"]],
+		["json", ["--mode", "json", "hello"]],
+		["rpc", ["--mode", "rpc"]],
+		["no-session", ["--no-session"]],
+	])("starts early for the %s client", (_label, args) => {
+		expect(shouldStartDaemonEarly(args, false)).toBe(true);
+	});
+
+	it.each([
+		["daemon process", ["--mode", "daemon"]],
+		["help", ["--help"]],
+		["version", ["--version"]],
+		["model listing", ["--list-models"]],
+		["management command after global flags", ["--daemon-socket", "/tmp/prime.sock", "status"]],
+		["startup benchmark", []],
+	])("does not start early for %s", (label, args) => {
+		expect(shouldStartDaemonEarly(args, label === "startup benchmark")).toBe(false);
+	});
+});
+
+describe("ensureInteractiveDaemonRunning", () => {
+	const cleanups: Array<() => Promise<void>> = [];
+	afterEach(async () => {
+		await Promise.all(cleanups.splice(0).map((fn) => fn()));
+	});
+
+	it("rejects a busy pre-session-action daemon before attach", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			protocolVersion: 3,
+			appVersion: VERSION,
+			sessions: [{ id: "active-1", activeSessionId: "active-1", isStreaming: true }],
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("incompatible");
+		expect(commands).not.toContain("list");
+		expect(commands).not.toContain("shutdown");
+	});
+
+	it("does not replace a stale daemon with busy private client sessions", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			protocolVersion: DAEMON_PROTOCOL_VERSION,
+			appVersion: VERSION,
+			schemaId: "stale-schema",
+			busyClientOwnedSessionCount: 1,
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("stale");
+		expect(commands).toContain("list");
+		expect(commands).not.toContain("shutdown");
+	});
+
+	it("does not treat a live daemon as absent when cold startup delays the first connection", async () => {
+		const daemon = await startFakeDaemon({
+			protocolVersion: DAEMON_PROTOCOL_VERSION,
+			appVersion: VERSION,
+			schemaId: DAEMON_SCHEMA_ID,
+		});
+		cleanups.push(daemon.close);
+
+		const probe = probeDaemonVersion(daemon.socketPath);
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+
+		await expect(probe).resolves.toMatchObject({ status: "current" });
+	});
+
+	it("fails fast with the daemon log tail when the spawned daemon exits during startup", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-startup-crash-"));
+		const entrypoint = join(dir, "crash.mjs");
+		const socketPath = join(dir, "d.sock");
+		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = join(dir, "agent");
+		const logPath = getDaemonLogPath(socketPath);
+		mkdirSync(dirname(logPath), { recursive: true });
+		const script = `import { appendFileSync } from "node:fs"; appendFileSync(${JSON.stringify(logPath)}, "supervisor: fatal startup failure\\n"); process.exit(23);`;
+		writeFileSync(entrypoint, script);
+		const originalEntrypoint = process.argv[1]!;
+		process.argv[1] = entrypoint;
+		const startedAt = Date.now();
+
+		try {
+			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
+				/Prime Agent daemon exited during startup \(code 23\)\.[\s\S]*fatal startup failure/,
+			);
+			expect(Date.now() - startedAt).toBeLessThan(10_000);
+		} finally {
+			process.argv[1] = originalEntrypoint;
+			if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = originalAgentDir;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("names the missing daemon log when the daemon crashes before logging", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-startup-silent-"));
+		const entrypoint = join(dir, "crash.mjs");
+		const socketPath = join(dir, "d.sock");
+		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = join(dir, "agent");
+		writeFileSync(entrypoint, "process.exit(7);");
+		const originalEntrypoint = process.argv[1]!;
+		process.argv[1] = entrypoint;
+
+		try {
+			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
+				/exited during startup \(code 7\)\. The daemon wrote nothing to its log/,
+			);
+		} finally {
+			process.argv[1] = originalEntrypoint;
+			if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = originalAgentDir;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("surfaces a spawn error when the child never emits exit", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-spawn-error-"));
+		const socketPath = join(dir, "d.sock");
+		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = join(dir, "agent");
+
+		try {
+			await expect(ensureInteractiveDaemonRunning(socketPath, join(dir, "missing-cwd"))).rejects.toThrow(
+				/Failed to spawn Prime Agent daemon: .*ENOENT/,
+			);
+		} finally {
+			if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = originalAgentDir;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("succeeds when the spawned child loses the race to an already-serving daemon", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-startup-race-"));
+		const entrypoint = join(dir, "loser.mjs");
+		const socketPath = join(dir, "d.sock");
+		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = join(dir, "agent");
+		writeFileSync(entrypoint, "process.exit(7);");
+		const originalEntrypoint = process.argv[1]!;
+		process.argv[1] = entrypoint;
+		const server: Server = createServer((socket) => {
+			socket.on("error", () => undefined);
+			send(socket, {
+				type: "daemon_hello",
+				socketPath,
+				protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
+				appVersion: VERSION,
+				schemaId: DAEMON_SCHEMA_ID,
+				clientId: "fake-client",
+				serverCapabilities: [],
+			});
+		});
+
+		try {
+			const ensurePromise = ensureInteractiveDaemonRunning(socketPath);
+			// Let the child exit first, then bring up the winning daemon inside
+			// the exit grace window.
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+			await expect(ensurePromise).resolves.toBeUndefined();
+		} finally {
+			process.argv[1] = originalEntrypoint;
+			if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = originalAgentDir;
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not attribute a previous run's log to a daemon that crashed before logging", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-startup-stale-"));
+		const entrypoint = join(dir, "crash.mjs");
+		const socketPath = join(dir, "d.sock");
+		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = join(dir, "agent");
+		const logPath = getDaemonLogPath(socketPath);
+		mkdirSync(dirname(logPath), { recursive: true });
+		writeFileSync(logPath, "supervisor: error from an earlier run in /tmp/\u00fcml\u00e4ut-p\u00e4th\n");
+		writeFileSync(entrypoint, "process.exit(7);");
+		const originalEntrypoint = process.argv[1]!;
+		process.argv[1] = entrypoint;
+
+		try {
+			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
+				/exited during startup \(code 7\)\. The daemon wrote nothing to its log/,
+			);
+		} finally {
+			process.argv[1] = originalEntrypoint;
+			if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = originalAgentDir;
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 

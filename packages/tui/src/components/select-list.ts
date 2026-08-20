@@ -1,6 +1,6 @@
 import { getKeybindings } from "../keybindings.js";
 import type { Component } from "../tui.js";
-import { truncateToWidth, visibleWidth } from "../utils.js";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 
 const DEFAULT_PRIMARY_COLUMN_WIDTH = 32;
 const PRIMARY_COLUMN_GAP = 2;
@@ -13,6 +13,8 @@ export interface SelectItem {
 	value: string;
 	label: string;
 	description?: string;
+	argumentHint?: string;
+	sourceTag?: string;
 	takesArgument?: boolean;
 }
 
@@ -20,6 +22,8 @@ export interface SelectListTheme {
 	selectedPrefix: (text: string) => string;
 	selectedText: (text: string) => string;
 	description: (text: string) => string;
+	argumentHint?: (text: string) => string;
+	sourceTag?: (text: string) => string;
 	scrollInfo: (text: string) => string;
 	noMatch: (text: string) => string;
 }
@@ -36,6 +40,9 @@ export interface SelectListLayoutOptions {
 	minPrimaryColumnWidth?: number;
 	maxPrimaryColumnWidth?: number;
 	truncatePrimary?: (context: SelectListTruncatePrimaryContext) => string;
+	showItemMetadata?: boolean;
+	showDirectionalScrollInfo?: boolean;
+	showSelectedDescription?: boolean;
 }
 
 export class SelectList implements Component {
@@ -60,7 +67,6 @@ export class SelectList implements Component {
 
 	setFilter(filter: string): void {
 		this.filteredItems = this.items.filter((item) => item.value.toLowerCase().startsWith(filter.toLowerCase()));
-		// Reset selection when filter changes
 		this.selectedIndex = 0;
 	}
 
@@ -68,14 +74,11 @@ export class SelectList implements Component {
 		this.selectedIndex = Math.max(0, Math.min(index, this.filteredItems.length - 1));
 	}
 
-	invalidate(): void {
-		// No cached state to invalidate currently
-	}
+	invalidate(): void {}
 
 	render(width: number): string[] {
 		const lines: string[] = [];
 
-		// If no items match filter, show message
 		if (this.filteredItems.length === 0) {
 			lines.push(this.theme.noMatch("  No matching commands"));
 			return lines;
@@ -83,14 +86,12 @@ export class SelectList implements Component {
 
 		const primaryColumnWidth = this.getPrimaryColumnWidth();
 
-		// Calculate visible range with scrolling
 		const startIndex = Math.max(
 			0,
 			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
 		);
 		const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
 
-		// Render visible items
 		for (let i = startIndex; i < endIndex; i++) {
 			const item = this.filteredItems[i];
 			if (!item) continue;
@@ -100,11 +101,15 @@ export class SelectList implements Component {
 			lines.push(this.renderItem(item, isSelected, width, descriptionSingleLine, primaryColumnWidth));
 		}
 
-		// Add scroll indicators if needed
 		if (startIndex > 0 || endIndex < this.filteredItems.length) {
-			const scrollText = `  (${this.selectedIndex + 1}/${this.filteredItems.length})`;
-			// Truncate if too long for terminal
+			const scrollText = this.layout.showDirectionalScrollInfo
+				? this.formatDirectionalScrollInfo(startIndex, this.filteredItems.length - endIndex)
+				: `  (${this.selectedIndex + 1}/${this.filteredItems.length})`;
 			lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, "")));
+		}
+
+		if (this.layout.showSelectedDescription) {
+			this.renderSelectedDescription(lines, width);
 		}
 
 		return lines;
@@ -112,25 +117,18 @@ export class SelectList implements Component {
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
-		// Up arrow - wrap to bottom when at top
 		if (kb.matches(keyData, "tui.select.up")) {
 			this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
 			this.notifySelectionChange();
-		}
-		// Down arrow - wrap to top when at bottom
-		else if (kb.matches(keyData, "tui.select.down")) {
+		} else if (kb.matches(keyData, "tui.select.down")) {
 			this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
 			this.notifySelectionChange();
-		}
-		// Enter
-		else if (kb.matches(keyData, "tui.select.confirm")) {
+		} else if (kb.matches(keyData, "tui.select.confirm")) {
 			const selectedItem = this.filteredItems[this.selectedIndex];
 			if (selectedItem && this.onSelect) {
 				this.onSelect(selectedItem);
 			}
-		}
-		// Escape or Ctrl+C
-		else if (kb.matches(keyData, "tui.select.cancel")) {
+		} else if (kb.matches(keyData, "tui.select.cancel")) {
 			if (this.onCancel) {
 				this.onCancel();
 			}
@@ -144,8 +142,12 @@ export class SelectList implements Component {
 		descriptionSingleLine: string | undefined,
 		primaryColumnWidth: number,
 	): string {
-		const prefix = isSelected ? "→ " : "  ";
+		const prefix = isSelected ? "› " : "  ";
 		const prefixWidth = visibleWidth(prefix);
+
+		if (this.layout.showItemMetadata) {
+			return this.renderMetadataItem(item, isSelected, width, primaryColumnWidth, prefix, prefixWidth);
+		}
 
 		if (descriptionSingleLine && width > 40) {
 			const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
@@ -157,7 +159,7 @@ export class SelectList implements Component {
 			const remainingWidth = width - descriptionStart - 2; // -2 for safety
 
 			if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
-				const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, "");
+				const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, "…");
 				if (isSelected) {
 					return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
 				}
@@ -174,6 +176,58 @@ export class SelectList implements Component {
 		}
 
 		return prefix + truncatedValue;
+	}
+
+	private formatDirectionalScrollInfo(hiddenAbove: number, hiddenBelow: number): string {
+		const indicators = [
+			hiddenAbove > 0 ? `↑ ${hiddenAbove} more` : undefined,
+			hiddenBelow > 0 ? `↓ ${hiddenBelow} more` : undefined,
+		].filter((indicator): indicator is string => indicator !== undefined);
+		return `  ${indicators.join("  ")}`;
+	}
+
+	private renderMetadataItem(
+		item: SelectItem,
+		isSelected: boolean,
+		width: number,
+		primaryColumnWidth: number,
+		prefix: string,
+		prefixWidth: number,
+	): string {
+		const argumentHint = item.argumentHint ? normalizeToSingleLine(item.argumentHint) : undefined;
+		const sourceTag = item.sourceTag ? normalizeToSingleLine(item.sourceTag) : undefined;
+		const hasMetadata = Boolean(argumentHint || sourceTag);
+		const contentWidth = Math.max(1, width - prefixWidth - 2);
+		const showMetadata = hasMetadata && contentWidth > primaryColumnWidth;
+		const effectivePrimaryColumnWidth = showMetadata ? primaryColumnWidth : contentWidth;
+		const maxPrimaryWidth = showMetadata
+			? Math.max(1, effectivePrimaryColumnWidth - PRIMARY_COLUMN_GAP)
+			: effectivePrimaryColumnWidth;
+		const primary = this.truncatePrimary(item, isSelected, maxPrimaryWidth, effectivePrimaryColumnWidth);
+		const styledPrefix = isSelected ? this.theme.selectedPrefix(prefix) : prefix;
+		const styledPrimary = isSelected ? this.theme.selectedText(primary) : primary;
+		if (!showMetadata) {
+			return truncateToWidth(`${styledPrefix}${styledPrimary}`, width, "");
+		}
+
+		const spacing = " ".repeat(Math.max(1, effectivePrimaryColumnWidth - visibleWidth(primary)));
+		let remainingWidth = Math.max(0, width - prefixWidth - visibleWidth(primary) - spacing.length - 2);
+		const metadata: string[] = [];
+		if (argumentHint && remainingWidth > 0) {
+			const truncatedArgumentHint = truncateToWidth(argumentHint, remainingWidth, "…");
+			metadata.push((this.theme.argumentHint ?? this.theme.description)(truncatedArgumentHint));
+			remainingWidth -= visibleWidth(truncatedArgumentHint);
+		}
+		if (sourceTag && remainingWidth > (metadata.length > 0 ? PRIMARY_COLUMN_GAP : 0)) {
+			if (metadata.length > 0) {
+				metadata.push(" ".repeat(PRIMARY_COLUMN_GAP));
+				remainingWidth -= PRIMARY_COLUMN_GAP;
+			}
+			metadata.push(
+				(this.theme.sourceTag ?? this.theme.description)(truncateToWidth(sourceTag, remainingWidth, "…")),
+			);
+		}
+		return truncateToWidth(`${styledPrefix}${styledPrimary}${spacing}${metadata.join("")}`, width, "");
 	}
 
 	private getPrimaryColumnWidth(): number {
@@ -214,6 +268,18 @@ export class SelectList implements Component {
 
 	private getDisplayValue(item: SelectItem): string {
 		return item.label || item.value;
+	}
+
+	private renderSelectedDescription(lines: string[], width: number): void {
+		const description = this.filteredItems[this.selectedIndex]?.description?.trim();
+		if (!description) return;
+
+		const indent = width >= 4 ? "  " : "";
+		const contentWidth = Math.max(1, width - visibleWidth(indent) - 2);
+		lines.push("");
+		for (const line of wrapTextWithAnsi(description, contentWidth)) {
+			lines.push(this.theme.description(indent + line));
+		}
 	}
 
 	private notifySelectionChange(): void {

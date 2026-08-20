@@ -7,9 +7,6 @@ const SHOW_IMAGES_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	maxPrimaryColumnWidth: 32,
 };
 
-/**
- * Component that renders a show images selector with borders
- */
 export class ShowImagesSelectorComponent extends Container {
 	private selectList: SelectList;
 
@@ -17,17 +14,14 @@ export class ShowImagesSelectorComponent extends Container {
 		super();
 
 		const items: SelectItem[] = [
-			{ value: "yes", label: "Yes", description: "Show images inline in terminal" },
+			{ value: "yes", label: "Yes", description: "Show image type and dimensions" },
 			{ value: "no", label: "No", description: "Show text placeholder instead" },
 		];
 
-		// Add top border
 		this.addChild(new DynamicBorder());
 
-		// Create selector
 		this.selectList = new SelectList(items, 5, getSelectListTheme(), SHOW_IMAGES_SELECT_LIST_LAYOUT);
 
-		// Preselect current value
 		this.selectList.setSelectedIndex(currentValue ? 0 : 1);
 
 		this.selectList.onSelect = (item) => {
@@ -40,7 +34,6 @@ export class ShowImagesSelectorComponent extends Container {
 
 		this.addChild(this.selectList);
 
-		// Add bottom border
 		this.addChild(new DynamicBorder());
 	}
 

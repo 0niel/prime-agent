@@ -8,6 +8,18 @@ import {
 } from "../terminal-image.js";
 import type { Component } from "../tui.js";
 
+let fullscreenFallback = false;
+
+export function withFullscreenImageFallback<T>(render: () => T): T {
+	const previous = fullscreenFallback;
+	fullscreenFallback = true;
+	try {
+		return render();
+	} finally {
+		fullscreenFallback = previous;
+	}
+}
+
 export interface ImageTheme {
 	fallbackColor: (str: string) => string;
 }
@@ -16,7 +28,11 @@ export interface ImageOptions {
 	maxWidthCells?: number;
 	maxHeightCells?: number;
 	filename?: string;
-	/** Kitty image ID. If provided, reuses this ID (for animations/updates). */
+	/** Renders textual image metadata instead of terminal graphics. */
+	fallbackOnly?: boolean;
+	/** Prefix prepended to textual fallback metadata. */
+	fallbackPrefix?: string;
+	/** Kitty image ID to reuse across updates or animations. */
 	imageId?: number;
 }
 
@@ -30,6 +46,7 @@ export class Image implements Component {
 
 	private cachedLines?: string[];
 	private cachedWidth?: number;
+	private cachedFullscreenFallback?: boolean;
 
 	constructor(
 		base64Data: string,
@@ -46,7 +63,7 @@ export class Image implements Component {
 		this.imageId = options.imageId;
 	}
 
-	/** Get the Kitty image ID used by this image (if any). */
+	/** Returns the Kitty image ID allocated or supplied for this image. */
 	getImageId(): number | undefined {
 		return this.imageId;
 	}
@@ -54,10 +71,11 @@ export class Image implements Component {
 	invalidate(): void {
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
+		this.cachedFullscreenFallback = undefined;
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
+		if (this.cachedLines && this.cachedWidth === width && this.cachedFullscreenFallback === fullscreenFallback) {
 			return this.cachedLines;
 		}
 
@@ -66,7 +84,12 @@ export class Image implements Component {
 		const caps = getCapabilities();
 		let lines: string[];
 
-		if (caps.images) {
+		if (fullscreenFallback || this.options.fallbackOnly === true) {
+			const parts = [this.mimeType];
+			parts.push(`${this.dimensions.widthPx}×${this.dimensions.heightPx}`);
+			if (this.options.filename) parts.unshift(this.options.filename);
+			lines = [this.theme.fallbackColor(`${this.options.fallbackPrefix ?? ""}[${parts.join(" · ")}]`)];
+		} else if (caps.images) {
 			if (caps.images === "kitty" && this.imageId === undefined) {
 				this.imageId = allocateImageId();
 			}
@@ -77,7 +100,6 @@ export class Image implements Component {
 			});
 
 			if (result) {
-				// Store the image ID for later cleanup
 				if (result.imageId) {
 					this.imageId = result.imageId;
 				}
@@ -106,6 +128,7 @@ export class Image implements Component {
 
 		this.cachedLines = lines;
 		this.cachedWidth = width;
+		this.cachedFullscreenFallback = fullscreenFallback;
 
 		return lines;
 	}

@@ -13,12 +13,18 @@ export interface DaemonSocketClient {
 	catchupActiveSessionIds?: Set<string>;
 	/** A real runtime replacement takes precedence over an ordinary resync for the same queued catch-up. */
 	catchupPurposes?: Map<string, "replacement" | "resync">;
+	/** The single catch-up drain currently serving this client. */
+	catchupPromise?: Promise<void>;
+	/** Delayed retry after transient catch-up snapshot preparation failure. */
+	catchupRetryTimer?: NodeJS.Timeout;
 	backpressured?: boolean;
 	authenticated?: boolean;
 	transport?: "jsonl" | "private-framed";
 	snapshotStreaming?: boolean;
 	snapshotActiveSessionIds?: Set<string>;
 	snapshotActiveSessionCounts?: Map<string, number>;
+	snapshotTransferAbortControllers?: Map<string, AbortController>;
+	snapshotTransferTails?: Map<string, Promise<void>>;
 	detachInput: () => void;
 	supportsExtensionUi: boolean;
 	capabilities: Set<DaemonClientCapability>;
@@ -29,6 +35,8 @@ export interface ActiveSessionState {
 	activeSessionId: string;
 	runtime: AgentSessionRuntime;
 	clients: Set<DaemonSocketClient>;
+	/** Attach snapshots in flight: reserved for passivation busyness, but not yet event recipients. */
+	pendingAttaches: number;
 	extensionUiRequests: Map<string, ActiveSessionExtensionUiRequest>;
 	eventGeneration: string;
 	lastEventSequence: DaemonEventSequence;
@@ -62,6 +70,13 @@ export function createActiveSessionId(existingIds?: ActiveSessionIdIndex): strin
 	}
 }
 
+export class AmbiguousActiveSessionError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "AmbiguousActiveSessionError";
+	}
+}
+
 export function resolveActiveSessionState(
 	sessions: ReadonlyMap<string, ActiveSessionState>,
 	selector: string,
@@ -81,7 +96,7 @@ export function resolveActiveSessionState(
 		return exactMatches[0]!;
 	}
 	if (exactMatches.length > 1) {
-		throw new Error(formatAmbiguousSessionError(selector, exactMatches));
+		throw new AmbiguousActiveSessionError(formatAmbiguousSessionError(selector, exactMatches));
 	}
 
 	const suffixMatches = uniqueStates(
@@ -97,7 +112,7 @@ export function resolveActiveSessionState(
 		return suffixMatches[0]!;
 	}
 	if (suffixMatches.length > 1) {
-		throw new Error(formatAmbiguousSessionError(selector, suffixMatches));
+		throw new AmbiguousActiveSessionError(formatAmbiguousSessionError(selector, suffixMatches));
 	}
 
 	throw new Error(`Unknown active session: ${selector}`);

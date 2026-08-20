@@ -134,4 +134,22 @@ describe("RPC JSONL framing", () => {
 		expect(JSON.parse(lines[0]).blob.length).toBe(8 * 1024 * 1024);
 		expect(elapsed).toBeLessThan(1000);
 	});
+
+	test("bounds oversized lines and resumes at the next record", () => {
+		const lines: string[] = [];
+		const overflows: string[] = [];
+		const emitter = new EventEmitter();
+		attachJsonlLineReader(emitter as unknown as Readable, (line) => lines.push(line), {
+			maxLineLength: 5,
+			onLineOverflow: (prefix) => overflows.push(prefix),
+		});
+
+		emitter.emit("data", "abc");
+		emitter.emit("data", "defghi");
+		emitter.emit("data", "jkl\nok\n");
+		emitter.emit("end");
+
+		expect(overflows).toEqual(["abcde"]);
+		expect(lines).toEqual(["ok"]);
+	});
 });

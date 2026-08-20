@@ -318,13 +318,30 @@ describe("parseCommandArgs", () => {
 		expect(parseCommandArgs("a  b   c")).toEqual(["a", "b", "c"]);
 	});
 
-	test("should handle tabs as separators", () => {
-		expect(parseCommandArgs("a\tb\tc")).toEqual(["a", "b", "c"]);
+	test.each([
+		{ name: "tabs", input: "a\tb\tc", expected: ["a", "b", "c"] },
+		{
+			name: "Unicode spaces",
+			input: "first\u2002second",
+			expected: ["first", "second"],
+			positionalResult: "first|second",
+		},
+	])("should handle $name as separators", ({ input, expected, positionalResult }) => {
+		const args = parseCommandArgs(input);
+
+		expect(args).toEqual(expected);
+		if (positionalResult) {
+			expect(substituteArgs("$1|$2", args)).toBe(positionalResult);
+		}
 	});
 
-	test("should handle quoted empty string", () => {
-		// Note: Empty quotes are skipped by current implementation
-		expect(parseCommandArgs('"" " "')).toEqual([" "]);
+	test("should preserve explicitly quoted empty strings", () => {
+		// An intentionally quoted "" is an argument (e.g. /mcp add ... -- cmd "").
+		expect(parseCommandArgs('"" " "')).toEqual(["", " "]);
+	});
+
+	test("keeps a quoted empty stdio argv element in slash-command parsing", () => {
+		expect(parseCommandArgs('add local -- command ""')).toEqual(["add", "local", "--", "command", ""]);
 	});
 
 	test("should handle arguments with special characters", () => {
@@ -483,6 +500,31 @@ Do something`,
 		const tmpl = templates.find((t) => t.name === "empty-hint");
 		expect(tmpl).toBeDefined();
 		expect(tmpl!.argumentHint).toBeUndefined();
+	});
+
+	test("should ignore non-string frontmatter metadata", () => {
+		writeTemplate(
+			"invalid-metadata",
+			`---
+description:
+  - not
+  - a string
+argument-hint: [temporary-value]
+---
+Fallback description from the template body`,
+		);
+
+		const templates = loadPromptTemplates({
+			cwd: process.cwd(),
+			agentDir: getAgentDir(),
+			promptPaths: [testDir],
+			includeDefaults: false,
+		});
+
+		const tmpl = templates.find((t) => t.name === "invalid-metadata");
+		expect(tmpl).toBeDefined();
+		expect(tmpl!.argumentHint).toBeUndefined();
+		expect(tmpl!.description).toBe("Fallback description from the template body");
 	});
 
 	test("should preserve argument-hint with special characters", () => {

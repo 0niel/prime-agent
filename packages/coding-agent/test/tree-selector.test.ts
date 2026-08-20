@@ -99,6 +99,20 @@ function modelChange(id: string, parentId: string | null): AgentConnectionModelC
 	};
 }
 
+function serviceTierChange(
+	id: string,
+	parentId: string | null,
+	serviceTier: "default" | "priority",
+): Extract<AgentConnectionSessionEntry, { type: "service_tier_change" }> {
+	return {
+		type: "service_tier_change",
+		id,
+		parentId,
+		timestamp: new Date().toISOString(),
+		serviceTier,
+	};
+}
+
 // Helper to build a tree from entries using parentId relationships
 function buildTree(entries: Array<AgentConnectionSessionEntry>): AgentConnectionSessionTreeNode[] {
 	if (entries.length === 0) return [];
@@ -191,6 +205,54 @@ describe("TreeSelectorComponent", () => {
 
 			const list = selector.getTreeList();
 			expect(list.getSelectedNode()?.entry.id).toBe("user-2");
+		});
+
+		test("focuses nearest visible ancestor when currentLeafId is a service_tier_change entry", () => {
+			const entries = [
+				userMessage("user-1", null, "hello"),
+				assistantMessage("asst-1", "user-1", "hi"),
+				userMessage("user-2", "asst-1", "active branch"),
+				serviceTierChange("tier-1", "user-2", "priority"),
+				userMessage("user-3", "asst-1", "sibling branch"),
+			];
+			const selector = new TreeSelectorComponent(
+				buildTree(entries),
+				"tier-1",
+				24,
+				() => {},
+				() => {},
+			);
+
+			expect(selector.getTreeList().getSelectedNode()?.entry.id).toBe("user-2");
+		});
+
+		test("renders and searches service tier changes in the all filter", () => {
+			const entries = [
+				userMessage("user-1", null, "hello"),
+				serviceTierChange("tier-1", "user-1", "priority"),
+				serviceTierChange("tier-2", "tier-1", "default"),
+				userMessage("user-2", "tier-2", "done"),
+			];
+			const selector = new TreeSelectorComponent(
+				buildTree(entries),
+				"user-2",
+				24,
+				() => {},
+				() => {},
+				undefined,
+				undefined,
+				"all",
+			);
+			const list = selector.getTreeList();
+
+			let render = list.render(200).join("\n");
+			expect(render).toContain("[service tier: priority]");
+			expect(render).toContain("[service tier: default]");
+
+			selector.handleInput("fast");
+			render = list.render(200).join("\n");
+			expect(render).toContain("[service tier: priority]");
+			expect(render).not.toContain("[service tier: default]");
 		});
 	});
 

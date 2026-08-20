@@ -9,6 +9,7 @@ import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { FauxModelDefinition, FauxProviderRegistration, FauxResponseStep, Model } from "@earendil-works/pi-ai";
 import { registerFauxProvider } from "@earendil-works/pi-ai";
+import type { AgentSessionMessageController } from "../../src/core/agent-messages.js";
 import type { AgentObserveController } from "../../src/core/agent-observe.js";
 import { AgentSession, type AgentSessionEvent, type AutoRefineReviewer } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
@@ -16,6 +17,7 @@ import type { AgentAutonomousConfig } from "../../src/core/autonomous.js";
 import type { ExtensionRunner } from "../../src/core/extensions/index.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
+import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import type { Settings } from "../../src/core/settings-manager.js";
 import { SettingsManager } from "../../src/core/settings-manager.js";
@@ -58,6 +60,7 @@ export function getAssistantTexts(harness: Harness): string[] {
 }
 
 export interface HarnessOptions {
+	api?: string;
 	provider?: string;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
@@ -67,10 +70,15 @@ export interface HarnessOptions {
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
 	agentObserveController?: AgentObserveController;
+	agentMessageController?: AgentSessionMessageController;
+	subagentRuntimeHost?: SubagentRuntimeHost;
 	persistSession?: boolean;
 	rlmDepth?: number;
+	rlmMaxDepth?: number;
 	autonomous?: AgentAutonomousConfig;
 	autoRefineReviewer?: AutoRefineReviewer;
+	serializedRefine?: boolean;
+	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
 export interface Harness {
@@ -100,6 +108,7 @@ function createTempDir(): string {
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
 	const tempDir = createTempDir();
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
+		api: options.api,
 		provider: options.provider,
 		models: options.models,
 	});
@@ -184,11 +193,16 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		modelRegistry,
 		resourceLoader,
 		agentObserveController: options.agentObserveController,
+		agentMessageController: options.agentMessageController,
+		subagentRuntimeHost: options.subagentRuntimeHost,
 		baseToolsOverride: toolMap,
 		extensionRunnerRef,
 		rlmDepth: options.rlmDepth,
+		rlmMaxDepth: options.rlmMaxDepth,
 		autonomous: options.autonomous,
 		autoRefineReviewer: options.autoRefineReviewer,
+		serializedRefine: options.serializedRefine,
+		initialGoal: options.initialGoal,
 	});
 
 	const events: AgentSessionEvent[] = [];
@@ -216,7 +230,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			session.dispose();
 			fauxProvider.unregister();
 			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true });
+				// Spawned fixture processes may still be flushing their final registry
+				// writes; retry briefly instead of failing the suite on ENOTEMPTY.
+				rmSync(tempDir, { recursive: true, force: true, maxRetries: 40, retryDelay: 50 });
 			}
 		},
 	};

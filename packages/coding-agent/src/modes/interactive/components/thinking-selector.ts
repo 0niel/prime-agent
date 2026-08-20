@@ -10,17 +10,14 @@ const THINKING_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 
 const LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
-	minimal: "Very brief reasoning (~1k tokens)",
-	low: "Light reasoning (~2k tokens)",
-	medium: "Moderate reasoning (~8k tokens)",
-	high: "Deep reasoning (~16k tokens)",
-	xhigh: "Very deep reasoning (~32k tokens)",
-	max: "Maximum reasoning (unconstrained)",
+	minimal: "Very brief reasoning",
+	low: "Light reasoning",
+	medium: "Moderate reasoning",
+	high: "Deep reasoning",
+	xhigh: "Very deep reasoning",
+	max: "Maximum reasoning",
 };
 
-/**
- * Component that renders a thinking level selector with borders
- */
 export class ThinkingSelectorComponent extends Container {
 	private selectList: SelectList;
 
@@ -38,10 +35,8 @@ export class ThinkingSelectorComponent extends Container {
 			description: LEVEL_DESCRIPTIONS[level],
 		}));
 
-		// Add top border
 		this.addChild(new DynamicBorder());
 
-		// Create selector
 		this.selectList = new SelectList(
 			thinkingLevels,
 			thinkingLevels.length,
@@ -49,7 +44,6 @@ export class ThinkingSelectorComponent extends Container {
 			THINKING_SELECT_LIST_LAYOUT,
 		);
 
-		// Preselect current level
 		const currentIndex = thinkingLevels.findIndex((item) => item.value === currentLevel);
 		if (currentIndex !== -1) {
 			this.selectList.setSelectedIndex(currentIndex);
@@ -65,7 +59,6 @@ export class ThinkingSelectorComponent extends Container {
 
 		this.addChild(this.selectList);
 
-		// Add bottom border
 		this.addChild(new DynamicBorder());
 	}
 

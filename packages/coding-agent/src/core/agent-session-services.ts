@@ -1,9 +1,10 @@
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, ServiceTier } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import type { AgentSessionMessageController } from "./agent-messages.js";
 import type { AgentObserveController } from "./agent-observe.js";
+import type { AgentExecutionMode } from "./agent-session-config.js";
 import { installAgentTraceUpload } from "./agent-traces.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
@@ -17,26 +18,13 @@ import type { SubagentRuntimeHost } from "./rlm-runtime.js";
 import { type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
 import type { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
+import { installAgentTelemetry, isTelemetryEnabled } from "./telemetry.js";
 
-/**
- * Non-fatal issues collected while creating services or sessions.
- *
- * Runtime creation returns diagnostics to the caller instead of printing or
- * exiting. The app layer decides whether warnings should be shown and whether
- * errors should abort startup.
- */
 export interface AgentSessionRuntimeDiagnostic {
 	type: "info" | "warning" | "error";
 	message: string;
 }
 
-/**
- * Inputs for creating cwd-bound runtime services.
- *
- * These services are recreated whenever the effective session cwd changes.
- * CLI-provided resource paths should be resolved to absolute paths before they
- * reach this function, so later cwd switches do not reinterpret them.
- */
 export interface CreateAgentSessionServicesOptions {
 	cwd: string;
 	agentDir?: string;
@@ -52,11 +40,13 @@ export interface CreateAgentSessionServicesOptions {
 	 * would release the pane while the parent is still running.
 	 */
 	noBuiltinHerdrReporter?: boolean;
+	telemetryDisabled?: true;
 }
 
 export interface AgentSessionCreationOptions {
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
+	serviceTier?: ServiceTier;
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	tools?: string[];
 	noTools?: "all" | "builtin";
@@ -71,30 +61,23 @@ export interface AgentSessionCreationOptions {
 	rlmMaxDepth?: number;
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
+	rlmParentAgent?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
 	autonomous?: AgentAutonomousConfig;
+	serializedRefine?: boolean;
+	executionMode?: AgentExecutionMode;
+	telemetryDisabled?: true;
+	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
-/**
- * Inputs for creating an AgentSession from already-created services.
- *
- * Use this after services exist and any cwd-bound model/tool/session options
- * have been resolved against those services.
- */
 export interface CreateAgentSessionFromServicesOptions extends AgentSessionCreationOptions {
 	services: AgentSessionServices;
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
 }
 
-/**
- * Coherent cwd-bound runtime services for one effective session cwd.
- *
- * This is infrastructure only. The AgentSession itself is created separately so
- * session options can be resolved against these services first.
- */
 export interface AgentSessionServices {
 	cwd: string;
 	agentDir: string;
@@ -154,11 +137,6 @@ function applyExtensionFlagValues(
 	return diagnostics;
 }
 
-/**
- * Create cwd-bound runtime services.
- *
- * Returns services plus diagnostics. It does not create an AgentSession.
- */
 export async function createAgentSessionServices(
 	options: CreateAgentSessionServicesOptions,
 ): Promise<AgentSessionServices> {
@@ -172,7 +150,7 @@ export async function createAgentSessionServices(
 	// integration skills by whether the user is logged in (enable-by-login).
 	const mcpManager = new McpManager({
 		authStorage,
-		getUserServers: () => settingsManager.getMcpServers(),
+		getUserServers: () => settingsManager.getGlobalMcpServers(),
 	});
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
@@ -200,6 +178,18 @@ export async function createAgentSessionServices(
 	await resourceLoader.reload();
 
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
+	if (
+		!options.telemetryDisabled &&
+		isTelemetryEnabled(settingsManager) &&
+		!settingsManager.getTelemetryNoticeShown()
+	) {
+		diagnostics.push({
+			type: "info",
+			message:
+				"Prime Agent sends pseudonymous usage and performance metrics without prompts, responses, tool content, file paths, or repository data. Disable this with telemetry.enabled=false, PRIME_AGENT_TELEMETRY=0, DO_NOT_TRACK=1, or offline mode.",
+		});
+		settingsManager.setTelemetryNoticeShown(true);
+	}
 	const extensionsResult = resourceLoader.getExtensions();
 	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
 		try {
@@ -227,13 +217,6 @@ export async function createAgentSessionServices(
 	};
 }
 
-/**
- * Create an AgentSession from previously created services.
- *
- * This keeps session creation separate from service creation so callers can
- * resolve model, thinking, tools, and other session inputs against the target
- * cwd before constructing the session.
- */
 export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
@@ -241,7 +224,7 @@ export async function createAgentSessionFromServices(
 		authStorage: options.services.authStorage,
 		settingsManager: options.services.settingsManager,
 	});
-	return createAgentSession({
+	const result = await createAgentSession({
 		cwd: options.services.cwd,
 		agentDir: options.services.agentDir,
 		authStorage: options.services.authStorage,
@@ -252,6 +235,7 @@ export async function createAgentSessionFromServices(
 		sessionManager: options.sessionManager,
 		model: options.model,
 		thinkingLevel: options.thinkingLevel,
+		serviceTier: options.serviceTier,
 		scopedModels: options.scopedModels,
 		tools: options.tools,
 		noTools: options.noTools,
@@ -266,10 +250,21 @@ export async function createAgentSessionFromServices(
 		rlmMaxDepth: options.rlmMaxDepth,
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
+		rlmParentAgent: options.rlmParentAgent,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
 		autonomous: options.autonomous,
+		serializedRefine: options.serializedRefine,
+		initialGoal: options.initialGoal,
 	});
+	if (result.session.rlmDepth === 0 && !options.telemetryDisabled) {
+		installAgentTelemetry(result.session, {
+			agentDir: options.services.agentDir,
+			settingsManager: options.services.settingsManager,
+			executionMode: options.executionMode,
+		});
+	}
+	return result;
 }

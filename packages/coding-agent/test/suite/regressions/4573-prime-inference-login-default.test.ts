@@ -10,7 +10,6 @@ import { createHarness, type Harness } from "../harness.js";
 
 type LoginHarness = {
 	prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean>;
-	invalidateConnectionModels(): void;
 	getCurrentModel(): AgentConnectionModel | undefined;
 	getConnectionAvailableModels(): Promise<AgentConnectionModel[]>;
 	applySelectedModel(model: AgentConnectionModel): Promise<void>;
@@ -86,7 +85,6 @@ describe("ENG-4573 Prime Inference login default", () => {
 		};
 		const order: string[] = [];
 		const fakeThis = Object.create(InteractiveMode.prototype) as LoginHarness;
-		fakeThis.invalidateConnectionModels = vi.fn(() => order.push("invalidate"));
 		fakeThis.getCurrentModel = vi.fn(() => placeholderModel);
 		fakeThis.getConnectionAvailableModels = vi.fn(async () => {
 			order.push("refresh");
@@ -119,6 +117,6 @@ describe("ENG-4573 Prime Inference login default", () => {
 
 		expect(fakeThis.applySelectedModel).toHaveBeenCalledWith(fallbackModel);
 		expect(fakeThis.showError).not.toHaveBeenCalled();
-		expect(order).toEqual(["invalidate", "refresh", "select", "persist"]);
+		expect(order).toEqual(["refresh", "select", "persist"]);
 	});
 });

@@ -11,8 +11,8 @@ import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earend
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.js";
-import { handleDaemonCommand, normalizeDaemonStartArgs } from "./cli/daemon-command.js";
+import { type Args, type Mode, parseArgs } from "./cli/args.js";
+import { formatTopLevelHelp } from "./cli/command-registry.js";
 import {
 	ensureInteractiveDaemonRunning,
 	isDaemonSessionSummary,
@@ -25,10 +25,17 @@ import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
-import { installOwnedSessionRecoveryTracking } from "./cli/owned-session-worker.js";
-import { selectSession } from "./cli/session-picker.js";
-import { expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
+import { installOwnedSessionRecoveryTracking, isOwnedSessionWorkerProcess } from "./cli/owned-session-worker.js";
+import { handlePublicCommand } from "./cli/public-command.js";
 import {
+	looksLikeSessionPath,
+	resolveSessionPath,
+	SessionSelectorError,
+	SessionSelectorNotFoundError,
+} from "./cli/session-resolver.js";
+import { APP_NAME, expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
+import {
+	type AgentExecutionMode,
 	type AgentSessionRuntimeConfig,
 	mergeAgentSessionRuntimeConfig,
 	mergeAutonomousConfig,
@@ -60,39 +67,50 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.js";
-import { SessionAlreadyActiveError } from "./core/session-lease.js";
+import { canonicalSessionPath, SessionAlreadyActiveError } from "./core/session-lease.js";
 import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { isTelemetryEnabled } from "./core/telemetry.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
-import { collectDaemonClientEnv } from "./modes/daemon/daemon-protocol.js";
+import { deserializeDaemonError } from "./modes/daemon/daemon-errors.js";
+import { collectDaemonClientEnv, collectDaemonLaunchEnv } from "./modes/daemon/daemon-protocol.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	isDaemonWorkerProcess,
 	requireDaemonWorkerAuthenticationToken,
+	waitForDaemonWorkerStartupGate,
 } from "./modes/daemon/daemon-worker-protocol.js";
 import {
 	type AgentConnection,
+	type AgentsViewScopeKey,
+	ClientPromptStashStore,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
+	DaemonCapabilityUnavailableError,
 	DaemonClient,
 	defaultDaemonSocketPath,
 	InProcessAgentConnection,
 	InteractiveMode,
+	normalizeSocketPath,
 	resolveAttachModelFallbackMessage,
+	runAcpMode,
+	runAcpModeWithConnection,
 	runAgentsViewMode,
 	runDaemonMode,
 	runDaemonSupervisorMode,
 	runPrintMode,
+	runPrintModeWithConnection,
 	runRpcMode,
+	runRpcModeWithConnection,
 	type SessionSummary,
 } from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
 import { shouldRunOnboarding } from "./modes/interactive/onboarding.js";
 import { initTheme, preloadCodeHighlighter, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
-import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
+import { handleConfigCommand } from "./package-manager-cli.js";
 import { isLocalPath } from "./utils/paths.js";
 
 /**
@@ -141,7 +159,17 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
-export type AppMode = "interactive" | "print" | "json" | "rpc" | "daemon";
+export type ClientMode = AgentExecutionMode;
+/** Compatibility view of the CLI's internal daemon process entrypoint. */
+export type AppMode = ClientMode | "daemon";
+
+export function shouldRejectNonInteractiveAttach(attachAgent: string | undefined, appMode: AppMode): boolean {
+	return attachAgent !== undefined && appMode !== "interactive";
+}
+
+export function shouldRejectNonInteractiveBareResume(resume: true | string | undefined, appMode: AppMode): boolean {
+	return resume === true && appMode !== "interactive";
+}
 
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 	if (parsed.mode === "daemon") {
@@ -149,6 +177,9 @@ function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 	}
 	if (parsed.mode === "rpc") {
 		return "rpc";
+	}
+	if (parsed.mode === "acp") {
+		return "acp";
 	}
 	if (parsed.mode === "json") {
 		return "json";
@@ -159,20 +190,23 @@ function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 	return "interactive";
 }
 
-function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "daemon"> {
+function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "acp" | "daemon"> {
 	return appMode === "json" ? "json" : "text";
 }
 
-// `prime-agent agents` / `prime-agent manage` open the agents view directly; the
-// leading verb is stripped so the remaining args parse as usual.
+export function isClientOwnedDaemonSession(appMode: AppMode, noSession?: boolean): boolean {
+	return appMode !== "acp" || noSession === true;
+}
+
+// `prime-agent agents` opens the agents view directly.
 export function parseAgentsViewCommand(args: string[]): { explicitAgentsView: boolean; args: string[] } {
-	if (args[0] === "agents" || args[0] === "manage") {
+	if (args[0] === "agents") {
 		return { explicitAgentsView: true, args: args.slice(1) };
 	}
 	return { explicitAgentsView: false, args };
 }
 
-export interface InteractiveDaemonStartupDecision {
+export interface DaemonClientStartupDecision {
 	appMode: AppMode;
 	startupBenchmark: boolean;
 	noSession?: boolean;
@@ -180,14 +214,38 @@ export interface InteractiveDaemonStartupDecision {
 	listModels?: string | true;
 }
 
-export function shouldUseDaemonInteractive(options: InteractiveDaemonStartupDecision): boolean {
+export type InteractiveDaemonStartupDecision = DaemonClientStartupDecision;
+
+/** Retained for callers that only classify persistent interactive startup. */
+export function shouldUseDaemonInteractive(options: DaemonClientStartupDecision): boolean {
 	return (
 		options.appMode === "interactive" &&
 		!options.startupBenchmark &&
 		!options.noSession &&
-		!options.help &&
 		options.listModels === undefined
 	);
+}
+
+export function shouldUseDaemonClient(options: DaemonClientStartupDecision): boolean {
+	return (
+		options.appMode !== "daemon" && !options.startupBenchmark && !options.help && options.listModels === undefined
+	);
+}
+
+export function shouldUseDaemonClientRuntime(
+	options: DaemonClientStartupDecision & {
+		ownedSessionWorker?: boolean;
+		hasProcessLocalExtensionFactories?: boolean;
+	},
+): boolean {
+	return shouldUseDaemonClient(options) && !options.ownedSessionWorker && !options.hasProcessLocalExtensionFactories;
+}
+
+export function shouldEnsureInteractiveDaemonForStartup(
+	useDaemonInteractive: boolean,
+	attachAgent: string | undefined,
+): boolean {
+	return useDaemonInteractive && attachAgent === undefined;
 }
 
 export interface AgentsViewStartupDecision {
@@ -200,16 +258,13 @@ export interface AgentsViewStartupDecision {
 }
 
 export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStartupDecision): boolean {
+	const bareResume = options.resume === true;
+	const requestsAgentsView = bareResume || (options.explicitAgentsView && !options.needsOnboarding);
 	return (
 		options.useDaemonInteractive &&
-		// `prime-agent` opens a new chat by default; the agents view is reached via
-		// left-arrow from a session or requested explicitly (`agents`/`manage`).
-		!!options.explicitAgentsView &&
-		// Onboarding lives in InteractiveMode, so a first run must take the
-		// direct session path; the agents view would otherwise require creating
-		// an agent before the onboarding splash ever renders.
-		!options.needsOnboarding &&
-		!options.resume &&
+		// A selector, continuation, or fork must open its target directly rather than the agents view.
+		!!requestsAgentsView &&
+		typeof options.resume !== "string" &&
 		!options.continue &&
 		!options.fork
 	);
@@ -225,92 +280,48 @@ export interface DaemonInteractiveSessionManagerDecision {
 export function shouldUseEphemeralSessionManagerForDaemonInteractive(
 	options: DaemonInteractiveSessionManagerDecision,
 ): boolean {
-	return !options.hasActiveDaemonSession && !options.resume && !options.continue && !options.fork;
+	return (
+		!options.hasActiveDaemonSession &&
+		(options.resume === undefined || options.resume === true) &&
+		!options.continue &&
+		!options.fork
+	);
 }
 
 export interface DaemonActiveSessionLookupDecision {
 	useDaemonInteractive: boolean;
 	resumeSelector?: string;
+	explicitAttach?: boolean;
 }
 
 export function shouldEnsureDaemonBeforeActiveSessionLookup(options: DaemonActiveSessionLookupDecision): boolean {
 	return (
 		options.useDaemonInteractive &&
 		options.resumeSelector !== undefined &&
-		!looksLikeSessionPath(options.resumeSelector)
+		(options.explicitAttach || !looksLikeSessionPath(options.resumeSelector))
 	);
 }
 
 type ActiveDaemonSessionSummaryLookup = (socketPath: string, selector: string) => Promise<SessionSummary | undefined>;
 
+interface ActiveDaemonSessionSummaryLookupOptions {
+	fallbackOnError?: boolean;
+	lookup?: ActiveDaemonSessionSummaryLookup;
+}
+
 export async function findActiveDaemonSessionSummaryForInteractiveStartup(
 	socketPath: string,
 	selector: string,
-	lookup: ActiveDaemonSessionSummaryLookup = findActiveDaemonSessionSummary,
+	options: ActiveDaemonSessionSummaryLookupOptions = {},
 ): Promise<SessionSummary | undefined> {
 	try {
-		return await lookup(socketPath, selector);
-	} catch {
+		return await (options.lookup ?? findActiveDaemonSessionSummary)(socketPath, selector);
+	} catch (error) {
+		if (options.fallbackOnError === false) {
+			throw error;
+		}
 		return undefined;
 	}
-}
-
-const DAEMON_RICH_TUI_SHORTCUT_COMMANDS = new Set([
-	"help",
-	"start",
-	"list",
-	"create",
-	"attach",
-	"detach",
-	"kill",
-	"rename",
-	"prompt",
-	"steer",
-	"follow-up",
-	"state",
-	"messages",
-	"stats",
-	"commands",
-	"shutdown",
-]);
-
-export interface DaemonRichTuiAttachShortcut {
-	socketPath: string;
-	selector: string;
-}
-
-export function parseDaemonRichTuiAttachShortcut(args: string[]): DaemonRichTuiAttachShortcut | undefined {
-	if (args[0] !== "daemon") {
-		return undefined;
-	}
-
-	let socketPath = defaultDaemonSocketPath();
-	let selector: string | undefined;
-	for (let index = 1; index < args.length; index++) {
-		const arg = args[index];
-		if (arg === "--socket" || arg === "--daemon-socket") {
-			const value = args[index + 1];
-			if (!value) {
-				return undefined;
-			}
-			socketPath = value;
-			index++;
-			continue;
-		}
-		if (arg === "--json" || arg.startsWith("-") || DAEMON_RICH_TUI_SHORTCUT_COMMANDS.has(arg)) {
-			return undefined;
-		}
-		if (selector) {
-			return undefined;
-		}
-		selector = arg;
-	}
-
-	return selector ? { socketPath, selector } : undefined;
-}
-
-function looksLikeSessionPath(sessionArg: string): boolean {
-	return sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl");
 }
 
 async function prepareInitialMessage(
@@ -334,44 +345,6 @@ async function prepareInitialMessage(
 	});
 }
 
-/** Result from resolving a session argument */
-type ResolvedSession =
-	| { type: "path"; path: string } // Direct file path
-	| { type: "local"; path: string } // Found in current project
-	| { type: "global"; path: string; cwd: string } // Found in different project
-	| { type: "not_found"; arg: string }; // Not found anywhere
-
-/**
- * Resolve a session argument to a file path.
- * If it looks like a path, use as-is. Otherwise try to match as session ID prefix.
- */
-async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
-	// If it looks like a file path, use as-is
-	if (looksLikeSessionPath(sessionArg)) {
-		return { type: "path", path: sessionArg };
-	}
-
-	// Try to match as session ID in current project first
-	const localSessions = await SessionManager.list(cwd, sessionDir);
-	const localMatches = localSessions.filter((s) => s.id.startsWith(sessionArg));
-
-	if (localMatches.length >= 1) {
-		return { type: "local", path: localMatches[0].path };
-	}
-
-	// Try global search across all projects
-	const allSessions = await SessionManager.listAll();
-	const globalMatches = allSessions.filter((s) => s.id.startsWith(sessionArg));
-
-	if (globalMatches.length >= 1) {
-		const match = globalMatches[0];
-		return { type: "global", path: match.path, cwd: match.cwd };
-	}
-
-	// Not found anywhere
-	return { type: "not_found", arg: sessionArg };
-}
-
 /** Prompt user for yes/no confirmation */
 async function promptConfirm(message: string): Promise<boolean> {
 	return new Promise((resolve) => {
@@ -391,12 +364,12 @@ async function promptConfirm(message: string): Promise<boolean> {
 const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
 	busyDetail(count) {
 		const { noun, pronoun } = pluralizeSessions(count);
-		return `A background daemon from a different prime-agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}.`;
+		return `A background service from a different Prime Agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}.`;
 	},
 	unlistableDetail:
-		"A background daemon from a different prime-agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
+		"A background service from a different Prime Agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
 	question: "Stop it and continue?",
-	nonTtyHint: 'Run "prime-agent daemon shutdown" to stop it, then retry.',
+	nonTtyHint: 'Run "prime-agent shutdown" to stop it, then retry.',
 };
 
 // The promise to keep after awaiting readiness. Wrapped in an object so it
@@ -418,7 +391,7 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 	}
 	if (!(await shutdownDaemonAndWait(socketPath))) {
 		console.error(
-			chalk.red(`Could not stop the daemon on ${socketPath}. Run "prime-agent daemon shutdown" and retry.`),
+			chalk.red(`Could not stop the background service on ${socketPath}. Run "prime-agent shutdown" and retry.`),
 		);
 		process.exit(1);
 	}
@@ -427,7 +400,7 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 		await ready;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(chalk.red(`Could not start the daemon: ${message}`));
+		console.error(chalk.red(`Could not start the background service: ${message}`));
 		process.exit(1);
 	}
 	return { ready };
@@ -480,19 +453,10 @@ function getResumeSelector(parsed: Pick<Args, "resume">): string | undefined {
 	return typeof parsed.resume === "string" ? parsed.resume : undefined;
 }
 
-export function restoreResumeSelectorFallback(parsed: Args, selector: string): boolean {
-	if (parsed.resumeSelectorFallback !== selector) return false;
-	delete parsed.resume;
-	delete parsed.resumeSelectorFallback;
-	parsed.messages.unshift(selector);
-	return true;
-}
-
 export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	sessionDir: string | undefined,
-	settingsManager: SettingsManager,
 ): Promise<SessionManager> {
 	const explicitCwdOverride = parsed.cwd ? cwd : undefined;
 
@@ -508,11 +472,6 @@ export async function createSessionManager(
 			case "local":
 			case "global":
 				return forkSessionOrExit(resolved.path, cwd, sessionDir);
-
-			case "not_found":
-				if (restoreResumeSelectorFallback(parsed, resolved.arg)) break;
-				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
-				process.exit(1);
 		}
 	}
 
@@ -534,29 +493,6 @@ export async function createSessionManager(
 				}
 				return forkSessionOrExit(resolved.path, cwd, sessionDir);
 			}
-
-			case "not_found":
-				if (restoreResumeSelectorFallback(parsed, resolved.arg)) break;
-				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
-				process.exit(1);
-		}
-	}
-
-	if (parsed.resume) {
-		initTheme(settingsManager.getTheme(), true);
-		try {
-			const selectedPath = await selectSession(
-				(callbacks) => SessionManager.list(cwd, sessionDir, callbacks),
-				SessionManager.listAll,
-				{ cwd, sessionDir },
-			);
-			if (!selectedPath) {
-				console.log(chalk.dim("No session selected"));
-				process.exit(0);
-			}
-			return SessionManager.open(selectedPath, sessionDir, explicitCwdOverride);
-		} finally {
-			stopThemeWatcher();
 		}
 	}
 
@@ -706,6 +642,8 @@ function runtimeConfigFromArgs(
 	cwd: string,
 	agentDir: string,
 	sessionDir: string | undefined,
+	appMode: AppMode,
+	telemetryDisabled?: true,
 ): AgentSessionRuntimeConfig {
 	return {
 		cwd,
@@ -732,6 +670,14 @@ function runtimeConfigFromArgs(
 		noContextFiles: parsed.noContextFiles,
 		autonomous: runtimeAutonomousConfigFromArgs(parsed),
 		extensionFlagValues: parsed.unknownFlags.size > 0 ? Object.fromEntries(parsed.unknownFlags.entries()) : undefined,
+		executionMode: appMode === "daemon" ? undefined : appMode,
+		telemetryDisabled,
+		// Serialized refine for print/json/rpc: the client's appMode is NOT
+		// "daemon" here — it's "print", "json", or "rpc". The daemon worker
+		// receives this flag via AgentSessionRuntimeConfig and uses it
+		// instead of its own appMode="daemon".
+		serializedRefine: appMode !== "interactive" && appMode !== "daemon",
+		initialGoal: parsed.goal ? { objective: parsed.goal, tokenBudget: parsed.goalTokenBudget } : undefined,
 	};
 }
 
@@ -743,6 +689,10 @@ interface PreparedRuntimeServices {
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
+export function daemonServerDefaultSessionConfig(config: AgentSessionRuntimeConfig): AgentSessionRuntimeConfig {
+	return { ...config, initialGoal: undefined };
+}
+
 export function resolveRuntimeSessionOptions(
 	sessionOptions: CreateAgentSessionOptions,
 	runtimeSessionOptions?: CreateAgentSessionOptions,
@@ -750,6 +700,7 @@ export function resolveRuntimeSessionOptions(
 	return {
 		model: runtimeSessionOptions?.model ?? sessionOptions.model,
 		thinkingLevel: runtimeSessionOptions?.thinkingLevel ?? sessionOptions.thinkingLevel,
+		serviceTier: runtimeSessionOptions?.serviceTier ?? sessionOptions.serviceTier,
 		scopedModels: runtimeSessionOptions?.scopedModels ?? sessionOptions.scopedModels,
 		tools: runtimeSessionOptions?.tools ?? sessionOptions.tools,
 		noTools: runtimeSessionOptions?.noTools ?? sessionOptions.noTools,
@@ -769,6 +720,7 @@ export function resolveRuntimeSessionOptions(
 		rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
 		rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
+		rlmParentAgent: runtimeSessionOptions?.rlmParentAgent,
 		subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
 	};
 }
@@ -794,6 +746,7 @@ async function prepareRuntimeServices(options: {
 		// Subagents share the parent's Herdr pane; their own reporter would race
 		// the parent's and a subagent quit would release the still-active pane.
 		noBuiltinHerdrReporter: (options.sessionOptionsOverride?.rlmDepth ?? 0) > 0,
+		telemetryDisabled: config.telemetryDisabled,
 		resourceLoaderOptions: {
 			additionalExtensionPaths: config.extensions,
 			additionalSkillPaths: config.skills,
@@ -945,11 +898,7 @@ async function findActiveDaemonSessionSummary(
 	selector: string,
 ): Promise<SessionSummary | undefined> {
 	const client = new DaemonClient(socketPath);
-	try {
-		await client.connect(250);
-	} catch {
-		return undefined;
-	}
+	await client.connect(250);
 
 	try {
 		const response = await client.request({ type: "get_state", activeSessionId: selector }, 3000);
@@ -966,20 +915,6 @@ async function findActiveDaemonSessionSummary(
 	} finally {
 		client.close();
 	}
-}
-
-async function normalizeDaemonRichTuiAttachArgs(args: string[]): Promise<string[] | undefined> {
-	const shortcut = parseDaemonRichTuiAttachShortcut(args);
-	if (!shortcut) {
-		return undefined;
-	}
-
-	const summary = await findActiveDaemonSessionSummary(shortcut.socketPath, shortcut.selector);
-	if (!summary) {
-		return undefined;
-	}
-
-	return ["--daemon-socket", shortcut.socketPath, "--resume", getDaemonSummaryActiveSessionId(summary)];
 }
 
 function createSessionManagerForActiveDaemonSummary(summary: SessionSummary, fallbackCwd: string): SessionManager {
@@ -1005,21 +940,24 @@ export function findActiveDaemonSessionSummaryForSessionFile(
 	summaries: readonly SessionSummary[],
 	sessionPath: string,
 ): SessionSummary | undefined {
-	const resolvedSessionPath = resolve(sessionPath);
+	const resolvedSessionPath = canonicalSessionPath(sessionPath);
 	return summaries.find(
 		(summary) =>
 			summary.activeSessionId !== undefined &&
 			summary.sessionFile !== undefined &&
-			resolve(summary.sessionFile) === resolvedSessionPath,
+			canonicalSessionPath(summary.sessionFile) === resolvedSessionPath,
 	);
 }
 
-async function createDaemonInteractiveConnection(options: {
+async function createDaemonClientConnection(options: {
 	socketPath: string;
 	config: AgentSessionRuntimeConfig;
 	sessionPath?: string;
 	continueRecent?: boolean;
 	activeSessionId?: string;
+	clientOwned?: boolean;
+	noSession?: boolean;
+	supportsExtensionUi?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
 	// Caller must have awaited ensureInteractiveDaemonRunning for this socket.
 	const client = new DaemonClient(options.socketPath);
@@ -1030,7 +968,11 @@ async function createDaemonInteractiveConnection(options: {
 			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
 				closeClientOnDispose: true,
 				sendClientEnv: true,
+				ownedSession: options.clientOwned,
+				ownedSessionRecoveryConfig: options.clientOwned ? options.config : undefined,
+				supportsExtensionUi: options.supportsExtensionUi,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
+				telemetryDisabled: options.config.telemetryDisabled,
 			});
 			return { connection, summary };
 		};
@@ -1040,13 +982,19 @@ async function createDaemonInteractiveConnection(options: {
 			return await attach(summary);
 		}
 
-		if (options.sessionPath) {
+		if (options.sessionPath && !options.clientOwned) {
 			const activeSummary = findActiveDaemonSessionSummaryForSessionFile(
 				await listActiveDaemonSessionSummaries(client),
 				options.sessionPath,
 			);
-			if (activeSummary) {
+			if (activeSummary && activeSummary.workerState !== "failed") {
 				return await attach(activeSummary);
+			}
+		}
+		if (options.clientOwned) {
+			await client.waitForHello();
+			if (!client.supportsServerCapability("client_owned_sessions")) {
+				throw new DaemonCapabilityUnavailableError("create", "client_owned_sessions");
 			}
 		}
 
@@ -1055,10 +1003,13 @@ async function createDaemonInteractiveConnection(options: {
 			config: options.config,
 			sessionPath: options.sessionPath,
 			continueRecent: options.continueRecent,
+			noSession: options.noSession,
 			env: collectDaemonClientEnv(),
+			lifecycle: options.clientOwned ? "client_owned" : "resident",
+			launchEnv: collectDaemonLaunchEnv(),
 		});
 		if (!response.success) {
-			throw new Error(response.error);
+			throw deserializeDaemonError(response);
 		}
 		if (!isDaemonSessionSummary(response.data)) {
 			throw new Error("Daemon returned an invalid create response");
@@ -1091,6 +1042,9 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	if (isDaemonWorkerProcess()) {
+		waitForDaemonWorkerStartupGate();
+	}
 	installFileLogSink();
 	if (isDaemonCatalogProcess()) {
 		await runDaemonCatalogProcess();
@@ -1098,37 +1052,23 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	// Client and daemon are separate processes; both need these in their registry.
 	registerBuiltinMcpOAuthProviders();
-	args = normalizeDaemonStartArgs(args) ?? args;
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
 		process.env.PI_SKIP_VERSION_CHECK = "1";
 	}
 
-	if (await handlePackageCommand(args)) {
+	const publicCommand = await handlePublicCommand(args);
+	if (publicCommand.handled) {
 		return;
 	}
+	args = publicCommand.args;
 
 	if (await handleConfigCommand(args)) {
 		return;
 	}
 
-	try {
-		args = (await normalizeDaemonRichTuiAttachArgs(args)) ?? args;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		console.error(chalk.red(`Error: ${message}`));
-		process.exit(1);
-	}
-
-	if (await handleDaemonCommand(args)) {
-		return;
-	}
-
-	// `prime-agent agents` / `prime-agent manage` open the agents view directly.
-	const agentsViewCommand = parseAgentsViewCommand(args);
-	const explicitAgentsView = agentsViewCommand.explicitAgentsView;
-	args = agentsViewCommand.args;
+	const explicitAgentsView = publicCommand.explicitAgentsView;
 
 	const parsed = parseArgs(args);
 	if (parsed.diagnostics.length > 0) {
@@ -1141,7 +1081,16 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 	}
 	time("parseArgs");
-	let appMode = resolveAppMode(parsed, process.stdin.isTTY);
+	const appMode = resolveAppMode(parsed, process.stdin.isTTY);
+
+	if (shouldRejectNonInteractiveAttach(publicCommand.attachAgent, appMode)) {
+		console.error(chalk.red("Error: attach requires an interactive terminal"));
+		process.exit(1);
+	}
+	if (shouldRejectNonInteractiveBareResume(parsed.resume, appMode)) {
+		console.error(chalk.red("Error: --resume without a session selector requires an interactive terminal"));
+		process.exit(1);
+	}
 	setLogContext({ mode: appMode });
 	const shouldTakeOverStdout = appMode !== "interactive";
 	if (shouldTakeOverStdout) {
@@ -1150,6 +1099,10 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (parsed.version) {
 		console.log(VERSION);
+		process.exit(0);
+	}
+	if (parsed.help) {
+		console.log(formatTopLevelHelp());
 		process.exit(0);
 	}
 
@@ -1184,6 +1137,10 @@ export async function main(args: string[], options?: MainOptions) {
 			process.exit(1);
 		}
 	}
+	if (parsed.daemonSocket) {
+		// After --cwd so a relative socket path resolves against the requested directory.
+		parsed.daemonSocket = normalizeSocketPath(parsed.daemonSocket);
+	}
 
 	// Run migrations (pass cwd for project-local migrations)
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
@@ -1197,13 +1154,17 @@ export async function main(args: string[], options?: MainOptions) {
 		console.error(chalk.red("Error: PI_STARTUP_BENCHMARK only supports interactive mode"));
 		process.exit(1);
 	}
-	const useDaemonInteractive = shouldUseDaemonInteractive({
+	// Programmatic factories are process-local functions and cannot be serialized to a daemon worker.
+	const hasProcessLocalExtensionFactories = (options?.extensionFactories?.length ?? 0) > 0;
+	const useDaemonClient = shouldUseDaemonClientRuntime({
 		appMode,
 		startupBenchmark,
 		noSession: parsed.noSession,
-		help: parsed.help,
 		listModels: parsed.listModels,
+		ownedSessionWorker: isOwnedSessionWorkerProcess(),
+		hasProcessLocalExtensionFactories,
 	});
+	const useDaemonInteractive = useDaemonClient && appMode === "interactive";
 
 	// Decide the final runtime cwd before creating cwd-bound runtime services.
 	// --resume may select a session from another project, so project-local
@@ -1216,8 +1177,10 @@ export async function main(args: string[], options?: MainOptions) {
 		startupSettingsManager.getSessionDir();
 	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
 	// Kick off daemon spawn/readiness immediately so it overlaps session-manager
-	// and runtime-services preparation; awaited wherever the daemon is first used.
-	let daemonReady = useDaemonInteractive ? ensureInteractiveDaemonRunning(daemonSocketPath) : undefined;
+	// and runtime-services preparation; attach only connects to an existing daemon.
+	let daemonReady = shouldEnsureInteractiveDaemonForStartup(useDaemonClient, publicCommand.attachAgent)
+		? ensureInteractiveDaemonRunning(daemonSocketPath)
+		: undefined;
 	// Errors are rethrown at the await sites below; this only avoids an unhandled
 	// rejection if startup exits before reaching them.
 	daemonReady?.catch(() => {});
@@ -1225,14 +1188,29 @@ export async function main(args: string[], options?: MainOptions) {
 	const shouldLookupDaemonActiveSession = shouldEnsureDaemonBeforeActiveSessionLookup({
 		useDaemonInteractive,
 		resumeSelector,
+		explicitAttach: publicCommand.attachAgent !== undefined,
 	});
 	if (shouldLookupDaemonActiveSession && daemonReady) {
 		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 	}
-	const activeDaemonSessionSummary =
-		shouldLookupDaemonActiveSession && resumeSelector
-			? await findActiveDaemonSessionSummaryForInteractiveStartup(daemonSocketPath, resumeSelector)
-			: undefined;
+	let activeDaemonSessionSummary: SessionSummary | undefined;
+	if (shouldLookupDaemonActiveSession && resumeSelector) {
+		try {
+			activeDaemonSessionSummary = await findActiveDaemonSessionSummaryForInteractiveStartup(
+				daemonSocketPath,
+				resumeSelector,
+				{ fallbackOnError: !publicCommand.attachAgent },
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(chalk.red(`Error: Could not look up active agent '${resumeSelector}': ${message}`));
+			process.exit(1);
+		}
+	}
+	if (publicCommand.attachAgent && !activeDaemonSessionSummary) {
+		console.error(chalk.red(`Error: No active agent found matching '${publicCommand.attachAgent}'`));
+		process.exit(1);
+	}
 	let sessionManager: SessionManager;
 	if (activeDaemonSessionSummary) {
 		sessionManager = createSessionManagerForActiveDaemonSummary(activeDaemonSessionSummary, cwd);
@@ -1246,7 +1224,20 @@ export async function main(args: string[], options?: MainOptions) {
 	) {
 		sessionManager = SessionManager.inMemory(cwd);
 	} else {
-		sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+		try {
+			sessionManager = await createSessionManager(parsed, cwd, sessionDir);
+		} catch (error) {
+			if (!(error instanceof SessionSelectorError)) {
+				throw error;
+			}
+			const suggestion =
+				error instanceof SessionSelectorNotFoundError && error.suggestion
+					? ` Did you mean '${error.suggestion}'?`
+					: "";
+			console.error(chalk.red(`Error: ${error.message}.${suggestion}`));
+			console.error(chalk.dim(`Open ${APP_NAME} and press left-arrow to browse sessions.`));
+			process.exit(1);
+		}
 	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
@@ -1263,7 +1254,23 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createSessionManager");
 
-	const defaultSessionConfig = runtimeConfigFromArgs(parsed, sessionManager.getCwd(), agentDir, sessionDir);
+	const telemetrySettingsManager =
+		sessionManager.getCwd() === cwd
+			? startupSettingsManager
+			: SettingsManager.create(sessionManager.getCwd(), agentDir);
+	const telemetryDisabled = isTelemetryEnabled(telemetrySettingsManager) ? undefined : true;
+	const defaultSessionConfig = runtimeConfigFromArgs(
+		parsed,
+		sessionManager.getCwd(),
+		agentDir,
+		sessionDir,
+		appMode,
+		telemetryDisabled,
+	);
+	// Verifier/headless clients pass initialGoal in each create request. The long-lived
+	// daemon fallback must not seed that goal into unrelated future sessions.
+	const daemonDefaultSessionConfig = daemonServerDefaultSessionConfig(defaultSessionConfig);
+	const runtimeDefaultSessionConfig = appMode === "daemon" ? daemonDefaultSessionConfig : defaultSessionConfig;
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -1272,7 +1279,7 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionConfig,
 		sessionOptions: runtimeSessionOptions,
 	}) => {
-		const config = mergeAgentSessionRuntimeConfig(defaultSessionConfig, sessionConfig);
+		const config = mergeAgentSessionRuntimeConfig(runtimeDefaultSessionConfig, sessionConfig);
 		const prepared = await prepareRuntimeServices({
 			config,
 			cwd,
@@ -1292,6 +1299,14 @@ export async function main(args: string[], options?: MainOptions) {
 			// Main agents boot their kernel in the background at session creation;
 			// subagent sessions (rlmDepth > 0) keep the lazy first-call start.
 			prewarmIpythonKernel: true,
+			// Read serializedRefine from the merged runtime config (passed
+			// from the JSON/print client through AgentSessionRuntimeConfig)
+			// so it survives the daemon worker's appMode="daemon" context.
+			serializedRefine: config.serializedRefine ?? false,
+			executionMode: config.executionMode,
+			telemetryDisabled: config.telemetryDisabled,
+			// Only seed initial goal for top-level sessions (rlmDepth 0).
+			initialGoal: (runtimeSessionOptions?.rlmDepth ?? 0) === 0 ? config.initialGoal : undefined,
 		});
 		const cliThinkingOverride = config.thinking !== undefined || prepared.cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
@@ -1308,13 +1323,13 @@ export async function main(args: string[], options?: MainOptions) {
 	// Daemon mode never uses the bootstrap runtime, so skip the heavy
 	// createAgentSessionRuntime below and start listening immediately; sessions
 	// are created on demand through the daemon protocol via createRuntime.
-	// --help/--list-models still take the full path to print and exit.
-	if (appMode === "daemon" && !parsed.help && parsed.listModels === undefined) {
+	// --list-models still takes the full path to print and exit.
+	if (appMode === "daemon" && parsed.listModels === undefined) {
 		printTimings();
 		if (isDaemonWorkerProcess()) {
 			await runDaemonMode({
 				socketPath: parsed.daemonSocket,
-				defaultSessionConfig,
+				defaultSessionConfig: daemonDefaultSessionConfig,
 				createRuntime,
 				worker: {
 					authenticationToken: requireDaemonWorkerAuthenticationToken(),
@@ -1324,7 +1339,7 @@ export async function main(args: string[], options?: MainOptions) {
 		} else {
 			await runDaemonSupervisorMode({
 				socketPath: parsed.daemonSocket,
-				defaultSessionConfig,
+				defaultSessionConfig: daemonDefaultSessionConfig,
 			});
 		}
 		return;
@@ -1342,8 +1357,7 @@ export async function main(args: string[], options?: MainOptions) {
 
 		const startupModel = await resolvePreparedStartupModel({ prepared, sessionManager });
 
-		let stdinContent: string | undefined;
-		stdinContent = await readPipedStdin();
+		const stdinContent = await readPipedStdin();
 		time("readPipedStdin");
 
 		const { initialMessage, initialImages } = await prepareInitialMessage(
@@ -1375,11 +1389,12 @@ export async function main(args: string[], options?: MainOptions) {
 			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
 		}
 
+		const promptStashStore = new ClientPromptStashStore();
 		const daemonUiServices = createInteractiveModeUiServicesFromServices({
 			services,
 			sessionManager,
 		});
-		const launchAgentsView = async (includeInitialPrompts: boolean) => {
+		const launchAgentsView = async (initialSession?: SessionSummary, initialScopeKey?: AgentsViewScopeKey) => {
 			await runAgentsViewMode({
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
@@ -1406,14 +1421,16 @@ export async function main(args: string[], options?: MainOptions) {
 				},
 				migratedProviders,
 				modelFallbackMessage: startupModel.modelFallbackMessage,
+				promptStashStore,
 				startupModelId: startupModel.model?.id,
-				...(includeInitialPrompts ? { initialMessage, initialImages, initialMessages: parsed.messages } : {}),
+				initialSession,
+				initialScopeKey,
 				verbose: parsed.verbose,
 			});
 		};
 		if (
 			shouldOpenAgentsViewForDaemonInteractive({
-				useDaemonInteractive,
+				useDaemonInteractive: useDaemonInteractive && !parsed.noSession,
 				explicitAgentsView,
 				needsOnboarding: shouldRunOnboarding({
 					settingsManager,
@@ -1428,7 +1445,7 @@ export async function main(args: string[], options?: MainOptions) {
 			daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 			await preloadCodeHighlighter();
 			printTimings();
-			await launchAgentsView(true);
+			await launchAgentsView();
 			return;
 		}
 
@@ -1438,13 +1455,16 @@ export async function main(args: string[], options?: MainOptions) {
 		// no DeferredAgentConnection is needed to avoid creating it up front.
 		const isFreshDefaultSession =
 			!activeDaemonSessionSummary && !getInteractiveDaemonSessionPath(parsed, sessionManager);
-		const { connection, summary } = await createDaemonInteractiveConnection({
+		const { connection, summary } = await createDaemonClientConnection({
 			socketPath: daemonSocketPath,
 			config: defaultSessionConfig,
 			activeSessionId: activeDaemonSessionSummary
 				? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
 				: undefined,
 			sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
+			clientOwned: parsed.noSession,
+			noSession: parsed.noSession,
+			supportsExtensionUi: true,
 		});
 		const agentConnection: AgentConnection = connection;
 		const attachModelFallbackMessage = isFreshDefaultSession
@@ -1453,7 +1473,10 @@ export async function main(args: string[], options?: MainOptions) {
 
 		const interactiveMode = new InteractiveMode({
 			agentConnection,
+			daemonSocketPath,
 			uiServices: daemonUiServices,
+			promptStashStore,
+			promptStashSessionId: summary.sessionId,
 			bindLocalSessionExtensions: false,
 			migratedProviders,
 			modelFallbackMessage: attachModelFallbackMessage,
@@ -1465,13 +1488,101 @@ export async function main(args: string[], options?: MainOptions) {
 			// arrow takes them to the agents view like any other session. The agents
 			// view was not rendered here, so we intentionally leave
 			// agentsViewOwnsStartupNotices unset and let the in-session fallback run.
-			returnToAgentsView: true,
+			returnToAgentsView: !parsed.noSession,
+			sessionDepth: summary.rlmDepth,
+			// Direct launch has only the attached summary; the live+passive+saved
+			// unified catalog index is not built until the agents view opens. Retained
+			// child snapshots augment this running-child fallback inside chat.
+			sessionHasChildren: summary.hasRunningRlmChildren === true,
 		});
 
 		await preloadCodeHighlighter();
 		printTimings();
-		await interactiveMode.run();
-		await launchAgentsView(false);
+		const interactiveResult = await interactiveMode.run();
+		if (parsed.noSession) {
+			return;
+		}
+		const returnedSummary = {
+			...summary,
+			...interactiveResult.source,
+			id: interactiveResult.source.activeSessionId ?? summary.id,
+		};
+		const initialScopeKey =
+			interactiveResult.type === "scoped_agents_view"
+				? {
+						sessionId: interactiveResult.source.sessionId,
+						activeSessionId: interactiveResult.source.activeSessionId,
+					}
+				: undefined;
+		await launchAgentsView(returnedSummary, initialScopeKey);
+		return;
+	}
+	if (useDaemonClient) {
+		const settingsManager = SettingsManager.create(sessionManager.getCwd(), agentDir);
+		let stdinContent: string | undefined;
+		if (appMode !== "rpc" && appMode !== "acp") {
+			stdinContent = await readPipedStdin();
+		}
+		time("readPipedStdin");
+		const { initialMessage, initialImages } = await prepareInitialMessage(
+			parsed,
+			settingsManager.getImageAutoResize(),
+			stdinContent,
+		);
+		time("prepareInitialMessage");
+		initTheme(settingsManager.getTheme(), false);
+		time("initTheme");
+
+		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
+		let connection: DaemonAgentConnection;
+		let summary: SessionSummary;
+		try {
+			({ connection, summary } = await createDaemonClientConnection({
+				socketPath: daemonSocketPath,
+				config: defaultSessionConfig,
+				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
+				continueRecent: parsed.continue,
+				clientOwned: isClientOwnedDaemonSession(appMode, parsed.noSession),
+				noSession: parsed.noSession,
+				supportsExtensionUi: appMode === "rpc",
+			}));
+		} catch (error) {
+			if (error instanceof SessionAlreadyActiveError) {
+				console.error(chalk.red(`Error: ${error.message}`));
+				process.exit(1);
+			}
+			throw error;
+		}
+		const diagnostics = summary.diagnostics ?? [];
+		reportDiagnostics(diagnostics);
+		if (diagnostics.some((diagnostic) => diagnostic.type === "error")) {
+			await connection.dispose();
+			process.exit(1);
+		}
+		if (!summary.model) {
+			console.error(chalk.red(summary.modelFallbackMessage ?? formatNoModelsAvailableMessage()));
+			await connection.dispose();
+			process.exit(1);
+		}
+
+		printTimings();
+		if (appMode === "rpc") {
+			return await runRpcModeWithConnection(connection);
+		}
+		if (appMode === "acp") {
+			return await runAcpModeWithConnection(connection);
+		}
+		const exitCode = await runPrintModeWithConnection(connection, {
+			mode: toPrintOutputMode(appMode),
+			messages: parsed.messages,
+			initialMessage,
+			initialImages,
+		});
+		stopThemeWatcher();
+		restoreStdout();
+		if (exitCode !== 0) {
+			process.exitCode = exitCode;
+		}
 		return;
 	}
 
@@ -1492,15 +1603,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	const { services, session, modelFallbackMessage } = runtime;
 	installOwnedSessionRecoveryTracking(runtime);
-	const { settingsManager, modelRegistry, resourceLoader } = services;
-
-	if (parsed.help) {
-		const extensionFlags = resourceLoader
-			.getExtensions()
-			.extensions.flatMap((extension) => Array.from(extension.flags.values()));
-		printHelp(extensionFlags);
-		process.exit(0);
-	}
+	const { settingsManager, modelRegistry } = services;
 
 	if (parsed.listModels !== undefined) {
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
@@ -1510,11 +1613,8 @@ export async function main(args: string[], options?: MainOptions) {
 
 	// Read piped stdin content (if any) - skip for RPC/daemon modes which use other transports
 	let stdinContent: string | undefined;
-	if (appMode !== "rpc" && appMode !== "daemon") {
+	if (appMode !== "rpc" && appMode !== "acp" && appMode !== "daemon") {
 		stdinContent = await readPipedStdin();
-		if (stdinContent !== undefined && appMode === "interactive") {
-			appMode = "print";
-		}
 	}
 	time("readPipedStdin");
 
@@ -1548,7 +1648,13 @@ export async function main(args: string[], options?: MainOptions) {
 	if (appMode === "rpc") {
 		printTimings();
 		await runRpcMode(runtime);
+	} else if (appMode === "acp") {
+		printTimings();
+		await runAcpMode(runtime);
 	} else if (appMode === "interactive") {
+		if (explicitAgentsView || parsed.resume === true) {
+			console.error(chalk.yellow("Warning: the agents view needs the daemon; opening a normal chat instead"));
+		}
 		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
 			const modelList = scopedModels
 				.map((sm) => {
@@ -1562,6 +1668,8 @@ export async function main(args: string[], options?: MainOptions) {
 		const interactiveMode = new InteractiveMode({
 			agentConnection: new InProcessAgentConnection(runtime),
 			localSessionHost: createInteractiveModeLocalSessionHost(runtime),
+			promptStashStore: new ClientPromptStashStore(),
+			promptStashSessionId: session.sessionId,
 			bindLocalSessionExtensions: true,
 			migratedProviders,
 			modelFallbackMessage,

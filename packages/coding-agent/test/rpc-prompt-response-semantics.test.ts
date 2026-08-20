@@ -231,7 +231,7 @@ describe("RPC prompt response semantics", () => {
 	});
 
 	it("emits one success response when prompt preflight succeeds", async () => {
-		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
+		const { lineHandler, session, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 250 });
 
 		try {
 			lineHandler(JSON.stringify({ id: "b2", type: "prompt", message: "Hello" }));
@@ -246,6 +246,10 @@ describe("RPC prompt response semantics", () => {
 					success: true,
 				});
 			});
+			await vi.waitFor(() => {
+				expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_start")).toBe(true);
+			});
+			expect(session.isStreaming).toBe(true);
 		} finally {
 			await cleanup();
 		}

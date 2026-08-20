@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
@@ -54,6 +54,17 @@ function deserializeSessionInfo(session: SessionInfoWire): SessionInfo {
 		created: new Date(session.created),
 		modified: new Date(session.modified),
 	};
+}
+
+export function resolveCatalogSessionMatch(
+	sessions: readonly SessionInfo[],
+	selector: string,
+): SessionInfo | undefined {
+	const matches = sessions.filter((session) => session.id.startsWith(selector) || session.name === selector);
+	if (matches.length > 1) {
+		throw new Error(`Ambiguous session selector "${selector}"`);
+	}
+	return matches[0];
 }
 
 function isCatalogOutbound(value: unknown): value is CatalogOutbound {
@@ -130,35 +141,31 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				return;
 			}
 			case "resolve": {
-				const localMatches = (await SessionManager.list(request.cwd, request.sessionDir)).filter((session) =>
-					session.id.startsWith(request.selector),
+				const localMatch = resolveCatalogSessionMatch(
+					await SessionManager.list(request.cwd, request.sessionDir),
+					request.selector,
 				);
-				if (localMatches.length === 1) {
+				if (localMatch) {
 					sendCatalogMessage({
 						type: "response",
 						id: request.id,
 						success: true,
-						data: { sessionPath: localMatches[0]!.path },
+						data: { sessionPath: localMatch.path },
 					});
 					return;
 				}
-				if (localMatches.length > 1) {
-					throw new Error(`Ambiguous session selector "${request.selector}"`);
-				}
-				const globalMatches = (await SessionManager.listAll(undefined, request.sessionDir)).filter((session) =>
-					session.id.startsWith(request.selector),
+				const globalMatch = resolveCatalogSessionMatch(
+					await SessionManager.listAll(undefined, request.sessionDir),
+					request.selector,
 				);
-				if (globalMatches.length === 1) {
+				if (globalMatch) {
 					sendCatalogMessage({
 						type: "response",
 						id: request.id,
 						success: true,
-						data: { sessionPath: globalMatches[0]!.path },
+						data: { sessionPath: globalMatch.path },
 					});
 					return;
-				}
-				if (globalMatches.length > 1) {
-					throw new Error(`Ambiguous session selector "${request.selector}"`);
 				}
 				throw new Error(`No session found matching '${request.selector}'`);
 			}
@@ -315,7 +322,7 @@ export class DaemonCatalogClient {
 		const launch = createCliSubprocessLaunchSpec(["--version"]);
 		const child = spawn(launch.command, launch.args, {
 			cwd: process.cwd(),
-			env: { ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" },
+			env: createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" }),
 			stdio: ["ignore", "ignore", "ignore", "ipc"],
 		});
 		this.child = child;

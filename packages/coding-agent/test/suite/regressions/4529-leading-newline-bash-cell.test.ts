@@ -63,7 +63,7 @@ describe("ENG-4529 leading newline before %%bash", () => {
 			start.toolName,
 			start.toolCallId,
 			start.args,
-			{ allowInlineImages: false },
+			{},
 			undefined,
 			{ requestRender: vi.fn() } as unknown as TUI,
 			harness.tempDir,

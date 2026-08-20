@@ -4,14 +4,19 @@ import { getDaemonLogPath } from "../../config.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import {
 	createDaemonCommandEnvelope,
+	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_PROTOCOL_VERSION,
 	type DaemonClosingReason,
 	type DaemonCommand,
+	type DaemonCommandCompatibility,
 	type DaemonCommandEnvelope,
 	type DaemonOutbound,
+	type DaemonProtocolVersion,
 	type DaemonRequestProgress,
 	type DaemonResponse,
 	type DaemonSavedSessionInfo,
+	type DaemonServerCapability,
+	getDaemonCommandCompatibilities,
 	isDaemonMutatingCommand,
 } from "./daemon-protocol.js";
 import type { DaemonWorkerCommand, DaemonWorkerCommandBody } from "./daemon-worker-protocol.js";
@@ -41,6 +46,8 @@ interface PendingDaemonRequest {
 	wireData: string;
 	awaitingReconnect: boolean;
 	acknowledgeResult: boolean;
+	/** Re-checked against the new hello before a reconnect replay. */
+	compatibilities: readonly DaemonCommandCompatibility[];
 }
 
 function daemonEndpointDetails(socketPath: string): string {
@@ -59,6 +66,21 @@ export class DaemonSocketClosedError extends Error {
 			`Connection to the Prime Agent daemon closed.${reasonDetails}${causeDetails} ${daemonEndpointDetails(socketPath)}`,
 		);
 		this.name = "DaemonSocketClosedError";
+	}
+}
+
+export class DaemonCapabilityUnavailableError extends Error {
+	constructor(
+		readonly command: DaemonCommand["type"],
+		readonly capability: DaemonServerCapability | undefined,
+		readonly afterReconnect = false,
+	) {
+		super(
+			capability
+				? `The running Prime Agent daemon does not support ${capability}.`
+				: `The running Prime Agent daemon does not support ${command}.`,
+		);
+		this.name = "DaemonCapabilityUnavailableError";
 	}
 }
 
@@ -111,6 +133,10 @@ export class DaemonClient {
 
 	get isConnected(): boolean {
 		return this.socket !== undefined && !this.socket.destroyed;
+	}
+
+	supportsServerCapability(capability: DaemonServerCapability): boolean {
+		return this.helloMessage?.serverCapabilities?.includes(capability) === true;
 	}
 
 	/** Wait for the daemon_hello greeting sent on connect. */
@@ -275,34 +301,51 @@ export class DaemonClient {
 			);
 		}
 		const hello = this.helloMessage ?? (await this.waitForHello());
-		return this.requestWire(command, timeoutMs, options, hello.protocol.version >= DAEMON_PROTOCOL_VERSION);
+		const compatibilities = getDaemonCommandCompatibilities(command);
+		const missingCompatibility = compatibilities.find(
+			(compatibility) => !this.meetsCommandCompatibility(hello, compatibility),
+		);
+		if (missingCompatibility) {
+			throw new DaemonCapabilityUnavailableError(command.type, missingCompatibility.capability);
+		}
+		const envelopeProtocolVersion = Math.min(hello.protocol.version, DAEMON_PROTOCOL_VERSION);
+		return this.requestWire(
+			command,
+			timeoutMs,
+			options,
+			envelopeProtocolVersion >= DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION ? envelopeProtocolVersion : undefined,
+			compatibilities,
+		);
 	}
 
-	/** One-release compatibility path for preparing and stopping a v1 daemon. */
-	async requestLegacy(
-		command: DaemonCommandBody,
-		timeoutMs = 30000,
-		options: DaemonClientRequestOptions = {},
-	): Promise<DaemonResponse> {
-		return this.requestWire(command, timeoutMs, options, false);
+	private meetsCommandCompatibility(hello: DaemonHello, compatibility: DaemonCommandCompatibility): boolean {
+		return (
+			hello.protocol.version >= compatibility.minProtocol &&
+			(compatibility.minSchemaRevision === undefined ||
+				(hello.schemaRevision ?? 0) >= compatibility.minSchemaRevision) &&
+			(compatibility.capability === undefined ||
+				hello.serverCapabilities?.includes(compatibility.capability) === true)
+		);
 	}
 
 	async authenticateWorker(token: string, timeoutMs = 3000): Promise<void> {
-		const response = await this.requestWire({ type: "worker_auth", token }, timeoutMs, {}, false);
+		const legacyAuthentication = { type: "worker_auth", token } as DaemonWorkerCommandBody;
+		const response = await this.requestWire(legacyAuthentication, timeoutMs);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
 	}
 
 	async requestWorker(command: DaemonWorkerCommandBody, timeoutMs = 30000): Promise<DaemonResponse> {
-		return this.requestWire(command, timeoutMs, {}, false);
+		return this.requestWire(command, timeoutMs);
 	}
 
 	private async requestWire(
 		command: DaemonWireCommandBody,
 		timeoutMs: number,
 		options: DaemonClientRequestOptions = {},
-		usePublicEnvelope: boolean,
+		publicEnvelopeProtocolVersion?: DaemonProtocolVersion,
+		compatibilities: readonly DaemonCommandCompatibility[] = [],
 	): Promise<DaemonResponse> {
 		if (!this.socket || this.socket.destroyed) {
 			throw new Error(
@@ -312,11 +355,17 @@ export class DaemonClient {
 
 		const id = `daemon_${++this.requestId}`;
 		const fullCommand = { ...command, id } as DaemonCommand | DaemonWorkerCommand;
-		const wireCommand: DaemonCommand | DaemonWorkerCommand | DaemonCommandEnvelope = usePublicEnvelope
-			? createDaemonCommandEnvelope(fullCommand as DaemonCommand, id, this.protocolClientId)
+		const wireCommand: DaemonCommand | DaemonWorkerCommand | DaemonCommandEnvelope = publicEnvelopeProtocolVersion
+			? createDaemonCommandEnvelope(
+					fullCommand as DaemonCommand,
+					id,
+					this.protocolClientId,
+					publicEnvelopeProtocolVersion,
+				)
 			: fullCommand;
 		const wireData = serializeJsonLine(wireCommand);
-		const acknowledgeResult = usePublicEnvelope && isDaemonMutatingCommand(fullCommand as DaemonCommand);
+		const acknowledgeResult =
+			publicEnvelopeProtocolVersion !== undefined && isDaemonMutatingCommand(fullCommand as DaemonCommand);
 
 		return new Promise((resolve, reject) => {
 			const pending: PendingDaemonRequest = {
@@ -328,6 +377,7 @@ export class DaemonClient {
 				wireData,
 				awaitingReconnect: false,
 				acknowledgeResult,
+				compatibilities,
 			};
 			this.pendingRequests.set(id, pending);
 			this.armPendingRequestTimeout(id, pending);
@@ -391,6 +441,20 @@ export class DaemonClient {
 						continue;
 					}
 					pending.awaitingReconnect = false;
+					const missingCompatibility = pending.compatibilities.find(
+						(compatibility) => !this.meetsCommandCompatibility(message, compatibility),
+					);
+					if (missingCompatibility) {
+						this.pendingRequests.delete(id);
+						pending.reject(
+							new DaemonCapabilityUnavailableError(
+								pending.commandType as DaemonCommand["type"],
+								missingCompatibility.capability,
+								true,
+							),
+						);
+						continue;
+					}
 					this.armPendingRequestTimeout(id, pending);
 					this.socket.write(pending.wireData);
 				}
@@ -423,17 +487,30 @@ export class DaemonClient {
 		}
 
 		for (const listener of this.listeners) {
-			listener(message as DaemonOutbound);
+			try {
+				listener(message as DaemonOutbound);
+			} catch {
+				// A consumer failure must not interrupt protocol parsing for other clients.
+			}
 		}
 	}
 
 	private acknowledgeCommandResult(commandId: string): void {
-		if (!this.socket || this.socket.destroyed || (this.helloMessage?.protocol.version ?? 0) < 2) {
+		const hello = this.helloMessage;
+		if (
+			!this.socket ||
+			this.socket.destroyed ||
+			!hello ||
+			hello.protocol.version < DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION
+		) {
 			return;
 		}
 		const id = `daemon_ack_${++this.requestId}`;
 		const command: DaemonCommand = { id, type: "ack_result", commandId };
-		this.socket.write(serializeJsonLine(createDaemonCommandEnvelope(command, id, this.protocolClientId)));
+		const protocolVersion = Math.min(hello.protocol.version, DAEMON_PROTOCOL_VERSION);
+		this.socket.write(
+			serializeJsonLine(createDaemonCommandEnvelope(command, id, this.protocolClientId, protocolVersion)),
+		);
 	}
 
 	private rejectAll(error: Error, preservePendingRequests = false): void {
