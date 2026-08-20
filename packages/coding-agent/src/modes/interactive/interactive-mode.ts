@@ -92,6 +92,7 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
+import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
 import {
 	bashOutputToText,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
@@ -1464,6 +1465,7 @@ export class InteractiveMode {
 
 	async run(): Promise<InteractiveModeRunResult> {
 		await this.init();
+		this.restorePromptStashOnOpen();
 
 		// Global, environment-scoped notices (app update, extension updates, tmux setup)
 		// belong on the agents view, not in a conversation. When the agents view already
@@ -4137,6 +4139,27 @@ export class InteractiveMode {
 		return this.snapshotPromptStashFrom(this.editor, text);
 	}
 
+	private restorePromptStashOnOpen(): void {
+		if (!this.promptStash?.restoreOnOpen) return;
+		// Land the restore notice in its own status block: init may have just posted
+		// a notice (e.g. compaction) that showStatus would otherwise replace.
+		this.lastStatusText = undefined;
+		this.lastStatusSpacer = undefined;
+		this.restorePromptStashIfEditorEmpty();
+	}
+
+	private stashDraftForAgentsView(): void {
+		const text = this.editor.getText();
+		if (!text.trim()) return;
+		// Head of the durable queue so it restores first on return; an existing
+		// manual stash stays queued behind it and keeps its manual-stash semantics.
+		const existing = [this.promptStashState.stash, ...(this.promptStashState.queuedStashes ?? [])].filter(
+			(stash): stash is PromptStash => stash !== undefined,
+		);
+		this.promptStashState.stash = { ...this.snapshotPromptStash(text), restoreOnOpen: true };
+		this.promptStashState.queuedStashes = existing.length > 0 ? existing : undefined;
+	}
+
 	private handlePromptStash(): void {
 		const text = this.editor.getText();
 		if (!text.trim()) {
@@ -5878,11 +5901,6 @@ export class InteractiveMode {
 	}
 
 	private async openScopedAgentsView(): Promise<void> {
-		if (this.editor.getText().trim()) {
-			this.focusEditor();
-			this.showStatus("Send, stash, or clear your draft before opening agents");
-			return;
-		}
 		if (!this.options.returnToAgentsView) {
 			this.focusEditor();
 			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
@@ -5900,7 +5918,8 @@ export class InteractiveMode {
 			this.toggleAgentMessageExpansion();
 			return;
 		}
-		if (this.keybindings.matches(data, "app.edits.expand")) {
+		// A raw "\n" is a newline for the editor, not ctrl+j.
+		if (data !== "\n" && this.keybindings.matches(data, "app.edits.expand")) {
 			this.toggleEditDiffExpansion();
 			return;
 		}
@@ -6716,10 +6735,6 @@ export class InteractiveMode {
 	}
 
 	private async requestAgentsView(): Promise<void> {
-		if (this.editor.getText().length > 0) {
-			this.showStatus("Send, stash, or clear your draft before opening agents");
-			return;
-		}
 		if (!this.options.returnToAgentsView) {
 			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
 			return;
@@ -6729,6 +6744,7 @@ export class InteractiveMode {
 
 	private async returnToAgentsView(request: InteractiveModeRunResult["type"] = "agents_view"): Promise<void> {
 		if (this.isShuttingDown || this.agentsViewRequest) return;
+		this.stashDraftForAgentsView();
 		this.agentsViewRequest = request;
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
@@ -8515,7 +8531,8 @@ export class InteractiveMode {
 	}
 
 	private async handleMcpCommand(args: string | undefined): Promise<void> {
-		const [sub, server] = (args ?? "").trim().split(/\s+/);
+		const argv = parseCommandArgs((args ?? "").trim());
+		const [sub, server] = argv;
 		if (!sub) {
 			await this.showConfigurationMenu("mcp-connections");
 			return;
@@ -8523,41 +8540,18 @@ export class InteractiveMode {
 
 		const authStorage = this.modelRegistry.authStorage;
 		const isAuthed = (name: string) => authStorage.get(`mcp:${name}`) !== undefined;
-
-		if (sub === "list") {
-			const labels = new Map(BUILTIN_MCP_CATALOG.map((e) => [e.server, e.label]));
-			const names = new Set([...labels.keys(), ...Object.keys(this.settingsManager.getMcpServers() ?? {})]);
-			const lines = [...names].map((name) => {
-				const status = isAuthed(name) ? "connected" : "not connected";
-				return `  ${labels.get(name) ?? name} (${name}) — ${status}`;
-			});
-			this.showStatus(
-				`MCP integrations:\n${lines.join("\n")}\n\nUse /mcp login <name> to connect, /mcp logout <name> to disconnect.`,
-			);
-			return;
-		}
-
 		if (sub === "login") {
-			if (!server) {
+			if (!server || argv.length !== 2) {
 				this.showError("Usage: /mcp login <name> (e.g. /mcp login linear)");
 				return;
 			}
 			const result = await this.createAuthFlows().runMcpLogin(server);
-			if (result.status === "success") {
-				// Enabling the skill needs a reload, which is refused mid-turn; tell the
-				// user to /reload rather than silently leaving creds saved but inactive.
-				if (this.isAgentStreaming() || this.isAgentCompacting()) {
-					this.showStatus(`Connected ${server}. Run /reload (after the current turn) to activate it.`);
-				} else {
-					this.showStatus(`Connected ${server}. Reloading so the integration becomes available…`);
-					await this.handleReloadCommand();
-				}
-			}
+			if (result.status === "success") await this.reloadAfterMcpChange(`Connected ${server}.`);
 			return;
 		}
 
 		if (sub === "logout") {
-			if (!server) {
+			if (!server || argv.length !== 2) {
 				this.showError("Usage: /mcp logout <name>");
 				return;
 			}
@@ -8566,16 +8560,45 @@ export class InteractiveMode {
 				return;
 			}
 			authStorage.logout(`mcp:${server}`);
-			if (this.isAgentStreaming() || this.isAgentCompacting()) {
-				this.showStatus(`Disconnected ${server}. Run /reload (after the current turn) to fully unload it.`);
-			} else {
-				this.showStatus(`Disconnected ${server}. Reloading…`);
-				await this.handleReloadCommand();
-			}
+			await this.reloadAfterMcpChange(`Disconnected ${server}.`);
 			return;
 		}
 
-		this.showError(`Unknown /mcp subcommand: ${sub}. Use list, login, or logout.`);
+		try {
+			const result = await runMcpManagementCommand(argv, this.settingsManager, this.modelRegistry.authStorage);
+			if (result.changed && result.serverChange) {
+				const { name, transport, verb } = result.serverChange;
+				const successMessage =
+					verb === "removed"
+						? `Removed MCP server "${name}" (${transport}). It is no longer available through mcp.`
+						: `${verb === "replaced" ? "Replaced" : "Added"} MCP server "${name}" (${transport}). Available next turn through mcp.`;
+				await this.reloadAfterMcpChange(result.message, successMessage);
+			} else if (result.action === "list") {
+				const builtins = BUILTIN_MCP_CATALOG.map(
+					(entry) => `${entry.label} (${entry.server}): ${isAuthed(entry.server) ? "connected" : "not connected"}`,
+				).join("\n");
+				this.showStatus(
+					`Built-in MCP integrations:\n${builtins}\n\nUser-configured MCP servers:\n${result.message}`,
+				);
+			} else {
+				this.showStatus(result.message);
+			}
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async reloadAfterMcpChange(message: string, successMessage = message): Promise<void> {
+		if (this.isAgentStreaming() || this.isAgentCompacting()) {
+			this.showStatus(`${message} The change was saved. Run /reload after the current turn to activate it.`);
+			return;
+		}
+		const reloaded = await this.handleReloadCommand();
+		if (reloaded) {
+			this.showStatus(successMessage);
+		} else {
+			this.showWarning(`${message} The change remains saved, but it is not active in this session.`);
+		}
 	}
 
 	private async showLogoutSelector(): Promise<void> {
@@ -8700,14 +8723,14 @@ export class InteractiveMode {
 		await this.handleReloadCommand();
 	}
 
-	private async handleReloadCommand(): Promise<void> {
+	private async handleReloadCommand(): Promise<boolean> {
 		if (this.isAgentStreaming()) {
 			this.showWarning("Wait for the current response to finish before reloading.");
-			return;
+			return false;
 		}
 		if (this.isAgentCompacting()) {
 			this.showWarning("Wait for compaction to finish before reloading.");
-			return;
+			return false;
 		}
 
 		this.resetExtensionUI();
@@ -8778,9 +8801,11 @@ export class InteractiveMode {
 				this.showError(`models.json error: ${modelsJsonError}`);
 			}
 			this.showStatus("Reloaded keybindings, extensions, skills, prompts, themes");
+			return true;
 		} catch (error) {
 			dismissReloadBox(previousEditor as Component);
 			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
+			return false;
 		}
 	}
 
