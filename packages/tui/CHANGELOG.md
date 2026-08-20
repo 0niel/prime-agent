@@ -1,8 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.4] - 2026-08-19
 
-- Added source-line coordinates to editor layout lines and `styleDisplayText()` so subclasses can style wrapped or scrolled text against exact source offsets.
+## [0.7.3] - 2026-08-17
+
+- Fixed hyperlinks not being clickable in fullscreen mode on terminals that gate native link handling while mouse reporting is active (e.g. Ghostty); left-clicking a link now opens it directly.
+
+## [0.7.2] - 2026-08-11
 
 ## [0.7.1] - 2026-08-07
 
