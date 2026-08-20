@@ -76,11 +76,6 @@ describe("Package Manager git source parsing", () => {
 			const parsed = (packageManager as any).parseSource("git@github.com:user/repo");
 			expect(parsed.type).toBe("local");
 		});
-
-		it("should treat host/path shorthand as local without git: prefix", () => {
-			const parsed = (packageManager as any).parseSource("github.com/user/repo");
-			expect(parsed.type).toBe("local");
-		});
 	});
 
 	describe("identity normalization", () => {

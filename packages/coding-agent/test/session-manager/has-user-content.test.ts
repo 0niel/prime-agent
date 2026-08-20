@@ -15,11 +15,12 @@ describe("SessionManager.hasUserContent", () => {
 		}
 	}
 
-	it("is false for a fresh session with only the default model and thinking entries", () => {
+	it("is false for a fresh session with only the default configuration entries", () => {
 		withSession((session) => {
 			// What createAgentSession writes for every new session.
 			session.appendModelChange("anthropic", "claude-opus-4-8");
 			session.appendThinkingLevelChange("off");
+			session.appendServiceTierChange("default");
 			expect(session.hasUserContent()).toBe(false);
 		});
 	});
@@ -38,6 +39,16 @@ describe("SessionManager.hasUserContent", () => {
 			session.appendModelChange("anthropic", "claude-opus-4-8");
 			session.appendThinkingLevelChange("off");
 			session.appendThinkingLevelChange("high");
+			expect(session.hasUserContent()).toBe(true);
+		});
+	});
+
+	it("is true once the user enables Fast mode after creation", () => {
+		withSession((session) => {
+			session.appendModelChange("openai-codex", "gpt-5.5");
+			session.appendThinkingLevelChange("medium");
+			session.appendServiceTierChange("default");
+			session.appendServiceTierChange("priority");
 			expect(session.hasUserContent()).toBe(true);
 		});
 	});

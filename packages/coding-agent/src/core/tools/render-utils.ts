@@ -1,6 +1,6 @@
 import * as os from "node:os";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import { getCapabilities, getImageDimensions, imageFallback } from "@earendil-works/pi-tui";
+import { getImageDimensions, imageFallback } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { sanitizeBinaryOutput } from "../../utils/shell.js";
 
@@ -23,10 +23,6 @@ export function replaceTabs(text: string): string {
 	return text.replace(/\t/g, "   ");
 }
 
-export function normalizeDisplayText(text: string): string {
-	return text.replace(/\r/g, "");
-}
-
 export interface TextOutputOptions {
 	/** Whether image fallbacks should parse image dimensions from base64 data. */
 	includeImageDimensions?: boolean;
@@ -44,9 +40,8 @@ export function getTextOutput(
 
 	let output = textBlocks.map((c) => sanitizeBinaryOutput(stripAnsi(c.text || "")).replace(/\r/g, "")).join("\n");
 
-	const caps = getCapabilities();
 	const includeImageDimensions = options.includeImageDimensions ?? true;
-	if (imageBlocks.length > 0 && (!caps.images || !showImages)) {
+	if (imageBlocks.length > 0 && !showImages) {
 		const imageIndicators = imageBlocks
 			.map((img) => {
 				const mimeType = img.mimeType ?? "image/unknown";

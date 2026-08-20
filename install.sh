@@ -2,11 +2,17 @@
 
 set -eu
 
-# Keep this sentinel split so release publishing only rewrites the install URL
-# below; local or unpublished copies still need an unreplaced value to compare.
+# Keep these sentinels split so release publishing only rewrites the configured
+# values below; local or unpublished copies still need unreplaced values to compare.
 prime_agent_unconfigured_base_url="__PRIME_AGENT_DOWNLOAD_BASE""_URL__"
+prime_agent_unconfigured_default_release_channel="__PRIME_AGENT_DEFAULT_RELEASE_""CHANNEL__"
 prime_agent_base_url="${PRIME_AGENT_DOWNLOAD_BASE_URL:-__PRIME_AGENT_DOWNLOAD_BASE_URL__}"
 prime_agent_base_url="${prime_agent_base_url%/}"
+prime_agent_default_release_channel="__PRIME_AGENT_DEFAULT_RELEASE_CHANNEL__"
+if [ "$prime_agent_default_release_channel" = "$prime_agent_unconfigured_default_release_channel" ]; then
+	prime_agent_default_release_channel=stable
+fi
+prime_agent_release_channel="${PRIME_AGENT_RELEASE_CHANNEL:-$prime_agent_default_release_channel}"
 prime_agent_package="${PRIME_AGENT_PACKAGE:-prime-agent}"
 prime_agent_cmd="${PRIME_AGENT_CMD:-prime-agent}"
 prime_agent_esc=$(printf '\033')
@@ -27,7 +33,7 @@ prime_agent_color_dim="${prime_agent_esc}[38;2;113;113;122m"
 prime_agent_color_primary="${prime_agent_esc}[38;2;127;91;213m"
 prime_agent_color_scan="${prime_agent_esc}[38;2;14;165;233m"
 prime_agent_color_warning="${prime_agent_esc}[38;2;245;158;11m"
-readonly prime_agent_unconfigured_base_url prime_agent_base_url prime_agent_package prime_agent_cmd prime_agent_esc prime_agent_original_path
+readonly prime_agent_unconfigured_base_url prime_agent_unconfigured_default_release_channel prime_agent_base_url prime_agent_default_release_channel prime_agent_release_channel prime_agent_package prime_agent_cmd prime_agent_esc prime_agent_original_path
 readonly prime_agent_reset prime_agent_bold prime_agent_italic prime_agent_hide_cursor prime_agent_show_cursor prime_agent_home_cursor prime_agent_clear_screen prime_agent_clear_line
 readonly prime_agent_sync_start prime_agent_sync_end
 readonly prime_agent_color_text prime_agent_color_muted prime_agent_color_dim prime_agent_color_primary prime_agent_color_scan prime_agent_color_warning
@@ -917,8 +923,15 @@ run_preflight_checks() {
 
 resolve_prime_agent_version() {
 	if [ "${1:-}" ]; then
-		normalize_version "$1"
-		return
+		case "$1" in
+			stable|beta) release_channel="$1" ;;
+			*)
+				normalize_version "$1"
+				return
+				;;
+		esac
+	else
+		release_channel="$prime_agent_release_channel"
 	fi
 
 	if [ "${PRIME_AGENT_VERSION:-}" ]; then
@@ -931,24 +944,32 @@ resolve_prime_agent_version() {
 		exit 1
 	fi
 
-	stable_dir=$(create_temp_dir)
-	stable_path="$stable_dir/stable"
+	case "$release_channel" in
+		stable|beta) ;;
+		*)
+			printf 'error: invalid Prime Agent release channel: %s\n' "$release_channel" >&2
+			exit 1
+			;;
+	esac
+
+	channel_dir=$(create_temp_dir)
+	channel_path="$channel_dir/$release_channel"
 	if ! prime_agent_run_quiet_with_animation \
 		"Resolving latest release" \
 		"Resolving latest release" \
-		"Checking the stable release channel." \
-		curl -fsSL "$prime_agent_base_url/stable" -o "$stable_path"; then
-		rm -rf "$stable_dir"
-		printf 'error: could not resolve latest Prime Agent version from %s/stable\n' "$prime_agent_base_url" >&2
+		"Checking the $release_channel release channel." \
+		curl -fsSL "$prime_agent_base_url/$release_channel" -o "$channel_path"; then
+		rm -rf "$channel_dir"
+		printf 'error: could not resolve latest Prime Agent version from %s/%s\n' "$prime_agent_base_url" "$release_channel" >&2
 		exit 1
 	fi
-	stable_version="$(tr -d '[:space:]' <"$stable_path")"
-	rm -rf "$stable_dir"
-	if [ -z "$stable_version" ]; then
-		printf 'error: could not resolve latest Prime Agent version from %s/stable\n' "$prime_agent_base_url" >&2
+	channel_version="$(tr -d '[:space:]' <"$channel_path")"
+	rm -rf "$channel_dir"
+	if [ -z "$channel_version" ]; then
+		printf 'error: could not resolve latest Prime Agent version from %s/%s\n' "$prime_agent_base_url" "$release_channel" >&2
 		exit 1
 	fi
-	normalize_version "$stable_version"
+	normalize_version "$channel_version"
 }
 
 normalize_version() {

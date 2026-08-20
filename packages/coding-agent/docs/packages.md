@@ -1,14 +1,14 @@
-> pi can help you create pi packages. Ask it to bundle your extensions, skills, prompt templates, or themes.
+> Prime Agent can help you create resource packages. Ask it to bundle your extensions, skills, prompt templates, or themes.
 
-# Pi Packages
+# Prime Agent Packages
 
-Pi packages bundle extensions, skills, prompt templates, and themes so you can share them through npm or git. A package can declare resources in `package.json` under the `pi` key, or use conventional directories.
+Prime Agent packages bundle extensions, skills, prompt templates, and themes so you can share them through npm or git. For compatibility with the inherited extension ecosystem, a package declares resources in `package.json` under the `pi` key, or uses conventional directories.
 
 ## Table of Contents
 
 - [Install and Manage](#install-and-manage)
 - [Package Sources](#package-sources)
-- [Creating a Pi Package](#creating-a-pi-package)
+- [Creating a Prime Agent Package](#creating-a-prime-agent-package)
 - [Package Structure](#package-structure)
 - [Dependencies](#dependencies)
 - [Package Filtering](#package-filtering)
@@ -17,37 +17,35 @@ Pi packages bundle extensions, skills, prompt templates, and themes so you can s
 
 ## Install and Manage
 
-> **Security:** Pi packages run with full system access. Extensions execute arbitrary code, and skills can instruct the model to perform any action including running executables. Review source code before installing third-party packages.
+> **Security:** Prime Agent packages run with full system access. Extensions execute arbitrary code, and skills can instruct the model to perform any action including running executables. Review source code before installing third-party packages.
 
 ```bash
-pi install npm:@foo/bar@1.0.0
-pi install git:github.com/user/repo@v1
-pi install https://github.com/user/repo  # raw URLs work too
-pi install /absolute/path/to/package
-pi install ./relative/path/to/package
+prime-agent package install npm:@foo/bar@1.0.0
+prime-agent package install git:github.com/user/repo@v1
+prime-agent package install https://github.com/user/repo  # raw URLs work too
+prime-agent package install /absolute/path/to/package
+prime-agent package install ./relative/path/to/package
 
-pi remove npm:@foo/bar
-pi list                     # show installed packages from settings
-prime-agent update                   # update Prime Agent and all non-pinned packages
-prime-agent update --extensions      # update all non-pinned packages only
-prime-agent update --self            # update Prime Agent only
-prime-agent update --self --force    # reinstall Prime Agent even if current
-prime-agent update npm:@foo/bar      # update one package
-prime-agent update --extension npm:@foo/bar
+prime-agent package remove npm:@foo/bar
+prime-agent package list                  # show installed packages from settings
+prime-agent package update                # update all non-pinned packages
+prime-agent package update npm:@foo/bar   # update one package
+prime-agent update                        # update Prime Agent
+prime-agent update --force                # reinstall Prime Agent even if current
 ```
 
-By default, `install` and `remove` write to global settings (`~/.pi/agent/settings.json`). Use `-l` to write to project settings (`.pi/settings.json`) instead. Project settings can be shared with your team, and pi installs any missing packages automatically on startup.
+By default, `package install` and `package remove` write to global settings (`~/.prime/agent/settings.json`). Use `--local` to write to project settings (`.prime/agent/settings.json`) instead. Project settings can be shared with your team, and Prime Agent installs any missing packages automatically on startup.
 
 To try a package without installing it, use `--extension` or `-e`. This installs to a temporary directory for the current run only:
 
 ```bash
-pi -e npm:@foo/bar
-pi -e git:github.com/user/repo
+prime-agent -e npm:@foo/bar
+prime-agent -e git:github.com/user/repo
 ```
 
 ## Package Sources
 
-Pi accepts three source types in settings and `pi install`.
+Prime Agent accepts three source types in settings and `prime-agent package install`.
 
 ### npm
 
@@ -56,9 +54,9 @@ npm:@scope/pkg@1.2.3
 npm:pkg
 ```
 
-- Versioned specs are pinned and skipped by package updates (`prime-agent update`, `prime-agent update --extensions`).
+- Versioned specs are pinned and skipped by `prime-agent package update`.
 - Global installs use `npm install -g`.
-- Project installs go under `.pi/npm/`.
+- Project installs go under `.prime/agent/npm/`.
 - Set `npmCommand` in `settings.json` to pin npm package lookup and install operations to a specific wrapper command such as `mise` or `asdf`.
 
 Example:
@@ -83,20 +81,20 @@ ssh://git@github.com/user/repo@v1
 - HTTPS and SSH URLs are both supported.
 - SSH URLs use your configured SSH keys automatically (respects `~/.ssh/config`).
 - For non-interactive runs (for example CI), you can set `GIT_TERMINAL_PROMPT=0` to disable credential prompts and set `GIT_SSH_COMMAND` (for example `ssh -o BatchMode=yes -o ConnectTimeout=5`) to fail fast.
-- Refs pin the package and skip package updates (`prime-agent update`, `prime-agent update --extensions`).
-- Cloned to `~/.pi/agent/git/<host>/<path>` (global) or `.pi/git/<host>/<path>` (project).
+- Refs pin the package and skip `prime-agent package update`.
+- Cloned to `~/.prime/agent/git/<host>/<path>` (global) or `.prime/agent/git/<host>/<path>` (project).
 - Runs `npm install` after clone or pull if `package.json` exists.
 
 **SSH examples:**
 ```bash
 # git@host:path shorthand (requires git: prefix)
-pi install git:git@github.com:user/repo
+prime-agent package install git:git@github.com:user/repo
 
 # ssh:// protocol format
-pi install ssh://git@github.com/user/repo
+prime-agent package install ssh://git@github.com/user/repo
 
 # With version ref
-pi install git:git@github.com:user/repo@v1.0.0
+prime-agent package install git:git@github.com:user/repo@v1.0.0
 ```
 
 ### Local Paths
@@ -106,9 +104,9 @@ pi install git:git@github.com:user/repo@v1.0.0
 ./relative/path/to/package
 ```
 
-Local paths point to files or directories on disk and are added to settings without copying. Relative paths are resolved against the settings file they appear in. If the path is a file, it loads as a single extension. If it is a directory, pi loads resources using package rules.
+Local paths point to files or directories on disk and are added to settings without copying. Relative paths are resolved against the settings file they appear in. If the path is a file, it loads as a single extension. If it is a directory, Prime Agent loads resources using package rules.
 
-## Creating a Pi Package
+## Creating a Prime Agent Package
 
 Add a `pi` manifest to `package.json` or use conventional directories. Include the `pi-package` keyword for discoverability.
 
@@ -129,7 +127,7 @@ Paths are relative to the package root. Arrays support glob patterns and `!exclu
 
 ### Gallery Metadata
 
-The [package gallery](https://pi.dev/packages) displays packages tagged with `pi-package`. Add `video` or `image` fields to show a preview:
+The inherited `pi-package` keyword and optional `video` or `image` fields remain available as package metadata:
 
 ```json
 {
@@ -143,8 +141,8 @@ The [package gallery](https://pi.dev/packages) displays packages tagged with `pi
 }
 ```
 
-- **video**: MP4 only. On desktop, autoplays on hover. Clicking opens a fullscreen player.
-- **image**: PNG, JPEG, GIF, or WebP. Displayed as a static preview.
+- **video**: URL for an MP4 preview.
+- **image**: URL for a PNG, JPEG, GIF, or WebP preview.
 
 If both are set, video takes precedence.
 
@@ -152,7 +150,7 @@ If both are set, video takes precedence.
 
 ### Convention Directories
 
-If no `pi` manifest is present, pi auto-discovers resources from these directories:
+If no `pi` manifest is present, Prime Agent auto-discovers resources from these directories:
 
 - `extensions/` loads `.ts` and `.js` files
 - `skills/` recursively finds `SKILL.md` folders and loads top-level `.md` files as skills
@@ -161,11 +159,11 @@ If no `pi` manifest is present, pi auto-discovers resources from these directori
 
 ## Dependencies
 
-Third party runtime dependencies belong in `dependencies` in `package.json`. Dependencies that do not register extensions, skills, prompt templates, or themes also belong in `dependencies`. When pi installs a package from npm or git, it runs `npm install`, so those dependencies are installed automatically.
+Third party runtime dependencies belong in `dependencies` in `package.json`. Dependencies that do not register extensions, skills, prompt templates, or themes also belong in `dependencies`. When Prime Agent installs a package from npm or git, it runs `npm install`, so those dependencies are installed automatically.
 
-Pi bundles core packages for extensions and skills. If you import any of these, list them in `peerDependencies` with a `"*"` range and do not bundle them: `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, `typebox`.
+Prime Agent bundles core packages for extensions and skills. The workspace still publishes these inherited package names; if you import any of them, list them in `peerDependencies` with a `"*"` range and do not bundle them: `@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, `typebox`.
 
-Other pi packages must be bundled in your tarball. Add them to `dependencies` and `bundledDependencies`, then reference their resources through `node_modules/` paths. Pi loads packages with separate module roots, so separate installs do not collide or share modules.
+Other resource packages must be bundled in your tarball. Add them to `dependencies` and `bundledDependencies`, then reference their resources through `node_modules/` paths. Prime Agent loads packages with separate module roots, so separate installs do not collide or share modules.
 
 Example:
 
@@ -212,7 +210,7 @@ Filter what a package loads using the object form in settings:
 
 ## Enable and Disable Resources
 
-Use `pi config` to enable or disable extensions, skills, prompt templates, and themes from installed packages and local directories. Works for both global (`~/.pi/agent`) and project (`.pi/`) scopes.
+Use `prime-agent config` to enable or disable extensions, skills, prompt templates, and themes from installed packages and local directories. This works for both global (`~/.prime/agent`) and project (`.prime/agent/`) scopes.
 
 ## Scope and Deduplication
 

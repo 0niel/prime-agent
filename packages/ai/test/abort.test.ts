@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { getModel } from "../src/models.js";
 import { complete, stream } from "../src/stream.js";
 import type { Api, Context, Model, StreamOptions } from "../src/types.js";
+import { getKimiCodingTestModel } from "./kimi-test-model.js";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -9,7 +10,6 @@ import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-u
 import { hasBedrockCredentials } from "./bedrock-utils.js";
 import { resolveApiKey } from "./oauth.js";
 
-// Resolve OAuth tokens at module level (async, runs before tests)
 const [openaiCodexToken] = await Promise.all([resolveApiKey("openai-codex")]);
 
 async function testAbortSignal<TApi extends Api>(llm: Model<TApi>, options: StreamOptionsWithExtras = {}) {
@@ -40,7 +40,6 @@ async function testAbortSignal<TApi extends Api>(llm: Model<TApi>, options: Stre
 	}
 	const msg = await response.result();
 
-	// If we get here without throwing, the abort didn't work
 	expect(msg.stopReason).toBe("aborted");
 	expect(msg.content.length).toBeGreaterThan(0);
 
@@ -70,7 +69,6 @@ async function testImmediateAbort<TApi extends Api>(llm: Model<TApi>, options: S
 }
 
 async function testAbortThenNewMessage<TApi extends Api>(llm: Model<TApi>, options: StreamOptionsWithExtras = {}) {
-	// First request: abort immediately before any response content arrives
 	const controller = new AbortController();
 	controller.abort();
 
@@ -80,13 +78,10 @@ async function testAbortThenNewMessage<TApi extends Api>(llm: Model<TApi>, optio
 
 	const abortedResponse = await complete(llm, context, { ...options, signal: controller.signal });
 	expect(abortedResponse.stopReason).toBe("aborted");
-	// The aborted message has empty content since we aborted before anything arrived
 	expect(abortedResponse.content.length).toBe(0);
 
-	// Add the aborted assistant message to context (this is what happens in the real coding agent)
 	context.messages.push(abortedResponse);
 
-	// Second request: send a new message - this should work even with the aborted message in context
 	context.messages.push({
 		role: "user",
 		content: "What is 2 + 2?",
@@ -155,7 +150,7 @@ describe("AI Providers Abort Tests", () => {
 	});
 
 	describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("Anthropic Provider Abort", () => {
-		const llm = getModel("anthropic", "claude-opus-4-1-20250805");
+		const llm = getModel("anthropic", "claude-opus-4-6");
 
 		it("should abort mid-stream", { retry: 3 }, async () => {
 			await testAbortSignal(llm, { thinkingEnabled: true, thinkingBudgetTokens: 2048 });
@@ -239,7 +234,7 @@ describe("AI Providers Abort Tests", () => {
 	});
 
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider Abort", () => {
-		const llm = getModel("kimi-coding", "kimi-k2-thinking");
+		const llm = getKimiCodingTestModel();
 
 		it("should abort mid-stream", { retry: 3 }, async () => {
 			await testAbortSignal(llm);

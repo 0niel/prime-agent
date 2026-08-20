@@ -1,23 +1,92 @@
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import {
 	type AppMode,
 	type DaemonInteractiveSessionManagerDecision,
+	daemonServerDefaultSessionConfig,
 	findActiveDaemonSessionSummaryForInteractiveStartup,
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
+	isClientOwnedDaemonSession,
 	parseAgentsViewCommand,
-	parseDaemonRichTuiAttachShortcut,
 	resolveRuntimeSessionOptions,
-	restoreResumeSelectorFallback,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
+	shouldEnsureInteractiveDaemonForStartup,
 	shouldOpenAgentsViewForDaemonInteractive,
+	shouldRejectNonInteractiveAttach,
+	shouldRejectNonInteractiveBareResume,
+	shouldUseDaemonClient,
+	shouldUseDaemonClientRuntime,
 	shouldUseDaemonInteractive,
 	shouldUseEphemeralSessionManagerForDaemonInteractive,
 } from "../src/main.js";
 import type { SessionSummary } from "../src/modes/index.js";
 
 describe("interactive startup routing", () => {
+	test.each([
+		["acp", false, false],
+		["acp", true, true],
+		["rpc", false, true],
+		["print", false, true],
+	] as const)("classifies %s noSession=%s ownership", (appMode, noSession, expected) => {
+		expect(isClientOwnedDaemonSession(appMode, noSession)).toBe(expected);
+	});
+
+	test.each(["interactive", "print", "json", "rpc"] as const)(
+		"uses the daemon runtime for the %s client",
+		(appMode) => {
+			expect(
+				shouldUseDaemonClient({
+					appMode,
+					startupBenchmark: false,
+				}),
+			).toBe(true);
+		},
+	);
+
+	test("uses a client-owned daemon session for --no-session", () => {
+		expect(
+			shouldUseDaemonClient({
+				appMode: "interactive",
+				startupBenchmark: false,
+				noSession: true,
+			}),
+		).toBe(true);
+	});
+
+	test("keeps process-local extension factories and rollback workers in process", () => {
+		expect(
+			shouldUseDaemonClientRuntime({
+				appMode: "print",
+				startupBenchmark: false,
+				hasProcessLocalExtensionFactories: true,
+			}),
+		).toBe(false);
+		expect(
+			shouldUseDaemonClientRuntime({
+				appMode: "rpc",
+				startupBenchmark: false,
+				ownedSessionWorker: true,
+			}),
+		).toBe(false);
+	});
+
+	test.each([
+		["daemon process", { appMode: "daemon", startupBenchmark: false }],
+		["startup benchmark", { appMode: "interactive", startupBenchmark: true }],
+		["help", { appMode: "interactive", startupBenchmark: false, help: true }],
+		["model listing", { appMode: "interactive", startupBenchmark: false, listModels: true }],
+	] satisfies Array<[string, InteractiveDaemonStartupDecision]>)(
+		"keeps %s out of daemon client routing",
+		(_label, decision) => {
+			expect(shouldUseDaemonClient(decision)).toBe(false);
+		},
+	);
+
 	test("uses daemon-backed interactive mode for normal interactive startup", () => {
 		expect(
 			shouldUseDaemonInteractive({
@@ -44,13 +113,12 @@ describe("interactive startup routing", () => {
 	});
 
 	type InteractiveFallbackOverrides = Partial<
-		Pick<InteractiveDaemonStartupDecision, "startupBenchmark" | "noSession" | "help" | "listModels">
+		Pick<InteractiveDaemonStartupDecision, "startupBenchmark" | "noSession" | "listModels">
 	>;
 
 	const fallbackCases: Array<[string, InteractiveFallbackOverrides]> = [
 		["startup benchmark", { startupBenchmark: true }],
 		["--no-session", { noSession: true }],
-		["--help", { help: true }],
 		["--list-models", { listModels: true }],
 		["--list-models search", { listModels: "claude" }],
 	];
@@ -64,6 +132,22 @@ describe("interactive startup routing", () => {
 			}),
 		).toBe(false);
 	});
+
+	test("rejects interactive-only selectors before non-interactive startup", () => {
+		expect(shouldRejectNonInteractiveAttach("worker", "print")).toBe(true);
+		expect(shouldRejectNonInteractiveAttach("worker", "interactive")).toBe(false);
+		expect(shouldRejectNonInteractiveAttach(undefined, "print")).toBe(false);
+		expect(shouldRejectNonInteractiveBareResume(true, "print")).toBe(true);
+		expect(shouldRejectNonInteractiveBareResume(true, "rpc")).toBe(true);
+		expect(shouldRejectNonInteractiveBareResume("session-id", "print")).toBe(false);
+		expect(shouldRejectNonInteractiveBareResume(true, "interactive")).toBe(false);
+	});
+
+	test("does not start the daemon for attach", () => {
+		expect(shouldEnsureInteractiveDaemonForStartup(true, undefined)).toBe(true);
+		expect(shouldEnsureInteractiveDaemonForStartup(true, "worker")).toBe(false);
+		expect(shouldEnsureInteractiveDaemonForStartup(false, undefined)).toBe(false);
+	});
 });
 
 describe("daemon-backed interactive session manager routing", () => {
@@ -76,7 +160,7 @@ describe("daemon-backed interactive session manager routing", () => {
 		).toBe(false);
 	});
 
-	test("opens the agents view when explicitly requested via the agents/manage command", () => {
+	test("opens the agents view when explicitly requested", () => {
 		expect(
 			shouldOpenAgentsViewForDaemonInteractive({
 				useDaemonInteractive: true,
@@ -96,7 +180,6 @@ describe("daemon-backed interactive session manager routing", () => {
 			"resume selector",
 			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, resume: "active-1" },
 		],
-		["resume picker", { useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, resume: true }],
 		[
 			"continue recent",
 			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, continue: true },
@@ -109,6 +192,16 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	test.each(directAttachCases)("does not open agents view for %s", (_label, decision) => {
 		expect(shouldOpenAgentsViewForDaemonInteractive(decision)).toBe(false);
+	});
+
+	test.each([false, true])("opens the agents view for bare --resume (onboarding=%s)", (needsOnboarding) => {
+		expect(
+			shouldOpenAgentsViewForDaemonInteractive({
+				useDaemonInteractive: true,
+				needsOnboarding,
+				resume: true,
+			}),
+		).toBe(true);
 	});
 
 	test("ensures daemon is available before probing non-path session selectors", () => {
@@ -126,6 +219,13 @@ describe("daemon-backed interactive session manager routing", () => {
 		).toBe(false);
 		expect(
 			shouldEnsureDaemonBeforeActiveSessionLookup({
+				useDaemonInteractive: true,
+				resumeSelector: "/tmp/session.jsonl",
+				explicitAttach: true,
+			}),
+		).toBe(true);
+		expect(
+			shouldEnsureDaemonBeforeActiveSessionLookup({
 				useDaemonInteractive: false,
 				resumeSelector: "active-1",
 			}),
@@ -134,27 +234,43 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	test("falls back to local session lookup when daemon active-session probing fails", async () => {
 		await expect(
-			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "saved-session-id", async () => {
-				throw new Error("Daemon returned an invalid active session summary");
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "saved-session-id", {
+				lookup: async () => {
+					throw new Error("Daemon returned an invalid active session summary");
+				},
 			}),
 		).resolves.toBeUndefined();
 	});
 
+	test("propagates active-session lookup failures for explicit attach", async () => {
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
+				fallbackOnError: false,
+				lookup: async () => {
+					throw new Error("protocol mismatch");
+				},
+			}),
+		).rejects.toThrow("protocol mismatch");
+	});
+
 	test("uses daemon active-session summary when probing succeeds", async () => {
 		await expect(
-			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", async () => ({
-				id: "active-1",
-				activeSessionId: "active-1",
-				lifecycle: "draft",
-				activity: "idle",
-				sessionId: "session-1",
-				cwd: "/tmp/project",
-				isStreaming: false,
-				isCompacting: false,
-				attachedClients: 0,
-				messageCount: 0,
-				pendingMessageCount: 0,
-			})),
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
+				lookup: async () => ({
+					id: "active-1",
+					activeSessionId: "active-1",
+					lifecycle: "draft",
+					activity: "idle",
+					isSessionActive: false,
+					sessionId: "session-1",
+					cwd: "/tmp/project",
+					isStreaming: false,
+					isCompacting: false,
+					attachedClients: 0,
+					messageCount: 0,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+				}),
+			}),
 		).resolves.toMatchObject({ activeSessionId: "active-1" });
 	});
 
@@ -165,7 +281,6 @@ describe("daemon-backed interactive session manager routing", () => {
 	const persistentSelectionCases: Array<[string, DaemonInteractiveSessionManagerDecision]> = [
 		["active daemon attach", { hasActiveDaemonSession: true }],
 		["explicit saved session", { resume: "saved-session-id" }],
-		["resume picker", { resume: true }],
 		["continue recent", { continue: true }],
 		["fork", { fork: "source-session-id" }],
 	];
@@ -174,20 +289,8 @@ describe("daemon-backed interactive session manager routing", () => {
 		expect(shouldUseEphemeralSessionManagerForDaemonInteractive(decision)).toBe(false);
 	});
 
-	test("restores an unresolved resume selector candidate as prompt text", () => {
-		const parsed = {
-			resume: "fix",
-			resumeSelectorFallback: "fix",
-			messages: ["the", "bug"],
-			fileArgs: [],
-			unknownFlags: new Map(),
-			diagnostics: [],
-		};
-
-		expect(restoreResumeSelectorFallback(parsed, "fix")).toBe(true);
-		expect(parsed.resume).toBeUndefined();
-		expect(parsed.resumeSelectorFallback).toBeUndefined();
-		expect(parsed.messages).toEqual(["fix", "the", "bug"]);
+	test("uses an ephemeral local session manager for bare --resume", () => {
+		expect(shouldUseEphemeralSessionManagerForDaemonInteractive({ resume: true })).toBe(true);
 	});
 
 	test("finds an active daemon session by resolved session file", () => {
@@ -209,6 +312,25 @@ describe("daemon-backed interactive session manager routing", () => {
 			),
 		).toBe(activeSummary);
 	});
+
+	test("finds an active daemon session through a symlinked resume path", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-agent-resume-"));
+		try {
+			const sessionFile = join(directory, "session.jsonl");
+			const symlink = join(directory, "session-link.jsonl");
+			writeFileSync(sessionFile, "");
+			symlinkSync(sessionFile, symlink);
+			const activeSummary = makeSessionSummary({
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionFile,
+			});
+
+			expect(findActiveDaemonSessionSummaryForSessionFile([activeSummary], symlink)).toBe(activeSummary);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("agents view command parsing", () => {
@@ -216,10 +338,10 @@ describe("agents view command parsing", () => {
 		expect(parseAgentsViewCommand(["agents"])).toEqual({ explicitAgentsView: true, args: [] });
 	});
 
-	test("treats manage as an alias for agents", () => {
+	test("does not treat manage as an alias", () => {
 		expect(parseAgentsViewCommand(["manage", "--verbose"])).toEqual({
-			explicitAgentsView: true,
-			args: ["--verbose"],
+			explicitAgentsView: false,
+			args: ["manage", "--verbose"],
 		});
 	});
 
@@ -238,28 +360,31 @@ describe("agents view command parsing", () => {
 	});
 });
 
-describe("daemon rich TUI attach shortcut parsing", () => {
-	test("recognizes daemon active-session shorthand", () => {
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "d5c1e83e2182"])).toMatchObject({
-			selector: "d5c1e83e2182",
-		});
-	});
-
-	test("preserves explicit daemon client commands", () => {
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "attach", "d5c1e83e2182"])).toBeUndefined();
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "list"])).toBeUndefined();
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "create", "scratch"])).toBeUndefined();
-	});
-
-	test("carries daemon socket option into shorthand attach", () => {
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "--socket", "/tmp/prime.sock", "d5c1e83e2182"])).toEqual({
-			socketPath: "/tmp/prime.sock",
-			selector: "d5c1e83e2182",
-		});
-	});
-});
-
 describe("runtime session option resolution", () => {
+	test("keeps verifier goals per session instead of in the daemon fallback", () => {
+		const headlessCreateConfig = {
+			cwd: "/repo",
+			serializedRefine: true,
+			initialGoal: { objective: "solve the verifier task", tokenBudget: 100_000 },
+		};
+
+		expect(headlessCreateConfig.initialGoal).toEqual({
+			objective: "solve the verifier task",
+			tokenBudget: 100_000,
+		});
+		const daemonFallback = daemonServerDefaultSessionConfig(headlessCreateConfig);
+		expect(daemonFallback).toEqual({
+			cwd: "/repo",
+			serializedRefine: true,
+			initialGoal: undefined,
+		});
+		expect(
+			mergeAgentSessionRuntimeConfig(daemonFallback, {
+				initialGoal: headlessCreateConfig.initialGoal,
+			}),
+		).toMatchObject({ initialGoal: headlessCreateConfig.initialGoal });
+	});
+
 	test("preserves daemon-provided RLM heartbeat controller when creating sessions", () => {
 		const preparedModel = { id: "prepared-model" } as unknown as CreateAgentSessionOptions["model"];
 		const runtimeModel = { id: "runtime-model" } as unknown as CreateAgentSessionOptions["model"];
@@ -294,6 +419,12 @@ describe("runtime session option resolution", () => {
 			rlmDepth: 1,
 			rlmSessionDir: "/tmp/rlm-session",
 		});
+	});
+
+	test("preserves the runtime child parent-agent identity", () => {
+		const resolved = resolveRuntimeSessionOptions({}, { rlmDepth: 1, rlmParentAgent: "parent-worker" });
+
+		expect(resolved.rlmParentAgent).toBe("parent-worker");
 	});
 
 	test("deep-merges autonomous runtime session overrides", () => {
@@ -359,7 +490,8 @@ function makeSessionSummary(overrides: Partial<SessionSummary>): SessionSummary 
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount: 0,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		...overrides,
+		isSessionActive: overrides.isSessionActive ?? false,
 	};
 }

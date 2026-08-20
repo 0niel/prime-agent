@@ -2,14 +2,17 @@
  * Minimal TUI implementation with differential rendering
  */
 
+import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
+import { withFullscreenImageFallback } from "./components/image.js";
 import { FullscreenViewport, type ScrollInfo, type SelectionScrollDirection } from "./fullscreen.js";
 import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease, matchesKey } from "./keys.js";
 import { isMouseSequence, isWheelDown, isWheelUp, MOUSE_BUTTON_LEFT, parseSgrMouseEvent } from "./mouse.js";
+import type { TableCellSelectionRegion } from "./selection-metadata.js";
 import type { Terminal } from "./terminal.js";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
 import {
@@ -17,6 +20,7 @@ import {
 	normalizeTerminalOutput,
 	sliceByColumn,
 	sliceWithWidth,
+	stripAnsi,
 	visibleContentSpan,
 	visibleWidth,
 } from "./utils.js";
@@ -53,6 +57,8 @@ export interface Component {
 	 * @returns Array of strings, each representing a line
 	 */
 	render(width: number): string[];
+
+	getSelectionRegions?(): ReadonlyArray<TableCellSelectionRegion>;
 
 	/**
 	 * Optional handler for keyboard input when component has focus
@@ -195,6 +201,8 @@ export interface OverlayOptions {
 	row?: SizeValue;
 	/** Column position: absolute number, or percentage (e.g., "50%" = centered horizontally) */
 	col?: SizeValue;
+	/** Zero-width marker in base content; positions the overlay immediately above its row. */
+	aboveMarker?: string;
 
 	// === Margin from terminal edges ===
 	/** Margin from terminal edges. Number applies to all sides. */
@@ -236,23 +244,28 @@ export interface OverlayHandle {
  */
 export class Container implements Component {
 	children: Component[] = [];
+	private selectionRegions: TableCellSelectionRegion[] = [];
 
 	addChild(component: Component): void {
 		this.children.push(component);
+		this.selectionRegions = [];
 	}
 
 	removeChild(component: Component): void {
 		const index = this.children.indexOf(component);
 		if (index !== -1) {
 			this.children.splice(index, 1);
+			this.selectionRegions = [];
 		}
 	}
 
 	clear(): void {
 		this.children = [];
+		this.selectionRegions = [];
 	}
 
 	invalidate(): void {
+		this.selectionRegions = [];
 		for (const child of this.children) {
 			child.invalidate?.();
 		}
@@ -260,13 +273,28 @@ export class Container implements Component {
 
 	render(width: number): string[] {
 		const lines: string[] = [];
+		const selectionRegions: TableCellSelectionRegion[] = [];
 		for (const child of this.children) {
+			const lineOffset = lines.length;
 			const childLines = child.render(width);
+			for (const region of child.getSelectionRegions?.() ?? []) {
+				selectionRegions.push({
+					...region,
+					line: region.line + lineOffset,
+					tableTop: region.tableTop + lineOffset,
+					tableBottom: region.tableBottom + lineOffset,
+				});
+			}
 			for (const line of childLines) {
 				lines.push(line);
 			}
 		}
+		this.selectionRegions = selectionRegions;
 		return lines;
+	}
+
+	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
+		return this.selectionRegions;
 	}
 }
 
@@ -286,6 +314,8 @@ export class TUI extends Container {
 	public onDebug?: () => void;
 	/** Copies fullscreen mouse selections; when unset, OSC 52 is written directly. */
 	public onCopy?: (text: string) => void;
+	/** Opens hyperlinks clicked in the fullscreen viewport; when unset, the platform opener is used. */
+	public onOpenUrl?: (url: string) => void;
 	private renderRequested = false;
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
@@ -299,6 +329,8 @@ export class TUI extends Container {
 	private fullRedrawCount = 0;
 	private preserveViewportOnNextRender = false; // One-shot: repaint visible viewport in place instead of replaying scrollback
 	private stopped = false;
+	private fullscreenLeftMouseDragged = false;
+	private fullscreenPressedHyperlink: string | null = null;
 	private overlaySelectionRegions: FrameSelectionRegion[] = [];
 
 	// While set, doRender paints fixed frames via the viewport; the inline
@@ -522,6 +554,8 @@ export class TUI extends Container {
 		const enabled = this.shouldEnableFullscreenMouseTracking();
 		if (!enabled) {
 			this.stopSelectionAutoScroll();
+			this.fullscreenLeftMouseDragged = false;
+			this.fullscreenPressedHyperlink = null;
 			this.fullscreen?.viewport.clearSelection();
 		} else if (this.isFullscreenOverlayFocused()) {
 			this.stopSelectionAutoScroll();
@@ -646,6 +680,8 @@ export class TUI extends Container {
 	 */
 	enterFullscreen(options: FullscreenOptions): void {
 		if (this.fullscreen) return;
+		this.fullscreenLeftMouseDragged = false;
+		this.fullscreenPressedHyperlink = null;
 		this.fullscreen = {
 			viewport: new FullscreenViewport(),
 			scroll: options.scroll,
@@ -722,6 +758,36 @@ export class TUI extends Container {
 	/** Scroll state of the fullscreen window, or null when not fullscreen. */
 	getScrollInfo(): ScrollInfo | null {
 		return this.fullscreen?.viewport.scrollInfo() ?? null;
+	}
+
+	// Terminals gate their native link handling while mouse reporting is active
+	// (Ghostty only refreshes link hover when reporting is off or shift is held),
+	// so clicks the TUI consumes must open OSC 8 hyperlinks itself.
+	private openHyperlink(url: string): void {
+		if (/\p{Cc}/u.test(url)) return;
+		let href: string;
+		try {
+			const parsed = new URL(url);
+			if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+			href = parsed.href;
+		} catch {
+			return;
+		}
+		if (this.onOpenUrl) {
+			this.onOpenUrl(href);
+			return;
+		}
+		const [command, ...args] =
+			process.platform === "darwin"
+				? ["open", href]
+				: process.platform === "win32"
+					? [
+							path.win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "rundll32.exe"),
+							"url.dll,FileProtocolHandler",
+							href,
+						]
+					: ["xdg-open", href];
+		execFile(command, args, () => {});
 	}
 
 	private copySelection(text: string): void {
@@ -865,6 +931,14 @@ export class TUI extends Container {
 		if (isMouseSequence(data)) {
 			// consumed even when disabled — mouse reports are garbage downstream
 			const event = this.terminal.mouseTrackingActive ? parseSgrMouseEvent(data) : null;
+			const leftReleaseWasDrag =
+				event?.button === MOUSE_BUTTON_LEFT && !event.press ? this.fullscreenLeftMouseDragged : false;
+			if (event?.button === MOUSE_BUTTON_LEFT && event.press) {
+				this.fullscreenLeftMouseDragged = event.motion;
+				if (!event.motion) {
+					this.fullscreenPressedHyperlink = fullscreen.viewport.hyperlinkAt(event.y - 1, event.x - 1);
+				}
+			}
 			if (event && !overlayFocused) {
 				const viewport = fullscreen.viewport;
 				if (isWheelUp(event)) {
@@ -891,6 +965,10 @@ export class TUI extends Container {
 				} else if (!event.press) {
 					this.stopSelectionAutoScroll();
 					viewport.clearSelection();
+					if (event.button === MOUSE_BUTTON_LEFT && !event.motion && !leftReleaseWasDrag) {
+						const url = this.fullscreenPressedHyperlink ?? viewport.hyperlinkAt(event.y - 1, event.x - 1);
+						if (url) this.openHyperlink(url);
+					}
 				}
 			} else if (event && overlayFocused) {
 				this.stopSelectionAutoScroll();
@@ -909,7 +987,15 @@ export class TUI extends Container {
 					this.requestRender();
 				} else if (!event.press) {
 					viewport.clearSelection();
+					if (event.button === MOUSE_BUTTON_LEFT && !event.motion && !leftReleaseWasDrag) {
+						const url = this.fullscreenPressedHyperlink ?? viewport.hyperlinkAt(event.y - 1, event.x - 1);
+						if (url) this.openHyperlink(url);
+					}
 				}
+			}
+			if (event?.button === MOUSE_BUTTON_LEFT && !event.press) {
+				this.fullscreenLeftMouseDragged = false;
+				this.fullscreenPressedHyperlink = null;
 			}
 			return true;
 		}
@@ -1109,6 +1195,7 @@ export class TUI extends Container {
 			col: number;
 			w: number;
 			scrollback: boolean;
+			aboveMarker?: { line: number; col: number; offsetY: number };
 		}[] = [];
 		let minLinesNeeded = result.length;
 
@@ -1117,6 +1204,22 @@ export class TUI extends Container {
 		for (const entry of visibleEntries) {
 			const { component, options } = entry;
 			const scrollback = options?.scrollback === true;
+			let aboveMarker: { line: number; col: number; offsetY: number } | undefined;
+			if (options?.aboveMarker) {
+				for (let line = result.length - 1; line >= 0; line--) {
+					const markerIndex = result[line].indexOf(options.aboveMarker);
+					if (markerIndex === -1) continue;
+					aboveMarker = {
+						line,
+						col: visibleWidth(result[line].slice(0, markerIndex)),
+						offsetY: options.offsetY ?? 0,
+					};
+					result[line] =
+						result[line].slice(0, markerIndex) + result[line].slice(markerIndex + options.aboveMarker.length);
+					break;
+				}
+				if (!aboveMarker) continue;
+			}
 
 			// Get layout with height=0 first to determine width and maxHeight
 			// (width and maxHeight don't depend on overlay height)
@@ -1133,8 +1236,10 @@ export class TUI extends Container {
 			// Get final row/col with actual overlay height
 			const { row, col } = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
 
-			rendered.push({ component, overlayLines, row, col, w: width, scrollback });
-			minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
+			rendered.push({ component, overlayLines, row, col, w: width, scrollback, aboveMarker });
+			if (!aboveMarker) {
+				minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
+			}
 		}
 
 		// Pad to at least terminal height so overlays have screen-relative positions.
@@ -1150,8 +1255,27 @@ export class TUI extends Container {
 		const viewportStart = Math.max(0, workingHeight - termHeight);
 
 		// Composite each overlay
-		for (const { component, overlayLines, row, col, w, scrollback } of rendered) {
-			const overlayStart = scrollback ? Math.max(0, workingHeight - (row + overlayLines.length)) : viewportStart;
+		for (const renderedOverlay of rendered) {
+			const { component, w, scrollback, aboveMarker } = renderedOverlay;
+			let { overlayLines, row, col } = renderedOverlay;
+			if (aboveMarker) {
+				const markerRow = Math.max(1, aboveMarker.line - viewportStart + aboveMarker.offsetY);
+				if (markerRow >= termHeight) continue;
+				while (overlayLines.length > markerRow && stripAnsi(overlayLines[0] ?? "").trim().length === 0) {
+					overlayLines = overlayLines.slice(1);
+				}
+				while (overlayLines.length > markerRow && stripAnsi(overlayLines.at(-1) ?? "").trim().length === 0) {
+					overlayLines = overlayLines.slice(0, -1);
+				}
+				if (overlayLines.length > markerRow) {
+					overlayLines = overlayLines.slice(overlayLines.length - markerRow);
+				}
+				row = markerRow - overlayLines.length;
+				col = Math.max(0, Math.min(aboveMarker.col, termWidth - w));
+			}
+
+			const overlayStart =
+				scrollback && !aboveMarker ? Math.max(0, workingHeight - (row + overlayLines.length)) : viewportStart;
 			for (let i = 0; i < overlayLines.length; i++) {
 				const idx = overlayStart + row + i;
 				if (idx >= 0 && idx < result.length) {
@@ -1359,14 +1483,25 @@ export class TUI extends Container {
 		this.overlaySelectionRegions = [];
 
 		const transcript: string[] = [];
-		for (const component of fullscreen.scroll) {
-			for (const line of component.render(width)) {
-				transcript.push(line);
+		const selectionRegions: TableCellSelectionRegion[] = [];
+		const dock = withFullscreenImageFallback(() => {
+			for (const component of fullscreen.scroll) {
+				const lineOffset = transcript.length;
+				const componentLines = component.render(width);
+				for (const region of component.getSelectionRegions?.() ?? []) {
+					selectionRegions.push({
+						...region,
+						line: region.line + lineOffset,
+						tableTop: region.tableTop + lineOffset,
+						tableBottom: region.tableBottom + lineOffset,
+					});
+				}
+				transcript.push(...componentLines);
 			}
-		}
-		const dock = fullscreen.dock.render(width);
+			return fullscreen.dock.render(width);
+		});
 
-		let frame = fullscreen.viewport.composeFrame(transcript, dock, height);
+		let frame = fullscreen.viewport.composeFrame(transcript, dock, height, selectionRegions);
 		this.overlaySelectionRegions.push(
 			...this.createDockSelectionRegions(frame, fullscreen.viewport.windowHeight(), width),
 		);
@@ -1374,7 +1509,7 @@ export class TUI extends Container {
 		if (fullscreen.viewportControls && !scrollInfo.following) {
 			// Follow hint composited over the bottom of the transcript window,
 			// just above the dock. Overlays still paint on top of it.
-			const followKey = getKeybindings().getKeys("tui.viewport.follow")[0] ?? "alt+down";
+			const followKey = getKeybindings().getKeys("tui.viewport.follow")[0] ?? "ctrl+shift+down";
 			const label = ` ${followKey} to follow `;
 			const labelWidth = visibleWidth(label);
 			const row = fullscreen.viewport.windowHeight() - 1;
@@ -1384,7 +1519,7 @@ export class TUI extends Container {
 			}
 		}
 		if (this.overlayStack.length > 0) {
-			frame = this.compositeOverlays(frame, width, height);
+			frame = withFullscreenImageFallback(() => this.compositeOverlays(frame, width, height));
 		}
 		const cursorPos = this.extractCursorPosition(frame, height);
 		fullscreen.viewport.applyFrameSelection(frame, height, this.overlaySelectionRegions);

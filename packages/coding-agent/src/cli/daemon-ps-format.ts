@@ -20,7 +20,9 @@ export function formatDaemonListTable(daemons: readonly DaemonInfo[]): string {
 		uptime: formatUptime(daemon.uptimeSeconds),
 	}));
 	const table = formatTable(["socket", "pid", "version", "status", "sessions", "uptime"], rows, formatDaemonCell);
-	return daemons.some((daemon) => daemon.isDefault) ? `${table}\n\n${chalk.dim("* default daemon")}` : table;
+	return daemons.some((daemon) => daemon.isDefault)
+		? `${table}\n\n${chalk.dim("* default background service")}`
+		: table;
 }
 
 function formatDaemonCell(_row: DaemonRow, column: keyof DaemonRow, value: string): string {

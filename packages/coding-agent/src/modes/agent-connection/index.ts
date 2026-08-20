@@ -17,8 +17,10 @@ export type {
 	AgentConnectionExtensionUiRequest,
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionForkOptions,
+	AgentConnectionHeartbeat,
 	AgentConnectionLabelEntry,
 	AgentConnectionModel,
+	AgentConnectionModelCatalog,
 	AgentConnectionModelChangeEntry,
 	AgentConnectionModelCycleResult,
 	AgentConnectionNavigateTreeOptions,
@@ -26,6 +28,7 @@ export type {
 	AgentConnectionNewSessionOptions,
 	AgentConnectionParentMetadata,
 	AgentConnectionPromptOptions,
+	AgentConnectionQueuedMessageMutationStatus,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
 	AgentConnectionReplayInfo,
@@ -59,6 +62,7 @@ export type {
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
 	AgentConnectionSideQuestionEvent,
+	AgentConnectionSideQuestionTurn,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionSourceInfo,
@@ -70,3 +74,4 @@ export type {
 	AgentConnectionToolDefinition,
 	AgentConnectionUserMessage,
 } from "./types.js";
+export { AgentConnectionPromptAdmissionError } from "./types.js";

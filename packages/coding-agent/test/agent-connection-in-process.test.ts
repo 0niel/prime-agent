@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { describe, expect, it } from "vitest";
-import type { AgentSessionEvent, AgentSessionEventListener } from "../src/core/agent-session.js";
+import { getModel } from "@earendil-works/pi-ai";
+import { describe, expect, it, vi } from "vitest";
+import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
@@ -74,6 +75,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		thinkingLevel,
 		model: null,
 	});
+	const model = getModel("openai", "gpt-5.1");
 	const session = {
 		sessionManager: {
 			getCwd: () => `/tmp/${id}`,
@@ -97,12 +99,16 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		sessionName: `${id} name`,
 		autoCompactionEnabled: true,
 		messages,
-		pendingMessageCount: 0,
+		getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 		goalState: emptyGoalState(),
+		modelRegistry: {
+			refreshModelCatalog: async () => ({ models: model ? [model] : [], configuredProviders: ["openai"] }),
+		},
 		scopedModels: [],
 		getActiveToolNames: () => ["ipython"],
 		getContextUsage: () => undefined,
 		cancelRlmChildRun: (childId: string) => childId === "child-1",
+		getRlmChildSnapshots: () => [],
 		getToolDefinition: (toolName: string) => ({
 			name: toolName,
 			label: toolName,
@@ -137,6 +143,73 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 }
 
 describe("InProcessAgentConnection", () => {
+	it.each([
+		{ accepted: true, promptResult: "pending", expectedError: undefined },
+		{ accepted: false, promptResult: "resolve", expectedError: "Prompt was not accepted by the session." },
+		{ accepted: false, promptResult: "reject", expectedError: "real session error" },
+	] as const)(
+		"settles bare prompts from admission (accepted: $accepted, result: $promptResult)",
+		async ({ accepted, promptResult, expectedError }) => {
+			const session = createFakeSession("prompt-admission", []);
+			let finishTurn = () => {};
+			const turn = new Promise<void>((resolve) => {
+				finishTurn = resolve;
+			});
+			const prompt = vi.fn((_message: string, options?: PromptOptions) => {
+				options?.preflightResult?.(accepted);
+				if (promptResult === "pending") return turn;
+				if (promptResult === "reject") return Promise.reject(new Error("real session error"));
+				return Promise.resolve();
+			});
+			Object.assign(session.session, { prompt });
+			const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+			const result = expect(connection.prompt("hello"));
+
+			if (expectedError) await result.rejects.toThrow(expectedError);
+			else await result.resolves.toBeUndefined();
+			expect(prompt).toHaveBeenCalledWith(
+				"hello",
+				expect.objectContaining({ preflightResult: expect.any(Function) }),
+			);
+			finishTurn();
+		},
+	);
+	it("forwards prompt admission cancellation to the session", async () => {
+		const session = createFakeSession("prompt-cancellation", []);
+		const prompt = vi.fn(
+			(_message: string, options?: PromptOptions) =>
+				new Promise<void>((_resolve, reject) => {
+					options?.signal?.addEventListener("abort", () => reject(new Error("Prompt admission was cancelled.")), {
+						once: true,
+					});
+				}),
+		);
+		Object.assign(session.session, { prompt });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+		const controller = new AbortController();
+
+		const admission = connection.prompt("hello", { signal: controller.signal });
+		controller.abort();
+
+		await expect(admission).rejects.toThrow("Prompt admission was cancelled.");
+		expect(prompt).toHaveBeenCalledWith(
+			"hello",
+			expect.objectContaining({ signal: controller.signal, preflightResult: expect.any(Function) }),
+		);
+	});
+
+	it("loads the full model catalog through the connection boundary", async () => {
+		const session = createFakeSession("models", []);
+		const runtime = new FakeRuntime(session.session);
+		const connection = new InProcessAgentConnection(asRuntime(runtime));
+
+		const catalog = await connection.getModelCatalog();
+
+		expect(catalog.configuredProviders).toEqual(["openai"]);
+		expect(catalog.models).toHaveLength(1);
+		expect(catalog.models[0]).toMatchObject({ provider: "openai", id: "gpt-5.1" });
+	});
+
 	it("exposes serializable tool metadata without local execution or renderer callbacks", async () => {
 		const session = createFakeSession("tools", []);
 		const runtime = new FakeRuntime(session.session);
@@ -249,13 +322,19 @@ describe("InProcessAgentConnection", () => {
 		]);
 
 		events.length = 0;
-		oldSession.emit({ type: "queue_update", steering: ["old"], followUp: [] });
-		newSession.emit({ type: "queue_update", steering: ["new"], followUp: ["later"] });
+		oldSession.emit({ type: "session_action_update", actions: { queuedCount: 1, steering: ["old"], followUps: [] } });
+		newSession.emit({
+			type: "session_action_update",
+			actions: { queuedCount: 2, steering: ["new"], followUps: ["later"] },
+		});
 
 		expect(events).toEqual([
 			{
 				type: "session_event",
-				event: { type: "queue_update", steering: ["new"], followUp: ["later"] },
+				event: {
+					type: "session_action_update",
+					actions: { queuedCount: 2, steering: ["new"], followUps: ["later"] },
+				},
 			},
 		]);
 

@@ -3,6 +3,7 @@ import { homedir } from "os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "path";
 import { CONFIG_DIR_NAME } from "../config.js";
 import { parseFrontmatter } from "../utils/frontmatter.js";
+import { parseSlashCommand } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 
 /**
@@ -25,6 +26,8 @@ export function parseCommandArgs(argsString: string): string[] {
 	const args: string[] = [];
 	let current = "";
 	let inQuote: string | null = null;
+	// An explicitly quoted token is an argument even when empty ("" or '').
+	let quoted = false;
 
 	for (let i = 0; i < argsString.length; i++) {
 		const char = argsString[i];
@@ -37,17 +40,19 @@ export function parseCommandArgs(argsString: string): string[] {
 			}
 		} else if (char === '"' || char === "'") {
 			inQuote = char;
-		} else if (char === " " || char === "\t") {
-			if (current) {
+			quoted = true;
+		} else if (/[\t\p{Zs}]/u.test(char)) {
+			if (current || quoted) {
 				args.push(current);
 				current = "";
+				quoted = false;
 			}
 		} else {
 			current += char;
 		}
 	}
 
-	if (current) {
+	if (current || quoted) {
 		args.push(current);
 	}
 
@@ -104,12 +109,12 @@ export function substituteArgs(content: string, args: string[]): string {
 function loadTemplateFromFile(filePath: string, sourceInfo: SourceInfo): PromptTemplate | null {
 	try {
 		const rawContent = readFileSync(filePath, "utf-8");
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(rawContent);
+		const { frontmatter, body } = parseFrontmatter(rawContent);
 
 		const name = basename(filePath).replace(/\.md$/, "");
 
 		// Get description from frontmatter or first non-empty line
-		let description = frontmatter.description || "";
+		let description = typeof frontmatter.description === "string" ? frontmatter.description : "";
 		if (!description) {
 			const firstLine = body.split("\n").find((line) => line.trim());
 			if (firstLine) {
@@ -118,11 +123,12 @@ function loadTemplateFromFile(filePath: string, sourceInfo: SourceInfo): PromptT
 				if (firstLine.length > 60) description += "...";
 			}
 		}
+		const argumentHint = typeof frontmatter["argument-hint"] === "string" ? frontmatter["argument-hint"] : undefined;
 
 		return {
 			name,
 			description,
-			...(frontmatter["argument-hint"] && { argumentHint: frontmatter["argument-hint"] }),
+			...(argumentHint && { argumentHint }),
 			content: body,
 			sourceInfo,
 			filePath,
@@ -282,9 +288,10 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions): Prompt
 export function expandPromptTemplate(text: string, templates: PromptTemplate[]): string {
 	if (!text.startsWith("/")) return text;
 
-	const spaceIndex = text.indexOf(" ");
-	const templateName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-	const argsString = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return text;
+	const templateName = parsed.name;
+	const argsString = parsed.args;
 
 	const template = templates.find((t) => t.name === templateName);
 	if (template) {

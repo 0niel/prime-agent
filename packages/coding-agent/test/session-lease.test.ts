@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	acquireSessionLease,
 	canonicalSessionPath,
+	getWindowsProcessStartId,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 	SessionAlreadyActiveError,
@@ -34,6 +35,40 @@ function enabledEnvironment(owner: string): NodeJS.ProcessEnv {
 }
 
 describe("session leases", () => {
+	it("reads an invariant process start identity on Windows", () => {
+		const calls: Array<{ command: string; args: string[] }> = [];
+		const processStartId = getWindowsProcessStartId(42, (command, args) => {
+			calls.push({ command, args });
+			return "638880485801234567\r\n";
+		});
+
+		expect(processStartId).toBe("win:638880485801234567");
+		expect(calls).toEqual([
+			{
+				command: "powershell.exe",
+				args: [
+					"-NoLogo",
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					"([System.Diagnostics.Process]::GetProcessById(42)).StartTime.ToUniversalTime().Ticks",
+				],
+			},
+		]);
+	});
+
+	it("rejects invalid Windows process start identities", () => {
+		let queryCount = 0;
+		const query = () => {
+			queryCount++;
+			return "not-a-start-time";
+		};
+
+		expect(getWindowsProcessStartId(42, query)).toBeUndefined();
+		expect(getWindowsProcessStartId(0, query)).toBeUndefined();
+		expect(queryCount).toBe(1);
+	});
+
 	it("rejects a second live owner with a typed active-session error", () => {
 		const agentDir = createTempDir();
 		const sessionPath = join(agentDir, "session.jsonl");

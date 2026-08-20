@@ -4,6 +4,7 @@ import {
 	buildSessionContext,
 	type CompactionEntry,
 	type ModelChangeEntry,
+	type ServiceTierChangeEntry,
 	type SessionEntry,
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
@@ -60,12 +61,17 @@ function modelChange(id: string, parentId: string | null, provider: string, mode
 	return { type: "model_change", id, parentId, timestamp: "2025-01-01T00:00:00Z", provider, modelId };
 }
 
+function serviceTier(id: string, parentId: string | null, tier: "default" | "priority"): ServiceTierChangeEntry {
+	return { type: "service_tier_change", id, parentId, timestamp: "2025-01-01T00:00:00Z", serviceTier: tier };
+}
+
 describe("buildSessionContext", () => {
 	describe("trivial cases", () => {
 		it("empty entries returns empty context", () => {
 			const ctx = buildSessionContext([]);
 			expect(ctx.messages).toEqual([]);
 			expect(ctx.thinkingLevel).toBe("off");
+			expect(ctx.serviceTier).toBe("default");
 			expect(ctx.model).toBeNull();
 		});
 
@@ -99,6 +105,18 @@ describe("buildSessionContext", () => {
 			expect(ctx.messages).toHaveLength(2);
 		});
 
+		it("tracks service tier changes on the active branch", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "hello"),
+				serviceTier("2", "1", "priority"),
+				msg("3", "2", "assistant", "fast response"),
+				serviceTier("4", "1", "default"),
+			];
+
+			expect(buildSessionContext(entries, "3").serviceTier).toBe("priority");
+			expect(buildSessionContext(entries, "4").serviceTier).toBe("default");
+		});
+
 		it("tracks model from assistant message", () => {
 			const entries: SessionEntry[] = [msg("1", null, "user", "hello"), msg("2", "1", "assistant", "hi")];
 			const ctx = buildSessionContext(entries);
@@ -112,7 +130,6 @@ describe("buildSessionContext", () => {
 				msg("3", "2", "assistant", "hi"),
 			];
 			const ctx = buildSessionContext(entries);
-			// Assistant message overwrites model change
 			expect(ctx.model).toEqual({ provider: "anthropic", modelId: "claude-test" });
 		});
 	});
@@ -130,7 +147,6 @@ describe("buildSessionContext", () => {
 			];
 			const ctx = buildSessionContext(entries);
 
-			// Should have: summary + kept (3,4) + after (6,7) = 5 messages
 			expect(ctx.messages).toHaveLength(5);
 			expect((ctx.messages[0] as any).summary).toContain("Summary of first two turns");
 			expect((ctx.messages[1] as any).content).toBe("second");
@@ -148,7 +164,6 @@ describe("buildSessionContext", () => {
 			];
 			const ctx = buildSessionContext(entries);
 
-			// Summary + all messages (1,2,4)
 			expect(ctx.messages).toHaveLength(4);
 			expect((ctx.messages[0] as any).summary).toContain("Empty summary");
 		});
@@ -178,7 +193,6 @@ describe("buildSessionContext", () => {
 			];
 			const ctx = buildSessionContext(entries);
 
-			// Should use second summary, keep from 4
 			expect(ctx.messages).toHaveLength(4);
 			expect((ctx.messages[0] as any).summary).toContain("Second summary");
 		});
@@ -186,9 +200,6 @@ describe("buildSessionContext", () => {
 
 	describe("with branches", () => {
 		it("follows path to specified leaf", () => {
-			// Tree:
-			//   1 -> 2 -> 3 (branch A)
-			//         \-> 4 (branch B)
 			const entries: SessionEntry[] = [
 				msg("1", null, "user", "start"),
 				msg("2", "1", "assistant", "response"),
@@ -221,10 +232,6 @@ describe("buildSessionContext", () => {
 		});
 
 		it("complex tree with multiple branches and compaction", () => {
-			// Tree:
-			//   1 -> 2 -> 3 -> 4 -> compaction(5) -> 6 -> 7 (main path)
-			//              \-> 8 -> 9 (abandoned branch)
-			//                    \-> branchSummary(10) -> 11 (resumed from 3)
 			const entries: SessionEntry[] = [
 				msg("1", null, "user", "start"),
 				msg("2", "1", "assistant", "r1"),
@@ -233,15 +240,12 @@ describe("buildSessionContext", () => {
 				compaction("5", "4", "Compacted history", "3"),
 				msg("6", "5", "user", "q3"),
 				msg("7", "6", "assistant", "r3"),
-				// Abandoned branch from 3
 				msg("8", "3", "user", "wrong path"),
 				msg("9", "8", "assistant", "wrong response"),
-				// Branch summary resuming from 3
 				branchSummary("10", "3", "Tried wrong approach", "9"),
 				msg("11", "10", "user", "better approach"),
 			];
 
-			// Main path to 7: summary + kept(3,4) + after(6,7)
 			const ctxMain = buildSessionContext(entries, "7");
 			expect(ctxMain.messages).toHaveLength(5);
 			expect((ctxMain.messages[0] as any).summary).toContain("Compacted history");
@@ -250,7 +254,6 @@ describe("buildSessionContext", () => {
 			expect((ctxMain.messages[3] as any).content).toBe("q3");
 			expect((ctxMain.messages[4] as any).content[0].text).toBe("r3");
 
-			// Branch path to 11: 1,2,3 + branch_summary + 11
 			const ctxBranch = buildSessionContext(entries, "11");
 			expect(ctxBranch.messages).toHaveLength(5);
 			expect((ctxBranch.messages[0] as any).content).toBe("start");
@@ -274,7 +277,6 @@ describe("buildSessionContext", () => {
 				msg("2", "missing", "assistant", "orphan"), // parent doesn't exist
 			];
 			const ctx = buildSessionContext(entries, "2");
-			// Should only get the orphan since parent chain is broken
 			expect(ctx.messages).toHaveLength(1);
 		});
 	});

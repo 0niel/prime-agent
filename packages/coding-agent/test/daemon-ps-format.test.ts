@@ -42,7 +42,7 @@ describe("formatDaemonListTable", () => {
 		const lines = table.split("\n");
 		expect(lines[0]!.trim().split(/\s+/)).toEqual(["socket", "pid", "version", "status", "sessions", "uptime"]);
 		expect(table).toContain("/tmp/prime-agent-1000/daemon.sock *");
-		expect(table).toContain("* default daemon");
+		expect(table).toContain("* default background service");
 		expect(table).toContain("current");
 		expect(table).toContain("orphan-file");
 		expect(table).toContain("2h");
