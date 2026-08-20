@@ -7,7 +7,7 @@ RPC mode enables headless operation of the coding agent via a JSON protocol over
 ## Starting RPC Mode
 
 ```bash
-pi --mode rpc [options]
+prime-agent --mode rpc [options]
 ```
 
 Common options:
@@ -184,7 +184,12 @@ Response:
     "sessionName": "my-feature-work",
     "autoCompactionEnabled": true,
     "messageCount": 5,
-    "pendingMessageCount": 0
+    "unfinishedActionCount": 0,
+    "sessionActions": {
+      "queuedCount": 0,
+      "steering": [],
+      "followUps": []
+    }
   }
 }
 ```
@@ -210,6 +215,46 @@ Response:
 ```
 
 Messages are `AgentMessage` objects (see [Message Types](#message-types)).
+
+### Daemon Coordination
+
+RPC clients can use the same daemon-owned coordination features as the interactive client. These commands are additive; existing commands and event shapes are unchanged.
+
+| Command | Fields | Successful response data |
+|---------|--------|--------------------------|
+| `send_message` | `targetActiveSessionId`, `message`, optional `deliveryMode` (`auto`, `steer`, `follow_up`) | Agent-message delivery receipt |
+| `agent_messages_status` | none | Messaging safety status |
+| `agent_messages_pause` | none | Updated messaging safety status |
+| `agent_messages_resume` | none | Updated messaging safety status |
+| `agent_messages_clear` | none | `{ "cleared": number }` |
+| `list_schedules` | optional `includeInactive` | `{ "jobs": [...] }` |
+| `add_schedule` | `schedule`, `prompt` | `{ "job": {...} }` |
+| `cancel_schedule` | `jobId` | `{ "job": {...} }` |
+| `list_heartbeats` | none | `{ "heartbeats": [...] }` |
+| `get_heartbeat` | none | `{ "heartbeat": {...} }` or `null` |
+| `set_heartbeat` | `schedule`, `prompt`, optional `deliveryMode` (`steer`, `follow_up`) | `{ "heartbeat": {...} }` |
+| `update_heartbeat` | `action` (`pause`, `resume`, `clear`) | `{ "heartbeat": {...} }` or `null` |
+| `manage_heartbeat` | `activeSessionId`, `jobId`, `action` (`pause`, `resume`, `stop`) | `{ "heartbeat": {...} }` |
+
+Adding a schedule or heartbeat promotes an invocation-local RPC session to a resident daemon session so the scheduled work remains available after RPC stdin closes.
+
+Use `observe` to subscribe to another active root or subagent session:
+
+```json
+{"id":"watch-1","type":"observe","activeSessionId":"target-session-id"}
+```
+
+The response contains the target's current messages. Later target events are wrapped so they cannot be confused with events from the RPC client's own session:
+
+```json
+{"type":"observed_session_event","activeSessionId":"target-session-id","event":{"type":"agent_start"}}
+```
+
+When the target closes, RPC emits `observed_session_closed`. Stop watching explicitly with:
+
+```json
+{"type":"unobserve","activeSessionId":"target-session-id"}
+```
 
 ### Model
 
@@ -285,9 +330,9 @@ Set the reasoning/thinking level for models that support it.
 {"type": "set_thinking_level", "level": "high"}
 ```
 
-Levels: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`
+Levels: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`
 
-Note: `"xhigh"` is only supported by OpenAI codex-max models.
+Available levels depend on the current model.
 
 Response:
 ```json
@@ -714,9 +759,9 @@ Response:
   "success": true,
   "data": {
     "commands": [
-      {"name": "session-name", "description": "Set or clear session name", "source": "extension", "path": "/home/user/.pi/agent/extensions/session.ts"},
-      {"name": "fix-tests", "description": "Fix failing tests", "source": "prompt", "location": "project", "path": "/home/user/myproject/.pi/agent/prompts/fix-tests.md"},
-      {"name": "skill:brave-search", "description": "Web search via Brave API", "source": "skill", "location": "user", "path": "/home/user/.pi/agent/skills/brave-search/SKILL.md"}
+      {"name": "session-name", "description": "Set or clear session name", "source": "extension", "path": "/home/user/.prime/agent/extensions/session.ts"},
+      {"name": "fix-tests", "description": "Fix failing tests", "source": "prompt", "location": "project", "path": "/home/user/myproject/.prime/agent/prompts/fix-tests.md"},
+      {"name": "skill:brave-search", "description": "Web search via Brave API", "source": "skill", "location": "user", "path": "/home/user/.prime/agent/skills/brave-search/SKILL.md"}
     ]
   }
 }
@@ -730,8 +775,8 @@ Each command has:
   - `"prompt"`: Loaded from a prompt template `.md` file
   - `"skill"`: Loaded from a skill directory (name is prefixed with `skill:`)
 - `location`: Where it was loaded from (optional, not present for extensions):
-  - `"user"`: User-level (`~/.pi/agent/`)
-  - `"project"`: Project-level (`./.pi/agent/`)
+  - `"user"`: User-level (`~/.prime/agent/`)
+  - `"project"`: Project-level (`./.prime/agent/`)
   - `"path"`: Explicit path via CLI or settings
 - `path`: Absolute file path to the command source (optional)
 
@@ -755,7 +800,7 @@ Events are streamed to stdout as JSON lines during agent operation. Events do NO
 | `tool_execution_start` | Tool begins execution |
 | `tool_execution_update` | Tool execution progress (streaming output) |
 | `tool_execution_end` | Tool completes |
-| `queue_update` | Pending steering/follow-up queue changed |
+| `session_action_update` | Pending steering/follow-up queue changed |
 | `compaction_start` | Compaction begins |
 | `compaction_end` | Compaction completes |
 | `auto_retry_start` | Auto-retry begins (after transient error) |
@@ -893,15 +938,19 @@ When complete:
 
 Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update.
 
-### queue_update
+### session_action_update
 
-Emitted whenever the pending steering or follow-up queue changes.
+Emitted whenever literal queued actions or the active scheduler action changes.
 
 ```json
 {
-  "type": "queue_update",
-  "steering": ["Focus on error handling"],
-  "followUp": ["After that, summarize the result"]
+  "type": "session_action_update",
+  "actions": {
+    "queuedCount": 2,
+    "steering": ["Focus on error handling"],
+    "followUps": ["After that, summarize the result"],
+    "active": { "kind": "session_command", "phase": "running", "label": "/compact" }
+  }
 }
 ```
 
@@ -1132,7 +1181,7 @@ Set the terminal window/tab title. Fire-and-forget.
   "type": "extension_ui_request",
   "id": "uuid-8",
   "method": "setTitle",
-  "title": "pi - my project"
+  "title": "Prime Agent - my project"
 }
 ```
 
@@ -1319,7 +1368,7 @@ import subprocess
 import json
 
 proc = subprocess.Popen(
-    ["pi", "--mode", "rpc", "--no-session"],
+    ["prime-agent", "--mode", "rpc", "--no-session"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     text=True
@@ -1358,7 +1407,7 @@ For a complete example of handling the extension UI protocol, see [`examples/rpc
 const { spawn } = require("child_process");
 const { StringDecoder } = require("string_decoder");
 
-const agent = spawn("pi", ["--mode", "rpc", "--no-session"]);
+const agent = spawn("prime-agent", ["--mode", "rpc", "--no-session"]);
 
 function attachJsonlReader(stream, onLine) {
     const decoder = new StringDecoder("utf8");

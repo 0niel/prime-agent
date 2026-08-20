@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import {
+	DAEMON_COMMAND_COMPATIBILITY,
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_REVISION,
+} from "../src/modes/daemon/daemon-protocol.js";
 
 const netMock = vi.hoisted(() => {
 	type Listener = (...args: unknown[]) => void;
@@ -85,16 +90,22 @@ vi.mock("node:net", () => ({
 	createConnection: netMock.createConnection,
 }));
 
-function emitHello(socket: (typeof netMock.sockets)[number], version = 2): void {
+function emitHello(
+	socket: (typeof netMock.sockets)[number],
+	version = DAEMON_PROTOCOL_VERSION,
+	serverCapabilities: string[] = ["session_input_admission"],
+	schemaRevision?: number,
+): void {
 	socket.emit(
 		"data",
 		`${JSON.stringify({
 			type: "daemon_hello",
 			socketPath: "/tmp/prime-agent.sock",
 			protocol: { name: "prime-agent.daemon", version },
+			schemaRevision,
 			appVersion: "9.9.9",
 			clientId: "client-1",
-			serverCapabilities: [],
+			serverCapabilities,
 		})}\n`,
 	);
 }
@@ -190,6 +201,141 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("rejects unsupported optional commands without writing them to an older daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 3);
+
+		expect(client.supportsServerCapability("heartbeat_catalog")).toBe(false);
+		await expect(client.request({ type: "heartbeats_list" })).rejects.toThrow("does not support heartbeat_catalog");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("does not send subagent deletion to an old daemon without the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, []);
+
+		await expect(
+			client.request({ type: "delete_rlm_subagent", activeSessionId: "active-1", childId: "child-1" }),
+		).rejects.toThrow("does not support delete_rlm_subagent");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("sends subagent deletion to a capable daemon without requiring a schema bump", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["delete_rlm_subagent"], DAEMON_SCHEMA_REVISION - 1);
+
+		const request = client.request({
+			type: "delete_rlm_subagent",
+			activeSessionId: "active-1",
+			childId: "child-1",
+		});
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
+	it("rejects an old daemon before requesting session state", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION - 1);
+
+		await expect(client.request({ type: "get_state", activeSessionId: "active-1" })).rejects.toThrow(
+			"does not support get_state",
+		);
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("rejects session input admission clearly when an old daemon lacks the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, []);
+
+		await expect(
+			client.request({ type: "prompt", activeSessionId: "active-1", message: "hello", queueIfBusy: true }),
+		).rejects.toThrow("does not support session_input_admission");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("field-gates prompt admissionId before writing raw commands", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["session_input_admission", "prompt_admission_cancellation"], 3);
+
+		await expect(
+			client.request({ type: "prompt", activeSessionId: "active-1", message: "hello", admissionId: "a-1" }),
+		).rejects.toThrow("does not support prompt_admission_cancellation");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("accepts a newer compatible daemon schema for admission-gated prompts", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		const compatibility = DAEMON_COMMAND_COMPATIBILITY.cancel_prompt_admission;
+		emitHello(
+			socket,
+			compatibility.minProtocol,
+			["session_input_admission", "prompt_admission_cancellation"],
+			compatibility.minSchemaRevision + 1,
+		);
+
+		const request = client.request({
+			type: "prompt",
+			activeSessionId: "active-1",
+			message: "hello",
+			admissionId: "a-1",
+		});
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
+	it("isolates a message consumer failure from the rest of the client", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+		let delivered = 0;
+		client.onMessage(() => {
+			throw new Error("broken optional consumer");
+		});
+		client.onMessage(() => delivered++);
+
+		expect(() => socket.emit("data", `${JSON.stringify({ type: "heartbeats_changed" })}\n`)).not.toThrow();
+		expect(delivered).toBe(1);
+		client.close();
+	});
+
 	it("serializes activeSessionId for session commands", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 
@@ -213,7 +359,7 @@ describe("DaemonClient", () => {
 		expect(envelope).toMatchObject({
 			type: "command",
 			clientId: expect.any(String),
-			protocol: { name: "prime-agent.daemon", version: 2 },
+			protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
 			command: { type: "attach", activeSessionId: "active-1" },
 		});
 		expect(envelope.command).not.toHaveProperty("daemonSessionId");
@@ -271,42 +417,35 @@ describe("DaemonClient", () => {
 		});
 	});
 
-	it("keeps a raw one-release request path for v1 daemon handoff", async () => {
+	it("keeps durable command envelopes on the session-action protocol", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
 		const socket = netMock.sockets[0]!;
 		socket.emit("connect");
 		await connect;
-
-		const response = client.requestLegacy({ type: "prepare_update_restart" });
-		const command = JSON.parse(socket.writes[0]!.trim()) as { id: string; type: string };
-		expect(command.type).toBe("prepare_update_restart");
-		expect(command).not.toHaveProperty("protocol");
-		socket.emit(
-			"data",
-			`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`,
-		);
-		await expect(response).resolves.toMatchObject({ success: true });
-		client.close();
-	});
-
-	it("uses legacy framing automatically after a v1 daemon hello", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-		emitHello(socket, 1);
+		emitHello(socket, DAEMON_PROTOCOL_VERSION);
 
 		const response = client.request({ type: "create" });
-		const command = JSON.parse(socket.writes[0]!.trim()) as { id: string; type: string };
-		expect(command.type).toBe("create");
-		expect(command).not.toHaveProperty("protocol");
+		const request = JSON.parse(socket.writes[0]!.trim()) as {
+			id: string;
+			protocol: { version: number };
+		};
+		expect(request.protocol.version).toBe(DAEMON_PROTOCOL_VERSION);
+
 		socket.emit(
 			"data",
-			`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`,
+			`${JSON.stringify({ id: request.id, type: "response", command: "create", success: true })}\n`,
 		);
-		await expect(response).resolves.toMatchObject({ success: true });
+		await response;
+
+		const acknowledgement = JSON.parse(socket.writes[1]!.trim()) as {
+			protocol: { version: number };
+			command: { type: string; commandId: string };
+		};
+		expect(acknowledgement).toMatchObject({
+			protocol: { version: DAEMON_PROTOCOL_VERSION },
+			command: { type: "ack_result", commandId: request.id },
+		});
 		client.close();
 	});
 
@@ -468,7 +607,7 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
-	it("acknowledges durable mutating-command results on protocol v2", async () => {
+	it("acknowledges durable mutating-command results on the current protocol", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
 		const socket = netMock.sockets[0]!;
@@ -639,9 +778,9 @@ describe("DaemonClient", () => {
 			`${JSON.stringify({
 				type: "daemon_hello",
 				socketPath: "/tmp/prime-agent.sock",
-				protocol: { name: "prime-agent.daemon", version: 2 },
+				protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
 				clientId: "server-client-2",
-				serverCapabilities: [],
+				serverCapabilities: ["session_input_admission"],
 			})}\n`,
 		);
 		expect(secondSocket.writes).toEqual([firstWireData]);
@@ -693,6 +832,43 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("rejects a pending admission-gated prompt when the reconnected daemon is downgraded", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(
+			firstSocket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "prompt_admission_cancellation"],
+			DAEMON_SCHEMA_REVISION,
+		);
+
+		const response = client.request({
+			type: "prompt",
+			activeSessionId: "active-1",
+			message: "hello",
+			admissionId: "a-1",
+		});
+		expect(firstSocket.writes).toHaveLength(1);
+		firstSocket.emit("close");
+
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		// The replacement daemon no longer supports admission cancellation, so
+		// replaying would silently drop admissionId and take ownership.
+		emitHello(secondSocket, DAEMON_PROTOCOL_VERSION, ["session_input_admission"], DAEMON_SCHEMA_REVISION);
+
+		await expect(response).rejects.toThrow("does not support prompt_admission_cancellation");
+		expect(secondSocket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("reconnects raw clients and replays pending commands after supervisor replacement", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const firstConnect = client.connect();
@@ -721,7 +897,7 @@ describe("DaemonClient", () => {
 			`${JSON.stringify({
 				type: "daemon_hello",
 				socketPath: "/tmp/prime-agent.sock",
-				protocol: { name: "prime-agent.daemon", version: 2 },
+				protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
 				clientId: "server-client-2",
 				serverCapabilities: [],
 			})}\n`,

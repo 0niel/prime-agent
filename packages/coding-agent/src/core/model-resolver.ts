@@ -7,8 +7,10 @@ import { type Api, getLogger, type KnownProvider, type Model, modelsAreEqual } f
 import chalk from "chalk";
 import { minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.js";
+import { APP_NAME } from "../config.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { isPrivatePrimeInferenceModel } from "./prime-inference-models.js";
 
 const log = getLogger("coding-agent.model-resolver");
 
@@ -30,7 +32,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	"vercel-ai-gateway": "zai/glm-5.1",
 	xai: "grok-4.20-0309-reasoning",
 	groq: "openai/gpt-oss-120b",
-	cerebras: "zai-glm-4.7",
+	cerebras: "gpt-oss-120b",
 	zai: "glm-5.1",
 	mistral: "devstral-medium-latest",
 	minimax: "MiniMax-M2.7",
@@ -61,10 +63,7 @@ export interface ScopedModel {
  * Dates are typically in format: -20241022 or -20250929
  */
 function isAlias(id: string): boolean {
-	// Check if ID ends with -latest
 	if (id.endsWith("-latest")) return true;
-
-	// Check if ID ends with a date pattern (-YYYYMMDD)
 	const datePattern = /-\d{8}$/;
 	return !datePattern.test(id);
 }
@@ -127,8 +126,6 @@ function tryMatchModel(modelPattern: string, availableModels: Model<Api>[]): Mod
 	if (exactMatch) {
 		return exactMatch;
 	}
-
-	// No exact match - fall back to partial matching
 	const matches = availableModels.filter(
 		(m) =>
 			m.id.toLowerCase().includes(modelPattern.toLowerCase()) ||
@@ -138,17 +135,13 @@ function tryMatchModel(modelPattern: string, availableModels: Model<Api>[]): Mod
 	if (matches.length === 0) {
 		return undefined;
 	}
-
-	// Separate into aliases and dated versions
 	const aliases = matches.filter((m) => isAlias(m.id));
 	const datedVersions = matches.filter((m) => !isAlias(m.id));
 
 	if (aliases.length > 0) {
-		// Prefer alias - if multiple aliases, pick the one that sorts highest
 		aliases.sort((a, b) => b.id.localeCompare(a.id));
 		return aliases[0];
 	} else {
-		// No alias found, pick latest dated version
 		datedVersions.sort((a, b) => b.id.localeCompare(a.id));
 		return datedVersions[0];
 	}
@@ -214,16 +207,12 @@ export function parseModelPattern(
 	availableModels: Model<Api>[],
 	options?: { allowInvalidThinkingLevelFallback?: boolean },
 ): ParsedModelResult {
-	// Try exact match first
 	const exactMatch = tryMatchModel(pattern, availableModels);
 	if (exactMatch) {
 		return { model: exactMatch, thinkingLevel: undefined, warning: undefined };
 	}
-
-	// No match - try splitting on last colon if present
 	const lastColonIndex = pattern.lastIndexOf(":");
 	if (lastColonIndex === -1) {
-		// No colons, pattern simply doesn't match any model
 		return { model: undefined, thinkingLevel: undefined, warning: undefined };
 	}
 
@@ -231,10 +220,8 @@ export function parseModelPattern(
 	const suffix = pattern.substring(lastColonIndex + 1);
 
 	if (isValidThinkingLevel(suffix)) {
-		// Valid thinking level - recurse on prefix and use this level
 		const result = parseModelPattern(prefix, availableModels, options);
 		if (result.model) {
-			// Only use this thinking level if no warning from inner recursion
 			return {
 				model: result.model,
 				thinkingLevel: result.warning ? undefined : suffix,
@@ -243,15 +230,12 @@ export function parseModelPattern(
 		}
 		return result;
 	} else {
-		// Invalid suffix
 		const allowFallback = options?.allowInvalidThinkingLevelFallback ?? true;
 		if (!allowFallback) {
 			// In strict mode (CLI --model parsing), treat it as part of the model id and fail.
 			// This avoids accidentally resolving to a different model.
 			return { model: undefined, thinkingLevel: undefined, warning: undefined };
 		}
-
-		// Scope mode: recurse on prefix and warn
 		const result = parseModelPattern(prefix, availableModels, options);
 		if (result.model) {
 			return {
@@ -279,9 +263,7 @@ export function resolveModelScopeFromModels(patterns: string[], availableModels:
 	const scopedModels: ScopedModel[] = [];
 
 	for (const pattern of patterns) {
-		// Check if pattern contains glob characters
 		if (pattern.includes("*") || pattern.includes("?") || pattern.includes("[")) {
-			// Extract optional thinking level suffix (e.g., "provider/*:high")
 			const colonIdx = pattern.lastIndexOf(":");
 			let globPattern = pattern;
 			let thinkingLevel: ThinkingLevel | undefined;
@@ -293,8 +275,6 @@ export function resolveModelScopeFromModels(patterns: string[], availableModels:
 					globPattern = pattern.substring(0, colonIdx);
 				}
 			}
-
-			// Match against "provider/modelId" format OR just model ID
 			// This allows "*sonnet*" to match without requiring "anthropic/*sonnet*"
 			const matchingModels = availableModels.filter((m) => {
 				const fullId = `${m.provider}/${m.id}`;
@@ -327,8 +307,6 @@ export function resolveModelScopeFromModels(patterns: string[], availableModels:
 			console.warn(chalk.yellow(`Warning: No models match pattern "${pattern}"`));
 			continue;
 		}
-
-		// Avoid duplicates
 		if (!scopedModels.find((sm) => modelsAreEqual(sm.model, model))) {
 			scopedModels.push({ model, thinkingLevel });
 		}
@@ -338,7 +316,7 @@ export function resolveModelScopeFromModels(patterns: string[], availableModels:
 }
 
 export async function resolveModelScope(patterns: string[], modelRegistry: ModelRegistry): Promise<ScopedModel[]> {
-	const availableModels = await modelRegistry.getAvailable();
+	const availableModels = await modelRegistry.refreshAvailableModels();
 	return resolveModelScopeFromModels(patterns, availableModels);
 }
 
@@ -385,8 +363,6 @@ export function resolveCliModel(options: {
 			error: "No models available. Check your installation or add models to models.json.",
 		};
 	}
-
-	// Build canonical provider lookup (case-insensitive)
 	const providerMap = new Map<string, string>();
 	for (const m of availableModels) {
 		providerMap.set(m.provider.toLowerCase(), m.provider);
@@ -397,7 +373,7 @@ export function resolveCliModel(options: {
 		return {
 			model: undefined,
 			warning: undefined,
-			error: `Unknown provider "${cliProvider}". Use --list-models to see available providers/models.`,
+			error: `Unknown provider "${cliProvider}". Use "${APP_NAME} model list" to see available providers/models.`,
 		};
 	}
 
@@ -463,7 +439,6 @@ export function resolveCliModel(options: {
 		if (exact) {
 			return { model: exact, warning: undefined, thinkingLevel: undefined, error: undefined };
 		}
-		// Also try parseModelPattern on the full input against all models
 		const fallback = parseModelPattern(cliModel, availableModels, {
 			allowInvalidThinkingLevelFallback: false,
 		});
@@ -492,7 +467,7 @@ export function resolveCliModel(options: {
 		model: undefined,
 		thinkingLevel: undefined,
 		warning,
-		error: `Model "${display}" not found. Use --list-models to see available models.`,
+		error: `Model "${display}" not found. Use "${APP_NAME} model list" to see available models.`,
 	};
 }
 
@@ -533,8 +508,11 @@ export async function findInitialModel(options: {
 
 	let model: Model<Api> | undefined;
 	let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
-
-	// 1. CLI args take priority
+	let cachedAvailableModels: Model<Api>[] | undefined;
+	const getAvailableModels = async (): Promise<Model<Api>[]> => {
+		cachedAvailableModels ??= await modelRegistry.refreshAvailableModels();
+		return cachedAvailableModels;
+	};
 	if (cliProvider && cliModel) {
 		const resolved = resolveCliModel({
 			cliProvider,
@@ -546,12 +524,23 @@ export async function findInitialModel(options: {
 			console.error(chalk.red(resolved.error));
 			process.exit(1);
 		}
-		if (resolved.model) {
-			return { model: resolved.model, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+		const resolvedModel = resolved.model;
+		if (resolvedModel) {
+			if (isPrivatePrimeInferenceModel(resolvedModel)) {
+				const availableModel = (await getAvailableModels()).find((candidate) =>
+					modelsAreEqual(candidate, resolvedModel),
+				);
+				if (!availableModel) {
+					const error = `Model "${resolvedModel.provider}/${resolvedModel.id}" is not available for the current Prime team.`;
+					log.error(error, { cliProvider, cliModel });
+					console.error(chalk.red(error));
+					process.exit(1);
+				}
+				return { model: availableModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+			}
+			return { model: resolvedModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
 		}
 	}
-
-	// 2. Use first model from scoped models (skip if continuing/resuming)
 	if (scopedModels.length > 0 && !isContinuing) {
 		return {
 			model: scopedModels[0].model,
@@ -559,15 +548,18 @@ export async function findInitialModel(options: {
 			fallbackMessage: undefined,
 		};
 	}
-
-	// 3. Try saved default from settings
+	const availableModels = await getAvailableModels();
 	if (defaultProvider && defaultModelId) {
 		// Rebuild from the provider template when the saved id is missing from this
 		// build's snapshot (e.g. prime-inference catalog churn), so it survives updates.
 		const found =
-			modelRegistry.find(defaultProvider, defaultModelId) ??
-			buildFallbackModel(defaultProvider, defaultModelId, modelRegistry.getAll());
-		if (found && modelRegistry.hasConfiguredAuth(found)) {
+			availableModels.find(
+				(candidate) => candidate.provider === defaultProvider && candidate.id === defaultModelId,
+			) ??
+			(!isPrivatePrimeInferenceModel({ provider: defaultProvider, id: defaultModelId })
+				? buildFallbackModel(defaultProvider, defaultModelId, availableModels)
+				: undefined);
+		if (found) {
 			model = found;
 			if (defaultThinkingLevel) {
 				thinkingLevel = defaultThinkingLevel;
@@ -575,21 +567,13 @@ export async function findInitialModel(options: {
 			return { model, thinkingLevel, fallbackMessage: undefined };
 		}
 	}
-
-	// 4. Try first available model with valid API key
-	const availableModels = await modelRegistry.getAvailable();
-
 	if (availableModels.length > 0) {
 		const defaultModel = findPreferredDefaultModel(availableModels);
 		if (defaultModel) {
 			return { model: defaultModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
 		}
-
-		// If no default found, use first available
 		return { model: availableModels[0], thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
 	}
-
-	// 5. No model found
 	return { model: undefined, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
 }
 
@@ -603,40 +587,44 @@ export async function restoreModelFromSession(
 	shouldPrintMessages: boolean,
 	modelRegistry: ModelRegistry,
 ): Promise<{ model: Model<Api> | undefined; fallbackMessage: string | undefined }> {
-	const restoredModel = modelRegistry.find(savedProvider, savedModelId);
+	const availableModels = await modelRegistry.refreshAvailableModels();
+	const restoredModel = availableModels.find(
+		(candidate) => candidate.provider === savedProvider && candidate.id === savedModelId,
+	);
 
-	// Check if restored model exists and still has auth configured
-	const hasConfiguredAuth = restoredModel ? modelRegistry.hasConfiguredAuth(restoredModel) : false;
-
-	if (restoredModel && hasConfiguredAuth) {
+	if (restoredModel) {
 		if (shouldPrintMessages) {
 			console.log(chalk.dim(`Restored model: ${savedProvider}/${savedModelId}`));
 		}
 		return { model: restoredModel, fallbackMessage: undefined };
 	}
-
-	// Model not found or no API key - fall back
-	const reason = !restoredModel ? "model no longer exists" : "no auth configured";
+	const registeredModel = modelRegistry.find(savedProvider, savedModelId);
+	const reason = !registeredModel
+		? "model no longer exists"
+		: !modelRegistry.hasConfiguredAuth(registeredModel)
+			? "no auth configured"
+			: "model is not available";
 	log.warn("could not restore model", { provider: savedProvider, model: savedModelId, reason });
 
 	if (shouldPrintMessages) {
 		console.error(chalk.yellow(`Warning: Could not restore model ${savedProvider}/${savedModelId} (${reason}).`));
 	}
-
-	// If we already have a model, use it as fallback
-	if (currentModel) {
+	const availableCurrentModel = currentModel
+		? availableModels.find((candidate) => modelsAreEqual(candidate, currentModel))
+		: undefined;
+	const fallbackCurrentModel =
+		currentModel && (!isPrivatePrimeInferenceModel(currentModel) || availableCurrentModel)
+			? (availableCurrentModel ?? currentModel)
+			: undefined;
+	if (fallbackCurrentModel) {
 		if (shouldPrintMessages) {
-			console.log(chalk.dim(`Falling back to: ${currentModel.provider}/${currentModel.id}`));
+			console.log(chalk.dim(`Falling back to: ${fallbackCurrentModel.provider}/${fallbackCurrentModel.id}`));
 		}
 		return {
-			model: currentModel,
-			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${currentModel.provider}/${currentModel.id}.`,
+			model: fallbackCurrentModel,
+			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${fallbackCurrentModel.provider}/${fallbackCurrentModel.id}.`,
 		};
 	}
-
-	// Try to find any available model
-	const availableModels = await modelRegistry.getAvailable();
-
 	if (availableModels.length > 0) {
 		const fallbackModel = findPreferredDefaultModel(availableModels) ?? availableModels[0];
 
@@ -649,7 +637,5 @@ export async function restoreModelFromSession(
 			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${fallbackModel.provider}/${fallbackModel.id}.`,
 		};
 	}
-
-	// No models available
 	return { model: undefined, fallbackMessage: undefined };
 }

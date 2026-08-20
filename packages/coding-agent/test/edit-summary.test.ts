@@ -5,7 +5,7 @@ import type { AssistantMessage, ToolResultMessage, Usage } from "@earendil-works
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test } from "vitest";
 import {
-	FileChangeSummaryComponent,
+	formatFileChangeSummaryLine,
 	formatTotalChangeSummary,
 	getToolFileChanges,
 	mergeTurnFileChanges,
@@ -61,19 +61,6 @@ describe("edit summaries", () => {
 		).toEqual([{ path: "b.ts", added: 1, removed: 1 }]);
 	});
 
-	test("limits a collapsed tool summary to five files plus hidden totals", () => {
-		const changes = Array.from({ length: 7 }, (_, index) => ({
-			path: `src/${index}.ts`,
-			added: index + 1,
-			removed: 1,
-		}));
-		const lines = new FileChangeSummaryComponent(changes, "/tmp").render(80).map(stripAnsi);
-		expect(lines).toHaveLength(6);
-		expect(lines[0]).toBe("    ╰─ src/0.ts +1 -1");
-		expect(lines[4]).toBe("    ╰─ src/4.ts +5 -1");
-		expect(lines[5]).toBe("    ╰─ [2 more files +13 -2]");
-	});
-
 	test("renders one total line for all changed files in an agent run", () => {
 		const line = formatTotalChangeSummary([
 			{ path: "a.ts", added: 2, removed: 1 },
@@ -119,7 +106,7 @@ describe("edit summaries", () => {
 		expect([...changes.values()]).toEqual([{ path: "~/same.ts", added: 2, removed: 2 }]);
 	});
 
-	test("coalesces canonical paths and renders them relative to a symlinked cwd", () => {
+	test("coalesces canonical paths across a symlinked cwd", () => {
 		const root = mkdtempSync(join(tmpdir(), "edit-summary-symlink-"));
 		try {
 			const realCwd = join(root, "real");
@@ -145,10 +132,23 @@ describe("edit summaries", () => {
 			);
 
 			expect([...changes.values()]).toEqual([{ path: realpathSync(file), added: 2, removed: 2 }]);
-			const lines = new FileChangeSummaryComponent([...changes.values()], linkedCwd).render(80).map(stripAnsi);
-			expect(lines).toEqual(["    ╰─ same.ts +2 -2"]);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("formatFileChangeSummaryLine", () => {
+	beforeAll(() => initTheme("dark"));
+
+	test("keeps the truncated path stable when the ctrl+j hint flips", () => {
+		const change = { added: 3, removed: 1 };
+		const path = "src/some/deeply/nested/directory/with-a-long-file-name.ts";
+		const width = 44;
+		const pathPart = (line: string) => stripAnsi(line).replace(/\s*\+\d+ -\d+.*$/, "");
+		const expanded = formatFileChangeSummaryLine(path, undefined, change, true, width);
+		const collapsed = formatFileChangeSummaryLine(path, undefined, change, false, width);
+		expect(stripAnsi(expanded)).toContain("…");
+		expect(pathPart(expanded)).toBe(pathPart(collapsed));
 	});
 });

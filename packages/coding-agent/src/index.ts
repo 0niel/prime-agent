@@ -93,6 +93,7 @@ export type {
 	MessageRenderOptions,
 	ProviderConfig,
 	ProviderModelConfig,
+	RefineCompleteEvent,
 	RegisteredCommand,
 	RegisteredTool,
 	ResolvedCommand,
@@ -178,6 +179,7 @@ export {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./core/sdk.js";
+export type { SessionActionSnapshot } from "./core/session-action-store.js";
 export { SessionImportFileNotFoundError } from "./core/session-import-errors.js";
 export {
 	type BranchSummaryEntry,
@@ -284,6 +286,7 @@ export {
 } from "./modes/agent-connection/index.js";
 // Run modes for programmatic SDK usage
 export {
+	ClientPromptStashStore,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServices,
 	createInteractiveModeUiServicesFromServices,
@@ -314,12 +317,15 @@ export {
 	type DaemonResumeCursor,
 	type DaemonSessionSnapshot,
 	defaultDaemonSocketPath,
+	type InteractiveInitialPrompt,
 	InteractiveMode,
 	type InteractiveModeLocalSessionHost,
 	type InteractiveModeOptions,
 	type InteractiveModeUiServices,
 	type ModelInfo,
 	type PrintModeOptions,
+	type PromptStash,
+	type PromptStashState,
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCommand,
@@ -358,7 +364,6 @@ export {
 	type RenderDiffOptions,
 	rawKeyHint,
 	renderDiff,
-	SessionSelectorComponent,
 	type SettingsCallbacks,
 	type SettingsConfig,
 	SettingsSelectorComponent,

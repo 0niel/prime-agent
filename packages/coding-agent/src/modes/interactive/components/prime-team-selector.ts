@@ -25,6 +25,7 @@ export class PrimeTeamSelectorComponent extends Container implements Focusable {
 	private readonly allOptions: PrimeTeamOption[];
 	private filteredOptions: PrimeTeamOption[];
 	private selectedIndex = 0;
+	private searchQuery = "";
 	private _focused = false;
 	private listLayout = getMenuListLayout({
 		preferredVisibleItems: PREFERRED_VISIBLE_TEAMS,
@@ -76,10 +77,14 @@ export class PrimeTeamSelectorComponent extends Container implements Focusable {
 	}
 
 	private filterOptions(query: string): void {
+		const queryChanged = query !== this.searchQuery;
+		this.searchQuery = query;
 		this.filteredOptions = query
 			? fuzzyFilter(this.allOptions, query, (option) => this.getSearchText(option))
 			: this.allOptions;
-		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, Math.max(0, this.filteredOptions.length - 1)));
+		this.selectedIndex = queryChanged
+			? 0
+			: Math.max(0, Math.min(this.selectedIndex, Math.max(0, this.filteredOptions.length - 1)));
 		this.updateList();
 	}
 

@@ -1,4 +1,3 @@
-// TODO: reconsider whether the persistent kernel is needed once RLM-1 weights land.
 import { existsSync } from "node:fs";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
@@ -26,6 +25,7 @@ import asyncio
 import os as _prime_agent_os
 
 _prime_agent_os.environ["NO_COLOR"] = "1"
+get_ipython().colors = "nocolor"
 
 try:
     import nest_asyncio as _prime_agent_nest_asyncio
@@ -36,17 +36,31 @@ except Exception:
 try:
     import rlm as _prime_agent_rlm_module
     rlm = _prime_agent_rlm_module.rlm
+    import rlm.mcp as mcp
+    mcp.install_shutdown_hook()
 except Exception as _prime_agent_rlm_error:
     _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
 
     class _PrimeAgentMissingRlm:
-        async def run(self, prompt, **kwargs):
+        def _raise_missing(self):
             raise RuntimeError(
                 "prime-agent-runtime is not installed in this IPython kernel. "
                 "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
                 "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
+
+        async def run(self, prompt, **kwargs):
+            self._raise_missing()
+
+        async def find_models(self, query="", limit=8):
+            self._raise_missing()
+
+        async def list_subagents(self):
+            self._raise_missing()
+
+        async def delete_subagent(self, target):
+            self._raise_missing()
 
         async def __call__(self, prompt, **kwargs):
             return await self.run(prompt, **kwargs)
@@ -348,6 +362,13 @@ export class IpythonKernelProvisioner {
 	/** Whether a kernel has finished starting and is currently running. */
 	get hasRunningKernel(): boolean {
 		return this.startedManager?.isRunning ?? false;
+	}
+
+	/** Remove live variables above the snapshot's per-variable size limit. */
+	async pruneOversizedVariables(): Promise<string[] | null> {
+		const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
+		const result = await m?.pruneOversizedVariables();
+		return result ? (result.pruned ?? []) : null;
 	}
 
 	/** Live user-defined names in the kernel namespace, or null if listing failed / no kernel. */

@@ -15,7 +15,6 @@ import type {
 	StreamFunction,
 	StreamOptions,
 	TextContent,
-	ThinkingBudgets,
 	ThinkingContent,
 	ThinkingLevel,
 	ToolCall,
@@ -31,6 +30,7 @@ import type { GoogleThinkingLevel } from "./google-shared.js";
 import {
 	convertMessages,
 	convertTools,
+	getGoogleThinkingBudget,
 	isThinkingPart,
 	mapStopReason,
 	mapToolChoice,
@@ -47,7 +47,6 @@ export interface GoogleOptions extends StreamOptions {
 	};
 }
 
-// Counter for generating unique tool call IDs
 let toolCallCounter = 0;
 
 export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions> = (
@@ -178,7 +177,6 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 								currentBlock = null;
 							}
 
-							// Generate unique ID if not provided or if it's a duplicate
 							const providedId = part.functionCall.id;
 							const needsNewId =
 								!providedId || output.content.some((b) => b.type === "toolCall" && b.id === providedId);
@@ -295,7 +293,7 @@ export const streamSimpleGoogle: StreamFunction<"google-generative-ai", SimpleSt
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	if (!options?.reasoning) {
+	if (!options?.reasoning || options.reasoning === "off") {
 		return streamGoogle(model, context, { ...base, thinking: { enabled: false } } satisfies GoogleOptions);
 	}
 
@@ -317,7 +315,7 @@ export const streamSimpleGoogle: StreamFunction<"google-generative-ai", SimpleSt
 		...base,
 		thinking: {
 			enabled: true,
-			budgetTokens: getGoogleBudget(googleModel, effort, options.thinkingBudgets),
+			budgetTokens: getGoogleThinkingBudget(googleModel.id, effort, options.thinkingBudgets),
 		},
 	} satisfies GoogleOptions);
 };
@@ -465,46 +463,4 @@ function getThinkingLevel(effort: ClampedThinkingLevel, model: Model<"google-gen
 		case "high":
 			return "HIGH";
 	}
-}
-
-function getGoogleBudget(
-	model: Model<"google-generative-ai">,
-	effort: ClampedThinkingLevel,
-	customBudgets?: ThinkingBudgets,
-): number {
-	if (customBudgets?.[effort] !== undefined) {
-		return customBudgets[effort]!;
-	}
-
-	if (model.id.includes("2.5-pro")) {
-		const budgets: Record<ClampedThinkingLevel, number> = {
-			minimal: 128,
-			low: 2048,
-			medium: 8192,
-			high: 32768,
-		};
-		return budgets[effort];
-	}
-
-	if (model.id.includes("2.5-flash-lite")) {
-		const budgets: Record<ClampedThinkingLevel, number> = {
-			minimal: 512,
-			low: 2048,
-			medium: 8192,
-			high: 24576,
-		};
-		return budgets[effort];
-	}
-
-	if (model.id.includes("2.5-flash")) {
-		const budgets: Record<ClampedThinkingLevel, number> = {
-			minimal: 128,
-			low: 2048,
-			medium: 8192,
-			high: 24576,
-		};
-		return budgets[effort];
-	}
-
-	return -1;
 }

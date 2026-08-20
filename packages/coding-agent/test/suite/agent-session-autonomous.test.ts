@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	addAutonomousUsage,
 	createAutonomousRuntimeState,
@@ -326,7 +326,9 @@ describe("AgentSession autonomous mode", () => {
 			suppressAutonomousContinuation: true,
 		});
 		sessionInternals._compactionAbortController = undefined;
-		await harness.session.agent.continue();
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await vi.waitFor(() => expect(harness.session.queuedActionCount).toBe(0));
+		await harness.session.waitForSessionInputIdle();
 
 		expect(getAssistantTexts(harness)).toEqual(["Still failing."]);
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);

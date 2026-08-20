@@ -1,7 +1,12 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import { Box } from "../src/components/box.js";
+import { Image } from "../src/components/image.js";
+import { Markdown } from "../src/components/markdown.js";
 import type { TerminalStopOptions } from "../src/terminal.js";
-import { type Component, TUI } from "../src/tui.js";
+import { resetCapabilitiesCache, setCapabilities, setCellDimensions } from "../src/terminal-image.js";
+import { type Component, Container, TUI } from "../src/tui.js";
+import { defaultMarkdownTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
 class TestComponent implements Component {
@@ -61,7 +66,7 @@ const WHEEL_UP = "\x1b[<64;5;5M";
 const WHEEL_DOWN = "\x1b[<65;5;5M";
 const PAGE_UP = "\x1b[5~";
 const VIEWPORT_TOP = "\x1b[1;4A"; // shift+alt+up
-const FOLLOW = "\x1b[1;3B"; // alt+down
+const FOLLOW = "\x1b[1;6B"; // ctrl+shift+down
 
 interface Setup {
 	terminal: LoggingVirtualTerminal;
@@ -77,8 +82,6 @@ function setup(transcriptLines: string[], cols = 40, rows = 10): Setup {
 	chat.lines = transcriptLines;
 	const dock = new TestComponent();
 	dock.lines = ["> prompt", "footer"];
-	// Children drive inline rendering (before enter / after exit); the same
-	// components are passed explicitly as fullscreen scroll/dock roots.
 	tui.addChild(chat);
 	tui.addChild(dock);
 	tui.start();
@@ -109,7 +112,6 @@ describe("TUI fullscreen mode", () => {
 		assert.strictEqual(terminal.getActiveBufferType(), "alternate");
 		assert.strictEqual(terminal.mouseTrackingActive, true, "probe succeeds → wheel tracking enabled");
 
-		// rows=10, dock=2 → window shows the last 8 of 20 transcript lines
 		const viewport = terminal.getViewport();
 		assert.strictEqual(viewport[0], "Line 12");
 		assert.strictEqual(viewport[7], "Line 19");
@@ -117,6 +119,95 @@ describe("TUI fullscreen mode", () => {
 		assert.strictEqual(viewport[9], "footer");
 
 		tui.stop();
+	});
+
+	it("renders terminal images as compact metadata fallbacks", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		try {
+			const { terminal, tui, chat, dock } = setup(["before"], 80);
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{},
+				{ widthPx: 120, heightPx: 80 },
+			);
+			tui.enterFullscreen({ scroll: [chat, image], dock });
+			await terminal.waitForRender();
+
+			const viewport = terminal.getViewport();
+			const imageRow = viewport.indexOf("[image/png · 120×80]");
+			assert.strictEqual(viewport.indexOf("before") + 1, imageRow);
+			assert.strictEqual(viewport.filter((line) => line.includes("/fullscreen off to view")).length, 0);
+			assert.ok(!terminal.getWrites().includes("\x1b_G"));
+
+			tui.stop();
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("restores inline rendering after leaving fullscreen", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		try {
+			const terminal = new LoggingVirtualTerminal(80, 10);
+			const tui = new TUI(terminal);
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 2, fallbackOnly: false },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			const dock = new TestComponent();
+			dock.lines = ["> prompt"];
+			tui.addChild(image);
+			tui.start();
+			await terminal.waitForRender();
+			assert.ok(terminal.getWrites().includes("\x1b_G"));
+
+			tui.enterFullscreen({ scroll: [image], dock });
+			await terminal.waitForRender();
+			assert.ok(terminal.getViewport().includes("[image/png · 20×20]"));
+
+			tui.exitFullscreen({ flush: false });
+			assert.strictEqual(image.render(80).length, 2);
+			assert.ok(image.render(80).some((line) => line.includes("\x1b_G")));
+
+			tui.stop();
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("uses compact metadata for images in fullscreen overlays", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		try {
+			const { terminal, tui, chat, dock } = setup(["history"], 80);
+			tui.enterFullscreen({ scroll: [chat], dock });
+			tui.showOverlay(
+				new Image(
+					"AAAA",
+					"image/png",
+					{ fallbackColor: (value) => value },
+					{ fallbackOnly: false },
+					{ widthPx: 20, heightPx: 20 },
+				),
+				{ width: 30 },
+			);
+			await terminal.waitForRender();
+
+			assert.ok(!terminal.getWrites().includes("\x1b_G"));
+			assert.ok(terminal.getViewport().some((line) => line.includes("[image/png · 20×20]")));
+
+			tui.stop();
+		} finally {
+			resetCapabilitiesCache();
+		}
 	});
 
 	it("keeps the window pinned to the bottom while following", async () => {
@@ -155,7 +246,7 @@ describe("TUI fullscreen mode", () => {
 		assert.strictEqual(viewport[0], "Line 9", "appended content does not move the window");
 		assert.strictEqual(viewport[8], "> prompt", "dock still visible");
 		assert.strictEqual(tui.getScrollInfo()?.linesBelow, 23);
-		assert.ok(viewport[7]?.includes("to follow"), "follow hint composited above the dock");
+		assert.ok(viewport[7]?.includes("ctrl+shift+down to follow"), "follow hint composited above the dock");
 
 		tui.stop();
 	});
@@ -208,7 +299,6 @@ describe("TUI fullscreen mode", () => {
 
 		terminal.sendInput(PAGE_UP);
 		await terminal.waitForRender();
-		// window height 8 → page size 7; top was 22, now 15
 		assert.strictEqual(terminal.getViewport()[0], "Line 15");
 
 		terminal.sendInput(VIEWPORT_TOP);
@@ -629,7 +719,6 @@ describe("TUI fullscreen mode", () => {
 		tui.enterFullscreen({ scroll: [chat], dock });
 		await terminal.waitForRender();
 
-		// window shows lines 12-19; press on row 1 col 1, drag to row 2 col 6
 		terminal.sendInput("\x1b[<0;1;1M");
 		terminal.sendInput("\x1b[<32;6;2M");
 		await terminal.waitForRender();
@@ -638,6 +727,97 @@ describe("TUI fullscreen mode", () => {
 		terminal.sendInput("\x1b[<0;6;2m");
 		await terminal.waitForRender();
 		assert.deepStrictEqual(copies, ["Line 12\nLine"]);
+
+		tui.stop();
+	});
+
+	it("keeps wrapped table-cell selection inside the originating cell", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 12);
+		const tui = new TUI(terminal);
+		const markdown = new Markdown(
+			`| URL | Status |
+| --- | --- |
+| https://example.com/this/is/a/very/long/path | should-not-copy |`,
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const box = new Box(1, 0);
+		box.addChild(markdown);
+		const chat = new Container();
+		chat.addChild(box);
+		const dock = new TestComponent();
+		dock.lines = ["> prompt", "footer"];
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.addChild(chat);
+		tui.addChild(dock);
+		tui.start();
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const lines = chat.render(40);
+		const regions = chat
+			.getSelectionRegions()
+			.filter((region) => region.row === 1 && region.column === 0)
+			.sort((a, b) => a.segment - b.segment);
+		assert.ok(regions.length > 1, "URL cell should wrap across physical lines");
+		assert.ok(lines.length <= 10, "table should fit without scrolling");
+
+		const first = regions[0];
+		const last = regions.at(-1)!;
+		const expected = first.content;
+		terminal.sendInput(`\x1b[<0;${first.col + 1};${first.line + 1}M`);
+		terminal.sendInput(`\x1b[<32;${last.col + last.width + 1};${last.line + 1}M`);
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "cell selection should be highlighted");
+
+		terminal.sendInput(`\x1b[<0;${last.col + last.width + 1};${last.line + 1}m`);
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, [expected]);
+		assert.ok(!copies[0].includes("should-not-copy"));
+
+		tui.stop();
+	});
+
+	it("copies table selections as tab-separated content without borders", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 12);
+		const tui = new TUI(terminal);
+		const markdown = new Markdown(
+			`| Name | Score | City |
+| --- | --- | --- |
+| Avery | 87 | Seattle |
+| Jordan | 92 | Austin |
+| Morgan | 74 | Boston |`,
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const box = new Box(1, 0);
+		box.addChild(markdown);
+		const chat = new Container();
+		chat.addChild(box);
+		const dock = new TestComponent();
+		dock.lines = ["> prompt", "footer"];
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.addChild(chat);
+		tui.addChild(dock);
+		tui.start();
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const tableRegions = chat.getSelectionRegions();
+		const { tableTop: top, tableBottom: bottom, tableLeft: left, tableRight: right } = tableRegions[0];
+		terminal.sendInput(`\x1b[<0;${left};${top + 1}M`);
+		terminal.sendInput(`\x1b[<32;${right};${bottom + 1}M`);
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "table cell contents should be highlighted");
+
+		terminal.sendInput(`\x1b[<0;${right};${bottom + 1}m`);
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["Name\tScore\tCity\nAvery\t87\tSeattle\nJordan\t92\tAustin\nMorgan\t74\tBoston"]);
+		assert.ok(!/[┌┬┐├┼┤└┴┘│─]/.test(copies[0]));
 
 		tui.stop();
 	});
@@ -721,7 +901,6 @@ describe("TUI fullscreen mode", () => {
 		tui.enterFullscreen({ scroll: [chat], dock });
 		await terminal.waitForRender();
 
-		// rows=10 and dock=2, so the user prompt is visible at screen row 9.
 		terminal.sendInput("\x1b[<0;3;9M");
 		terminal.sendInput("\x1b[<32;9;9M");
 		await terminal.waitForRender();
@@ -747,6 +926,199 @@ describe("TUI fullscreen mode", () => {
 
 		const expected = Buffer.from("Line 12", "utf8").toString("base64");
 		assert.ok(terminal.getWrites().includes(`\x1b]52;c;${expected}\x07`));
+
+		tui.stop();
+	});
+
+	it("clicking an OSC 8 hyperlink opens it through the URL handler", async () => {
+		const transcript = lines(20);
+		transcript[12] = "see \x1b]8;;https://example.com/docs\x1b\\\x1b[36mdocs\x1b[39m\x1b]8;;\x1b\\ here";
+		const { terminal, tui, chat, dock } = setup(transcript);
+		const opened: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;6;1M");
+		terminal.sendInput("\x1b[<0;6;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, ["https://example.com/docs"]);
+
+		terminal.sendInput("\x1b[<0;2;1M");
+		terminal.sendInput("\x1b[<0;2;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, ["https://example.com/docs"]);
+
+		tui.stop();
+	});
+
+	it("clicking a bare URL opens it when OSC 8 metadata is absent", async () => {
+		const transcript = lines(20);
+		transcript[12] = "see https://example.com/docs here";
+		const { terminal, tui, chat, dock } = setup(transcript);
+		const opened: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;6;1M");
+		transcript[12] = "updated without the URL";
+		tui.requestRender();
+		await terminal.waitForRender();
+		terminal.sendInput("\x1b[<0;6;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, ["https://example.com/docs"]);
+
+		tui.stop();
+	});
+
+	it("clicking a hyperlink after a tab opens the painted target", async () => {
+		const transcript = lines(20);
+		transcript[12] = "\t\x1b]8;;https://example.com/docs\x1b\\docs\x1b]8;;\x1b\\";
+		const { terminal, tui, chat, dock } = setup(transcript);
+		const opened: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;4;1M");
+		terminal.sendInput("\x1b[<0;4;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, ["https://example.com/docs"]);
+
+		tui.stop();
+	});
+
+	it("drag-selecting over a hyperlink copies text without opening it", async () => {
+		const transcript = lines(20);
+		transcript[12] = "see \x1b]8;;https://example.com/docs\x1b\\docs\x1b]8;;\x1b\\ here";
+		const { terminal, tui, chat, dock } = setup(transcript);
+		const opened: string[] = [];
+		const copies: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;5;1M");
+		terminal.sendInput("\x1b[<32;9;1M");
+		terminal.sendInput("\x1b[<0;9;1m");
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, ["docs"]);
+		assert.deepStrictEqual(opened, []);
+
+		tui.stop();
+	});
+
+	it("does not open a link when a drag returns to its press cell", async () => {
+		const transcript = lines(20);
+		transcript[12] = "see \x1b]8;;https://example.com/docs\x1b\\docs\x1b]8;;\x1b\\ here";
+		const { terminal, tui, chat, dock } = setup(transcript);
+		const opened: string[] = [];
+		const copies: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;5;1M");
+		terminal.sendInput("\x1b[<32;9;1M");
+		terminal.sendInput("\x1b[<32;5;1M");
+		terminal.sendInput("\x1b[<0;5;1m");
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, []);
+		assert.deepStrictEqual(opened, []);
+
+		tui.stop();
+	});
+
+	it("does not open a link when a focused-overlay drag returns to its press cell", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
+		const opened: string[] = [];
+		const copies: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const overlay = new InputComponent();
+		overlay.lines = ["\x1b]8;;https://example.com/docs\x1b\\docs\x1b]8;;\x1b\\"];
+		tui.showOverlay(overlay, { anchor: "center", width: 20 });
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		const row = viewport.findIndex((line) => line.includes("docs"));
+		assert.notStrictEqual(row, -1);
+		const x = viewport[row]!.indexOf("docs") + 1;
+		const y = row + 1;
+		terminal.sendInput(`\x1b[<0;${x};${y}M`);
+		terminal.sendInput(`\x1b[<32;${x + 4};${y}M`);
+		terminal.sendInput(`\x1b[<32;${x};${y}M`);
+		terminal.sendInput(`\x1b[<0;${x};${y}m`);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, []);
+		assert.deepStrictEqual(opened, []);
+		assert.deepStrictEqual(overlay.inputs, []);
+
+		tui.stop();
+	});
+
+	it("ignores clicked hyperlinks with non-http schemes", async () => {
+		const transcript = lines(20);
+		transcript[12] = "\x1b]8;;file:///etc/passwd\x1b\\secrets\x1b]8;;\x1b\\";
+		const { terminal, tui, chat, dock } = setup(transcript);
+		const opened: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;3;1M");
+		terminal.sendInput("\x1b[<0;3;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, []);
+
+		tui.stop();
+	});
+
+	it("rejects malformed or control-character hyperlink URLs", async () => {
+		const transcript = lines(20);
+		transcript[12] =
+			"\x1b]8;;https://example.com/\x00bad\x1b\\nul\x1b]8;;\x1b\\ " +
+			"\x1b]8;;https://[invalid\x1b\\malformed\x1b]8;;\x1b\\ " +
+			"\x1b]8;;https://example.com/\u0085bad\x1b\\c1\x1b]8;;\x1b\\";
+		const { terminal, tui, chat, dock } = setup(transcript);
+		const opened: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<0;1;1m");
+		terminal.sendInput("\x1b[<0;6;1M");
+		terminal.sendInput("\x1b[<0;6;1m");
+		terminal.sendInput("\x1b[<0;15;1M");
+		terminal.sendInput("\x1b[<0;15;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, []);
+
+		tui.stop();
+	});
+
+	it("clicking a hyperlink in the dock opens it", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20));
+		dock.lines = ["\x1b]8;;https://example.com/login\x07sign in\x1b]8;;\x07", "footer"];
+		const opened: string[] = [];
+		tui.onOpenUrl = (url) => opened.push(url);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;3;9M");
+		terminal.sendInput("\x1b[<0;3;9m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(opened, ["https://example.com/login"]);
 
 		tui.stop();
 	});

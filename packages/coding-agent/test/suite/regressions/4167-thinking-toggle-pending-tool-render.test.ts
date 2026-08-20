@@ -42,7 +42,6 @@ type RenderSessionContextThis = {
 	ui: TUI;
 	settingsManager: {
 		getShowImages(): boolean;
-		getImageWidthCells(): number;
 	};
 	toolOutputExpanded: boolean;
 	isInitialized: boolean;
@@ -86,7 +85,6 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		ui: { requestRender: vi.fn() } as unknown as TUI,
 		settingsManager: {
 			getShowImages: () => false,
-			getImageWidthCells: () => 60,
 		},
 		toolOutputExpanded: false,
 		isInitialized: true,
@@ -141,6 +139,7 @@ function createSessionContext(messages: AgentMessage[]): AgentConnectionSessionC
 	return {
 		messages,
 		thinkingLevel: "off",
+		serviceTier: "default",
 		model: null,
 	};
 }

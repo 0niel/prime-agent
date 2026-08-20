@@ -254,15 +254,10 @@ describe("builtin skills", () => {
 			expect(rlmHeartbeat?.kind === "python" && rlmHeartbeat.python.importName).toBe("rlm_heartbeat");
 		});
 
-		it("loads the bundled orchestration heartbeat skill as a python skill", () => {
+		it("does not ship orchestration heartbeat as a built-in skill", () => {
 			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
 
-			const orchestrationHeartbeat = skills.find((s) => s.name === "orchestration-heartbeat");
-			expect(orchestrationHeartbeat).toBeDefined();
-			expect(orchestrationHeartbeat?.kind).toBe("python");
-			expect(orchestrationHeartbeat?.kind === "python" && orchestrationHeartbeat.python.importName).toBe(
-				"orchestration_heartbeat",
-			);
+			expect(skills.map((skill) => skill.name)).not.toContain("orchestration-heartbeat");
 		});
 
 		it("ships the edit skill as a python skill importable as `edit`", () => {
@@ -299,10 +294,7 @@ describe("builtin skills", () => {
 		});
 	});
 
-	// The bundled skills only reach a deployed agent if the build/release scripts
-	// copy skills/ into the shipped layout. A regression here resolves zero
-	// built-in skills at runtime even though the source tree looks correct
-	// (ENG-4220), so assert each shipping path still copies skills.
+	// Verify every shipping path includes bundled skills; source-only success would hide a release packaging regression.
 	describe("packaging ships bundled skills", () => {
 		const packageRoot = join(__dirname, "..");
 		const repoRoot = join(packageRoot, "..", "..");

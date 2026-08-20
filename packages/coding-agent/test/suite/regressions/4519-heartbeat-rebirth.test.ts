@@ -263,6 +263,7 @@ describe("ENG-4519 heartbeat rebirth", () => {
 		const activeSessionId = "active-session";
 		const runtime = { session: original.session };
 		const state = { activeSessionId, runtime } as unknown as ActiveSessionState;
+		internals.sessions.set(activeSessionId, state);
 		let releaseLock: () => void = () => {};
 		const lock = new Promise<void>((resolve) => {
 			releaseLock = resolve;

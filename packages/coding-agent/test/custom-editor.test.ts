@@ -1,4 +1,4 @@
-import type { AutocompleteProvider, EditorTheme, TUI } from "@earendil-works/pi-tui";
+import type { AutocompleteProvider, EditorTheme, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { CURSOR_MARKER, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
@@ -17,8 +17,18 @@ const editorTheme: EditorTheme = {
 	},
 };
 
+const fakeOverlayHandle: OverlayHandle = {
+	hide: vi.fn(),
+	setHidden: vi.fn(),
+	isHidden: () => false,
+	focus: vi.fn(),
+	unfocus: vi.fn(),
+	isFocused: () => false,
+};
+
 const fakeTui = {
 	requestRender: vi.fn(),
+	showOverlay: vi.fn(() => fakeOverlayHandle),
 	terminal: { rows: 24, columns: 80 },
 } as unknown as TUI;
 
@@ -66,6 +76,30 @@ describe("CustomEditor", () => {
 		expect(editor.isShowingAutocomplete()).toBe(false);
 		expect(handler).toHaveBeenCalledTimes(1);
 		expect(editor.getText()).toBe("/");
+	});
+
+	it("inserts a newline for a raw \\n byte instead of firing the ctrl+j edit-diff action", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const toggleEditDiffs = vi.fn();
+		editor.onAction("app.edits.expand", toggleEditDiffs);
+
+		editor.handleInput("a");
+		editor.handleInput("\n");
+		editor.handleInput("b");
+
+		expect(toggleEditDiffs).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("a\nb");
+	});
+
+	it("still fires the edit-diff action for kitty CSI-u ctrl+j", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const toggleEditDiffs = vi.fn();
+		editor.onAction("app.edits.expand", toggleEditDiffs);
+
+		editor.handleInput("\x1b[106;5u");
+
+		expect(toggleEditDiffs).toHaveBeenCalledOnce();
+		expect(editor.getText()).toBe("");
 	});
 
 	it("routes Escape through its handler while dismissing autocomplete", async () => {
@@ -172,6 +206,7 @@ describe("CustomEditor", () => {
 		const line = editor.render(40)[1]!;
 
 		expect(line).not.toContain(CURSOR_MARKER);
+		expect(line).toContain("\x1b_pi:autocomplete:");
 		expect(line).toContain("\x1b[7m \x1b[0mtype to start");
 	});
 
@@ -233,7 +268,7 @@ describe("CustomEditor", () => {
 	it("keeps the surface background across truncation resets in the header line", () => {
 		const backgroundColor = (text: string) => `<bg>${text}</bg>`;
 		const editor = new CustomEditor(fakeTui, { ...editorTheme, backgroundColor }, new KeybindingsManager());
-		editor.getHeaderLine = () => "x".repeat(100);
+		editor.getHeaderLine = () => `\x1b[31m${"x".repeat(100)}`;
 		const lines = editor.render(40);
 
 		const segments = lines[1]!.split("\x1b[0m");

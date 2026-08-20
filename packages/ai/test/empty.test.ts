@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { getModel } from "../src/models.js";
 import { complete } from "../src/stream.js";
 import type { Api, AssistantMessage, Context, Model, StreamOptions, UserMessage } from "../src/types.js";
+import { getKimiCodingTestModel } from "./kimi-test-model.js";
+import { getZaiTestModel } from "./zai-test-model.js";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -10,7 +12,6 @@ import { hasBedrockCredentials } from "./bedrock-utils.js";
 import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.js";
 import { resolveApiKey } from "./oauth.js";
 
-// Resolve OAuth tokens at module level (async, runs before tests)
 const oauthTokens = await Promise.all([
 	resolveApiKey("anthropic"),
 	resolveApiKey("github-copilot"),
@@ -19,7 +20,6 @@ const oauthTokens = await Promise.all([
 const [anthropicOAuthToken, githubCopilotToken, openaiCodexToken] = oauthTokens;
 
 async function testEmptyMessage<TApi extends Api>(llm: Model<TApi>, options: StreamOptionsWithExtras = {}) {
-	// Test with completely empty content array
 	const emptyMessage: UserMessage = {
 		role: "user",
 		content: [],
@@ -32,10 +32,8 @@ async function testEmptyMessage<TApi extends Api>(llm: Model<TApi>, options: Str
 
 	const response = await complete(llm, context, options);
 
-	// Should either handle gracefully or return an error
 	expect(response).toBeDefined();
 	expect(response.role).toBe("assistant");
-	// Should handle empty string gracefully
 	if (response.stopReason === "error") {
 		expect(response.errorMessage).toBeDefined();
 	} else {
@@ -44,7 +42,6 @@ async function testEmptyMessage<TApi extends Api>(llm: Model<TApi>, options: Str
 }
 
 async function testEmptyStringMessage<TApi extends Api>(llm: Model<TApi>, options: StreamOptionsWithExtras = {}) {
-	// Test with empty string content
 	const context: Context = {
 		messages: [
 			{
@@ -60,7 +57,6 @@ async function testEmptyStringMessage<TApi extends Api>(llm: Model<TApi>, option
 	expect(response).toBeDefined();
 	expect(response.role).toBe("assistant");
 
-	// Should handle empty string gracefully
 	if (response.stopReason === "error") {
 		expect(response.errorMessage).toBeDefined();
 	} else {
@@ -69,7 +65,6 @@ async function testEmptyStringMessage<TApi extends Api>(llm: Model<TApi>, option
 }
 
 async function testWhitespaceOnlyMessage<TApi extends Api>(llm: Model<TApi>, options: StreamOptionsWithExtras = {}) {
-	// Test with whitespace-only content
 	const context: Context = {
 		messages: [
 			{
@@ -85,7 +80,6 @@ async function testWhitespaceOnlyMessage<TApi extends Api>(llm: Model<TApi>, opt
 	expect(response).toBeDefined();
 	expect(response.role).toBe("assistant");
 
-	// Should handle whitespace-only gracefully
 	if (response.stopReason === "error") {
 		expect(response.errorMessage).toBeDefined();
 	} else {
@@ -94,8 +88,6 @@ async function testWhitespaceOnlyMessage<TApi extends Api>(llm: Model<TApi>, opt
 }
 
 async function testEmptyAssistantMessage<TApi extends Api>(llm: Model<TApi>, options: StreamOptionsWithExtras = {}) {
-	// Test with empty assistant message in conversation flow
-	// User -> Empty Assistant -> User
 	const emptyAssistant: AssistantMessage = {
 		role: "assistant",
 		content: [],
@@ -135,7 +127,6 @@ async function testEmptyAssistantMessage<TApi extends Api>(llm: Model<TApi>, opt
 	expect(response).toBeDefined();
 	expect(response.role).toBe("assistant");
 
-	// Should handle empty assistant message in context gracefully
 	if (response.stopReason === "error") {
 		expect(response.errorMessage).toBeDefined();
 	} else {
@@ -368,7 +359,7 @@ describe("AI Providers Empty Message Tests", () => {
 	});
 
 	describe.skipIf(!process.env.ZAI_API_KEY)("zAI Provider Empty Messages", () => {
-		const llm = getModel("zai", "glm-4.5-air");
+		const llm = getZaiTestModel();
 
 		it("should handle empty content array", { retry: 3, timeout: 30000 }, async () => {
 			await testEmptyMessage(llm);
@@ -517,7 +508,7 @@ describe("AI Providers Empty Message Tests", () => {
 	);
 
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider Empty Messages", () => {
-		const llm = getModel("kimi-coding", "kimi-k2-thinking");
+		const llm = getKimiCodingTestModel();
 
 		it("should handle empty content array", { retry: 3, timeout: 30000 }, async () => {
 			await testEmptyMessage(llm);
@@ -575,10 +566,6 @@ describe("AI Providers Empty Message Tests", () => {
 			await testEmptyAssistantMessage(llm);
 		});
 	});
-
-	// =========================================================================
-	// OAuth-based providers (credentials from ~/.pi/agent/oauth.json)
-	// =========================================================================
 
 	describe("Anthropic OAuth Provider Empty Messages", () => {
 		const llm = getModel("anthropic", "claude-haiku-4-5");

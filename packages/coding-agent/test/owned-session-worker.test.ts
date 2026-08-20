@@ -1,19 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { PUBLIC_COMMAND_NAMES } from "../src/cli/command-registry.js";
 import {
 	classifyOwnedSessionWorkerInvocation,
 	createOwnedWorkerLaunchSpec,
 	createRpcRecoveryArgs,
+	isOwnedSessionWorkerProcess,
 } from "../src/cli/owned-session-worker.js";
 
 describe("owned session worker CLI routing", () => {
-	it("routes every headless surface to an owned worker", () => {
-		expect(classifyOwnedSessionWorkerInvocation(["-p", "hello"], true, {})).toBe("print");
-		expect(classifyOwnedSessionWorkerInvocation([], false, {})).toBe("print");
-		expect(classifyOwnedSessionWorkerInvocation(["--mode", "json", "hello"], true, {})).toBe("json");
-		expect(classifyOwnedSessionWorkerInvocation(["--mode", "rpc"], true, {})).toBe("rpc");
-		expect(classifyOwnedSessionWorkerInvocation(["--no-session"], true, {})).toBe("interactive-ephemeral");
-	});
-
 	it("leaves resident interactive and non-session operations in the frontend", () => {
 		expect(classifyOwnedSessionWorkerInvocation([], true, {})).toBeUndefined();
 		expect(classifyOwnedSessionWorkerInvocation(["--mode", "daemon"], false, {})).toBeUndefined();
@@ -21,10 +15,17 @@ describe("owned session worker CLI routing", () => {
 		expect(classifyOwnedSessionWorkerInvocation(["--version"], false, {})).toBeUndefined();
 		expect(classifyOwnedSessionWorkerInvocation(["--list-models"], false, {})).toBeUndefined();
 		expect(classifyOwnedSessionWorkerInvocation(["--export", "session.jsonl"], false, {})).toBeUndefined();
+		expect(classifyOwnedSessionWorkerInvocation(["help"], false, {})).toBeUndefined();
+		expect(classifyOwnedSessionWorkerInvocation(["help", "me", "fix", "this"], false, {})).toBe("print");
 		expect(classifyOwnedSessionWorkerInvocation(["daemon", "list"], false, {})).toBeUndefined();
+		for (const command of PUBLIC_COMMAND_NAMES) {
+			expect(classifyOwnedSessionWorkerInvocation([command], false, {})).toBeUndefined();
+		}
 	});
 
 	it("does not recursively route an owned worker", () => {
+		expect(isOwnedSessionWorkerProcess({ PRIME_AGENT_INTERNAL_OWNED_WORKER: "1" })).toBe(true);
+		expect(isOwnedSessionWorkerProcess({})).toBe(false);
 		expect(
 			classifyOwnedSessionWorkerInvocation(["--mode", "rpc"], true, {
 				PRIME_AGENT_INTERNAL_OWNED_WORKER: "1",
