@@ -609,7 +609,6 @@ Explicit override.`,
 
 	describe("extension conflict detection", () => {
 		it("should detect tool conflicts between extensions", async () => {
-			// Create two extensions that register the same tool
 			const ext1Dir = join(agentDir, "extensions", "ext1");
 			const ext2Dir = join(agentDir, "extensions", "ext2");
 			mkdirSync(ext1Dir, { recursive: true });

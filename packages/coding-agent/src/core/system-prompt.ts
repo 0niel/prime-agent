@@ -43,6 +43,8 @@ export interface BuildSystemPromptOptions {
 	rlmParentAgent?: string;
 	/** Global harness state to inject as compact persistent context. */
 	harnessState?: HarnessState;
+	/** Enabled user-configured servers available through the generic kernel MCP API. */
+	genericMcpServers?: string[];
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -83,6 +85,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
 	const visiblePythonSkillImportNames = getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName);
 	const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
+	const genericMcpSection = hasIpython ? formatGenericMcpGuidance(options.genericMcpServers) : "";
 
 	if (resolvedSystemPromptSource.provenance === "custom") {
 		let prompt = resolvedSystemPromptSource.content;
@@ -121,6 +124,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
 		}
 
+		if (genericMcpSection) {
+			prompt += `\n\n${genericMcpSection}`;
+		}
+
 		if (appendSection) {
 			prompt += appendSection;
 		}
@@ -154,6 +161,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	if (harnessState) {
 		prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
+	}
+
+	if (genericMcpSection) {
+		prompt += `\n\n${genericMcpSection}`;
 	}
 
 	const guidelines = formatPromptGuidelines(promptGuidelines);
@@ -206,6 +217,22 @@ function isSystemPromptSource(value: unknown): value is SystemPromptSource {
 		keys.length === 2 &&
 		keys.includes("content")
 	);
+}
+
+function formatGenericMcpGuidance(servers: string[] | undefined): string {
+	const enabledServers = [...new Set(servers ?? [])].sort((left, right) => left.localeCompare(right));
+	if (enabledServers.length === 0) return "";
+
+	return [
+		"# Generic MCP Connections",
+		"",
+		"Generic MCP connections are accessed through the pre-imported Python `mcp` object in IPython, not as top-level native tool namespaces or installed Python skills.",
+		`Enabled user-configured generic MCP servers: ${enabledServers.map((server) => `\`${server}\``).join(", ")}.`,
+		...enabledServers.map(
+			(server) =>
+				`For \`${server}\`, first discover its tools with \`await mcp.list_tools("${server}")\`, then call one with \`await mcp.call_tool("${server}", "<tool>", arguments)\`.`,
+		),
+	].join("\n");
 }
 
 function formatPromptGuidelines(promptGuidelines: string[] | undefined): string {
