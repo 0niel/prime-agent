@@ -1,0 +1,105 @@
+name: Update model catalog
+
+on:
+  schedule:
+    # Daily at 05:17 UTC; off the top of the hour to dodge the cron rush.
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-model-catalog
+  cancel-in-progress: false
+
+env:
+  UPDATE_BRANCH: bot/update-model-catalog
+  CATALOG_FILE: packages/ai/src/models.generated.ts
+
+jobs:
+  regenerate:
+    name: Regenerate and open PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        # Credentials stay persisted (checkout default): the push step below
+        # needs them. The job only ever pushes to $UPDATE_BRANCH.
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      # npm ci runs every workspace's install scripts, and some need the same
+      # native libraries CI installs (node-canvas builds against cairo/pango).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Regenerate model catalog
+        working-directory: packages/ai
+        run: npm run generate-models
+
+      - name: Guard against gutted providers
+        # generate-models exits 0 even when a source fetch fails, and most
+        # failed sources fall back to an empty list rather than the committed
+        # snapshot. A large drop in total models means a source silently
+        # failed, so refuse to open a PR from that state.
+        run: |
+          old=$(git show "HEAD:$CATALOG_FILE" | grep -c 'satisfies Model')
+          new=$(grep -c 'satisfies Model' "$CATALOG_FILE")
+          echo "Committed snapshot: $old models; regenerated: $new models"
+          if [ "$new" -lt $(( old * 9 / 10 )) ]; then
+            echo "::error::Regenerated catalog dropped from $old to $new models; a provider fetch likely failed."
+            exit 1
+          fi
+
+      - name: Detect changes
+        id: diff
+        run: |
+          if git diff --quiet -- "$CATALOG_FILE"; then
+            echo "Catalog unchanged; nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --stat -- "$CATALOG_FILE"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update pull request
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Note: PRs opened with the default GITHUB_TOKEN do not trigger
+        # pull_request workflows (CI). Push to the branch or close/reopen the
+        # PR to run CI, or swap github.token for a PAT/App token here.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          old=$(git show "HEAD:$CATALOG_FILE" | grep -c 'satisfies Model')
+          new=$(grep -c 'satisfies Model' "$CATALOG_FILE")
+
+          git switch -c "$UPDATE_BRANCH"
+          git add "$CATALOG_FILE"
+          git commit -m "chore(ai): refresh the generated model catalog from live provider catalogs"
+          git push -f origin "$UPDATE_BRANCH"
+
+          open_prs=$(gh pr list --head "$UPDATE_BRANCH" --base main --state open --json number --jq length)
+          if [ "$open_prs" = "0" ]; then
+            gh pr create \
+              --base main \
+              --head "$UPDATE_BRANCH" \
+              --title "chore(ai): refresh the generated model catalog from live provider catalogs" \
+              --body "$(printf 'Automated daily refresh of `%s` from the live provider catalogs (models.dev, OpenRouter, Vercel AI Gateway, Prime Inference).\n\nModel count: %s -> %s. Review the diff for pricing changes, renames, and removals before merging.\n\nCI does not run automatically on PRs opened by the workflow token; push to the branch or close/reopen to trigger it.' "$CATALOG_FILE" "$old" "$new")"
+          else
+            echo "Open PR for $UPDATE_BRANCH already exists; force-pushed the refreshed catalog to it."
+          fi
