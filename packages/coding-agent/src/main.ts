@@ -532,7 +532,6 @@ function buildSessionOptions(
 		}
 		if (resolved.error) {
 			diagnostics.push({ type: "error", message: resolved.error });
-			// A stale catalog heals for the next resolution; never blocks.
 			void modelRegistry.refreshRemoteModelCatalog();
 		}
 		if (resolved.model) {

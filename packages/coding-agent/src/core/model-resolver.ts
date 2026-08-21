@@ -318,7 +318,6 @@ export function resolveModelScopeFromModels(patterns: string[], availableModels:
 export async function resolveModelScope(patterns: string[], modelRegistry: ModelRegistry): Promise<ScopedModel[]> {
 	const availableModels = await modelRegistry.refreshAvailableModels();
 	const scopedModels = resolveModelScopeFromModels(patterns, availableModels);
-	// A stale catalog heals for the next resolution; never blocks.
 	if (scopedModels.length === 0 && patterns.length > 0) void modelRegistry.refreshRemoteModelCatalog();
 	return scopedModels;
 }

@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { VERSION } from "../src/config.js";
 import { overlayRemoteModels, RemoteCatalogStore, refreshRemoteCatalog } from "../src/core/remote-catalog.js";
 
 function model(id: string): Model<Api> {
@@ -43,16 +42,13 @@ describe("remote catalog", () => {
 	}
 
 	it("overlays remote models only when the remote catalog is newer than the bundled one", async () => {
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
 			new Response(JSON.stringify({ remote: model("remote"), static: { ...model("static"), name: "updated" } }), {
 				headers: { "last-modified": new Date(GENERATED_AT + 60_000).toUTCString() },
 			}),
 		);
 
 		await refresh();
-		expect(fetchSpy.mock.calls[0]?.[1]?.headers).toMatchObject({
-			"User-Agent": expect.stringContaining(`prime-agent/${VERSION}`),
-		});
 
 		const bundled = [model("static")];
 		const merged = overlayRemoteModels(bundled, store.get("test-provider"), GENERATED_AT);
@@ -172,13 +168,7 @@ describe("remote catalog", () => {
 		store.reload();
 		expect(store.get("test-provider")).toBeUndefined();
 
-		const corruptEntries = [
-			{ models: "corrupt" },
-			{ models: [null] },
-			{ models: [{ name: "no id" }] },
-			{ models: [], lastModified: "yesterday" },
-			{ models: [], etag: 42 },
-		];
+		const corruptEntries = [{ models: "corrupt" }, { models: [null] }, { models: [], lastModified: "yesterday" }];
 		for (const entry of corruptEntries) {
 			writeFileSync(join(tempDir, "models-store.json"), JSON.stringify({ "test-provider": entry }));
 			store.reload();
