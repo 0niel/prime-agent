@@ -1,5 +1,11 @@
-import { MODELS } from "./models.generated.js";
+import { MODELS, MODELS_GENERATED_AT } from "./models.generated.js";
 import type { Api, KnownProvider, Model, ModelThinkingLevel, Usage } from "./types.js";
+
+/** Unix ms timestamp of the bundled catalog generation, undefined if unparsable. */
+export function getModelsGeneratedAt(): number | undefined {
+	const t = Date.parse(MODELS_GENERATED_AT);
+	return Number.isNaN(t) ? undefined : t;
+}
 
 const modelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
 

@@ -317,7 +317,10 @@ export function resolveModelScopeFromModels(patterns: string[], availableModels:
 
 export async function resolveModelScope(patterns: string[], modelRegistry: ModelRegistry): Promise<ScopedModel[]> {
 	const availableModels = await modelRegistry.refreshAvailableModels();
-	return resolveModelScopeFromModels(patterns, availableModels);
+	const scopedModels = resolveModelScopeFromModels(patterns, availableModels);
+	// A stale catalog heals for the next resolution; never blocks.
+	if (scopedModels.length === 0 && patterns.length > 0) void modelRegistry.refreshRemoteModelCatalog();
+	return scopedModels;
 }
 
 export interface ResolveCliModelResult {
@@ -605,6 +608,8 @@ export async function restoreModelFromSession(
 			? "no auth configured"
 			: "model is not available";
 	log.warn("could not restore model", { provider: savedProvider, model: savedModelId, reason });
+	// A stale catalog heals for the next attempt; never blocks startup.
+	void modelRegistry.refreshRemoteModelCatalog();
 
 	if (shouldPrintMessages) {
 		console.error(chalk.yellow(`Warning: Could not restore model ${savedProvider}/${savedModelId} (${reason}).`));

@@ -3,6 +3,8 @@
 
 import type { Model } from "./types.js";
 
+export const MODELS_GENERATED_AT = "2026-08-20T15:21:33.000Z";
+
 export const MODELS = {
 	"amazon-bedrock": {
 		"amazon.nova-2-lite-v1:0": {

@@ -2373,6 +2373,8 @@ async function generateModels() {
 
 import type { Model } from "./types.js";
 
+export const MODELS_GENERATED_AT = "${new Date().toISOString()}";
+
 export const MODELS = {
 `;
 

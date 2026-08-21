@@ -10,6 +10,7 @@ import {
 	type AssistantMessageEventStream,
 	type Context,
 	getModels,
+	getModelsGeneratedAt,
 	getProviders,
 	type KnownProvider,
 	type Model,
@@ -36,6 +37,12 @@ import {
 	isPrivatePrimeInferenceModel,
 } from "./prime-inference-models.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
+import {
+	overlayRemoteModels,
+	REMOTE_CATALOG_STORE_FILE,
+	RemoteCatalogStore,
+	refreshRemoteCatalog,
+} from "./remote-catalog.js";
 import {
 	clearConfigValueCache,
 	resolveConfigValueOrThrow,
@@ -450,6 +457,8 @@ export class ModelRegistry {
 	private openAICodexModelsCache: { authFingerprint: string; modelIds: Set<string>; refreshedAt: number } | undefined;
 	private backgroundPrivatePrimeAuthorization: { fingerprint: string; promise: Promise<void> } | undefined;
 	private loadError: string | undefined = undefined;
+	private readonly remoteCatalogStore: RemoteCatalogStore | undefined;
+	private remoteCatalogRefresh: Promise<void> | undefined;
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
 	private onOAuthProvidersReset?: () => void;
@@ -458,6 +467,9 @@ export class ModelRegistry {
 		readonly authStorage: AuthStorage,
 		private modelsJsonPath: string | undefined,
 	) {
+		this.remoteCatalogStore = modelsJsonPath
+			? RemoteCatalogStore.open(join(dirname(modelsJsonPath), REMOTE_CATALOG_STORE_FILE))
+			: undefined;
 		this.loadModels();
 	}
 
@@ -488,6 +500,7 @@ export class ModelRegistry {
 		// Credentials may have been written by another process (e.g. the UI
 		// process saving a login while the session lives in the daemon).
 		this.authStorage.reload();
+		this.remoteCatalogStore?.reload();
 		resetApiProviders();
 		resetOAuthProviders();
 		// reset drops everything but model-provider built-ins; re-add MCP integrations
@@ -548,7 +561,11 @@ export class ModelRegistry {
 		modelOverrides: Map<string, Map<string, ModelOverride>>,
 	): Model<Api>[] {
 		return getProviders().flatMap((provider) => {
-			const models = getModels(provider as KnownProvider) as Model<Api>[];
+			const models = overlayRemoteModels(
+				getModels(provider as KnownProvider) as Model<Api>[],
+				provider === PRIME_INFERENCE_PROVIDER_ID ? undefined : this.remoteCatalogStore?.get(provider),
+				getModelsGeneratedAt(),
+			);
 			const providerOverride = overrides.get(provider);
 			const perModelOverrides = modelOverrides.get(provider);
 
@@ -938,7 +955,37 @@ export class ModelRegistry {
 		}
 	}
 
+	/**
+	 * Fetch remote per-provider catalogs into the persisted store, single-flight.
+	 * Reloads the registry when entries changed. Never throws; respects PI_OFFLINE.
+	 */
+	refreshRemoteModelCatalog(): Promise<void> {
+		const store = this.remoteCatalogStore;
+		if (!store || isOfflineModeEnabled()) return Promise.resolve();
+		this.remoteCatalogRefresh ??= refreshRemoteCatalog(
+			store,
+			getProviders().filter((provider) => provider !== PRIME_INFERENCE_PROVIDER_ID),
+			{
+				baseUrl: process.env.PI_MODEL_CATALOG_URL || undefined,
+				signal: AbortSignal.timeout(10_000),
+			},
+		)
+			.then((changed) => {
+				if (changed) this.refresh();
+			})
+			.catch(() => {
+				// Fail open to the bundled catalog.
+			})
+			.finally(() => {
+				this.remoteCatalogRefresh = undefined;
+			});
+		return this.remoteCatalogRefresh;
+	}
+
 	async refreshModelCatalog(): Promise<ModelCatalogSnapshot> {
+		// Never block on the network: the persisted overlay already applies via
+		// loadModels; a completed fetch reloads the registry for the next snapshot.
+		void this.refreshRemoteModelCatalog();
 		const availableModels = await this.refreshAvailableModels();
 		const availablePrivateModels = new Set(
 			availableModels.filter(isPrivatePrimeInferenceModel).map((model) => `${model.provider}/${model.id}`),

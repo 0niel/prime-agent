@@ -1656,4 +1656,54 @@ describe("ModelRegistry", () => {
 			});
 		});
 	});
+
+	describe("remote catalog overlay", () => {
+		function writeRemoteCatalogStore(lastModified: number) {
+			writeFileSync(
+				join(tempDir, "models-store.json"),
+				JSON.stringify({
+					anthropic: {
+						models: [
+							{
+								id: "claude-test-remote",
+								name: "Claude Test Remote",
+								api: "anthropic-messages",
+								provider: "anthropic",
+								baseUrl: "https://api.anthropic.com",
+								reasoning: false,
+								input: ["text"],
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+								contextWindow: 200000,
+								maxTokens: 8192,
+							},
+						],
+						lastModified,
+						checkedAt: Date.now(),
+						etag: '"catalog-1"',
+					},
+				}),
+			);
+		}
+
+		test("serves remote models when the store is newer than the bundled catalog", () => {
+			writeRemoteCatalogStore(Date.now());
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.find("anthropic", "claude-test-remote")).toBeDefined();
+		});
+
+		test("ignores remote models when the store is older than the bundled catalog", () => {
+			writeRemoteCatalogStore(0);
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.find("anthropic", "claude-test-remote")).toBeUndefined();
+		});
+
+		test("still serves the bundled catalog when the store is corrupt", () => {
+			writeFileSync(
+				join(tempDir, "models-store.json"),
+				JSON.stringify({ anthropic: { models: [null], lastModified: Date.now(), checkedAt: Date.now() } }),
+			);
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(getModelsForProvider(registry, "anthropic").length).toBeGreaterThan(0);
+		});
+	});
 });

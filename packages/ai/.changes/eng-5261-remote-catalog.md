@@ -1,0 +1,1 @@
+- Added a generation timestamp (MODELS_GENERATED_AT) to the generated model catalog so consumers can compare it against remote catalogs.

@@ -1,0 +1,1 @@
+- Added a persisted remote model-catalog overlay (models-store.json): per-provider catalogs are fetched from pi.dev with ETag revalidation and a 4-hour freshness window on model-picker open, so new provider models appear without a release; any failure falls back to the bundled catalog.
