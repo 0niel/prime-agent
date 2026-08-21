@@ -1,4 +1,4 @@
-import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
+import { type Api, getApiProvider, getLogger, type Model } from "@earendil-works/pi-ai";
 import { readFileSync, renameSync, writeFileSync } from "fs";
 import { VERSION } from "../config.js";
 import { getPiUserAgent } from "../utils/pi-user-agent.js";
@@ -38,6 +38,9 @@ function isRemoteModel(value: unknown): value is Model<Api> {
 		typeof model.name === "string" &&
 		typeof model.api === "string" &&
 		typeof model.baseUrl === "string" &&
+		typeof model.reasoning === "boolean" &&
+		Array.isArray(model.input) &&
+		model.input.every((input) => input === "text" || input === "image") &&
 		typeof model.cost === "object" &&
 		model.cost !== null &&
 		isFiniteNumber(model.cost.input) &&
@@ -127,7 +130,11 @@ export function overlayRemoteModels(
 	if (localGeneratedAt !== undefined && (entry.lastModified === undefined || entry.lastModified <= localGeneratedAt)) {
 		return bundled;
 	}
-	return mergeModels(bundled, entry.models);
+	// pi.dev may serve apis our fork doesn't support; keep the bundled model instead.
+	return mergeModels(
+		bundled,
+		entry.models.filter((model) => getApiProvider(model.api) !== undefined),
+	);
 }
 
 function parseCatalog(providerId: string, value: unknown): Model<Api>[] {

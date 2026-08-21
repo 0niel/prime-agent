@@ -957,6 +957,9 @@ export class ModelRegistry {
 
 	/** Rebuild the model list from current state without touching auth, OAuth registries, or on-disk stores. */
 	private reloadModels(): void {
+		this.providerRequestConfigs.clear();
+		this.modelRequestHeaders.clear();
+		this.loadError = undefined;
 		this.loadModels();
 		for (const [providerName, config] of this.registeredProviders.entries()) {
 			this.applyProviderConfig(providerName, config);

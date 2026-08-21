@@ -46,6 +46,7 @@ describe("remote catalog", () => {
 			remote: model("remote"),
 			static: { ...model("static"), name: "updated" },
 			plain: { id: "plain" },
+			exotic: { ...model("exotic"), api: "definitely-not-registered" },
 		};
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(
 			new Response(JSON.stringify(catalog), {
@@ -55,13 +56,15 @@ describe("remote catalog", () => {
 
 		await expect(refresh()).resolves.toBe(true);
 
-		// The malformed id-only entry is dropped and never shadows the bundled model.
-		expect(store.get("test-provider")?.models.map((entry) => entry.id)).toEqual(["remote", "static"]);
-		const bundled = [model("static"), model("plain")];
+		// The malformed id-only entry is dropped at parse time; the well-formed entry
+		// with an unregistered api is stored but never overlays the bundled model.
+		expect(store.get("test-provider")?.models.map((entry) => entry.id)).toEqual(["remote", "static", "exotic"]);
+		const bundled = [model("static"), model("plain"), model("exotic")];
 		const merged = overlayRemoteModels(bundled, store.get("test-provider"), GENERATED_AT);
-		expect(merged.map((entry) => entry.id)).toEqual(["static", "plain", "remote"]);
+		expect(merged.map((entry) => entry.id)).toEqual(["static", "plain", "exotic", "remote"]);
 		expect(merged[0]?.name).toBe("updated");
 		expect(merged[1]?.name).toBe("plain");
+		expect(merged[2]?.api).toBe("openai-completions");
 		expect(overlayRemoteModels(bundled, store.get("test-provider"), GENERATED_AT + 120_000)).toEqual(bundled);
 		expect(overlayRemoteModels(bundled, undefined, GENERATED_AT)).toEqual(bundled);
 	});
@@ -176,7 +179,13 @@ describe("remote catalog", () => {
 		store.reload();
 		expect(store.get("test-provider")).toBeUndefined();
 
-		const corruptEntries = [{ models: "corrupt" }, { models: [null] }, { models: [], lastModified: "yesterday" }];
+		const corruptEntries = [
+			{ models: "corrupt" },
+			{ models: [null] },
+			{ models: [], lastModified: "yesterday" },
+			{ models: [{ ...model("no-reasoning"), reasoning: "yes" }] },
+			{ models: [{ ...model("no-input"), input: undefined }] },
+		];
 		for (const entry of corruptEntries) {
 			writeFileSync(join(tempDir, "models-store.json"), JSON.stringify({ "test-provider": entry }));
 			store.reload();

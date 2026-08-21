@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AnthropicMessagesCompat, Api, Context, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai";
 import { getOAuthProvider, registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { clearApiKeyCache, ModelRegistry, type ProviderConfigInput } from "../src/core/model-registry.js";
 
@@ -1704,6 +1704,48 @@ describe("ModelRegistry", () => {
 			);
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 			expect(getModelsForProvider(registry, "anthropic").length).toBeGreaterThan(0);
+		});
+
+		test("remote-driven reload keeps models.json request auth intact", async () => {
+			writeModelsJson({
+				"custom-provider": providerConfig("https://custom.example.com", [{ id: "custom-model" }]),
+			});
+			process.env.TEST_KEY = "test-key-value";
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const catalog = {
+				"claude-test-remote": {
+					id: "claude-test-remote",
+					name: "Claude Test Remote",
+					api: "anthropic-messages",
+					provider: "anthropic",
+					baseUrl: "https://api.anthropic.com",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 200000,
+					maxTokens: 8192,
+				},
+			};
+			vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				if (String(input).includes("/api/models/providers/anthropic")) {
+					return new Response(JSON.stringify(catalog), {
+						headers: { "last-modified": new Date().toUTCString() },
+					});
+				}
+				return new Response("{}", { headers: { "last-modified": new Date(0).toUTCString() } });
+			});
+			try {
+				await registry.refreshRemoteModelCatalog();
+			} finally {
+				vi.restoreAllMocks();
+				delete process.env.TEST_KEY;
+			}
+
+			expect(registry.find("anthropic", "claude-test-remote")).toBeDefined();
+			const customModel = registry.find("custom-provider", "custom-model");
+			expect(customModel).toBeDefined();
+			const auth = await registry.getApiKeyAndHeaders(customModel!);
+			expect(auth).toMatchObject({ ok: true });
 		});
 	});
 });
