@@ -21,6 +21,7 @@ import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
 import { emptyGoalState, type GoalState } from "../src/core/goals.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { createSessionSlashCommandMessage, createSessionSlashCommandResultMessage } from "../src/core/messages.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
@@ -1358,6 +1359,7 @@ describe("InteractiveMode pending bash components", () => {
 			pendingBashComponents: [component],
 			activityTracker: { reset: vi.fn() },
 			agentRunFileChanges: new Map(),
+			discardRefineLoader: vi.fn(),
 			recapContainer: new Container(),
 			renderRecap: vi.fn(),
 			ipythonToolComponents: new Map(),
@@ -5320,4 +5322,129 @@ describe("InteractiveMode.showLoadedResources", () => {
 `);
 		expect(output).not.toContain("[Skill conflicts]");
 	});
+});
+
+test("shows a refine loader from the /refine command message until its result row settles it", () => {
+	initTheme("dark");
+	const statusContainer = new Container();
+	const fakeThis = {
+		ui: { requestRender: vi.fn() } as unknown as TUI,
+		statusContainer,
+		refineLoader: undefined,
+		stopWorkingLoader: vi.fn(),
+		syncWorkingLoader: vi.fn(),
+	} as unknown as InteractiveMode;
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	const prototype = InteractiveMode.prototype as unknown as {
+		startRefineLoader(this: InteractiveMode): void;
+		stopRefineLoader(this: InteractiveMode): void;
+	};
+
+	prototype.startRefineLoader.call(fakeThis);
+	expect(statusContainer.children.length).toBe(1);
+
+	prototype.stopRefineLoader.call(fakeThis);
+	expect(statusContainer.children.length).toBe(0);
+	expect((fakeThis as unknown as { syncWorkingLoader: () => void }).syncWorkingLoader).toHaveBeenCalled();
+});
+
+test("syncWorkingLoader remounts a refine loader that a compaction cleared", () => {
+	initTheme("dark");
+	const statusContainer = new Container();
+	const fakeThis = {
+		ui: { requestRender: vi.fn() } as unknown as TUI,
+		statusContainer,
+		refineLoader: undefined,
+		autoCompactionLoader: undefined,
+		retryLoader: undefined,
+		stopWorkingLoader: vi.fn(),
+		isAgentCompacting: () => false,
+	} as unknown as InteractiveMode;
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	const prototype = InteractiveMode.prototype as unknown as {
+		startRefineLoader(this: InteractiveMode): void;
+		syncWorkingLoader(this: InteractiveMode): void;
+	};
+
+	prototype.startRefineLoader.call(fakeThis);
+	statusContainer.clear();
+	expect(statusContainer.children.length).toBe(0);
+
+	prototype.syncWorkingLoader.call(fakeThis);
+	expect(statusContainer.children.length).toBe(1);
+});
+
+test("only the queued user /refine settlement stops its loader", async () => {
+	initTheme("dark");
+	const statusContainer = new Container();
+	const fakeThis = {
+		ui: { requestRender: vi.fn() } as unknown as TUI,
+		statusContainer,
+		refineLoader: undefined,
+		stopWorkingLoader: vi.fn(),
+		syncWorkingLoader: vi.fn(),
+		addMessageToChat: vi.fn(),
+		showError: vi.fn(),
+		isInitialized: true,
+		footer: { invalidate: vi.fn() },
+		updateConnectionStateFromEvent: vi.fn(),
+		prepareFeatureHintRun: vi.fn(),
+		activityTracker: { handleEvent: vi.fn(), reset: vi.fn() },
+		updateWorkingLoaderMessage: vi.fn(),
+		renderRecap: vi.fn(),
+	} as unknown as InteractiveMode;
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	const prototype = InteractiveMode.prototype as unknown as {
+		handleEvent(this: InteractiveMode, event: unknown): Promise<void>;
+	};
+	const command = { name: "refine", args: "", text: "/refine" } as const;
+
+	await prototype.handleEvent.call(fakeThis, {
+		type: "message_start",
+		message: createSessionSlashCommandMessage(command),
+	});
+	expect(statusContainer.children.length).toBe(1);
+
+	// The waited-on agent/auto refinement settles first; the user /refine is still running.
+	await prototype.handleEvent.call(fakeThis, { type: "refine_complete", result: {} });
+	expect(statusContainer.children.length).toBe(1);
+	await prototype.handleEvent.call(fakeThis, { type: "refine_failed", error: "background failure" });
+	expect(statusContainer.children.length).toBe(1);
+
+	await prototype.handleEvent.call(fakeThis, {
+		type: "message_start",
+		message: createSessionSlashCommandResultMessage(
+			"Refined continual harness state: 0 edits applied.",
+			{ command, success: true, severity: "info" },
+			false,
+		),
+	});
+	expect(statusContainer.children.length).toBe(0);
+});
+
+test("session teardown removes a running refine loader without remounting anything", () => {
+	initTheme("dark");
+	const statusContainer = new Container();
+	const fakeThis = {
+		ui: { requestRender: vi.fn() } as unknown as TUI,
+		statusContainer,
+		refineLoader: undefined,
+		stopWorkingLoader: vi.fn(),
+		syncWorkingLoader: vi.fn(),
+	} as unknown as InteractiveMode;
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	const prototype = InteractiveMode.prototype as unknown as {
+		startRefineLoader(this: InteractiveMode): void;
+		discardRefineLoader(this: InteractiveMode): void;
+	};
+
+	prototype.startRefineLoader.call(fakeThis);
+	const loader = (fakeThis as unknown as { refineLoader?: { stop(): void } }).refineLoader;
+	const stopSpy = vi.spyOn(loader!, "stop");
+
+	prototype.discardRefineLoader.call(fakeThis);
+	expect(stopSpy).toHaveBeenCalled();
+	expect(statusContainer.children).toHaveLength(0);
+	expect((fakeThis as unknown as { refineLoader?: unknown }).refineLoader).toBeUndefined();
+	expect((fakeThis as unknown as { syncWorkingLoader: () => void }).syncWorkingLoader).not.toHaveBeenCalled();
 });

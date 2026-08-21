@@ -100,11 +100,14 @@ import { runMcpManagementCommand } from "../../core/mcp/mcp-command.js";
 import {
 	bashOutputToText,
 	COMPACTION_OUTCOME_CUSTOM_TYPE,
+	type CustomMessage,
 	createHeartbeatPromptMessage,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	isCompactionOutcomeMessage,
+	isRefinementOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
+	REFINEMENT_OUTCOME_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../core/messages.js";
@@ -204,6 +207,10 @@ import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./compo
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
+import {
+	MalformedRefinementOutcomeMessageComponent,
+	RefinementOutcomeMessageComponent,
+} from "./components/refinement-outcome-message.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
@@ -1004,6 +1011,7 @@ export class InteractiveMode {
 	private signalCleanupHandlers: Array<() => void> = [];
 
 	private autoCompactionLoader: Loader | undefined = undefined;
+	private refineLoader: Loader | undefined = undefined;
 
 	private retryLoader: Loader | undefined = undefined;
 	private retryCountdown: CountdownTimer | undefined = undefined;
@@ -2851,6 +2859,8 @@ export class InteractiveMode {
 		// bash_end will reach it once the reference is dropped.
 		this.activeBashComponent?.setComplete(undefined, true);
 		this.activeBashComponent = undefined;
+		// Likewise: the next session's view may never see this refine settle.
+		this.discardRefineLoader();
 		this.pendingBashComponents = [];
 		this.activityTracker.reset();
 		this.contextUsageTokenBaseline = 0;
@@ -3395,6 +3405,35 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	/** Live status for a user-issued /refine, mirroring the compaction loader. */
+	private startRefineLoader(): void {
+		this.stopWorkingLoader();
+		this.statusContainer.clear();
+		this.refineLoader = new Loader(
+			this.ui,
+			(spinner) => theme.fg("muted", spinner),
+			(text) => theme.fg("muted", text),
+			"Refining continual harness state...",
+		);
+		this.statusContainer.addChild(this.refineLoader);
+		this.ui.requestRender();
+	}
+
+	private stopRefineLoader(): void {
+		if (!this.refineLoader) return;
+		this.discardRefineLoader();
+		this.statusContainer.clear();
+		this.syncWorkingLoader();
+	}
+
+	/** Stops and removes the loader without remounting old-session state. */
+	private discardRefineLoader(): void {
+		if (!this.refineLoader) return;
+		this.refineLoader.stop();
+		this.statusContainer.removeChild(this.refineLoader);
+		this.refineLoader = undefined;
+	}
+
 	private syncWorkingLoader(): void {
 		// A compaction that started before this client attached (or while another
 		// view was open) has no start-event edge; restore its loader from state.
@@ -3404,6 +3443,14 @@ export class InteractiveMode {
 		}
 		// Compaction/retry own the status container while active; don't fight them.
 		if (this.autoCompactionLoader || this.retryLoader) {
+			return;
+		}
+		// Remount the refine loader if another owner (e.g. a compaction) cleared it.
+		if (this.refineLoader) {
+			if (!this.statusContainer.children.includes(this.refineLoader)) {
+				this.statusContainer.clear();
+				this.statusContainer.addChild(this.refineLoader);
+			}
 			return;
 		}
 		if (this.shouldShowWorkingLoader()) {
@@ -5433,6 +5480,17 @@ export class InteractiveMode {
 					}
 				}
 				if (event.message.role === "custom") {
+					if (isSessionSlashCommandMessage(event.message) && event.message.details.command.name === "refine") {
+						this.startRefineLoader();
+					}
+					// The /refine result row is the user refine's settle edge; refine_complete
+					// alone can belong to an agent/auto refinement the queued /refine waited on.
+					if (
+						isSessionSlashCommandResultMessage(event.message) &&
+						event.message.details.command.name === "refine"
+					) {
+						this.stopRefineLoader();
+					}
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
@@ -5680,6 +5738,7 @@ export class InteractiveMode {
 				break;
 
 			case "refine_failed":
+				// This event has no request identity; the matching command result settles its loader.
 				this.showError(`Refinement failed: ${event.error}`);
 				break;
 
@@ -6204,6 +6263,40 @@ export class InteractiveMode {
 		}
 	}
 
+	private createDisplayedCustomMessageComponent(message: CustomMessage): Component {
+		if (isSessionSlashCommandMessage(message)) return new SlashCommandMessageComponent(message.content);
+		if (isSessionSlashCommandResultMessage(message)) return new SlashCommandResultMessageComponent(message);
+		if (
+			message.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
+			message.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE
+		) {
+			return new UserMessageComponent("[Malformed session command message]", this.getMarkdownThemeWithSettings());
+		}
+		if (isCompactionOutcomeMessage(message)) return new CompactionOutcomeMessageComponent(message);
+		if (message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
+			return new MalformedCompactionOutcomeMessageComponent();
+		}
+		if (isRefinementOutcomeMessage(message)) return new RefinementOutcomeMessageComponent(message);
+		if (message.customType === REFINEMENT_OUTCOME_CUSTOM_TYPE) {
+			return new MalformedRefinementOutcomeMessageComponent();
+		}
+		if (isAgentSessionMessage(message)) {
+			return new AgentMessageComponent(message, this.getMarkdownThemeWithSettings(), {
+				suppressLeadingSpace: isCompactAgentMessageNeighbor(this.chatContainer.children.at(-1)),
+			});
+		}
+		if (isInjectedPromptMessage(message)) {
+			return new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings());
+		}
+		return new CustomMessageComponent(
+			message,
+			this.bindLocalSessionExtensions
+				? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(message.customType)
+				: undefined,
+			this.getMarkdownThemeWithSettings(),
+		);
+	}
+
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
 		switch (message.role) {
 			case "bashExecution": {
@@ -6224,41 +6317,12 @@ export class InteractiveMode {
 			}
 			case "custom": {
 				if (message.display) {
-					const reservedSessionCommand =
-						message.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
-						message.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
-					const component = isSessionSlashCommandMessage(message)
-						? new SlashCommandMessageComponent(message.content)
-						: isSessionSlashCommandResultMessage(message)
-							? new SlashCommandResultMessageComponent(message)
-							: reservedSessionCommand
-								? new UserMessageComponent(
-										"[Malformed session command message]",
-										this.getMarkdownThemeWithSettings(),
-									)
-								: isCompactionOutcomeMessage(message)
-									? new CompactionOutcomeMessageComponent(message)
-									: message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
-										? new MalformedCompactionOutcomeMessageComponent()
-										: isAgentSessionMessage(message)
-											? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings(), {
-													suppressLeadingSpace: isCompactAgentMessageNeighbor(
-														this.chatContainer.children.at(-1),
-													),
-												})
-											: isInjectedPromptMessage(message)
-												? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-												: new CustomMessageComponent(
-														message,
-														this.bindLocalSessionExtensions
-															? this.getLocalSessionHost()
-																	.getExtensionRunner()
-																	.getMessageRenderer(message.customType)
-															: undefined,
-														this.getMarkdownThemeWithSettings(),
-													);
-					if (!(component instanceof UserMessageComponent)) {
+					const component = this.createDisplayedCustomMessageComponent(message);
+					if (isExpandable(component)) {
 						component.setExpanded(this.expansionStateFor(component));
+					}
+					if (hasEditDiffsExpansion(component)) {
+						component.setEditDiffsExpanded(this.editDiffsExpanded);
 					}
 					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
@@ -9941,6 +10005,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 			this.ui.terminal.setProgress(false);
 		}
 		this.stopWorkingLoader();
+		this.discardRefineLoader();
 		this.endFeatureHintRun();
 		this.stopWorkingPulse();
 		this.stopGoalTrayTimer();

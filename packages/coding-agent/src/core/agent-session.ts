@@ -170,6 +170,7 @@ import {
 	convertToLlm,
 	createCompactionOutcomeMessage,
 	createHeartbeatPromptMessage,
+	createRefinementOutcomeMessage,
 	createRlmChildFailureMessage,
 	createRlmChildTerminalNoticeMessage,
 	createSessionSlashCommandMessage,
@@ -1097,7 +1098,7 @@ export class AgentSession {
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
-	private readonly _unpersistedCompactionOutcomes: CustomMessage[] = [];
+	private readonly _unpersistedOutcomes: CustomMessage[] = [];
 
 	private _bashAbortController: AbortController | undefined = undefined;
 	private _userBashRunning = false;
@@ -4219,12 +4220,12 @@ export class AgentSession {
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
 		}
-		this._mergeUnpersistedCompactionOutcomes(context.messages);
+		this._mergeUnpersistedOutcomes(context.messages);
 		return context;
 	}
 
-	private _mergeUnpersistedCompactionOutcomes(messages: AgentMessage[]): void {
-		for (const outcome of this._unpersistedCompactionOutcomes) {
+	private _mergeUnpersistedOutcomes(messages: AgentMessage[]): void {
+		for (const outcome of this._unpersistedOutcomes) {
 			let insertAt = messages.length;
 			while (insertAt > 0 && messages[insertAt - 1]!.timestamp > outcome.timestamp) {
 				insertAt -= 1;
@@ -6041,6 +6042,7 @@ export class AgentSession {
 		const input = action.payload;
 		try {
 			let resultText: string | undefined;
+			let displayResult = true;
 			switch (input.command.name) {
 				case "compact":
 					await this.compact(input.command.args || undefined, {
@@ -6048,10 +6050,19 @@ export class AgentSession {
 					});
 					break;
 				case "refine": {
-					const options = parseRefineCommandOptions(input.command.args);
-					const result = await this.refine(options, { skipAbort: true });
-					const applied = result.appliedEdits.filter((appliedEdit) => appliedEdit.applied).length;
+					let result: RefinementResult;
+					try {
+						const options = parseRefineCommandOptions(input.command.args);
+						result = await this.refine(options, { skipAbort: true });
+					} catch (error) {
+						// Only a failure of the refinement itself is a refine failure; a later
+						// result-row persist error must not report a completed refinement as failed.
+						this._emitRefineFailed(this._asError(error));
+						throw error;
+					}
+					const applied = result.appliedEdits.filter((edit) => edit.applied).length;
 					resultText = `Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied.`;
+					displayResult = false;
 					break;
 				}
 				case "goal":
@@ -6065,7 +6076,7 @@ export class AgentSession {
 					break;
 			}
 			if (resultText) {
-				this._appendDurableSessionCommandMessage(resultText, input.command, true, false);
+				this._appendDurableSessionCommandMessage(resultText, input.command, true, false, displayResult);
 			}
 		} catch (error) {
 			if (error instanceof CompactionSkippedError) return;
@@ -6078,7 +6089,15 @@ export class AgentSession {
 					true,
 				);
 			} catch {
-				// Surfacing the command failure matters more than persisting its row.
+				// The result row is also the command-correlated UI settle edge.
+				const message = createSessionSlashCommandResultMessage(`Command failed: ${commandError.message}`, {
+					command: input.command,
+					success: false,
+					severity: "error",
+					error: commandError.message,
+				});
+				this._emit({ type: "message_start", message });
+				this._emit({ type: "message_end", message });
 			}
 			throw commandError;
 		}
@@ -6089,14 +6108,19 @@ export class AgentSession {
 		command: SessionSlashCommand,
 		isResult: boolean,
 		isError = false,
+		display = true,
 	): void {
 		const message: CustomMessage = isResult
-			? createSessionSlashCommandResultMessage(content, {
-					command,
-					success: !isError,
-					severity: isError ? "error" : "info",
-					...(isError ? { error: content.replace(/^Command failed:\s*/, "") } : {}),
-				})
+			? createSessionSlashCommandResultMessage(
+					content,
+					{
+						command,
+						success: !isError,
+						severity: isError ? "error" : "info",
+						...(isError ? { error: content.replace(/^Command failed:\s*/, "") } : {}),
+					},
+					display,
+				)
 			: createSessionSlashCommandMessage(command);
 		// Persist before touching live state so a failed write cannot leave an
 		// unsaved leaf that the next entry would silently parent onto.
@@ -7426,7 +7450,7 @@ export class AgentSession {
 		);
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
-		this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
+		this._mergeUnpersistedOutcomes(this.agent.state.messages);
 		this._restoreLateIpythonSentAgentMessages();
 
 		const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -8103,6 +8127,24 @@ export class AgentSession {
 		return { ...plan, baselineState };
 	}
 
+	private _recordRefinementOutcome(result: RefinementResult): void {
+		const message = createRefinementOutcomeMessage(result);
+		try {
+			this.sessionManager.appendCustomMessageEntryWithRollback(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} catch {
+			// Not in the session file, so context rebuilds would drop the outcome.
+			this._unpersistedOutcomes.push(message);
+		}
+		this.agent.state.messages.push(message);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
+	}
+
 	/**
 	 * Synchronous application phase: disconnects from the agent, aborts any
 	 * in-flight agent run, applies the refinement plan to disk and memory, then
@@ -8175,7 +8217,18 @@ export class AgentSession {
 			if (targetScope === "global") {
 				appendGlobalRefinement(globalHarnessStateDir, result);
 			}
-			this.sessionManager.appendCustomEntry("prime-agent.refinement", result);
+			let refinementAuditAppendError: { error: unknown } | undefined;
+			try {
+				this.sessionManager.appendCustomEntry("prime-agent.refinement", result);
+			} catch (error) {
+				refinementAuditAppendError = { error };
+			}
+			try {
+				this._recordRefinementOutcome(result);
+			} catch (error) {
+				if (!refinementAuditAppendError) throw error;
+			}
+			if (refinementAuditAppendError) throw refinementAuditAppendError.error;
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 			try {
@@ -8398,7 +8451,7 @@ export class AgentSession {
 				{ reason, outcome },
 			);
 			// Not in the session file, so context rebuilds would drop the disclosure.
-			this._unpersistedCompactionOutcomes.push(outcomeMessage);
+			this._unpersistedOutcomes.push(outcomeMessage);
 		}
 		this.agent.state.messages.push(outcomeMessage);
 		this._emit({ type: "message_start", message: outcomeMessage });
@@ -11363,7 +11416,7 @@ export class AgentSession {
 
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
+			this._mergeUnpersistedOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
 			this._reloadGoalStateFromBranch();
 			this._reloadRlmMaxDepthFromBranch();
