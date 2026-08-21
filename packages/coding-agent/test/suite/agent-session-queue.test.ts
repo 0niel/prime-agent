@@ -232,6 +232,7 @@ describe("AgentSession queue characterization", () => {
 				for (const fragment of refineFragments) {
 					expect(refine).toHaveBeenCalledWith(
 						expect.objectContaining({ instructions: expect.stringContaining(fragment) }),
+						{ trigger: "auto" },
 					);
 				}
 			}
@@ -442,6 +443,7 @@ describe("AgentSession queue characterization", () => {
 
 		expect(refine).toHaveBeenCalledWith(
 			expect.objectContaining({ instructions: expect.stringContaining("durable lesson") }),
+			{ trigger: "auto" },
 		);
 		expect(guardWasSetDuringRefine).toBe(true);
 		expect(internals._autoRefineInProgress).toBe(false);
