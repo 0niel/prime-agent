@@ -4,7 +4,7 @@ import { VERSION } from "../config.js";
 import { getPiUserAgent } from "../utils/pi-user-agent.js";
 
 export const REMOTE_CATALOG_STORE_FILE = "models-store.json";
-export const REMOTE_CATALOG_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const REMOTE_CATALOG_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const DEFAULT_CATALOG_BASE_URL = "https://pi.dev";
 const ATTEMPT_TIMEOUT_MS = 4_000;
 const MAX_RETRIES = 2;
@@ -25,12 +25,36 @@ function isOptionalFiniteNumber(value: unknown): boolean {
 	return value === undefined || (typeof value === "number" && Number.isFinite(value));
 }
 
+function isFiniteNumber(value: unknown): boolean {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+/** Requires every field that registry consumers dereference, so a malformed entry can never overlay a bundled model. */
+function isRemoteModel(value: unknown): value is Model<Api> {
+	if (typeof value !== "object" || value === null) return false;
+	const model = value as Partial<Model<Api>>;
+	return (
+		typeof model.id === "string" &&
+		typeof model.name === "string" &&
+		typeof model.api === "string" &&
+		typeof model.baseUrl === "string" &&
+		typeof model.cost === "object" &&
+		model.cost !== null &&
+		isFiniteNumber(model.cost.input) &&
+		isFiniteNumber(model.cost.output) &&
+		isFiniteNumber(model.cost.cacheRead) &&
+		isFiniteNumber(model.cost.cacheWrite) &&
+		isFiniteNumber(model.contextWindow) &&
+		isFiniteNumber(model.maxTokens)
+	);
+}
+
 function isCatalogEntry(value: unknown): value is RemoteCatalogEntry {
 	if (typeof value !== "object" || value === null) return false;
 	const entry = value as Partial<RemoteCatalogEntry>;
 	return (
 		Array.isArray(entry.models) &&
-		entry.models.every((model) => typeof model === "object" && model !== null && typeof model.id === "string") &&
+		entry.models.every(isRemoteModel) &&
 		isOptionalFiniteNumber(entry.lastModified) &&
 		isOptionalFiniteNumber(entry.checkedAt) &&
 		(entry.etag === undefined || typeof entry.etag === "string")
@@ -115,9 +139,7 @@ function parseCatalog(providerId: string, value: unknown): Model<Api>[] {
 				? Object.values(value)
 				: undefined;
 	if (!entries) throw new Error(`Invalid model catalog for provider "${providerId}"`);
-	return entries
-		.filter((entry): entry is Model<Api> => typeof entry === "object" && entry !== null && "id" in entry)
-		.map((model) => ({ ...model, provider: providerId }));
+	return entries.filter(isRemoteModel).map((model) => ({ ...model, provider: providerId }));
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -159,7 +181,7 @@ async function refreshProvider(
 	baseUrl: string,
 	signal: AbortSignal | undefined,
 	force: boolean,
-): Promise<boolean> {
+): Promise<"skipped" | "checked" | "changed"> {
 	const stored = store.get(providerId);
 	if (
 		!force &&
@@ -167,7 +189,7 @@ async function refreshProvider(
 		stored.lastModified !== undefined &&
 		Date.now() - stored.checkedAt < REMOTE_CATALOG_REFRESH_INTERVAL_MS
 	) {
-		return false;
+		return "skipped";
 	}
 
 	// Only revalidate when a cached body backs the validator, so a 304 can never
@@ -185,18 +207,18 @@ async function refreshProvider(
 		const checkedAt = Date.now();
 		if (response.status === 304 && stored) {
 			store.set(providerId, { ...stored, checkedAt });
-			return true;
+			return "checked";
 		}
 		if (response.status === 404 || response.status === 501) {
 			store.set(providerId, { ...(stored ?? {}), models: [], checkedAt, lastModified: 0, etag: undefined });
-			return true;
+			return stored?.models.length ? "changed" : "checked";
 		}
 		if (!response.ok) {
 			// Transient failure: the cached body and its validator stay valid, so keep
 			// the etag and let the next refresh revalidate.
 			store.set(providerId, { ...(stored ?? { models: [] }), checkedAt });
 			log.warn("remote model catalog request failed", { provider: providerId, status: response.status });
-			return true;
+			return "checked";
 		}
 		const models = parseCatalog(providerId, await response.json());
 		const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
@@ -206,18 +228,23 @@ async function refreshProvider(
 			lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
 			etag: response.headers.get("etag") ?? undefined,
 		});
-		return true;
+		return "changed";
 	} catch (error) {
+		// No lastModified on purpose: a failed first check stays outside the freshness
+		// window so the next user-triggered refresh retries.
 		store.set(providerId, { ...(stored ?? { models: [] }), checkedAt: Date.now() });
 		log.warn("remote model catalog refresh failed", {
 			provider: providerId,
 			error: error instanceof Error ? error.message : String(error),
 		});
-		return true;
+		return "checked";
 	}
 }
 
-/** Refresh all providers concurrently. Fails open per provider; returns true if any entry changed. */
+/**
+ * Refresh all providers concurrently. Fails open per provider. Persists whenever any
+ * check completed (freshness window), but returns true only when catalog content changed.
+ */
 export async function refreshRemoteCatalog(
 	store: RemoteCatalogStore,
 	providerIds: readonly string[],
@@ -227,7 +254,7 @@ export async function refreshRemoteCatalog(
 	const results = await Promise.allSettled(
 		providerIds.map((id) => refreshProvider(store, id, baseUrl, options.signal, options.force ?? false)),
 	);
-	const changed = results.some((result) => result.status === "fulfilled" && result.value);
-	if (changed) store.save();
-	return changed;
+	const outcomes = results.map((result) => (result.status === "fulfilled" ? result.value : "skipped"));
+	if (outcomes.some((outcome) => outcome !== "skipped")) store.save();
+	return outcomes.some((outcome) => outcome === "changed");
 }

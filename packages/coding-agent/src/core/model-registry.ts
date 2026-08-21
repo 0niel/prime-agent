@@ -955,9 +955,17 @@ export class ModelRegistry {
 		}
 	}
 
+	/** Rebuild the model list from current state without touching auth, OAuth registries, or on-disk stores. */
+	private reloadModels(): void {
+		this.loadModels();
+		for (const [providerName, config] of this.registeredProviders.entries()) {
+			this.applyProviderConfig(providerName, config);
+		}
+	}
+
 	/**
 	 * Fetch remote per-provider catalogs into the persisted store, single-flight.
-	 * Reloads the registry when entries changed. Never throws; respects PI_OFFLINE.
+	 * Rebuilds the model list when catalog content changed. Never throws; respects PI_OFFLINE.
 	 */
 	refreshRemoteModelCatalog(): Promise<void> {
 		const store = this.remoteCatalogStore;
@@ -971,7 +979,7 @@ export class ModelRegistry {
 			},
 		)
 			.then((changed) => {
-				if (changed) this.refresh();
+				if (changed) this.reloadModels();
 			})
 			.catch(() => {
 				// Fail open to the bundled catalog.
@@ -984,7 +992,8 @@ export class ModelRegistry {
 
 	async refreshModelCatalog(): Promise<ModelCatalogSnapshot> {
 		// Never block on the network: the persisted overlay already applies via
-		// loadModels; a completed fetch reloads the registry for the next snapshot.
+		// loadModels. Fetched models appear in the next catalog snapshot (picker
+		// TTL/force refresh); cross-connection cache invalidation is deliberately avoided.
 		void this.refreshRemoteModelCatalog();
 		const availableModels = await this.refreshAvailableModels();
 		const availablePrivateModels = new Set(

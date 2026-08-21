@@ -42,18 +42,26 @@ describe("remote catalog", () => {
 	}
 
 	it("overlays remote models only when the remote catalog is newer than the bundled one", async () => {
+		const catalog = {
+			remote: model("remote"),
+			static: { ...model("static"), name: "updated" },
+			plain: { id: "plain" },
+		};
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(JSON.stringify({ remote: model("remote"), static: { ...model("static"), name: "updated" } }), {
+			new Response(JSON.stringify(catalog), {
 				headers: { "last-modified": new Date(GENERATED_AT + 60_000).toUTCString() },
 			}),
 		);
 
-		await refresh();
+		await expect(refresh()).resolves.toBe(true);
 
-		const bundled = [model("static")];
+		// The malformed id-only entry is dropped and never shadows the bundled model.
+		expect(store.get("test-provider")?.models.map((entry) => entry.id)).toEqual(["remote", "static"]);
+		const bundled = [model("static"), model("plain")];
 		const merged = overlayRemoteModels(bundled, store.get("test-provider"), GENERATED_AT);
-		expect(merged.map((entry) => entry.id)).toEqual(["static", "remote"]);
+		expect(merged.map((entry) => entry.id)).toEqual(["static", "plain", "remote"]);
 		expect(merged[0]?.name).toBe("updated");
+		expect(merged[1]?.name).toBe("plain");
 		expect(overlayRemoteModels(bundled, store.get("test-provider"), GENERATED_AT + 120_000)).toEqual(bundled);
 		expect(overlayRemoteModels(bundled, undefined, GENERATED_AT)).toEqual(bundled);
 	});
@@ -105,15 +113,15 @@ describe("remote catalog", () => {
 			return response;
 		});
 
-		await refresh();
-		await expect(refresh({ force: true })).resolves.toBe(true);
+		await expect(refresh()).resolves.toBe(true);
+		await expect(refresh({ force: true })).resolves.toBe(false);
 
 		const stored = store.get("test-provider");
 		expect(stored?.models.map((entry) => entry.id)).toEqual(["remote"]);
 		expect(stored?.etag).toBe('"catalog-1"');
 
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("boom", { status: 500 }));
-		await expect(refresh({ force: true })).resolves.toBe(true);
+		await expect(refresh({ force: true })).resolves.toBe(false);
 		expect(store.get("test-provider")?.models.map((entry) => entry.id)).toEqual(["remote"]);
 		expect(store.get("test-provider")?.etag).toBe('"catalog-1"');
 	});
@@ -185,7 +193,7 @@ describe("remote catalog", () => {
 		);
 
 		await expect(refreshRemoteCatalog(store, ["test-provider"], { signal: AbortSignal.timeout(500) })).resolves.toBe(
-			true,
+			false,
 		);
 		expect(store.get("test-provider")?.models).toEqual([]);
 	});
