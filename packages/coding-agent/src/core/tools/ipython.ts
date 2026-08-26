@@ -3,6 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { IMAGE_MIME_TYPES } from "../../utils/mime.js";
+import { resolveKernelBashShell } from "../../utils/shell.js";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
@@ -36,6 +37,7 @@ except Exception:
 try:
     import rlm as _prime_agent_rlm_module
     rlm = _prime_agent_rlm_module.rlm
+    bash = _prime_agent_rlm_module.bash
     import rlm.mcp as mcp
     mcp.install_shutdown_hook()
 except Exception as _prime_agent_rlm_error:
@@ -66,6 +68,9 @@ except Exception as _prime_agent_rlm_error:
             return await self.run(prompt, **kwargs)
 
     rlm = _PrimeAgentMissingRlm()
+
+    def bash(command):
+        rlm._raise_missing()
 `.trim();
 
 export function buildRlmBootstrapCode(pythonSkills: readonly PythonSkillRuntimeInfo[] = []): string {
@@ -483,10 +488,19 @@ export class IpythonKernelProvisioner {
 				);
 			}
 			const snapshotDir = this.options?.snapshotDir;
+			// Always inject an absolute trusted shell (undefined only on win32
+			// without bash, where the runtime's teaching error fires instead).
+			const shellPath = resolveKernelBashShell(this.options?.shellPath);
+			const commandPrefix = this.options?.commandPrefix;
 			const m = new KernelManager({
 				python: this.options?.python,
 				cwd: this.cwd,
-				env: this.options?.env,
+				// bash() reads these so it applies the same shell settings as %%bash cells.
+				env: {
+					...this.options?.env,
+					...(shellPath ? { PRIME_AGENT_BASH_SHELL: shellPath } : {}),
+					...(commandPrefix ? { PRIME_AGENT_BASH_COMMAND_PREFIX: commandPrefix } : {}),
+				},
 				sessionId: this.options?.sessionId,
 				hostHandlers: this.options?.hostHandlers,
 				pythonSkills: this.options?.pythonSkills,

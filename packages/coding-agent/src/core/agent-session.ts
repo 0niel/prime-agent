@@ -8956,6 +8956,8 @@ export class AgentSession {
 			const notifyRestore = !this._ipythonRuntimeBuilt;
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
+				commandPrefix: this.settingsManager.getShellCommandPrefix(),
+				shellPath: this.settingsManager.getShellPath(),
 				sessionId: this.sessionId,
 				hostHandlers: this._createKernelHostHandlers(),
 				pythonSkills,
