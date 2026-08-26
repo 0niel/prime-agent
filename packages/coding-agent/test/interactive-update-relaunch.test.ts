@@ -63,7 +63,7 @@ describe("tryExecUpdateRelaunch", () => {
 		expect(
 			tryExecUpdateRelaunch(
 				{ command: "/usr/bin/node", args: ["--trace-warnings", "/opt/prime-agent/cli.js", "--resume", "session"] },
-				{ platform: "darwin", cwd: "/tmp/project", environment, chdir, execve },
+				{ platform: "darwin", nodeVersion: "26.1.0", cwd: "/tmp/project", environment, chdir, execve },
 			),
 		).toBe(true);
 		expect(chdir).toHaveBeenCalledWith("/tmp/project");
@@ -81,18 +81,35 @@ describe("tryExecUpdateRelaunch", () => {
 		expect(
 			tryExecUpdateRelaunch(
 				{ command: "node", args: ["cli.js"] },
-				{ platform, cwd: "/tmp/project", environment: {}, chdir, execve },
+				{ platform, nodeVersion: "26.1.0", cwd: "/tmp/project", environment: {}, chdir, execve },
 			),
 		).toBe(false);
 		expect(chdir).not.toHaveBeenCalled();
 		expect(execve).not.toHaveBeenCalled();
 	});
 
+	it.each(["22.22.0", "24.13.0", "25.8.1", "26.0.0"])(
+		"keeps the compatible child relaunch when execve failures abort Node %s",
+		(nodeVersion) => {
+			const chdir = vi.fn();
+			const execve = vi.fn(() => undefined as never);
+
+			expect(
+				tryExecUpdateRelaunch(
+					{ command: "/usr/bin/node", args: ["cli.js"] },
+					{ platform: "linux", nodeVersion, cwd: "/tmp/project", environment: {}, chdir, execve },
+				),
+			).toBe(false);
+			expect(chdir).not.toHaveBeenCalled();
+			expect(execve).not.toHaveBeenCalled();
+		},
+	);
+
 	it("keeps the compatible child relaunch when execve is unavailable", () => {
 		expect(
 			tryExecUpdateRelaunch(
 				{ command: "/usr/bin/node", args: ["cli.js"] },
-				{ platform: "linux", cwd: "/tmp/project", environment: {}, chdir: vi.fn() },
+				{ platform: "linux", nodeVersion: "26.1.0", cwd: "/tmp/project", environment: {}, chdir: vi.fn() },
 			),
 		).toBe(false);
 	});
@@ -128,11 +145,13 @@ describe("interactive self-update relaunch", () => {
 				execve?: (file: string, args: string[], environment: NodeJS.ProcessEnv) => never;
 			};
 			const originalExecve = updateProcess.execve;
+			const originalNodeVersion = Object.getOwnPropertyDescriptor(process.versions, "node");
 			const execve = vi.fn((_file: string, _args: string[], _environment: NodeJS.ProcessEnv) => {
 				events.push("execve");
 				return undefined as never;
 			});
 			updateProcess.execve = execve;
+			Object.defineProperty(process.versions, "node", { ...originalNodeVersion, value: "26.1.0" });
 
 			const receiver = {
 				connectionState: {
@@ -165,6 +184,9 @@ describe("interactive self-update relaunch", () => {
 				await handleUpdateCommand.call(receiver, "");
 			} finally {
 				updateProcess.execve = originalExecve;
+				if (originalNodeVersion) {
+					Object.defineProperty(process.versions, "node", originalNodeVersion);
+				}
 			}
 
 			expect(events).toEqual([
