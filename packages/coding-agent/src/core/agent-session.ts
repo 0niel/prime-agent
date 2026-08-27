@@ -7707,7 +7707,9 @@ export class AgentSession {
 
 			try {
 				await continuation;
-				this._forgetConsumedPostCompactionContinuations(continuationMessages);
+				if (this._postCompactionContinuationSettlement === settlement) {
+					this._forgetConsumedPostCompactionContinuations(continuationMessages);
+				}
 				return;
 			} catch (error) {
 				const code = error instanceof AgentContinueError ? error.code : undefined;
@@ -8541,6 +8543,11 @@ export class AgentSession {
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
 		this._autoCompactionAbortController = new AbortController();
+		let resolveCompactionOperation: () => void = () => {};
+		const compactionOperation = new Promise<void>((resolve) => {
+			resolveCompactionOperation = resolve;
+		});
+		this._compactionOperation = compactionOperation;
 
 		try {
 			const authResult = this.model ? await this._modelRegistry.getApiKeyAndHeaders(this.model) : undefined;
@@ -8643,6 +8650,10 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._autoCompactionAbortController = undefined;
+			if (this._compactionOperation === compactionOperation) {
+				this._compactionOperation = undefined;
+			}
+			resolveCompactionOperation();
 			this._scheduleSessionInputPump();
 		}
 	}
