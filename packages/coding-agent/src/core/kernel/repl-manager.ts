@@ -896,7 +896,7 @@ export class ReplKernelManager {
 		}
 	}
 
-	/** Resolves true when this call performed the cleanup (false: a concurrent teardown won). */
+	/** Resolves true when this call performed the cleanup (false: a concurrent teardown won; a joiner's options are ignored - the first caller's policy wins). */
 	async shutdown(opts: KernelShutdownOptions = {}): Promise<boolean> {
 		const inFlightShutdown = this.gracefulShutdownPromise;
 		if (inFlightShutdown) {
@@ -925,6 +925,7 @@ export class ReplKernelManager {
 			await this.flushSnapshotForDispose();
 			if (this.startStale(generation)) return false;
 		}
+		// Protocol shutdown first: the runtime closes MCP servers and kills live bash() process groups a bare hard-kill would leak.
 		const protocolShutdownAvailable = this.state === "running";
 		this.state = "shutdown";
 		liveKernels.delete(this);
