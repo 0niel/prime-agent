@@ -328,7 +328,7 @@ describe("ReplKernelManager abort handling", () => {
 			stdin: { destroyed: false, destroy: () => undefined },
 		};
 
-		await manager.dispose();
+		await manager.shutdown({ snapshot: true, drainHostRequests: true });
 		const types = writeLine.mock.calls.map((call) => (call[0] as { type?: string }).type);
 		expect(types).toContain("shutdown");
 		expect(killSignals).toContain("SIGTERM");
