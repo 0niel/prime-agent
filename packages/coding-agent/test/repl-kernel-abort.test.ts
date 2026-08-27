@@ -307,6 +307,55 @@ describe("ReplKernelManager abort handling", () => {
 		expect(cleanupResources).toHaveBeenCalledOnce();
 	});
 
+	it("rejects executions enqueued during the final snapshot flush so dispose stays bounded", async () => {
+		vi.useFakeTimers();
+		const manager = new ReplKernelManager({
+			cwd: process.cwd(),
+			snapshot: { path: "/tmp/test-state.dill", manifestPath: "/tmp/test-state.json" },
+		});
+		let releaseQueue: () => void = () => {};
+		const previousExecution = new Promise<void>((resolve) => {
+			releaseQueue = resolve;
+		});
+		const executeInner = vi.fn(
+			async (
+				_requestFields: Record<string, unknown>,
+				_code: string,
+				opts: { signal?: AbortSignal },
+			): Promise<{ stdout: string; stderr: string; status: "aborted"; durationMs: number }> =>
+				await new Promise((resolve) => {
+					opts.signal?.addEventListener(
+						"abort",
+						() => resolve({ stdout: "", stderr: "", status: "aborted", durationMs: 5000 }),
+						{ once: true },
+					);
+				}),
+		);
+		const cleanupResources = vi.fn();
+		Object.assign(
+			manager as unknown as {
+				state: "running";
+				executionQueue: Promise<void>;
+				executeInner: typeof executeInner;
+				start: () => Promise<void>;
+				cleanupResources: () => void;
+			},
+			{ state: "running", executionQueue: previousExecution, executeInner, start: async () => {}, cleanupResources },
+		);
+
+		const disposal = manager.dispose();
+		// A cell arriving mid-flush must not splice ahead of the final snapshot.
+		await expect(manager.execute("1 + 1")).rejects.toThrow("Kernel is shutting down");
+		releaseQueue();
+		await waitForCalls(executeInner, 1);
+		expect(executeInner.mock.calls[0]?.[0].type).toBe("snapshot");
+		await vi.advanceTimersByTimeAsync(5000);
+
+		await expect(disposal).resolves.toBeUndefined();
+		expect(executeInner).toHaveBeenCalledOnce();
+		expect(cleanupResources).toHaveBeenCalledOnce();
+	});
+
 	it("routes null-id and stale-id stream events into backgroundOutput, not stdout", async () => {
 		const writeLine = vi.fn(async (_request: Record<string, unknown>) => {});
 		const { manager, internals } = runningManagerWith(writeLine);

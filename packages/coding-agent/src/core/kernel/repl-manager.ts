@@ -132,6 +132,8 @@ export class ReplKernelManager {
 	private startPromise?: Promise<void>;
 	/** Pending debounced auto-snapshot, if one has been scheduled. */
 	private snapshotTimer?: ReturnType<typeof globalThis.setTimeout>;
+	/** While the final dispose snapshot is flushing, new external executions are rejected. */
+	private flushingSnapshotForDispose = false;
 
 	constructor(options: KernelManagerOptions) {
 		this.options = {
@@ -463,6 +465,9 @@ export class ReplKernelManager {
 		await this.start({ signal: opts.signal });
 		if ((this.state as string) === "shutdown") {
 			throw new Error("Kernel has been shut down");
+		}
+		if (this.flushingSnapshotForDispose && !opts.internal) {
+			throw new Error("Kernel is shutting down");
 		}
 
 		const prev = this.executionQueue;
@@ -1101,19 +1106,26 @@ export class ReplKernelManager {
 
 	private async flushSnapshotForDispose(): Promise<void> {
 		if (!this.options.snapshot || !this.isRunning) return;
-		const pendingExecutions = this.executionQueue;
-		if (this.activeExecution) void this.interrupt().catch(() => undefined);
-		let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
-		const queueSettled = await Promise.race([
-			pendingExecutions.then(() => true),
-			new Promise<false>((resolve) => {
-				timeout = globalThis.setTimeout(() => resolve(false), SNAPSHOT_EXECUTION_TIMEOUT_MS);
-				timeout.unref?.();
-			}),
-		]);
-		if (timeout) globalThis.clearTimeout(timeout);
-		if (!queueSettled) return;
-		await this.captureSnapshot({ executionTimeoutMs: SNAPSHOT_EXECUTION_TIMEOUT_MS });
+		// Block new external executions so none can splice ahead of the final snapshot and stall dispose.
+		this.flushingSnapshotForDispose = true;
+		try {
+			const pendingExecutions = this.executionQueue;
+			if (this.activeExecution) void this.interrupt().catch(() => undefined);
+			let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+			const queueSettled = await Promise.race([
+				pendingExecutions.then(() => true),
+				new Promise<false>((resolve) => {
+					timeout = globalThis.setTimeout(() => resolve(false), SNAPSHOT_EXECUTION_TIMEOUT_MS);
+					timeout.unref?.();
+				}),
+			]);
+			if (timeout) globalThis.clearTimeout(timeout);
+			if (!queueSettled) return;
+			await this.captureSnapshot({ executionTimeoutMs: SNAPSHOT_EXECUTION_TIMEOUT_MS });
+		} finally {
+			// Reset: a superseding start() can revive this kernel for new work.
+			this.flushingSnapshotForDispose = false;
+		}
 	}
 
 	/** Graceful cleanup. Waits briefly for in-flight host request handlers before killing the child. */
