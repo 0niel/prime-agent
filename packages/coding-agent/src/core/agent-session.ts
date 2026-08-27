@@ -7668,7 +7668,7 @@ export class AgentSession {
 					return;
 				}
 
-				if (this._queuedWorkPauses.size > 0 || this._compactionOperation) {
+				if (this._queuedWorkPauses.size > 0 || this._compactionOperation || this._refineInFlight) {
 					continue;
 				}
 

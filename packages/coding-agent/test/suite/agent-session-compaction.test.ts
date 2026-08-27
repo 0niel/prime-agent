@@ -1096,6 +1096,31 @@ describe("AgentSession compaction characterization", () => {
 		expect(sessionInternals._postCompactionContinuationMessages).toEqual([]);
 	});
 
+	it("waits for an in-flight refine application before continuing", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as {
+			_schedulePostCompactionContinue(): void;
+			_refineInFlight: Promise<void> | undefined;
+		};
+		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+		const pause = harness.session.acquireQueuedWorkPause();
+		sessionInternals._schedulePostCompactionContinue();
+		await new Promise<void>(setImmediate);
+
+		// Refine enters its apply phase while the runner waits out the pause.
+		const refineApply = createDeferred();
+		sessionInternals._refineInFlight = refineApply.promise;
+		pause.release();
+		await new Promise<void>(setImmediate);
+		expect(continueSpy).not.toHaveBeenCalled();
+
+		sessionInternals._refineInFlight = undefined;
+		refineApply.resolve();
+		await harness.session.waitForHeadlessIdle();
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
+
 	it("clears queued autonomous threshold continuations when autonomous mode is disabled", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({
