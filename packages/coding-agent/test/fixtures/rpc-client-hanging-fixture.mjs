@@ -11,4 +11,14 @@ if (process.env.RPC_FIXTURE_HOLD_STDIO === "1") {
 	process.stdout.write(`${JSON.stringify({ type: "fixture_grandchild", pid: grandchild.pid })}\n`);
 }
 
+if (process.env.RPC_FIXTURE_REPLY_EXIT === "1") {
+	// Answer the first command, then die immediately: the response is still in the
+	// pipe (or draining) when "exit" reaches the parent.
+	process.stdin.once("data", (chunk) => {
+		const { id, type } = JSON.parse(chunk.toString());
+		process.stdout.write(`${JSON.stringify({ id, type: "response", command: type, success: true, data: {} })}\n`);
+		process.exit(0);
+	});
+}
+
 process.stdin.resume();

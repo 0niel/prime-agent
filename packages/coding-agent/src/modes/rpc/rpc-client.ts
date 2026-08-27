@@ -129,8 +129,25 @@ export class RpcClient {
 		// the fallback for failed spawns, where "exit" never fires.
 		const finalize = () => {
 			if (this.process !== child) return;
-			this.failPendingOperations(new Error(`RPC process exited. Stderr: ${this.stderr}`));
 			this.process = null;
+			const fail = () => {
+				// A client restarted meanwhile must not be poisoned by its predecessor.
+				if (this.process) return;
+				this.failPendingOperations(new Error(`RPC process exited. Stderr: ${this.stderr}`));
+			};
+			const stdout = child.stdout;
+			if (!stdout || stdout.readableEnded || stdout.destroyed) {
+				fail();
+				return;
+			}
+			// Let buffered stdout drain so a response already in the pipe resolves instead
+			// of rejecting; the timer covers pipes a grandchild keeps open past the exit.
+			const timer = setTimeout(fail, 1000);
+			timer.unref?.();
+			stdout.once("close", () => {
+				clearTimeout(timer);
+				fail();
+			});
 		};
 		child.on("exit", finalize);
 		child.on("close", finalize);
