@@ -85,6 +85,31 @@ describe("RpcClient operation completion", () => {
 		await expect(state).resolves.toEqual({});
 	});
 
+	it("stop resolves and allows restart when a grandchild holds the stdio pipes", async () => {
+		const client = new RpcClient({ cliPath: fixturePath, env: { RPC_FIXTURE_HOLD_STDIO: "1" } });
+		const grandchildPids: number[] = [];
+		client.onEvent((event) => {
+			const data = event as unknown as { type: string; pid?: number };
+			if (data.type === "fixture_grandchild" && typeof data.pid === "number") grandchildPids.push(data.pid);
+		});
+		try {
+			await client.start();
+			await vi.waitFor(() => expect(grandchildPids).toHaveLength(1));
+			await client.stop();
+			await client.start();
+			await vi.waitFor(() => expect(grandchildPids).toHaveLength(2));
+			await client.stop();
+		} finally {
+			for (const pid of grandchildPids) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// Grandchild already exited.
+				}
+			}
+		}
+	});
+
 	it("rejects start when the child cannot spawn", async () => {
 		const client = new RpcClient({ cliPath: fixturePath, env: { PATH: "" } });
 

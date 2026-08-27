@@ -120,8 +120,9 @@ export class RpcClient {
 		child.stdout?.on("close", () => {
 			this.failPendingOperations(new Error(`RPC process output closed. Stderr: ${this.stderr}`));
 		});
-		child.on("close", () => {
-			this.process = null;
+		child.on("exit", () => {
+			// "exit" (not "close"): a grandchild holding the stdio pipes must not block cleanup.
+			if (this.process === child) this.process = null;
 		});
 
 		// Collect stderr for debugging
@@ -155,13 +156,18 @@ export class RpcClient {
 		this.stopReadingStdout = null;
 		this.failPendingOperations(new Error(`RPC client stopped. Stderr: ${this.stderr}`));
 		await new Promise<void>((resolve) => {
-			const timeout = setTimeout(() => child.kill("SIGKILL"), 1000);
-			child.once("close", () => {
+			// Resolve after SIGKILL as a fallback so stop() cannot hang on a child that never exits.
+			const timeout = setTimeout(() => {
+				child.kill("SIGKILL");
+				resolve();
+			}, 1000);
+			child.once("exit", () => {
 				clearTimeout(timeout);
 				resolve();
 			});
 			child.kill("SIGTERM");
 		});
+		this.process = null;
 	}
 
 	/**
