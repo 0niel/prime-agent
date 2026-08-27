@@ -114,16 +114,25 @@ export class RpcClient {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.process = child;
+		// All handlers are scoped to this child so late events from a replaced child
+		// cannot poison a restarted client.
 		child.on("error", (error) => {
+			if (this.process !== child) return;
 			this.failPendingOperations(new Error(`RPC process error: ${error.message}. Stderr: ${this.stderr}`));
 		});
 		child.stdout?.on("close", () => {
+			if (this.process !== child) return;
 			this.failPendingOperations(new Error(`RPC process output closed. Stderr: ${this.stderr}`));
 		});
-		child.on("exit", () => {
-			// "exit" (not "close"): a grandchild holding the stdio pipes must not block cleanup.
-			if (this.process === child) this.process = null;
-		});
+		// "exit" so a grandchild holding the stdio pipes cannot block cleanup; "close" as
+		// the fallback for failed spawns, where "exit" never fires.
+		const finalize = () => {
+			if (this.process !== child) return;
+			this.failPendingOperations(new Error(`RPC process exited. Stderr: ${this.stderr}`));
+			this.process = null;
+		};
+		child.on("exit", finalize);
+		child.on("close", finalize);
 
 		// Collect stderr for debugging
 		child.stderr?.on("data", (data) => {
