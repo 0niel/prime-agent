@@ -129,6 +129,12 @@ describe("RpcClient operation completion", () => {
 		await expect(client.start()).rejects.toThrow("RPC process error");
 	});
 
+	it("resolves a response the child wrote just before exiting", async () => {
+		const client = new RpcClient({ cliPath: fixturePath, env: { RPC_FIXTURE_REPLY_EXIT: "1" } });
+		await client.start();
+		await expect(client.getState()).resolves.toEqual({});
+	});
+
 	it("rejects pending work when the child exits while a grandchild holds stdout", async () => {
 		const client = new RpcClient({ cliPath: fixturePath, env: { RPC_FIXTURE_HOLD_STDIO: "1" } });
 		let grandchildPid: number | undefined;
