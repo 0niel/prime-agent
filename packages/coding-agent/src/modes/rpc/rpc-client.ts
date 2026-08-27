@@ -149,6 +149,8 @@ export class RpcClient {
 		try {
 			await once(child, "spawn");
 		} catch (error) {
+			// An error before "spawn" means the child never came up; allow retrying start().
+			if (this.process === child) this.process = null;
 			throw this.transportError ?? error;
 		}
 	}
