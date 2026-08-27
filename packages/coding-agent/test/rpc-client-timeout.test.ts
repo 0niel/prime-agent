@@ -98,6 +98,16 @@ describe("RpcClient operation completion", () => {
 			await client.stop();
 			await client.start();
 			await vi.waitFor(() => expect(grandchildPids).toHaveLength(2));
+			// Release the old child's stdio pipes: its late "close" must not poison
+			// the restarted client.
+			process.kill(grandchildPids[0], "SIGKILL");
+			await vi.waitFor(() => expect(() => process.kill(grandchildPids[0], 0)).toThrow());
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			const state = client.getState();
+			client["handleLine"](
+				JSON.stringify({ id: "req_1", type: "response", command: "get_state", success: true, data: {} }),
+			);
+			await expect(state).resolves.toEqual({});
 			await client.stop();
 		} finally {
 			for (const pid of grandchildPids) {
@@ -122,15 +132,40 @@ describe("RpcClient operation completion", () => {
 		const client = new RpcClient({ cliPath: fixturePath, env: { PATH: "" } });
 
 		await expect(client.start()).rejects.toThrow("RPC process error");
+		// The failed child is cleaned up, so a retry spawns again instead of
+		// throwing "Client already started".
+		await expect(client.start()).rejects.toThrow("RPC process error");
+	});
+
+	it("rejects pending work when the child exits while a grandchild holds stdout", async () => {
+		const client = new RpcClient({ cliPath: fixturePath, env: { RPC_FIXTURE_HOLD_STDIO: "1" } });
+		let grandchildPid: number | undefined;
+		client.onEvent((event) => {
+			const data = event as unknown as { type: string; pid?: number };
+			if (data.type === "fixture_grandchild") grandchildPid = data.pid;
+		});
+		await client.start();
+		await vi.waitFor(() => expect(grandchildPid).toBeDefined());
+		const child = client["process"];
+		if (!child) throw new Error("RPC child did not start");
+		try {
+			const command = expect(client.getState()).rejects.toThrow("RPC process exited");
+			const idle = expect(client.waitForIdle()).rejects.toThrow("RPC process exited");
+			child.kill("SIGKILL");
+			await Promise.all([command, idle]);
+		} finally {
+			if (grandchildPid) process.kill(grandchildPid, "SIGKILL");
+		}
 	});
 
 	it("rejects pending commands and completion waits when the child output closes", async () => {
 		const client = await createClient();
 		const child = client["process"];
 		if (!child) throw new Error("RPC child did not start");
-		const command = expect(client.getState()).rejects.toThrow("RPC process output closed");
-		const idle = expect(client.waitForIdle()).rejects.toThrow("RPC process output closed");
-		const events = expect(client.collectEvents()).rejects.toThrow("RPC process output closed");
+		const died = /RPC process (exited|output closed)/;
+		const command = expect(client.getState()).rejects.toThrow(died);
+		const idle = expect(client.waitForIdle()).rejects.toThrow(died);
+		const events = expect(client.collectEvents()).rejects.toThrow(died);
 
 		child.kill("SIGTERM");
 
