@@ -107,6 +107,11 @@ export class RpcClient {
 			args.push(...this.options.args);
 		}
 
+		// Cut the previous generation: its reader must not feed this session, and its
+		// pending work must fail now instead of hanging past the restart.
+		this.stopReadingStdout?.();
+		this.stopReadingStdout = null;
+		this.failPendingOperations(new Error(`RPC client restarted. Stderr: ${this.stderr}`));
 		this.transportError = null;
 		const child = spawn("node", [cliPath, ...args], {
 			cwd: this.options.cwd,
