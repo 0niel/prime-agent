@@ -7,7 +7,7 @@ if (process.env.RPC_FIXTURE_HOLD_STDIO === "1") {
 	// process dies, emulating child output that lands after a replacement started.
 	const script =
 		process.env.RPC_FIXTURE_GHOST_EVENT === "1"
-			? `process.stdin.on("end", () => setTimeout(() => process.stdout.write('{"type":"agent_end"}\\n'), 250)); process.stdin.resume(); setTimeout(() => {}, 30000);`
+			? `process.stdin.on("end", () => setTimeout(() => { process.stdout.write('{"type":"agent_end"}\\n'); process.stderr.write("ghost-event-written\\n"); }, 250)); process.stdin.resume(); setTimeout(() => {}, 30000);`
 			: "setTimeout(() => {}, 30000)";
 	const grandchild = spawn(process.execPath, ["-e", script], {
 		stdio: "inherit",
