@@ -181,7 +181,10 @@ describe("RpcClient operation completion", () => {
 			// The old grandchild writes an agent_end into the dead child's stdout ~250ms
 			// after the kill; it must not resolve the new session's waiter.
 			await vi.waitFor(() => expect(grandchildPids).toHaveLength(2));
-			await new Promise((resolve) => setTimeout(resolve, 500));
+			// The stderr sentinel proves the ghost's stdout write really happened, so the
+			// still-pending assertion below cannot pass vacuously.
+			await vi.waitFor(() => expect(client.getStderr()).toContain("ghost-event-written"), { timeout: 3000 });
+			await new Promise((resolve) => setTimeout(resolve, 50));
 			expect(await Promise.race([idle, Promise.resolve("pending")])).toBe("pending");
 			client["handleLine"](JSON.stringify({ type: "agent_end" }));
 			await expect(idle).resolves.toBeUndefined();
