@@ -164,6 +164,47 @@ describe("RpcClient operation completion", () => {
 		}
 	});
 
+	it("fails a dead generation's pending work on restart and ignores its late output", async () => {
+		const client = new RpcClient({
+			cliPath: fixturePath,
+			env: { RPC_FIXTURE_HOLD_STDIO: "1", RPC_FIXTURE_GHOST_EVENT: "1" },
+		});
+		const grandchildPids: number[] = [];
+		client.onEvent((event) => {
+			const data = event as unknown as { type: string; pid?: number };
+			if (data.type === "fixture_grandchild" && typeof data.pid === "number") grandchildPids.push(data.pid);
+		});
+		try {
+			await client.start();
+			await vi.waitFor(() => expect(grandchildPids).toHaveLength(1));
+			const child = client["process"];
+			if (!child) throw new Error("RPC child did not start");
+			const orphan = expect(client.getState()).rejects.toThrow("RPC client restarted");
+			child.kill("SIGKILL");
+			await vi.waitFor(() => expect(client["process"]).toBeNull());
+			// Restart inside the dead child's stdout-drain window.
+			await client.start();
+			await orphan;
+			const idle = client.waitForIdle();
+			// The old grandchild writes an agent_end into the dead child's stdout ~250ms
+			// after the kill; it must not resolve the new session's waiter.
+			await vi.waitFor(() => expect(grandchildPids).toHaveLength(2));
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			expect(await Promise.race([idle, Promise.resolve("pending")])).toBe("pending");
+			client["handleLine"](JSON.stringify({ type: "agent_end" }));
+			await expect(idle).resolves.toBeUndefined();
+			await client.stop();
+		} finally {
+			for (const pid of grandchildPids) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// Grandchild already exited.
+				}
+			}
+		}
+	});
+
 	it("rejects pending commands and completion waits when the child output closes", async () => {
 		const client = await createClient();
 		const child = client["process"];
