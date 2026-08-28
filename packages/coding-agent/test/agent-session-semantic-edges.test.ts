@@ -668,7 +668,7 @@ describe("AgentSession semantic edges", () => {
 		expect(ledgerFor(session).filter((event) => event.type === "compaction_finished")).toEqual([]);
 	});
 
-	it("stamps the model-request header on the real compaction summary call and derives its edge", async () => {
+	it("mints a distinct request identity for each split-turn summary call", async () => {
 		const harness = await createHarness({
 			persistSession: true,
 			settings: { compaction: { keepRecentTokens: 1 } },
@@ -699,39 +699,47 @@ describe("AgentSession semantic edges", () => {
 		await harness.session.prompt("two");
 
 		const captured: Array<Record<string, string> | undefined> = [];
-		let ledgerAtCall: SemanticEdgeLedgerEvent[] = [];
+		const ledgerAtCall: SemanticEdgeLedgerEvent[][] = [];
 		const summaryStep = (_context: unknown, streamOptions: { headers?: Record<string, string> } | undefined) => {
 			captured.push(streamOptions?.headers);
-			ledgerAtCall = readSemanticEdgeLedger(ledgerPath);
+			ledgerAtCall.push(readSemanticEdgeLedger(ledgerPath));
 			return fauxAssistantMessage("the summary");
 		};
-		// A split-turn compaction makes two summary calls; both share the one request ID.
+		// A split-turn compaction makes two summary calls with DIFFERENT bodies:
+		// one shared Idempotency-Key would be rejected (or replayed) downstream.
 		harness.setResponses([summaryStep, summaryStep]);
 		await harness.session.compact();
 
-		expect(captured.length).toBeGreaterThanOrEqual(1);
-		const wireId = captured[0]?.[MODEL_REQUEST_ID_HEADER];
-		expect(wireId).toMatch(/^[0-9a-f]{32}$/);
-		for (const headers of captured) {
+		expect(captured).toHaveLength(2);
+		const wireIds = captured.map((headers) => headers?.[MODEL_REQUEST_ID_HEADER]);
+		expect(wireIds[0]).toMatch(/^[0-9a-f]{32}$/);
+		expect(wireIds[1]).toMatch(/^[0-9a-f]{32}$/);
+		expect(wireIds[0]).not.toBe(wireIds[1]);
+		for (const [index, headers] of captured.entries()) {
 			expect(headers?.["x-semantic-sentinel"]).toBe("keep-me");
-			expect(headers?.[MODEL_REQUEST_ID_HEADER]).toBe(wireId);
-			expect(headers?.[IDEMPOTENCY_KEY_HEADER]).toBe(wireId);
+			expect(headers?.[IDEMPOTENCY_KEY_HEADER]).toBe(wireIds[index]);
+			// Each request event was durable before its own provider call went out.
+			expect(ledgerAtCall[index]).toContainEqual(
+				expect.objectContaining({ type: "request_started", request_id: wireIds[index] }),
+			);
 		}
-		// The summary request event was durable before the provider call went out.
-		expect(ledgerAtCall).toContainEqual(expect.objectContaining({ type: "request_started", request_id: wireId }));
 
-		// The compaction edge lands on the next committed request.
+		// Exactly one compaction edge, sourced at the last-committed summary slice.
 		harness.setResponses([fauxAssistantMessage("after")]);
 		await harness.session.prompt("after");
 		const events = readSemanticEdgeLedger(ledgerPath);
+		const committedSlices = events
+			.filter((event) => event.type === "request_finished")
+			.map((event) => (event.type === "request_finished" ? event.request_id : ""))
+			.filter((requestId) => wireIds.includes(requestId));
+		expect(committedSlices).toHaveLength(2);
 		const edges = deriveSemanticEdges([events]).edges;
 		const afterId = startedRequestIds(events).at(-1);
-		expect(edges).toContainEqual({
-			source_request_id: wireId,
-			target_request_id: afterId,
-			type: "compaction",
-		});
-		// The continuation from the summary is suppressed in favor of the compaction edge.
+		const compactionEdges = edges.filter((edge) => edge.type === "compaction");
+		expect(compactionEdges).toEqual([
+			{ source_request_id: committedSlices[1], target_request_id: afterId, type: "compaction" },
+		]);
+		// The continuation from that slice is suppressed in favor of the compaction edge.
 		expect(edges.filter((edge) => edge.target_request_id === afterId)).toHaveLength(1);
 	});
 });

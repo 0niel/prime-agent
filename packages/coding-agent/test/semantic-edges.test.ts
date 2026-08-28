@@ -413,6 +413,26 @@ describe("deriveSemanticEdges", () => {
 		]);
 	});
 
+	it("keys the compaction edge off the last-committed summary slice of a split turn", () => {
+		const root = recorderAt("root.jsonl");
+		const r1 = root.startTurnRequest();
+		root.finishRequest(r1);
+		const compaction = root.beginCompaction();
+		const sliceA = root.startCompactionRequest(compaction.compactionId);
+		const sliceB = root.startCompactionRequest(compaction.compactionId);
+		root.finishRequest(sliceA);
+		root.finishRequest(sliceB);
+		root.finishCompaction(compaction.compactionId, "completed");
+		const r2 = root.startTurnRequest();
+		root.finishRequest(r2);
+
+		expect(deriveSemanticEdges([eventsAt("root.jsonl")]).edges).toEqual([
+			{ source_request_id: r1, target_request_id: sliceA, type: "continuation" },
+			{ source_request_id: r1, target_request_id: sliceB, type: "continuation" },
+			{ source_request_id: sliceB, target_request_id: r2, type: "compaction" },
+		]);
+	});
+
 	it("emits no compaction edge when another request committed after the summary", () => {
 		const root = recorderAt("root.jsonl");
 		const r1 = root.startTurnRequest();

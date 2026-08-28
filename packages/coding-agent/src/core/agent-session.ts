@@ -7469,27 +7469,37 @@ export class AgentSession {
 			if (extensionCompaction) {
 				({ summary, firstKeptEntryId, tokensBefore, details } = extensionCompaction);
 			} else {
-				const summaryRequestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
-				try {
-					({ summary, firstKeptEntryId, tokensBefore, details } = await compact(
-						preparation,
-						model,
-						apiKey,
-						{ ...headers, ...modelRequestHeaders(summaryRequestId) },
-						customInstructions,
-						signal,
-						this.thinkingLevel,
-					));
-				} catch (error) {
+				// Each summary wire call gets its own request ID: split turns send two
+				// different bodies, and one Idempotency-Key must never cover both.
+				const summaryCall = async <T>(
+					call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
+				): Promise<T> => {
+					const requestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
+					let result: T;
 					try {
-						this._semanticEdges.failRequest(summaryRequestId);
-					} catch (ledgerError) {
-						// Keep the original summarization error; provenance is best-effort.
-						console.warn(`semantic-edge ledger write failed: ${String(ledgerError)}`);
+						result = await call({ ...headers, ...modelRequestHeaders(requestId) });
+					} catch (error) {
+						try {
+							this._semanticEdges.failRequest(requestId);
+						} catch (ledgerError) {
+							// Keep the original summarization error; provenance is best-effort.
+							console.warn(`semantic-edge ledger write failed: ${String(ledgerError)}`);
+						}
+						throw error;
 					}
-					throw error;
-				}
-				this._semanticEdges.finishRequest(summaryRequestId);
+					this._semanticEdges.finishRequest(requestId);
+					return result;
+				};
+				({ summary, firstKeptEntryId, tokensBefore, details } = await compact(
+					preparation,
+					model,
+					apiKey,
+					headers,
+					customInstructions,
+					signal,
+					this.thinkingLevel,
+					summaryCall,
+				));
 			}
 
 			if (signal.aborted) {

@@ -375,7 +375,7 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 		string,
 		{ sessionId: string; inbound: Array<{ source: string; type: SemanticEdgeType }> }
 	>();
-	const compactions = new Map<string, { sessionId: string; summaryRequestId?: string }>();
+	const compactions = new Map<string, { sessionId: string; summaryRequestIds: Set<string> }>();
 	const returnedChildren = new Set<string>();
 	const edges: SemanticEdge[] = [];
 
@@ -414,8 +414,9 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 				inFlight.set(event.request_id, { sessionId: event.session_id, inbound });
 				if (event.compaction_id !== undefined) {
 					const compaction = compactions.get(event.compaction_id);
-					if (compaction && compaction.sessionId === event.session_id && !compaction.summaryRequestId) {
-						compaction.summaryRequestId = event.request_id;
+					// A split-turn compaction sends several summary slices; all belong to it.
+					if (compaction && compaction.sessionId === event.session_id) {
+						compaction.summaryRequestIds.add(event.request_id);
 					}
 				}
 				break;
@@ -447,19 +448,19 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 				break;
 			}
 			case "compaction_begun":
-				compactions.set(event.compaction_id, { sessionId: event.session_id });
+				compactions.set(event.compaction_id, { sessionId: event.session_id, summaryRequestIds: new Set() });
 				break;
 			case "compaction_finished": {
 				const compaction = compactions.get(event.compaction_id);
 				compactions.delete(event.compaction_id);
-				if (event.status !== "completed" || !compaction?.summaryRequestId) {
+				if (event.status !== "completed" || !compaction) {
 					break;
 				}
 				const state = session(compaction.sessionId);
-				// The summary must be the session's last commit; an interrupted or
-				// extension-supplied compaction produces no edge.
-				if (state.lastRequestId === compaction.summaryRequestId) {
-					state.pending.push({ source: compaction.summaryRequestId, type: "compaction" });
+				// The session's last commit must be one of the compaction's summary slices;
+				// an interrupted or extension-supplied compaction produces no edge.
+				if (state.lastRequestId !== undefined && compaction.summaryRequestIds.has(state.lastRequestId)) {
+					state.pending.push({ source: state.lastRequestId, type: "compaction" });
 				}
 				break;
 			}
