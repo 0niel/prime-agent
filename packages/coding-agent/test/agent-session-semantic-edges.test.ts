@@ -358,28 +358,68 @@ describe("AgentSession semantic edges", () => {
 		);
 	});
 
-	it("never claims a return for a child whose run errors", async () => {
-		let child: AgentSession | undefined;
+	function failingChildHost(options: { commitBeforeFailure: boolean }) {
+		const state: { child?: AgentSession } = {};
 		const host: SubagentRuntimeHost = {
-			createRlmSubagentRuntime: async (options) => {
-				const childManager = SessionManager.create(tempDir, options.sessionDir);
-				const created = createSession({ sessionManager: childManager, rlmSessionDir: options.sessionDir }).session;
+			createRlmSubagentRuntime: async (hostOptions) => {
+				const childManager = SessionManager.create(tempDir, hostOptions.sessionDir);
+				const created = createSession({
+					sessionManager: childManager,
+					rlmSessionDir: hostOptions.sessionDir,
+				}).session;
+				if (options.commitBeforeFailure) {
+					await created.prompt("child work before the failure");
+				}
 				vi.spyOn(created, "promptAndWait").mockRejectedValue(new Error("child run failed"));
-				child = created;
-				options.onSessionPublished?.(created);
+				state.child = created;
+				hostOptions.onSessionPublished?.(created);
 				return { session: created };
 			},
 			deleteRlmSubagentRuntime: async (_childId, session) => {
 				await session?.disposeAsync();
 			},
 		};
+		return { host, state };
+	}
+
+	it("claims a failed child's return with its last committed request", async () => {
+		const { host, state } = failingChildHost({ commitBeforeFailure: true });
 		const { session: root } = createSession({ subagentRuntimeHost: host });
 
 		await root.prompt("parent turn");
 		await root.runRlmChild("doomed child");
 		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status !== "running");
 
-		expect(child).toBeDefined();
+		const child = state.child;
+		if (!child) throw new Error("Missing child session");
+		const childCommitted = child.semanticEdges.lastCommittedRequestId;
+		expect(childCommitted).toBeDefined();
+		expect(ledgerFor(root).filter((event) => event.type === "child_returned")).toEqual([
+			{
+				type: "child_returned",
+				session_id: root.sessionId,
+				child_session_id: child.sessionId,
+				request_id: childCommitted,
+			},
+		]);
+
+		// The error outcome the parent consumes links the child's last commit forward.
+		await root.prompt("after the failure");
+		const edges = deriveSemanticEdges([ledgerFor(root)]).edges;
+		const returns = edges.filter((edge) => edge.type === "subagent_return");
+		expect(returns).toHaveLength(1);
+		expect(returns[0]?.source_request_id).toBe(childCommitted);
+	});
+
+	it("never claims a return for a failed child with no committed request", async () => {
+		const { host, state } = failingChildHost({ commitBeforeFailure: false });
+		const { session: root } = createSession({ subagentRuntimeHost: host });
+
+		await root.prompt("parent turn");
+		await root.runRlmChild("doomed child");
+		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status !== "running");
+
+		expect(state.child).toBeDefined();
 		expect(ledgerFor(root).filter((event) => event.type === "child_returned")).toEqual([]);
 		const edges = deriveSemanticEdges([ledgerFor(root)]).edges;
 		expect(edges.filter((edge) => edge.type === "subagent_return")).toEqual([]);
@@ -403,6 +443,48 @@ describe("AgentSession semantic edges", () => {
 			return entry === undefined || entry.status !== "running";
 		});
 
+		expect(ledgerFor(root).filter((event) => event.type === "child_returned")).toEqual([]);
+	});
+
+	it("never claims a return for a cancelled child even with committed work", async () => {
+		let releaseRun: ((error: Error) => void) | undefined;
+		const state: { child?: AgentSession } = {};
+		const host: SubagentRuntimeHost = {
+			createRlmSubagentRuntime: async (hostOptions) => {
+				const childManager = SessionManager.create(tempDir, hostOptions.sessionDir);
+				const created = createSession({
+					sessionManager: childManager,
+					rlmSessionDir: hostOptions.sessionDir,
+				}).session;
+				await created.prompt("child work before the cancellation");
+				vi.spyOn(created, "promptAndWait").mockImplementation(
+					() =>
+						new Promise((_resolve, reject) => {
+							releaseRun = reject;
+						}),
+				);
+				state.child = created;
+				hostOptions.onSessionPublished?.(created);
+				return { session: created };
+			},
+			deleteRlmSubagentRuntime: async (_childId, session) => {
+				await session?.disposeAsync();
+			},
+		};
+		const { session: root } = createSession({ subagentRuntimeHost: host });
+
+		await root.prompt("parent turn");
+		const spawned = await root.runRlmChild("cancel me later");
+		await waitForAsync(async () => releaseRun !== undefined);
+		expect(state.child?.semanticEdges.lastCommittedRequestId).toBeDefined();
+		expect(root.cancelRlmChildRun(basename(spawned.session_dir))).toBe(true);
+		releaseRun?.(new Error("run torn down"));
+		await waitForAsync(async () => {
+			const entry = (await root.listRlmSubagents()).subagents[0];
+			return entry === undefined || entry.status !== "running";
+		});
+
+		// Cancelled runs return nothing, even when the child had committed work.
 		expect(ledgerFor(root).filter((event) => event.type === "child_returned")).toEqual([]);
 	});
 

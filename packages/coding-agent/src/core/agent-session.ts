@@ -10563,6 +10563,13 @@ export class AgentSession {
 					run.status = "error";
 					run.error = runError.message;
 				}
+				// A failed child still returns an error outcome the parent consumes;
+				// cancelled runs and zero-commit children return nothing.
+				const failedChild = childSession ?? childRuntime?.session;
+				const failedLastCommitted = failedChild?.semanticEdges.lastCommittedRequestId;
+				if (run.status === "error" && failedChild && failedLastCommitted !== undefined) {
+					this._semanticEdges.recordChildReturned(failedChild.sessionId, failedLastCommitted);
+				}
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
