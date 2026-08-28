@@ -3,12 +3,9 @@ import type { KernelBootstrapProgressHandler, KernelPythonSkill } from "./bootst
 import type { RestoreResult, SnapshotResult } from "./state-snapshot.js";
 
 export const DEFAULT_MAX_OUTPUT_CHARS = 65536;
-export const HOST_REQUEST_DISPOSE_TIMEOUT_MS = 5000;
+export const HOST_REQUEST_SHUTDOWN_TIMEOUT_MS = 5000;
 export const KERNEL_SHUTDOWN_TIMEOUT_MS = 5000;
 export const DEFAULT_SNAPSHOT_DEBOUNCE_MS = 1500;
-// Cap how long a graceful dispose waits on the final snapshot; the debounced
-// on-disk copy is the fallback if this is exceeded.
-export const SNAPSHOT_DISPOSE_TIMEOUT_MS = 5000;
 export const SNAPSHOT_EXECUTION_TIMEOUT_MS = 5000;
 export const KERNEL_ABORT_GRACE_MS = 1000;
 export const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
@@ -57,6 +54,8 @@ export interface KernelManagerOptions {
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
 	snapshot?: KernelSnapshotConfig;
+	/** Runtime bootstrap re-run on a protocol-repaired kernel so live handles (rlm, bash, skills) exist again. */
+	bootstrapCode?: string;
 }
 
 export interface KernelStartOptions {
@@ -73,6 +72,8 @@ export interface ExecuteOptions {
 	maxOutputChars?: number;
 	/** Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution. */
 	internal?: boolean;
+	/** The protocol repair's own restore; exempt from waiting on the repair it belongs to. */
+	protocolRepair?: boolean;
 }
 
 /** MIME tag the `edit` skill emits diff payloads under. */
@@ -268,16 +269,20 @@ export function createDeferred<T>(): Deferred<T> {
 	return { promise, resolve, reject };
 }
 
+export interface KernelShutdownOptions {
+	snapshot?: boolean;
+	drainHostRequests?: boolean;
+}
+
 /** Public surface every kernel client exposes to the provisioner and session layer. */
 export interface KernelClient {
 	readonly ownerSessionId: string | undefined;
 	readonly isRunning: boolean;
 	start(options?: KernelStartOptions): Promise<void>;
 	execute(code: string, opts?: ExecuteOptions): Promise<ExecuteResult>;
-	shutdown(opts?: { snapshot?: boolean }): Promise<boolean>;
+	shutdown(opts?: KernelShutdownOptions): Promise<boolean>;
 	restart(): Promise<void>;
 	kill(): Promise<void>;
-	dispose(): Promise<void>;
 	disposeSync(): void;
 	snapshotState(): Promise<SnapshotResult | null>;
 	pruneOversizedVariables(): Promise<SnapshotResult | null>;
@@ -293,7 +298,7 @@ let signalHandlersInstalled = false;
 registerSessionResourceCleanup((sessionId) => {
 	for (const k of liveKernels) {
 		if (!sessionId || k.ownerSessionId === sessionId) {
-			void k.dispose();
+			void k.shutdown({ snapshot: true, drainHostRequests: true });
 		}
 	}
 });
