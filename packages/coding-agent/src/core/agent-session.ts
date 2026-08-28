@@ -160,6 +160,7 @@ import {
 } from "./goals.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
+import { LineageRecorder, lineageRequestHeaders, wrapStreamFnWithLineage } from "./lineage.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -439,6 +440,8 @@ export interface AgentSessionConfig {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
+	lineageParentSessionId?: string;
+	lineageSpawnedByRequestId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	autonomous?: AgentAutonomousConfig;
 	prewarmIpythonKernel?: boolean;
@@ -1151,6 +1154,7 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
+	private readonly _lineage: LineageRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
@@ -1260,6 +1264,15 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
+		const lineageDir = this._rlmSessionDir ?? this.sessionManager.getSessionArtifactDir();
+		this._lineage = new LineageRecorder({
+			ledgerPath: lineageDir ? join(lineageDir, "lineage.jsonl") : undefined,
+			sessionId: this.sessionManager.getSessionId(),
+			depth: this._rlmDepth,
+			parentSessionId: config.lineageParentSessionId,
+			spawnedByRequestId: config.lineageSpawnedByRequestId,
+		});
+		this.agent.streamFn = wrapStreamFnWithLineage(this.agent.streamFn, this._lineage);
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -3700,6 +3713,7 @@ export class AgentSession {
 	}
 
 	private _resolveRetry(): void {
+		this._lineage.clearTurnRetry();
 		if (this._retryResolve) {
 			this._retryResolve();
 			this._retryResolve = undefined;
@@ -4257,6 +4271,10 @@ export class AgentSession {
 
 	get rlmDepth(): number {
 		return this._rlmDepth;
+	}
+
+	get lineage(): LineageRecorder {
+		return this._lineage;
 	}
 
 	get rlmMaxDepth(): number {
@@ -7418,41 +7436,62 @@ export class AgentSession {
 		let extensionCompaction: CompactionResult | undefined;
 		let fromExtension = false;
 
-		if (this._extensionRunner.hasHandlers("session_before_compact")) {
-			const result = (await this._extensionRunner.emit({
-				type: "session_before_compact",
-				preparation,
-				branchEntries: pathEntries,
-				customInstructions,
-				signal,
-			})) as SessionBeforeCompactResult | undefined;
+		const lineageCompaction = this._lineage.beginCompaction();
+		let summary: string;
+		let firstKeptEntryId: string;
+		let tokensBefore: number;
+		let details: CompactionResult["details"];
+		try {
+			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+				const result = (await this._extensionRunner.emit({
+					type: "session_before_compact",
+					preparation,
+					branchEntries: pathEntries,
+					customInstructions,
+					signal,
+				})) as SessionBeforeCompactResult | undefined;
 
-			if (result?.cancel) {
+				if (result?.cancel) {
+					throw new Error("Compaction cancelled");
+				}
+
+				if (result?.compaction) {
+					extensionCompaction = result.compaction;
+					fromExtension = true;
+				}
+			}
+
+			({ summary, firstKeptEntryId, tokensBefore, details } =
+				extensionCompaction ??
+				(await compact(
+					preparation,
+					model,
+					apiKey,
+					{ ...headers, ...lineageRequestHeaders(lineageCompaction.requestId) },
+					customInstructions,
+					signal,
+					this.thinkingLevel,
+				)));
+
+			if (signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
-			if (result?.compaction) {
-				extensionCompaction = result.compaction;
-				fromExtension = true;
-			}
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				customInstructions,
+			);
+		} catch (error) {
+			const cancelled =
+				error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
+			this._lineage.finishCompaction(lineageCompaction.compactionId, cancelled ? "cancelled" : "failed");
+			throw error;
 		}
-
-		const { summary, firstKeptEntryId, tokensBefore, details } =
-			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
-
-		if (signal.aborted) {
-			throw new Error("Compaction cancelled");
-		}
-
-		this.sessionManager.appendCompaction(
-			summary,
-			firstKeptEntryId,
-			tokensBefore,
-			details,
-			fromExtension,
-			customInstructions,
-		);
+		this._lineage.finishCompaction(lineageCompaction.compactionId, "completed");
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
@@ -9334,6 +9373,7 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth + 1,
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
+			spawnedByRequestId: this._lineage.lastTurnRequestId,
 		};
 	}
 
@@ -9399,6 +9439,8 @@ export class AgentSession {
 			rlmSessionDir: options.sessionDir,
 			rlmParentNodeId: options.rlmParentNodeId,
 			rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+			lineageParentSessionId: options.parentSession.sessionId,
+			lineageSpawnedByRequestId: options.spawnedByRequestId,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {
@@ -10460,6 +10502,7 @@ export class AgentSession {
 				await child.waitForRlmQuiescence();
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
+				child.lineage.recordSessionStatus("completed");
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
@@ -10494,6 +10537,7 @@ export class AgentSession {
 					run.status = "error";
 					run.error = runError.message;
 				}
+				childSession?.lineage.recordSessionStatus(run.status === "error" ? "failed" : "cancelled");
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
@@ -10808,6 +10852,8 @@ export class AgentSession {
 		}
 
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
+		this._lineage.prepareTurnRetry();
 
 		this._emit({
 			type: "auto_retry_start",

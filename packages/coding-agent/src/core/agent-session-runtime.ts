@@ -340,6 +340,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					rlmSessionDir: options.sessionDir,
 					rlmParentNodeId: options.rlmParentNodeId,
 					rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+					lineageParentSessionId: options.parentSession.sessionId,
+					lineageSpawnedByRequestId: options.spawnedByRequestId,
 				},
 				runtimeMetadata: {
 					kind: "subagent",
