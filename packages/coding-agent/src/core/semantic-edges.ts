@@ -101,6 +101,14 @@ export function hashTurnBody(
 	context: {
 		systemPrompt?: string;
 		messages: unknown[];
+		tools?: unknown[];
+	},
+	options?: {
+		reasoning?: unknown;
+		thinkingBudgets?: unknown;
+		temperature?: number;
+		maxTokens?: number;
+		serviceTier?: unknown;
 	},
 ): string {
 	return createHash("sha256")
@@ -110,6 +118,12 @@ export function hashTurnBody(
 				model: model.id,
 				systemPrompt: context.systemPrompt,
 				messages: context.messages,
+				tools: context.tools,
+				reasoning: options?.reasoning,
+				thinkingBudgets: options?.thinkingBudgets,
+				temperature: options?.temperature,
+				maxTokens: options?.maxTokens,
+				serviceTier: options?.serviceTier,
 			}),
 		)
 		.digest("hex");
@@ -467,6 +481,20 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 
 const SEMANTIC_INNER_STREAM_FN = Symbol.for("prime-agent.semantic-edges.inner-stream-fn");
 
+/** Unwrap a semantic-edge-bound stream function; aux calls outside session history use this. */
+export function unwrapSemanticEdgeStreamFn(streamFn: StreamFn): StreamFn {
+	return ((streamFn as { [SEMANTIC_INNER_STREAM_FN]?: StreamFn })[SEMANTIC_INNER_STREAM_FN] ?? streamFn) as StreamFn;
+}
+
+/** Provenance is best-effort: a ledger write failure must never crash or mask the model call. */
+function recordOutcomeSafely(write: () => void): void {
+	try {
+		write();
+	} catch (error) {
+		console.warn(`semantic-edge ledger write failed: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
 /**
  * Bind a stream function to one session's recorder. Re-wrapping an already
  * wrapped function rebinds the original, so a child session that inherits its
@@ -475,20 +503,21 @@ const SEMANTIC_INNER_STREAM_FN = Symbol.for("prime-agent.semantic-edges.inner-st
  * resolves (an error/aborted final message is a failure).
  */
 export function wrapStreamFnWithSemanticEdges(streamFn: StreamFn, recorder: SemanticEdgeRecorder): StreamFn {
-	const inner = ((streamFn as { [SEMANTIC_INNER_STREAM_FN]?: StreamFn })[SEMANTIC_INNER_STREAM_FN] ??
-		streamFn) as StreamFn;
+	const inner = unwrapSemanticEdgeStreamFn(streamFn);
 	const wrapped: StreamFn = (model, context, options) => {
-		const requestId = recorder.startTurnRequest(hashTurnBody(model, context));
+		const requestId = recorder.startTurnRequest(hashTurnBody(model, context, options));
 		const observe = (stream: Awaited<ReturnType<StreamFn>>) => {
 			void stream.result().then(
 				(message) => {
-					if (message.stopReason === "error" || message.stopReason === "aborted") {
-						recorder.failRequest(requestId);
-					} else {
-						recorder.finishRequest(requestId);
-					}
+					recordOutcomeSafely(() => {
+						if (message.stopReason === "error" || message.stopReason === "aborted") {
+							recorder.failRequest(requestId);
+						} else {
+							recorder.finishRequest(requestId);
+						}
+					});
 				},
-				() => recorder.failRequest(requestId),
+				() => recordOutcomeSafely(() => recorder.failRequest(requestId)),
 			);
 			return stream;
 		};
@@ -499,12 +528,12 @@ export function wrapStreamFnWithSemanticEdges(streamFn: StreamFn, recorder: Sema
 				headers: { ...options?.headers, ...modelRequestHeaders(requestId) },
 			});
 		} catch (error) {
-			recorder.failRequest(requestId);
+			recordOutcomeSafely(() => recorder.failRequest(requestId));
 			throw error;
 		}
 		if (result instanceof Promise) {
 			return result.then(observe, (error) => {
-				recorder.failRequest(requestId);
+				recordOutcomeSafely(() => recorder.failRequest(requestId));
 				throw error;
 			});
 		}

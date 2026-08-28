@@ -7481,7 +7481,12 @@ export class AgentSession {
 						this.thinkingLevel,
 					));
 				} catch (error) {
-					this._semanticEdges.failRequest(summaryRequestId);
+					try {
+						this._semanticEdges.failRequest(summaryRequestId);
+					} catch (ledgerError) {
+						// Keep the original summarization error; provenance is best-effort.
+						console.warn(`semantic-edge ledger write failed: ${String(ledgerError)}`);
+					}
 					throw error;
 				}
 				this._semanticEdges.finishRequest(summaryRequestId);
@@ -7491,9 +7496,11 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			// Ledger-before-effect: the compaction outcome is durable before the transcript commits it.
-			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
+			// Ledger-before-effect: the compaction outcome is durable before the transcript
+			// commits it. Marked first: the ID is consumed even when the write throws, and a
+			// second finish attempt would mask the original I/O error.
 			compactionRecorded = true;
+			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
 			this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -7506,7 +7513,15 @@ export class AgentSession {
 			if (!compactionRecorded) {
 				const cancelled =
 					error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
-				this._semanticEdges.finishCompaction(semanticCompaction.compactionId, cancelled ? "cancelled" : "failed");
+				try {
+					this._semanticEdges.finishCompaction(
+						semanticCompaction.compactionId,
+						cancelled ? "cancelled" : "failed",
+					);
+				} catch (ledgerError) {
+					// Keep the original compaction error; provenance is best-effort.
+					console.warn(`semantic-edge ledger write failed: ${String(ledgerError)}`);
+				}
 			}
 			throw error;
 		}
@@ -10885,7 +10900,10 @@ export class AgentSession {
 
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
 		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
-		this._semanticEdges.prepareTurnRetry();
+		// Payload hooks mutate the wire body after the hash point, so reuse is forfeited.
+		if (!this._extensionRunner.hasHandlers("before_provider_request")) {
+			this._semanticEdges.prepareTurnRetry();
+		}
 
 		this._emit({
 			type: "auto_retry_start",

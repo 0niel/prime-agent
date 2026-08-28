@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	deriveSemanticEdges,
 	hashTurnBody,
@@ -111,6 +111,32 @@ describe("SemanticEdgeRecorder", () => {
 		recorder.prepareTurnRetry();
 		expect(
 			recorder.startTurnRequest(hashTurnBody({ provider: "p", id: "m" }, { systemPrompt: "b", messages })),
+		).not.toBe(failedId);
+	});
+
+	it("keys retry identity on the tool set too", () => {
+		const recorder = createRecorder();
+		const messages = [{ role: "user", content: "hi" }];
+		const failedId = recorder.startTurnRequest(
+			hashTurnBody({ provider: "p", id: "m" }, { messages, tools: [{ name: "bash" }] }),
+		);
+		recorder.prepareTurnRetry();
+		// An extension toggling tools during backoff changes the wire body.
+		expect(recorder.startTurnRequest(hashTurnBody({ provider: "p", id: "m" }, { messages, tools: [] }))).not.toBe(
+			failedId,
+		);
+	});
+
+	it("keys retry identity on request-shaping options too", () => {
+		const recorder = createRecorder();
+		const messages = [{ role: "user", content: "hi" }];
+		const context = { messages };
+		const failedId = recorder.startTurnRequest(
+			hashTurnBody({ provider: "p", id: "m" }, context, { reasoning: "high" }),
+		);
+		recorder.prepareTurnRetry();
+		expect(
+			recorder.startTurnRequest(hashTurnBody({ provider: "p", id: "m" }, context, { reasoning: "low" })),
 		).not.toBe(failedId);
 	});
 
@@ -626,6 +652,31 @@ describe("wrapStreamFnWithSemanticEdges", () => {
 			.filter((event) => event.type === "request_finished" || event.type === "request_failed")
 			.map((event) => event.type);
 		expect(rejectedOutcomes).toEqual(["request_failed"]);
+	});
+	it("survives a ledger write failure in the stream outcome observer", async () => {
+		const recorder = recorderIn("enospc.jsonl");
+		vi.spyOn(recorder, "finishRequest").mockImplementation(() => {
+			throw new Error("ENOSPC: no space left on device");
+		});
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const stream = createAssistantMessageEventStream();
+			const wrapped = wrapStreamFnWithSemanticEdges(() => stream, recorder);
+			const returned = wrapped(model, context, undefined) as typeof stream;
+			stream.push({ type: "done", reason: "stop", message: message("stop") as never });
+
+			// The model call still resolves and the process never sees a rejection.
+			await expect(returned.result()).resolves.toMatchObject({ stopReason: "stop" });
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(unhandled).toEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			warn.mockRestore();
+		}
 	});
 
 	it("fails the request when the inner stream function throws", () => {

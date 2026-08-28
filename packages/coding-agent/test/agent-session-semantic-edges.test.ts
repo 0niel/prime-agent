@@ -27,6 +27,7 @@ import {
 } from "../src/core/semantic-edges.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.js";
+import { startSideQuestion } from "../src/core/side-question.js";
 import { createHarness, type Harness } from "./suite/harness.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
@@ -105,6 +106,7 @@ describe("AgentSession semantic edges", () => {
 			settings?: Partial<Settings>;
 			sessionManager?: SessionManager;
 			rlmSessionDir?: string;
+			extensionsResult?: Awaited<ReturnType<typeof createTestExtensionsResult>>;
 			subagentRuntimeHost?: SubagentRuntimeHost;
 			hangMarker?: string;
 			onChildCallStarted?: () => void;
@@ -151,7 +153,9 @@ describe("AgentSession semantic edges", () => {
 			settingsManager,
 			cwd: tempDir,
 			modelRegistry: ModelRegistry.create(authStorage, join(tempDir, "models.json")),
-			resourceLoader: createTestResourceLoader(),
+			resourceLoader: createTestResourceLoader(
+				options.extensionsResult ? { extensionsResult: options.extensionsResult } : undefined,
+			),
 			rlmSessionDir: options.rlmSessionDir,
 			subagentRuntimeHost: options.subagentRuntimeHost,
 		});
@@ -265,6 +269,53 @@ describe("AgentSession semantic edges", () => {
 			"request_finished",
 		]);
 		expect(deriveSemanticEdges([events]).edges).toEqual([]);
+	});
+
+	it("forfeits retry-ID reuse when a payload-mutating hook is registered", async () => {
+		// before_provider_request rewrites the wire body AFTER the hash point, so a
+		// reused Idempotency-Key could sit on two different bodies.
+		const extensionsResult = await createTestExtensionsResult(
+			[
+				(pi: any) => {
+					pi.on("before_provider_request", async (payload: any) => payload);
+				},
+			],
+			tempDir,
+		);
+		const { session, capturedHeaders } = createSession({
+			responses: [{ text: "", errorMessage: "overloaded_error" }, { text: "recovered" }],
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+			extensionsResult,
+		});
+
+		await session.prompt("retry me");
+
+		expect(capturedHeaders).toHaveLength(2);
+		expect(capturedHeaders[1]?.[MODEL_REQUEST_ID_HEADER]).toBeDefined();
+		expect(capturedHeaders[1]?.[MODEL_REQUEST_ID_HEADER]).not.toBe(capturedHeaders[0]?.[MODEL_REQUEST_ID_HEADER]);
+	});
+
+	it("excludes side questions from the ledger and the continuation chain", async () => {
+		const { session, capturedHeaders } = createSession();
+
+		await session.prompt("first");
+		const events: string[] = [];
+		const run = startSideQuestion(session.agent, "sq-1", "what changed?", (event) => {
+			events.push(event.status);
+		});
+		await run.done;
+		expect(events.at(-1)).toBe("complete");
+		await session.prompt("second");
+
+		// The side call reached the wire without provenance headers or ledger entries.
+		expect(capturedHeaders).toHaveLength(3);
+		expect(capturedHeaders[1]?.[MODEL_REQUEST_ID_HEADER]).toBeUndefined();
+		const ledger = ledgerFor(session);
+		const requestIds = startedRequestIds(ledger);
+		expect(requestIds).toHaveLength(2);
+		expect(deriveSemanticEdges([ledger]).edges).toEqual([
+			{ source_request_id: requestIds[0], target_request_id: requestIds[1], type: "continuation" },
+		]);
 	});
 
 	it("records spawned-child ancestry from the latest turn and returns it on success", async () => {
@@ -598,6 +649,23 @@ describe("AgentSession semantic edges", () => {
 
 		const finished = ledgerFor(session).filter((event) => event.type === "compaction_finished");
 		expect(finished).toEqual([expect.objectContaining({ status: "completed" })]);
+	});
+
+	it("propagates the original error when the completed-compaction ledger write fails", async () => {
+		const { session } = await createCompactionSession();
+		await session.prompt("one");
+		await session.prompt("two");
+
+		const finishCompaction = vi.spyOn(session.semanticEdges, "finishCompaction").mockImplementation(() => {
+			throw new Error("ledger write failed");
+		});
+
+		await expect(session.compact()).rejects.toThrow("ledger write failed");
+
+		// The consumed ID is never finished a second time, so nothing masks the I/O error.
+		expect(finishCompaction).toHaveBeenCalledOnce();
+		expect(finishCompaction).toHaveBeenCalledWith(expect.any(String), "completed");
+		expect(ledgerFor(session).filter((event) => event.type === "compaction_finished")).toEqual([]);
 	});
 
 	it("stamps the model-request header on the real compaction summary call and derives its edge", async () => {
