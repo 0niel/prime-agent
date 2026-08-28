@@ -14,19 +14,19 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import {
-	deriveLineageManifest,
-	IDEMPOTENCY_KEY_HEADER,
-	LINEAGE_REQUEST_ID_HEADER,
-	type LineageEvent,
-	readLineageLedger,
-} from "../src/core/lineage.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import type { SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
+import {
+	deriveSemanticEdges,
+	IDEMPOTENCY_KEY_HEADER,
+	MODEL_REQUEST_ID_HEADER,
+	readSemanticEdgeLedger,
+	SEMANTIC_EDGES_LEDGER_FILENAME,
+	type SemanticEdgeLedgerEvent,
+} from "../src/core/semantic-edges.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.js";
-import { assertLineageManifestInvariants } from "./lineage-invariants.js";
 import { createHarness, type Harness } from "./suite/harness.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
 
@@ -77,13 +77,13 @@ async function waitForAsync(condition: () => Promise<boolean>): Promise<void> {
 	}
 }
 
-describe("AgentSession lineage", () => {
+describe("AgentSession semantic edges", () => {
 	let tempDir: string;
 	let sessions: AgentSession[];
 	let harnesses: Harness[];
 
 	beforeEach(() => {
-		tempDir = join(tmpdir(), `pi-lineage-session-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDir = join(tmpdir(), `pi-semantic-session-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 		sessions = [];
 		harnesses = [];
@@ -159,22 +159,20 @@ describe("AgentSession lineage", () => {
 		return { session, sessionManager, capturedHeaders };
 	}
 
-	function ledgerFor(session: AgentSession): LineageEvent[] {
+	function ledgerFor(session: AgentSession): SemanticEdgeLedgerEvent[] {
 		const artifactDir = session.sessionManager.getSessionArtifactDir();
 		if (!artifactDir) throw new Error("Missing session artifact dir");
-		return readLineageLedger(join(artifactDir, "lineage.jsonl"));
+		return readSemanticEdgeLedger(join(artifactDir, SEMANTIC_EDGES_LEDGER_FILENAME));
 	}
 
-	function turnRequestIds(events: LineageEvent[]): string[] {
+	function startedRequestIds(events: SemanticEdgeLedgerEvent[]): string[] {
 		return events
-			.filter((event) => event.type === "request_started" && event.kind === "turn")
+			.filter((event) => event.type === "request_started")
 			.map((event) => (event.type === "request_started" ? event.request_id : ""));
 	}
 
-	function sessionStatuses(events: LineageEvent[]): string[] {
-		return events
-			.filter((event) => event.type === "session_status")
-			.map((event) => (event.type === "session_status" ? event.status : ""));
+	function childLedgerPath(sessionDir: string): string {
+		return join(sessionDir, SEMANTIC_EDGES_LEDGER_FILENAME);
 	}
 
 	it("sends one ledger-backed request ID per turn on both wire headers", async () => {
@@ -184,18 +182,22 @@ describe("AgentSession lineage", () => {
 		await session.prompt("second");
 
 		expect(capturedHeaders).toHaveLength(2);
-		const requestIds = capturedHeaders.map((headers) => headers?.[LINEAGE_REQUEST_ID_HEADER]);
+		const requestIds = capturedHeaders.map((headers) => headers?.[MODEL_REQUEST_ID_HEADER]);
 		expect(requestIds[0]).toMatch(/^[0-9a-f]{32}$/);
 		expect(requestIds[1]).toMatch(/^[0-9a-f]{32}$/);
 		expect(requestIds[0]).not.toBe(requestIds[1]);
 		for (const headers of capturedHeaders) {
-			expect(headers?.[IDEMPOTENCY_KEY_HEADER]).toBe(headers?.[LINEAGE_REQUEST_ID_HEADER]);
+			expect(headers?.[IDEMPOTENCY_KEY_HEADER]).toBe(headers?.[MODEL_REQUEST_ID_HEADER]);
 		}
 
-		// Every wire request ID was written to the durable ledger before the call.
+		// Every wire request ID was written to the durable ledger before the call,
+		// committed on stream completion, and the committed chain derives edges.
 		const events = ledgerFor(session);
-		expect(turnRequestIds(events)).toEqual(requestIds);
-		expect(events[0]).toMatchObject({ type: "session_registered", depth: 0 });
+		expect(startedRequestIds(events)).toEqual(requestIds);
+		expect(events.filter((event) => event.type === "request_finished")).toHaveLength(2);
+		expect(deriveSemanticEdges([events]).edges).toEqual([
+			{ source_request_id: requestIds[0], target_request_id: requestIds[1], type: "continuation" },
+		]);
 	});
 
 	it("writes the request event before the provider call is made", async () => {
@@ -204,10 +206,10 @@ describe("AgentSession lineage", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
 		const streamFn: StreamFn = (_model, _context, streamOptions) => {
-			const ledgerPath = join(sessionManager.getSessionArtifactDir() ?? "", "lineage.jsonl");
+			const ledgerPath = join(sessionManager.getSessionArtifactDir() ?? "", SEMANTIC_EDGES_LEDGER_FILENAME);
 			observed.push({
-				wireId: streamOptions?.headers?.[LINEAGE_REQUEST_ID_HEADER],
-				ledgerIds: turnRequestIds(readLineageLedger(ledgerPath)),
+				wireId: streamOptions?.headers?.[MODEL_REQUEST_ID_HEADER],
+				ledgerIds: startedRequestIds(readSemanticEdgeLedger(ledgerPath)),
 			});
 			const stream = createAssistantMessageEventStream();
 			queueMicrotask(() => {
@@ -247,14 +249,25 @@ describe("AgentSession lineage", () => {
 		await session.prompt("retry me");
 
 		expect(capturedHeaders).toHaveLength(2);
-		expect(capturedHeaders[0]?.[LINEAGE_REQUEST_ID_HEADER]).toBeDefined();
-		expect(capturedHeaders[1]?.[LINEAGE_REQUEST_ID_HEADER]).toBe(capturedHeaders[0]?.[LINEAGE_REQUEST_ID_HEADER]);
+		expect(capturedHeaders[0]?.[MODEL_REQUEST_ID_HEADER]).toBeDefined();
+		expect(capturedHeaders[1]?.[MODEL_REQUEST_ID_HEADER]).toBe(capturedHeaders[0]?.[MODEL_REQUEST_ID_HEADER]);
 
-		const requestEvents = ledgerFor(session).filter((event) => event.type === "request_started");
-		expect(requestEvents).toHaveLength(1);
+		// started, failed, re-logged start, finished — and no self-referential edges.
+		const events = ledgerFor(session);
+		const requestEvents = events.filter(
+			(event) =>
+				event.type === "request_started" || event.type === "request_failed" || event.type === "request_finished",
+		);
+		expect(requestEvents.map((event) => event.type)).toEqual([
+			"request_started",
+			"request_failed",
+			"request_started",
+			"request_finished",
+		]);
+		expect(deriveSemanticEdges([events]).edges).toEqual([]);
 	});
 
-	it("records spawned-child ancestry from the latest turn and terminal status only at release", async () => {
+	it("records spawned-child ancestry from the latest turn and returns it on success", async () => {
 		const { session: root, capturedHeaders } = createSession();
 
 		await root.prompt("parent turn one");
@@ -264,45 +277,50 @@ describe("AgentSession lineage", () => {
 		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status === "completed");
 
 		const rootEvents = ledgerFor(root);
-		const childLedgerPath = join(spawned.session_dir, "lineage.jsonl");
-		expect(existsSync(childLedgerPath)).toBe(true);
-		let childEvents = readLineageLedger(childLedgerPath);
+		expect(existsSync(childLedgerPath(spawned.session_dir))).toBe(true);
+		const childEvents = readSemanticEdgeLedger(childLedgerPath(spawned.session_dir));
 
 		// Ancestry points at the latest parent request at spawn time, not the first.
-		// (The parent may have run an extra turn since, for the child's terminal notice.)
-		const rootRequestIds = turnRequestIds(rootEvents);
+		const rootRequestIds = startedRequestIds(rootEvents);
 		expect(rootRequestIds.length).toBeGreaterThanOrEqual(2);
 		expect(childEvents.find((event) => event.type === "session_registered")).toMatchObject({
 			parent_session_id: root.sessionId,
-			depth: 1,
 			spawned_by_request_id: rootRequestIds[1],
 		});
 
-		// Exactly one child turn request, minted in the child ledger only, and on the wire.
-		const childRequestIds = turnRequestIds(childEvents);
+		// Exactly one committed child request, minted in the child ledger only, and on the wire.
+		const childRequestIds = startedRequestIds(childEvents);
 		expect(childRequestIds).toHaveLength(1);
 		expect(rootRequestIds).not.toContain(childRequestIds[0]);
-		expect(capturedHeaders.map((headers) => headers?.[LINEAGE_REQUEST_ID_HEADER])).toContain(childRequestIds[0]);
+		expect(capturedHeaders.map((headers) => headers?.[MODEL_REQUEST_ID_HEADER])).toContain(childRequestIds[0]);
 
-		// A reusable child stays running across follow-up runs until it is released.
-		expect(sessionStatuses(childEvents)).toEqual([]);
-		assertLineageManifestInvariants(deriveLineageManifest([rootEvents, childEvents]));
+		// The parent claimed the successful return with the child's last commit.
+		expect(rootEvents.filter((event) => event.type === "child_returned")).toEqual([
+			{
+				type: "child_returned",
+				session_id: root.sessionId,
+				child_session_id: root.getRlmChildSession(childId)?.sessionId,
+				request_id: childRequestIds[0],
+			},
+		]);
 
-		const retained = root.getRlmChildSession(childId);
-		if (!retained) throw new Error("Missing retained child session");
-		await retained.prompt("follow-up work");
-		expect(sessionStatuses(readLineageLedger(childLedgerPath))).toEqual([]);
-
-		await root.deleteRlmSubagent(childId);
-		childEvents = readLineageLedger(childLedgerPath);
-		expect(sessionStatuses(childEvents)).toEqual(["completed"]);
-		assertLineageManifestInvariants(deriveLineageManifest([ledgerFor(root), childEvents]));
+		// The next committed parent request carries both the call and return edges.
+		await root.prompt("after the child");
+		const edges = deriveSemanticEdges([ledgerFor(root), childEvents]).edges;
+		expect(edges).toContainEqual({
+			source_request_id: rootRequestIds[1],
+			target_request_id: childRequestIds[0],
+			type: "subagent_call",
+		});
+		const returnEdges = edges.filter((edge) => edge.type === "subagent_return");
+		expect(returnEdges).toHaveLength(1);
+		expect(returnEdges[0]?.source_request_id).toBe(childRequestIds[0]);
 	});
 
 	it("restores spawn attribution from the ledger after a resume", async () => {
 		const { session: first } = createSession();
 		await first.prompt("turn before resume");
-		const requestBeforeResume = turnRequestIds(ledgerFor(first))[0];
+		const requestBeforeResume = startedRequestIds(ledgerFor(first))[0];
 		const sessionFile = first.sessionFile;
 		if (!sessionFile) throw new Error("Missing session file");
 		first.dispose();
@@ -312,26 +330,27 @@ describe("AgentSession lineage", () => {
 		const spawned = await resumed.runRlmChild("child after resume");
 		await waitForAsync(async () => (await resumed.listRlmSubagents()).subagents[0]?.status === "completed");
 
-		const childEvents = readLineageLedger(join(spawned.session_dir, "lineage.jsonl"));
+		const childEvents = readSemanticEdgeLedger(childLedgerPath(spawned.session_dir));
 		expect(childEvents.find((event) => event.type === "session_registered")).toMatchObject({
 			parent_session_id: resumed.sessionId,
 			spawned_by_request_id: requestBeforeResume,
 		});
-		assertLineageManifestInvariants(deriveLineageManifest([ledgerFor(resumed), childEvents]));
+		const edges = deriveSemanticEdges([ledgerFor(resumed), childEvents]).edges;
+		expect(edges.filter((edge) => edge.type === "subagent_call")).toHaveLength(1);
 	});
 
 	it("snapshots spawn ancestry at the spawn entry point, before preflight awaits", async () => {
 		const { session: root } = createSession();
 		await root.prompt("turn one");
-		const firstId = turnRequestIds(ledgerFor(root))[0];
+		const firstId = startedRequestIds(ledgerFor(root))[0];
 
 		// Advance the parent's lineage while runRlmChild is still awaiting preflight.
 		const spawnPromise = root.runRlmChild("child task");
-		const laterId = root.lineage.startTurnRequest("later-body-hash");
+		const laterId = root.semanticEdges.startTurnRequest("later-body-hash");
 		const spawned = await spawnPromise;
 		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status === "completed");
 
-		const childEvents = readLineageLedger(join(spawned.session_dir, "lineage.jsonl"));
+		const childEvents = readSemanticEdgeLedger(childLedgerPath(spawned.session_dir));
 		const registration = childEvents.find((event) => event.type === "session_registered");
 		expect(registration).toMatchObject({ spawned_by_request_id: firstId });
 		expect(registration?.type === "session_registered" ? registration.spawned_by_request_id : undefined).not.toBe(
@@ -339,7 +358,7 @@ describe("AgentSession lineage", () => {
 		);
 	});
 
-	it("records failed for a child whose run errors", async () => {
+	it("never claims a return for a child whose run errors", async () => {
 		let child: AgentSession | undefined;
 		const host: SubagentRuntimeHost = {
 			createRlmSubagentRuntime: async (options) => {
@@ -357,16 +376,16 @@ describe("AgentSession lineage", () => {
 		const { session: root } = createSession({ subagentRuntimeHost: host });
 
 		await root.prompt("parent turn");
-		const spawned = await root.runRlmChild("doomed child");
-		await waitForAsync(
-			async () => sessionStatuses(readLineageLedger(join(spawned.session_dir, "lineage.jsonl"))).length > 0,
-		);
+		await root.runRlmChild("doomed child");
+		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status !== "running");
 
 		expect(child).toBeDefined();
-		expect(sessionStatuses(readLineageLedger(join(spawned.session_dir, "lineage.jsonl")))).toEqual(["failed"]);
+		expect(ledgerFor(root).filter((event) => event.type === "child_returned")).toEqual([]);
+		const edges = deriveSemanticEdges([ledgerFor(root)]).edges;
+		expect(edges.filter((edge) => edge.type === "subagent_return")).toEqual([]);
 	});
 
-	it("records cancelled for a cancelled child run", async () => {
+	it("never claims a return for a cancelled child run", async () => {
 		let childStarted = false;
 		const { session: root } = createSession({
 			hangMarker: "hang-task",
@@ -379,11 +398,12 @@ describe("AgentSession lineage", () => {
 		const spawned = await root.runRlmChild("hang-task");
 		await waitForAsync(async () => childStarted);
 		expect(root.cancelRlmChildRun(basename(spawned.session_dir))).toBe(true);
-		await waitForAsync(
-			async () => sessionStatuses(readLineageLedger(join(spawned.session_dir, "lineage.jsonl"))).length > 0,
-		);
+		await waitForAsync(async () => {
+			const entry = (await root.listRlmSubagents()).subagents[0];
+			return entry === undefined || entry.status !== "running";
+		});
 
-		expect(sessionStatuses(readLineageLedger(join(spawned.session_dir, "lineage.jsonl")))).toEqual(["cancelled"]);
+		expect(ledgerFor(root).filter((event) => event.type === "child_returned")).toEqual([]);
 	});
 
 	async function createCompactionSession() {
@@ -435,7 +455,7 @@ describe("AgentSession lineage", () => {
 		return { session, sessionManager };
 	}
 
-	it("opens a new context epoch on completed compaction and keeps it on cancel", async () => {
+	it("records extension compactions without a summary request or compaction edge", async () => {
 		const { session } = await createCompactionSession();
 
 		await session.prompt("one");
@@ -448,17 +468,20 @@ describe("AgentSession lineage", () => {
 
 		await session.compact();
 		events = ledgerFor(session);
-		const finished = events.filter((event) => event.type === "compaction_finished");
-		expect(finished.at(-1)).toMatchObject({ status: "completed" });
+		expect(events.filter((event) => event.type === "compaction_finished").at(-1)).toMatchObject({
+			status: "completed",
+		});
+		// Extension-supplied summaries make no wire request.
+		expect(startedRequestIds(events)).toHaveLength(2);
 
-		// The next turn runs on the new context epoch created by the completed compaction.
+		// The chain continues across the compaction; there is no compaction edge without a summary request.
 		await session.prompt("three");
-		const manifest = deriveLineageManifest([ledgerFor(session)]);
-		assertLineageManifestInvariants(manifest);
-		expect(manifest.contexts).toHaveLength(2);
-		const newContext = manifest.contexts.find((context) => context.transition === "compact");
-		const lastTurn = manifest.requests.filter((request) => request.kind === "turn").at(-1);
-		expect(lastTurn?.context_id).toBe(newContext?.context_id);
+		const requestIds = startedRequestIds(ledgerFor(session));
+		const edges = deriveSemanticEdges([ledgerFor(session)]).edges;
+		expect(edges).toEqual([
+			{ source_request_id: requestIds[0], target_request_id: requestIds[1], type: "continuation" },
+			{ source_request_id: requestIds[1], target_request_id: requestIds[2], type: "continuation" },
+		]);
 	});
 
 	it("commits the completed-compaction ledger event before the transcript entry", async () => {
@@ -467,7 +490,7 @@ describe("AgentSession lineage", () => {
 		await session.prompt("two");
 
 		const original = sessionManager.appendCompaction.bind(sessionManager);
-		let finishedAtCommit: LineageEvent[] = [];
+		let finishedAtCommit: SemanticEdgeLedgerEvent[] = [];
 		vi.spyOn(sessionManager, "appendCompaction").mockImplementation(((
 			...args: Parameters<SessionManager["appendCompaction"]>
 		) => {
@@ -495,7 +518,7 @@ describe("AgentSession lineage", () => {
 		expect(finished).toEqual([expect.objectContaining({ status: "completed" })]);
 	});
 
-	it("stamps lineage headers on the real compaction summary call without dropping auth headers", async () => {
+	it("stamps the model-request header on the real compaction summary call and derives its edge", async () => {
 		const harness = await createHarness({
 			persistSession: true,
 			settings: { compaction: { keepRecentTokens: 1 } },
@@ -506,7 +529,7 @@ describe("AgentSession lineage", () => {
 			baseUrl: fauxModel.baseUrl,
 			apiKey: "faux-key",
 			api: harness.faux.api,
-			headers: { "x-lineage-sentinel": "keep-me" },
+			headers: { "x-semantic-sentinel": "keep-me" },
 			models: harness.faux.models.map((registeredModel) => ({
 				id: registeredModel.id,
 				name: registeredModel.name,
@@ -519,17 +542,17 @@ describe("AgentSession lineage", () => {
 				baseUrl: registeredModel.baseUrl,
 			})),
 		});
-		const ledgerPath = join(harness.sessionManager.getSessionArtifactDir() ?? "", "lineage.jsonl");
+		const ledgerPath = join(harness.sessionManager.getSessionArtifactDir() ?? "", SEMANTIC_EDGES_LEDGER_FILENAME);
 
 		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 		await harness.session.prompt("one");
 		await harness.session.prompt("two");
 
 		const captured: Array<Record<string, string> | undefined> = [];
-		let ledgerAtCall: LineageEvent[] = [];
+		let ledgerAtCall: SemanticEdgeLedgerEvent[] = [];
 		const summaryStep = (_context: unknown, streamOptions: { headers?: Record<string, string> } | undefined) => {
 			captured.push(streamOptions?.headers);
-			ledgerAtCall = readLineageLedger(ledgerPath);
+			ledgerAtCall = readSemanticEdgeLedger(ledgerPath);
 			return fauxAssistantMessage("the summary");
 		};
 		// A split-turn compaction makes two summary calls; both share the one request ID.
@@ -537,20 +560,28 @@ describe("AgentSession lineage", () => {
 		await harness.session.compact();
 
 		expect(captured.length).toBeGreaterThanOrEqual(1);
-		const wireId = captured[0]?.[LINEAGE_REQUEST_ID_HEADER];
+		const wireId = captured[0]?.[MODEL_REQUEST_ID_HEADER];
 		expect(wireId).toMatch(/^[0-9a-f]{32}$/);
 		for (const headers of captured) {
-			expect(headers?.["x-lineage-sentinel"]).toBe("keep-me");
-			expect(headers?.[LINEAGE_REQUEST_ID_HEADER]).toBe(wireId);
+			expect(headers?.["x-semantic-sentinel"]).toBe("keep-me");
+			expect(headers?.[MODEL_REQUEST_ID_HEADER]).toBe(wireId);
 			expect(headers?.[IDEMPOTENCY_KEY_HEADER]).toBe(wireId);
 		}
-		// The compaction request event was durable before the provider call went out.
-		expect(ledgerAtCall).toContainEqual(
-			expect.objectContaining({ type: "request_started", kind: "compaction", request_id: wireId }),
-		);
-		const events = readLineageLedger(ledgerPath);
-		expect(events.filter((event) => event.type === "compaction_finished").at(-1)).toMatchObject({
-			status: "completed",
+		// The summary request event was durable before the provider call went out.
+		expect(ledgerAtCall).toContainEqual(expect.objectContaining({ type: "request_started", request_id: wireId }));
+
+		// The compaction edge lands on the next committed request.
+		harness.setResponses([fauxAssistantMessage("after")]);
+		await harness.session.prompt("after");
+		const events = readSemanticEdgeLedger(ledgerPath);
+		const edges = deriveSemanticEdges([events]).edges;
+		const afterId = startedRequestIds(events).at(-1);
+		expect(edges).toContainEqual({
+			source_request_id: wireId,
+			target_request_id: afterId,
+			type: "compaction",
 		});
+		// The continuation from the summary is suppressed in favor of the compaction edge.
+		expect(edges.filter((edge) => edge.target_request_id === afterId)).toHaveLength(1);
 	});
 });

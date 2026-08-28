@@ -160,7 +160,6 @@ import {
 } from "./goals.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
-import { LineageRecorder, lineageRequestHeaders, wrapStreamFnWithLineage } from "./lineage.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
@@ -230,6 +229,12 @@ import {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
+import {
+	modelRequestHeaders,
+	SEMANTIC_EDGES_LEDGER_FILENAME,
+	SemanticEdgeRecorder,
+	wrapStreamFnWithSemanticEdges,
+} from "./semantic-edges.js";
 import {
 	ActionStore,
 	type ActionTicket,
@@ -440,8 +445,8 @@ export interface AgentSessionConfig {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
-	lineageParentSessionId?: string;
-	lineageSpawnedByRequestId?: string;
+	semanticParentSessionId?: string;
+	semanticSpawnedByRequestId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	autonomous?: AgentAutonomousConfig;
 	prewarmIpythonKernel?: boolean;
@@ -1154,7 +1159,7 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
-	private readonly _lineage: LineageRecorder;
+	private readonly _semanticEdges: SemanticEdgeRecorder;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
 	private _repliedToParentSinceTask: boolean | undefined;
@@ -1264,15 +1269,14 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
-		const lineageDir = this._rlmSessionDir ?? this.sessionManager.getSessionArtifactDir();
-		this._lineage = new LineageRecorder({
-			ledgerPath: lineageDir ? join(lineageDir, "lineage.jsonl") : undefined,
+		const semanticEdgesDir = this._rlmSessionDir ?? this.sessionManager.getSessionArtifactDir();
+		this._semanticEdges = new SemanticEdgeRecorder({
+			ledgerPath: semanticEdgesDir ? join(semanticEdgesDir, SEMANTIC_EDGES_LEDGER_FILENAME) : undefined,
 			sessionId: this.sessionManager.getSessionId(),
-			depth: this._rlmDepth,
-			parentSessionId: config.lineageParentSessionId,
-			spawnedByRequestId: config.lineageSpawnedByRequestId,
+			parentSessionId: config.semanticParentSessionId,
+			spawnedByRequestId: config.semanticSpawnedByRequestId,
 		});
-		this.agent.streamFn = wrapStreamFnWithLineage(this.agent.streamFn, this._lineage);
+		this.agent.streamFn = wrapStreamFnWithSemanticEdges(this.agent.streamFn, this._semanticEdges);
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -3713,7 +3717,7 @@ export class AgentSession {
 	}
 
 	private _resolveRetry(): void {
-		this._lineage.clearTurnRetry();
+		this._semanticEdges.clearTurnRetry();
 		if (this._retryResolve) {
 			this._retryResolve();
 			this._retryResolve = undefined;
@@ -4054,8 +4058,7 @@ export class AgentSession {
 			unsubscribe();
 		}
 		this._rlmChildUnsubscribes.clear();
-		for (const [childId, session] of this._rlmChildSessions) {
-			this._recordRlmChildTerminalLineage(childId, session);
+		for (const session of this._rlmChildSessions.values()) {
 			await session.disposeAsync().catch(() => undefined);
 		}
 		this._rlmChildSessions.clear();
@@ -4117,8 +4120,7 @@ export class AgentSession {
 				unsubscribe();
 			}
 			this._rlmChildUnsubscribes.clear();
-			for (const [childId, session] of this._rlmChildSessions) {
-				this._recordRlmChildTerminalLineage(childId, session);
+			for (const session of this._rlmChildSessions.values()) {
 				session.dispose();
 			}
 			this._rlmChildSessions.clear();
@@ -4275,8 +4277,8 @@ export class AgentSession {
 		return this._rlmDepth;
 	}
 
-	get lineage(): LineageRecorder {
-		return this._lineage;
+	get semanticEdges(): SemanticEdgeRecorder {
+		return this._semanticEdges;
 	}
 
 	get rlmMaxDepth(): number {
@@ -7438,8 +7440,8 @@ export class AgentSession {
 		let extensionCompaction: CompactionResult | undefined;
 		let fromExtension = false;
 
-		const lineageCompaction = this._lineage.beginCompaction();
-		let lineageFinished = false;
+		const semanticCompaction = this._semanticEdges.beginCompaction();
+		let compactionRecorded = false;
 		let summary: string;
 		let firstKeptEntryId: string;
 		let tokensBefore: number;
@@ -7464,25 +7466,34 @@ export class AgentSession {
 				}
 			}
 
-			({ summary, firstKeptEntryId, tokensBefore, details } =
-				extensionCompaction ??
-				(await compact(
-					preparation,
-					model,
-					apiKey,
-					{ ...headers, ...lineageRequestHeaders(lineageCompaction.requestId) },
-					customInstructions,
-					signal,
-					this.thinkingLevel,
-				)));
+			if (extensionCompaction) {
+				({ summary, firstKeptEntryId, tokensBefore, details } = extensionCompaction);
+			} else {
+				const summaryRequestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
+				try {
+					({ summary, firstKeptEntryId, tokensBefore, details } = await compact(
+						preparation,
+						model,
+						apiKey,
+						{ ...headers, ...modelRequestHeaders(summaryRequestId) },
+						customInstructions,
+						signal,
+						this.thinkingLevel,
+					));
+				} catch (error) {
+					this._semanticEdges.failRequest(summaryRequestId);
+					throw error;
+				}
+				this._semanticEdges.finishRequest(summaryRequestId);
+			}
 
 			if (signal.aborted) {
 				throw new Error("Compaction cancelled");
 			}
 
-			// Ledger-before-effect: the new epoch is durable before the transcript commits it.
-			this._lineage.finishCompaction(lineageCompaction.compactionId, "completed");
-			lineageFinished = true;
+			// Ledger-before-effect: the compaction outcome is durable before the transcript commits it.
+			this._semanticEdges.finishCompaction(semanticCompaction.compactionId, "completed");
+			compactionRecorded = true;
 			this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -7492,10 +7503,10 @@ export class AgentSession {
 				customInstructions,
 			);
 		} catch (error) {
-			if (!lineageFinished) {
+			if (!compactionRecorded) {
 				const cancelled =
 					error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
-				this._lineage.finishCompaction(lineageCompaction.compactionId, cancelled ? "cancelled" : "failed");
+				this._semanticEdges.finishCompaction(semanticCompaction.compactionId, cancelled ? "cancelled" : "failed");
 			}
 			throw error;
 		}
@@ -9447,8 +9458,8 @@ export class AgentSession {
 			rlmSessionDir: options.sessionDir,
 			rlmParentNodeId: options.rlmParentNodeId,
 			rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
-			lineageParentSessionId: options.parentSession.sessionId,
-			lineageSpawnedByRequestId: options.spawnedByRequestId,
+			semanticParentSessionId: options.parentSession.sessionId,
+			semanticSpawnedByRequestId: options.spawnedByRequestId,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {
@@ -9760,7 +9771,6 @@ export class AgentSession {
 	}
 
 	private _deleteRlmSubagentSession(childId: string, session?: AgentSession): Promise<void> {
-		this._recordRlmChildTerminalLineage(childId, session);
 		if (this._subagentRuntimeHost) {
 			return this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
 		}
@@ -9944,16 +9954,6 @@ export class AgentSession {
 	 * the child) when the parent is already tearing down, so the caller can drop the
 	 * matching event forwarder too.
 	 */
-	/** Terminal lineage status is recorded once, at the child's actual release, from its final run state. */
-	// Follow-up runs have no run record, so deleting a retained child mid-follow-up records completed.
-	private _recordRlmChildTerminalLineage(childId: string, child: AgentSession | undefined): void {
-		if (!child) return;
-		const runStatus = this._activeRlmChildRuns.get(childId)?.status;
-		child.lineage.recordSessionStatus(
-			runStatus === "error" ? "failed" : runStatus === "cancelled" ? "cancelled" : "completed",
-		);
-	}
-
 	registerRlmChildSession(childId: string, session: AgentSession, unsubscribe?: () => void): boolean {
 		// A child can finish concurrently while the parent is (or has) torn down; don't
 		// resurrect the map (it would never be disposed), just drop the child now.
@@ -10264,7 +10264,7 @@ export class AgentSession {
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
 		// Snapshot before any await: the spawning request is the turn whose tool call is executing now.
-		const spawnedByRequestId = this._lineage.lastTurnRequestId;
+		const spawnedByRequestId = this._semanticEdges.lastTurnRequestId;
 		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
@@ -10524,6 +10524,11 @@ export class AgentSession {
 				await child.waitForRlmQuiescence();
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
+				// Only successful completions return; the edge lands on the parent's next commit.
+				const childLastCommitted = child.semanticEdges.lastCommittedRequestId;
+				if (childLastCommitted !== undefined) {
+					this._semanticEdges.recordChildReturned(child.sessionId, childLastCommitted);
+				}
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
@@ -10543,7 +10548,6 @@ export class AgentSession {
 					);
 				}
 				if (!this.registerRlmChildSession(run.id, child) && !run.detachedDeletion) {
-					this._recordRlmChildTerminalLineage(run.id, child);
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
@@ -10559,7 +10563,6 @@ export class AgentSession {
 					run.status = "error";
 					run.error = runError.message;
 				}
-				this._recordRlmChildTerminalLineage(run.id, childSession ?? childRuntime?.session);
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
@@ -10875,7 +10878,7 @@ export class AgentSession {
 
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
 		// Park now: the retry re-issues the failed call and must reuse its Idempotency-Key.
-		this._lineage.prepareTurnRetry();
+		this._semanticEdges.prepareTurnRetry();
 
 		this._emit({
 			type: "auto_retry_start",

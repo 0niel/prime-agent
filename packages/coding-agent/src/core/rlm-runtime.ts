@@ -233,7 +233,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 	rlmDepth: number;
 	rlmMaxDepth: number;
 	rlmParentNodeId: string;
-	/** Lineage request ID of the parent model call whose tool call caused this spawn. */
+	/** Request ID of the parent model call whose tool call caused this spawn. */
 	spawnedByRequestId?: string;
 	/** Source of the Python cell that spawned this subagent, for display. */
 	spawnCode?: string;

@@ -14,8 +14,8 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
-import { readLineageLedger } from "../../src/core/lineage.js";
 import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
+import { readSemanticEdgeLedger, SEMANTIC_EDGES_LEDGER_FILENAME } from "../../src/core/semantic-edges.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import type {
 	ExtensionAPI,
@@ -417,7 +417,7 @@ describe("AgentSessionRuntime characterization", () => {
 		await runtime.deleteRlmSubagentRuntime("parent-agent-child", childRuntime.session);
 	});
 
-	it("plumbs lineage ancestry into runtime-created child ledgers", async () => {
+	it("plumbs semantic-edge ancestry into runtime-created child ledgers", async () => {
 		const { runtime, tempDir } = await createRuntimeForTest(() => {});
 		const spawnedByRequestId = "a".repeat(32);
 		const sessionDir = join(tempDir, "lineage-child");
@@ -441,10 +441,9 @@ describe("AgentSessionRuntime characterization", () => {
 			spawnedByRequestId,
 		});
 
-		expect(readLineageLedger(join(sessionDir, "lineage.jsonl"))[0]).toMatchObject({
+		expect(readSemanticEdgeLedger(join(sessionDir, SEMANTIC_EDGES_LEDGER_FILENAME))[0]).toMatchObject({
 			type: "session_registered",
 			parent_session_id: runtime.session.sessionId,
-			depth: 1,
 			spawned_by_request_id: spawnedByRequestId,
 		});
 		await runtime.deleteRlmSubagentRuntime("lineage-child", childRuntime.session);

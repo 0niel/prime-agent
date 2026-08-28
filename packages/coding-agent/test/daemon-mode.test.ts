@@ -941,7 +941,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("plumbs lineage ancestry into daemon-hosted child session options", async () => {
+	it("plumbs semantic-edge ancestry into daemon-hosted child session options", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-lineage-ancestry-"));
 		try {
 			const sessionDir = join(tempDir, "sessions");
@@ -995,8 +995,8 @@ describe("daemon mode helpers", () => {
 
 			const childCreate = createRuntime.mock.calls.at(-1)?.[0];
 			expect(childCreate?.sessionOptions).toMatchObject({
-				lineageParentSessionId: parentState.runtime.session.sessionId,
-				lineageSpawnedByRequestId: spawnedByRequestId,
+				semanticParentSessionId: parentState.runtime.session.sessionId,
+				semanticSpawnedByRequestId: spawnedByRequestId,
 			});
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
