@@ -4054,7 +4054,8 @@ export class AgentSession {
 			unsubscribe();
 		}
 		this._rlmChildUnsubscribes.clear();
-		for (const session of this._rlmChildSessions.values()) {
+		for (const [childId, session] of this._rlmChildSessions) {
+			this._recordRlmChildTerminalLineage(childId, session);
 			await session.disposeAsync().catch(() => undefined);
 		}
 		this._rlmChildSessions.clear();
@@ -4116,7 +4117,8 @@ export class AgentSession {
 				unsubscribe();
 			}
 			this._rlmChildUnsubscribes.clear();
-			for (const session of this._rlmChildSessions.values()) {
+			for (const [childId, session] of this._rlmChildSessions) {
+				this._recordRlmChildTerminalLineage(childId, session);
 				session.dispose();
 			}
 			this._rlmChildSessions.clear();
@@ -7437,6 +7439,7 @@ export class AgentSession {
 		let fromExtension = false;
 
 		const lineageCompaction = this._lineage.beginCompaction();
+		let lineageFinished = false;
 		let summary: string;
 		let firstKeptEntryId: string;
 		let tokensBefore: number;
@@ -7477,6 +7480,9 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
+			// Ledger-before-effect: the new epoch is durable before the transcript commits it.
+			this._lineage.finishCompaction(lineageCompaction.compactionId, "completed");
+			lineageFinished = true;
 			this.sessionManager.appendCompaction(
 				summary,
 				firstKeptEntryId,
@@ -7486,12 +7492,13 @@ export class AgentSession {
 				customInstructions,
 			);
 		} catch (error) {
-			const cancelled =
-				error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
-			this._lineage.finishCompaction(lineageCompaction.compactionId, cancelled ? "cancelled" : "failed");
+			if (!lineageFinished) {
+				const cancelled =
+					error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
+				this._lineage.finishCompaction(lineageCompaction.compactionId, cancelled ? "cancelled" : "failed");
+			}
 			throw error;
 		}
-		this._lineage.finishCompaction(lineageCompaction.compactionId, "completed");
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 		this._mergeUnpersistedOutcomes(this.agent.state.messages);
@@ -9351,6 +9358,7 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		thinkingLevel?: ThinkingLevel;
+		spawnedByRequestId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
 			parentSession: this,
@@ -9373,7 +9381,7 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth + 1,
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
-			spawnedByRequestId: this._lineage.lastTurnRequestId,
+			spawnedByRequestId: options.spawnedByRequestId,
 		};
 	}
 
@@ -9752,6 +9760,7 @@ export class AgentSession {
 	}
 
 	private _deleteRlmSubagentSession(childId: string, session?: AgentSession): Promise<void> {
+		this._recordRlmChildTerminalLineage(childId, session);
 		if (this._subagentRuntimeHost) {
 			return this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
 		}
@@ -9935,6 +9944,15 @@ export class AgentSession {
 	 * the child) when the parent is already tearing down, so the caller can drop the
 	 * matching event forwarder too.
 	 */
+	/** Terminal lineage status is recorded once, at the child's actual release, from its final run state. */
+	private _recordRlmChildTerminalLineage(childId: string, child: AgentSession | undefined): void {
+		if (!child) return;
+		const runStatus = this._activeRlmChildRuns.get(childId)?.status;
+		child.lineage.recordSessionStatus(
+			runStatus === "error" ? "failed" : runStatus === "cancelled" ? "cancelled" : "completed",
+		);
+	}
+
 	registerRlmChildSession(childId: string, session: AgentSession, unsubscribe?: () => void): boolean {
 		// A child can finish concurrently while the parent is (or has) torn down; don't
 		// resurrect the map (it would never be disposed), just drop the child now.
@@ -10244,6 +10262,8 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
+		// Snapshot before any await: the spawning request is the turn whose tool call is executing now.
+		const spawnedByRequestId = this._lineage.lastTurnRequestId;
 		const { name: rawName, model: rawModel, thinking: rawThinking, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
@@ -10357,6 +10377,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				thinkingLevel: requestedThinkingLevel,
+				spawnedByRequestId,
 			}),
 			onSessionPublished: publishChildSession,
 		};
@@ -10502,7 +10523,6 @@ export class AgentSession {
 				await child.waitForRlmQuiescence();
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
-				child.lineage.recordSessionStatus("completed");
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
@@ -10522,6 +10542,7 @@ export class AgentSession {
 					);
 				}
 				if (!this.registerRlmChildSession(run.id, child) && !run.detachedDeletion) {
+					this._recordRlmChildTerminalLineage(run.id, child);
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 						await this._subagentRuntimeHost
 							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
@@ -10537,7 +10558,7 @@ export class AgentSession {
 					run.status = "error";
 					run.error = runError.message;
 				}
-				childSession?.lineage.recordSessionStatus(run.status === "error" ? "failed" : "cancelled");
+				this._recordRlmChildTerminalLineage(run.id, childSession ?? childRuntime?.session);
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();

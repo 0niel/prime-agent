@@ -1,9 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, truncateSync } from "node:fs";
 import { dirname } from "node:path";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
-/** ACP lineage-v1 producer: durable per-agent ledger, request-ID headers, manifest derivation. */
+/**
+ * ACP lineage-v1 producer: durable per-agent ledger, request-ID headers,
+ * manifest derivation. Ledger events are written before the effects they
+ * describe; for compaction commits the residual inverse window remains — a
+ * crash between compaction_finished(completed) and the session transcript's
+ * compaction entry leaves the ledger one epoch ahead of the transcript.
+ */
 
 export const LINEAGE_REQUEST_ID_HEADER = "X-ACP-Lineage-Request-ID";
 export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
@@ -102,14 +108,24 @@ function mintId(): string {
 	return randomUUID().replaceAll("-", "");
 }
 
-/** Shape of one turn call; Idempotency-Key reuse is only safe for a body-identical retry. */
-export interface TurnCallShape {
-	messageCount: number;
-	lastRole?: string;
-}
-
-function sameShape(left: TurnCallShape | undefined, right: TurnCallShape | undefined): boolean {
-	return left?.messageCount === right?.messageCount && left?.lastRole === right?.lastRole;
+/** Content hash of one turn call body; Idempotency-Key reuse is only safe for a byte-identical retry. */
+export function hashTurnBody(
+	model: { provider: string; id: string },
+	context: {
+		systemPrompt?: string;
+		messages: unknown[];
+	},
+): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				provider: model.provider,
+				model: model.id,
+				systemPrompt: context.systemPrompt,
+				messages: context.messages,
+			}),
+		)
+		.digest("hex");
 }
 
 /**
@@ -125,8 +141,9 @@ export class LineageRecorder {
 	private readonly _ledgerPath?: string;
 	private _activeContextId: string;
 	private _activeCompactionId?: string;
-	private _lastTurn?: { requestId: string; contextId: string; shape?: TurnCallShape };
-	private _parkedRetry?: { requestId: string; contextId: string; shape?: TurnCallShape };
+	private _pendingRepair?: { truncateToBytes: number } | { terminateLine: true };
+	private _lastTurn?: { requestId: string; contextId: string; bodyKey?: () => string };
+	private _parkedRetry?: { requestId: string; contextId: string; bodyHash?: string };
 	private _pendingCompactions = new Map<string, { sourceContextId: string; targetContextId: string }>();
 	private _terminalStatus?: SessionStatusEvent["status"];
 
@@ -173,15 +190,19 @@ export class LineageRecorder {
 	}
 
 	/** Mint (or, for a body-identical retry, reuse) the request ID for one turn call. */
-	startTurnRequest(shape?: TurnCallShape): string {
+	startTurnRequest(bodyKey?: () => string): string {
 		const parked = this._parkedRetry;
-		if (parked && parked.contextId === this._activeContextId && sameShape(parked.shape, shape)) {
+		if (
+			parked &&
+			parked.contextId === this._activeContextId &&
+			parked.bodyHash !== undefined &&
+			parked.bodyHash === bodyKey?.()
+		) {
 			this._parkedRetry = undefined;
-			this._lastTurn = parked;
+			this._lastTurn = { requestId: parked.requestId, contextId: parked.contextId, bodyKey };
 			return parked.requestId;
 		}
 		const requestId = mintId();
-		this._lastTurn = { requestId, contextId: this._activeContextId, shape };
 		this._append({
 			type: "request_started",
 			request_id: requestId,
@@ -190,18 +211,24 @@ export class LineageRecorder {
 			kind: "turn",
 			...(this._activeCompactionId !== undefined ? { compaction_id: this._activeCompactionId } : {}),
 		});
+		this._lastTurn = { requestId, contextId: this._activeContextId, bodyKey };
 		return requestId;
 	}
 
 	/** Park the last turn request so the upcoming auto-retry reuses its ID. */
 	prepareTurnRetry(): void {
-		this._parkedRetry = this._lastTurn;
+		this._parkedRetry = this._lastTurn && {
+			requestId: this._lastTurn.requestId,
+			contextId: this._lastTurn.contextId,
+			bodyHash: this._lastTurn.bodyKey?.(),
+		};
 	}
 
 	clearTurnRetry(): void {
 		this._parkedRetry = undefined;
 	}
 
+	/** The summary request is logical: an extension-supplied summary keeps it with zero wire attempts. */
 	beginCompaction(): { compactionId: string; requestId: string } {
 		const compactionId = mintId();
 		const requestId = mintId();
@@ -250,6 +277,13 @@ export class LineageRecorder {
 
 	private _replay(event: LineageEvent): void {
 		switch (event.type) {
+			case "request_started":
+				// Restores spawn attribution after resume; the body key is unknowable, so
+				// a parked retry from a replayed request can never be reused.
+				if (event.session_id === this.sessionId && event.kind === "turn") {
+					this._lastTurn = { requestId: event.request_id, contextId: event.context_id };
+				}
+				break;
 			case "compaction_begun":
 				if (event.session_id === this.sessionId) {
 					this._pendingCompactions.set(event.compaction_id, {
@@ -279,6 +313,8 @@ export class LineageRecorder {
 		}
 	}
 
+	// Construction never mutates the file: a viewer may be reading a live
+	// writer's ledger. Torn-tail repair is deferred to this recorder's first append.
 	private _loadExisting(): LineageEvent[] {
 		if (!this._ledgerPath || !existsSync(this._ledgerPath)) {
 			return [];
@@ -286,10 +322,9 @@ export class LineageRecorder {
 		const raw = readFileSync(this._ledgerPath, "utf8");
 		const parsed = parseLedgerContent(raw);
 		if (parsed.validLength < raw.length) {
-			// Discard a torn tail line before appending so it never becomes mid-file corruption.
-			truncateSync(this._ledgerPath, Buffer.byteLength(raw.slice(0, parsed.validLength)));
+			this._pendingRepair = { truncateToBytes: Buffer.byteLength(raw.slice(0, parsed.validLength)) };
 		} else if (raw.length > 0 && !raw.endsWith("\n")) {
-			appendFileSync(this._ledgerPath, "\n");
+			this._pendingRepair = { terminateLine: true };
 		}
 		return parsed.events;
 	}
@@ -300,11 +335,24 @@ export class LineageRecorder {
 			return;
 		}
 		mkdirSync(dirname(this._ledgerPath), { recursive: true });
+		if (this._pendingRepair) {
+			if ("truncateToBytes" in this._pendingRepair) {
+				// Discard the torn tail line so it never becomes mid-file corruption.
+				truncateSync(this._ledgerPath, this._pendingRepair.truncateToBytes);
+			} else {
+				appendFileSync(this._ledgerPath, "\n");
+			}
+			this._pendingRepair = undefined;
+		}
 		appendFileSync(this._ledgerPath, `${JSON.stringify(event)}\n`);
 	}
 }
 
-/** Parse a ledger, tolerating a torn (killed mid-append) final line only. */
+/**
+ * Parse a ledger, tolerating only a torn final line: malformed AND
+ * unterminated (a killed mid-append). A newline-terminated malformed line is
+ * real corruption anywhere in the file and throws.
+ */
 function parseLedgerContent(raw: string): { events: LineageEvent[]; validLength: number } {
 	const events: LineageEvent[] = [];
 	let offset = 0;
@@ -319,7 +367,7 @@ function parseLedgerContent(raw: string): { events: LineageEvent[]; validLength:
 			try {
 				events.push(JSON.parse(line) as LineageEvent);
 			} catch (error) {
-				if (end === raw.length) {
+				if (newlineIndex === -1) {
 					return { events, validLength };
 				}
 				throw new Error(`corrupt lineage ledger line ${lineNumber}: ${String(error)}`);
@@ -461,10 +509,7 @@ export function wrapStreamFnWithLineage(streamFn: StreamFn, recorder: LineageRec
 	const inner = ((streamFn as { [LINEAGE_INNER_STREAM_FN]?: StreamFn })[LINEAGE_INNER_STREAM_FN] ??
 		streamFn) as StreamFn;
 	const wrapped: StreamFn = (model, context, options) => {
-		const requestId = recorder.startTurnRequest({
-			messageCount: context.messages.length,
-			lastRole: context.messages[context.messages.length - 1]?.role,
-		});
+		const requestId = recorder.startTurnRequest(() => hashTurnBody(model, context));
 		return inner(model, context, {
 			...options,
 			headers: { ...options?.headers, ...lineageRequestHeaders(requestId) },
