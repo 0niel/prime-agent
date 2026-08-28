@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
@@ -259,6 +259,13 @@ describe("LineageRecorder", () => {
 		readLineageLedger(path);
 
 		expect(readFileSync(path).equals(before)).toBe(true);
+	});
+
+	it("readLineageLedger never opens the ledger for writing", () => {
+		// A write-mode open would create the missing file instead of throwing.
+		const missing = join(tempDir, "missing.jsonl");
+		expect(() => readLineageLedger(missing)).toThrow(/ENOENT/);
+		expect(existsSync(missing)).toBe(false);
 	});
 
 	it("applies torn-tail repair exactly once, not on every append", () => {
@@ -738,6 +745,44 @@ describe("assertLineageManifestInvariants negative calibration", () => {
 					kind: "turn",
 					compaction_id: "ghost",
 				}),
+		],
+		[
+			"a request naming another session's compaction",
+			/request .* has an invalid compaction/,
+			(m) => {
+				// Fully valid child compaction chain, so only the owner check can reject
+				// the root request that names it (a later wrong-context error would not
+				// match this row's message).
+				m.contexts.push({
+					context_id: "child-c1",
+					session_id: "child",
+					previous_context_id: "child-c0",
+					transition: "compact",
+					compaction_id: "child-k1",
+				});
+				m.compactions.push({
+					compaction_id: "child-k1",
+					session_id: "child",
+					source_context_id: "child-c0",
+					target_context_id: "child-c1",
+					summary_request_id: "child-r2",
+					status: "completed",
+				});
+				m.requests.push({
+					request_id: "child-r2",
+					session_id: "child",
+					context_id: "child-c0",
+					kind: "compaction",
+					compaction_id: "child-k1",
+				});
+				m.requests.push({
+					request_id: "root-r5",
+					session_id: "root",
+					context_id: "root-c0",
+					kind: "turn",
+					compaction_id: "child-k1",
+				});
+			},
 		],
 		[
 			"a turn request on the wrong compaction context",
