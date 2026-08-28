@@ -134,6 +134,8 @@ export class ReplKernelManager {
 	private snapshotTimer?: ReturnType<typeof globalThis.setTimeout>;
 	/** While the final dispose snapshot is flushing, new external executions are rejected. */
 	private flushingSnapshotForDispose = false;
+	/** In-flight final snapshot flush; concurrent teardowns join it instead of re-flushing. */
+	private snapshotFlushForDispose?: Promise<void>;
 
 	constructor(options: KernelManagerOptions) {
 		this.options = {
@@ -1104,7 +1106,17 @@ export class ReplKernelManager {
 		}
 	}
 
-	private async flushSnapshotForDispose(): Promise<void> {
+	private flushSnapshotForDispose(): Promise<void> {
+		// Concurrent teardowns (dispose vs a signal-handler shutdown) join one flush:
+		// a second flusher would clear the execution guard while the first is still
+		// snapshotting and enqueue a duplicate final snapshot behind it.
+		this.snapshotFlushForDispose ??= this.runSnapshotFlushForDispose().finally(() => {
+			this.snapshotFlushForDispose = undefined;
+		});
+		return this.snapshotFlushForDispose;
+	}
+
+	private async runSnapshotFlushForDispose(): Promise<void> {
 		if (!this.options.snapshot || !this.isRunning) return;
 		// Block new external executions so none can splice ahead of the final snapshot and stall dispose.
 		this.flushingSnapshotForDispose = true;

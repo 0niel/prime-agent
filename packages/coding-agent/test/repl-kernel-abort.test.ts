@@ -356,6 +356,42 @@ describe("ReplKernelManager abort handling", () => {
 		expect(cleanupResources).toHaveBeenCalledOnce();
 	});
 
+	it("joins concurrent teardowns into a single final snapshot flush", async () => {
+		const manager = new ReplKernelManager({
+			cwd: process.cwd(),
+			snapshot: { path: "/tmp/test-state.dill", manifestPath: "/tmp/test-state.json" },
+		});
+		const executeInner = vi.fn(
+			async (
+				_requestFields: Record<string, unknown> & { type: string },
+			): Promise<{ stdout: string; stderr: string; status: "ok"; durationMs: number }> => ({
+				stdout: "",
+				stderr: "",
+				status: "ok",
+				durationMs: 0,
+			}),
+		);
+		const cleanupResources = vi.fn();
+		Object.assign(
+			manager as unknown as {
+				state: "running";
+				executionQueue: Promise<void>;
+				executeInner: typeof executeInner;
+				start: () => Promise<void>;
+				cleanupResources: () => void;
+			},
+			{ state: "running", executionQueue: Promise.resolve(), executeInner, start: async () => {}, cleanupResources },
+		);
+
+		// A session dispose racing a signal-handler shutdown must share one final
+		// flush instead of queueing a second snapshot behind the first.
+		await Promise.all([manager.dispose(), manager.shutdown({ snapshot: true })]);
+
+		const snapshotRequests = executeInner.mock.calls.filter((call) => call[0].type === "snapshot");
+		expect(snapshotRequests).toHaveLength(1);
+		expect(cleanupResources).toHaveBeenCalled();
+	});
+
 	it("routes null-id and stale-id stream events into backgroundOutput, not stdout", async () => {
 		const writeLine = vi.fn(async (_request: Record<string, unknown>) => {});
 		const { manager, internals } = runningManagerWith(writeLine);
