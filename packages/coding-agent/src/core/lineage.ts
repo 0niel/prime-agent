@@ -142,7 +142,7 @@ export class LineageRecorder {
 	private _activeContextId: string;
 	private _activeCompactionId?: string;
 	private _pendingRepair?: { truncateToBytes: number } | { terminateLine: true };
-	private _lastTurn?: { requestId: string; contextId: string; bodyKey?: () => string };
+	private _lastTurn?: { requestId: string; contextId: string; bodyHash?: string };
 	private _parkedRetry?: { requestId: string; contextId: string; bodyHash?: string };
 	private _pendingCompactions = new Map<string, { sourceContextId: string; targetContextId: string }>();
 	private _terminalStatus?: SessionStatusEvent["status"];
@@ -189,17 +189,22 @@ export class LineageRecorder {
 		return this._lastTurn?.requestId;
 	}
 
-	/** Mint (or, for a body-identical retry, reuse) the request ID for one turn call. */
-	startTurnRequest(bodyKey?: () => string): string {
+	/**
+	 * Mint (or, for a body-identical retry, reuse) the request ID for one turn
+	 * call. The body hash is captured eagerly here, before the wire call, so a
+	 * later mutation of the live message objects can never alias two different
+	 * bodies under one parked Idempotency-Key.
+	 */
+	startTurnRequest(bodyHash?: string): string {
 		const parked = this._parkedRetry;
 		if (
 			parked &&
 			parked.contextId === this._activeContextId &&
 			parked.bodyHash !== undefined &&
-			parked.bodyHash === bodyKey?.()
+			parked.bodyHash === bodyHash
 		) {
 			this._parkedRetry = undefined;
-			this._lastTurn = { requestId: parked.requestId, contextId: parked.contextId, bodyKey };
+			this._lastTurn = parked;
 			return parked.requestId;
 		}
 		const requestId = mintId();
@@ -211,17 +216,13 @@ export class LineageRecorder {
 			kind: "turn",
 			...(this._activeCompactionId !== undefined ? { compaction_id: this._activeCompactionId } : {}),
 		});
-		this._lastTurn = { requestId, contextId: this._activeContextId, bodyKey };
+		this._lastTurn = { requestId, contextId: this._activeContextId, bodyHash };
 		return requestId;
 	}
 
 	/** Park the last turn request so the upcoming auto-retry reuses its ID. */
 	prepareTurnRetry(): void {
-		this._parkedRetry = this._lastTurn && {
-			requestId: this._lastTurn.requestId,
-			contextId: this._lastTurn.contextId,
-			bodyHash: this._lastTurn.bodyKey?.(),
-		};
+		this._parkedRetry = this._lastTurn;
 	}
 
 	clearTurnRetry(): void {
@@ -278,7 +279,7 @@ export class LineageRecorder {
 	private _replay(event: LineageEvent): void {
 		switch (event.type) {
 			case "request_started":
-				// Restores spawn attribution after resume; the body key is unknowable, so
+				// Restores spawn attribution after resume; the body hash is unknowable, so
 				// a parked retry from a replayed request can never be reused.
 				if (event.session_id === this.sessionId && event.kind === "turn") {
 					this._lastTurn = { requestId: event.request_id, contextId: event.context_id };
@@ -509,7 +510,7 @@ export function wrapStreamFnWithLineage(streamFn: StreamFn, recorder: LineageRec
 	const inner = ((streamFn as { [LINEAGE_INNER_STREAM_FN]?: StreamFn })[LINEAGE_INNER_STREAM_FN] ??
 		streamFn) as StreamFn;
 	const wrapped: StreamFn = (model, context, options) => {
-		const requestId = recorder.startTurnRequest(() => hashTurnBody(model, context));
+		const requestId = recorder.startTurnRequest(hashTurnBody(model, context));
 		return inner(model, context, {
 			...options,
 			headers: { ...options?.headers, ...lineageRequestHeaders(requestId) },

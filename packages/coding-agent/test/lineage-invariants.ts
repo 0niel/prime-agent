@@ -103,37 +103,9 @@ export function assertLineageManifestInvariants(manifest: LineageManifest): void
 		"context",
 	);
 
-	for (const request of manifest.requests) {
-		const context = contexts.get(request.context_id);
-		if (!sessions.has(request.session_id) || !context || context.session_id !== request.session_id) {
-			fail(`request ${request.request_id} has an invalid session/context`);
-		}
-		if (request.kind === "compaction" && request.compaction_id === undefined) {
-			fail(`compaction request ${request.request_id} requires a compaction id`);
-		}
-		if (request.compaction_id !== undefined) {
-			const compaction = compactions.get(request.compaction_id);
-			if (!compaction || compaction.session_id !== request.session_id) {
-				fail(`request ${request.request_id} has an invalid compaction`);
-			}
-			const expectedContext =
-				request.kind === "compaction" ? compaction.source_context_id : compaction.target_context_id;
-			if (request.context_id !== expectedContext) {
-				fail(`request ${request.request_id} is on the wrong compaction context`);
-			}
-		} else if (request.kind === "turn" && context.compaction_id !== undefined) {
-			fail(`request ${request.request_id} is missing its context compaction`);
-		}
-	}
-
-	for (const session of manifest.sessions) {
-		if (session.spawned_by_request_id === undefined) continue;
-		const spawn = requests.get(session.spawned_by_request_id);
-		if (!spawn || spawn.kind !== "turn" || spawn.session_id !== session.parent_session_id) {
-			fail(`session ${session.session_id} has an invalid spawn request`);
-		}
-	}
-
+	// Compactions are checked before requests so a deleted source-owner
+	// predicate is observable on its own (summary-request rules would
+	// otherwise reject every such manifest first).
 	for (const compaction of manifest.compactions) {
 		const source = contexts.get(compaction.source_context_id);
 		if (!sessions.has(compaction.session_id) || !source || source.session_id !== compaction.session_id) {
@@ -162,6 +134,37 @@ export function assertLineageManifestInvariants(manifest: LineageManifest): void
 			request.compaction_id !== compaction.compaction_id
 		) {
 			fail(`compaction ${compaction.compaction_id} has an invalid request`);
+		}
+	}
+
+	for (const request of manifest.requests) {
+		const context = contexts.get(request.context_id);
+		if (!sessions.has(request.session_id) || !context || context.session_id !== request.session_id) {
+			fail(`request ${request.request_id} has an invalid session/context`);
+		}
+		if (request.kind === "compaction" && request.compaction_id === undefined) {
+			fail(`compaction request ${request.request_id} requires a compaction id`);
+		}
+		if (request.compaction_id !== undefined) {
+			const compaction = compactions.get(request.compaction_id);
+			if (!compaction || compaction.session_id !== request.session_id) {
+				fail(`request ${request.request_id} has an invalid compaction`);
+			}
+			const expectedContext =
+				request.kind === "compaction" ? compaction.source_context_id : compaction.target_context_id;
+			if (request.context_id !== expectedContext) {
+				fail(`request ${request.request_id} is on the wrong compaction context`);
+			}
+		} else if (request.kind === "turn" && context.compaction_id !== undefined) {
+			fail(`request ${request.request_id} is missing its context compaction`);
+		}
+	}
+
+	for (const session of manifest.sessions) {
+		if (session.spawned_by_request_id === undefined) continue;
+		const spawn = requests.get(session.spawned_by_request_id);
+		if (!spawn || spawn.kind !== "turn" || spawn.session_id !== session.parent_session_id) {
+			fail(`session ${session.session_id} has an invalid spawn request`);
 		}
 	}
 }

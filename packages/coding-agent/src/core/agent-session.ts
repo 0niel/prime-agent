@@ -9945,6 +9945,7 @@ export class AgentSession {
 	 * matching event forwarder too.
 	 */
 	/** Terminal lineage status is recorded once, at the child's actual release, from its final run state. */
+	// Follow-up runs have no run record, so deleting a retained child mid-follow-up records completed.
 	private _recordRlmChildTerminalLineage(childId: string, child: AgentSession | undefined): void {
 		if (!child) return;
 		const runStatus = this._activeRlmChildRuns.get(childId)?.status;

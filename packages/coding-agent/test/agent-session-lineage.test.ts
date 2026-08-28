@@ -320,6 +320,25 @@ describe("AgentSession lineage", () => {
 		assertLineageManifestInvariants(deriveLineageManifest([ledgerFor(resumed), childEvents]));
 	});
 
+	it("snapshots spawn ancestry at the spawn entry point, before preflight awaits", async () => {
+		const { session: root } = createSession();
+		await root.prompt("turn one");
+		const firstId = turnRequestIds(ledgerFor(root))[0];
+
+		// Advance the parent's lineage while runRlmChild is still awaiting preflight.
+		const spawnPromise = root.runRlmChild("child task");
+		const laterId = root.lineage.startTurnRequest("later-body-hash");
+		const spawned = await spawnPromise;
+		await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status === "completed");
+
+		const childEvents = readLineageLedger(join(spawned.session_dir, "lineage.jsonl"));
+		const registration = childEvents.find((event) => event.type === "session_registered");
+		expect(registration).toMatchObject({ spawned_by_request_id: firstId });
+		expect(registration?.type === "session_registered" ? registration.spawned_by_request_id : undefined).not.toBe(
+			laterId,
+		);
+	});
+
 	it("records failed for a child whose run errors", async () => {
 		let child: AgentSession | undefined;
 		const host: SubagentRuntimeHost = {
@@ -367,7 +386,7 @@ describe("AgentSession lineage", () => {
 		expect(sessionStatuses(readLineageLedger(join(spawned.session_dir, "lineage.jsonl")))).toEqual(["cancelled"]);
 	});
 
-	it("opens a new context epoch on completed compaction and keeps it on cancel", async () => {
+	async function createCompactionSession() {
 		const extensionsResult = await createTestExtensionsResult(
 			[
 				(pi: any) => {
@@ -413,6 +432,11 @@ describe("AgentSession lineage", () => {
 			resourceLoader: createTestResourceLoader({ extensionsResult }),
 		});
 		sessions.push(session);
+		return { session, sessionManager };
+	}
+
+	it("opens a new context epoch on completed compaction and keeps it on cancel", async () => {
+		const { session } = await createCompactionSession();
 
 		await session.prompt("one");
 		await session.prompt("two");
@@ -435,6 +459,40 @@ describe("AgentSession lineage", () => {
 		const newContext = manifest.contexts.find((context) => context.transition === "compact");
 		const lastTurn = manifest.requests.filter((request) => request.kind === "turn").at(-1);
 		expect(lastTurn?.context_id).toBe(newContext?.context_id);
+	});
+
+	it("commits the completed-compaction ledger event before the transcript entry", async () => {
+		const { session, sessionManager } = await createCompactionSession();
+		await session.prompt("one");
+		await session.prompt("two");
+
+		const original = sessionManager.appendCompaction.bind(sessionManager);
+		let finishedAtCommit: LineageEvent[] = [];
+		vi.spyOn(sessionManager, "appendCompaction").mockImplementation(((
+			...args: Parameters<SessionManager["appendCompaction"]>
+		) => {
+			finishedAtCommit = ledgerFor(session).filter((event) => event.type === "compaction_finished");
+			return original(...args);
+		}) as SessionManager["appendCompaction"]);
+
+		await session.compact();
+
+		expect(finishedAtCommit).toEqual([expect.objectContaining({ status: "completed" })]);
+	});
+
+	it("does not double-finish the compaction when the transcript commit fails", async () => {
+		const { session, sessionManager } = await createCompactionSession();
+		await session.prompt("one");
+		await session.prompt("two");
+
+		vi.spyOn(sessionManager, "appendCompaction").mockImplementationOnce(() => {
+			throw new Error("append failed");
+		});
+
+		await expect(session.compact()).rejects.toThrow("append failed");
+
+		const finished = ledgerFor(session).filter((event) => event.type === "compaction_finished");
+		expect(finished).toEqual([expect.objectContaining({ status: "completed" })]);
 	});
 
 	it("stamps lineage headers on the real compaction summary call without dropping auth headers", async () => {
