@@ -44,10 +44,12 @@ describe("SemanticEdgeRecorder", () => {
 		const recorder = createRecorder();
 		const requestId = recorder.startTurnRequest();
 		expect(requestId).toMatch(/^[0-9a-f]{32}$/);
+		// Literal names: the wire contract must survive a renamed production constant.
 		expect(modelRequestHeaders(requestId)).toEqual({
-			[MODEL_REQUEST_ID_HEADER]: requestId,
-			[IDEMPOTENCY_KEY_HEADER]: requestId,
+			"X-ACP-Model-Request-ID": requestId,
+			"Idempotency-Key": requestId,
 		});
+		expect(MODEL_REQUEST_ID_HEADER).toBe("X-ACP-Model-Request-ID");
 	});
 
 	it("appends registration, request, and outcome events in order", () => {
@@ -385,6 +387,45 @@ describe("deriveSemanticEdges", () => {
 		]);
 	});
 
+	it("emits no compaction edge when another request committed after the summary", () => {
+		const root = recorderAt("root.jsonl");
+		const r1 = root.startTurnRequest();
+		root.finishRequest(r1);
+		const compaction = root.beginCompaction();
+		const s1 = root.startCompactionRequest(compaction.compactionId);
+		root.finishRequest(s1);
+		const r2 = root.startTurnRequest();
+		root.finishRequest(r2);
+		root.finishCompaction(compaction.compactionId, "completed");
+		const r3 = root.startTurnRequest();
+		root.finishRequest(r3);
+
+		// The summary is no longer the session's last commit, so the gate holds.
+		expect(deriveSemanticEdges([eventsAt("root.jsonl")]).edges).toEqual([
+			{ source_request_id: r1, target_request_id: s1, type: "continuation" },
+			{ source_request_id: s1, target_request_id: r2, type: "continuation" },
+			{ source_request_id: r2, target_request_id: r3, type: "continuation" },
+		]);
+	});
+
+	it("emits no compaction edge when the compaction fails after a committed summary", () => {
+		const root = recorderAt("root.jsonl");
+		const r1 = root.startTurnRequest();
+		root.finishRequest(r1);
+		const compaction = root.beginCompaction();
+		const s1 = root.startCompactionRequest(compaction.compactionId);
+		root.finishRequest(s1);
+		root.finishCompaction(compaction.compactionId, "failed");
+		const r2 = root.startTurnRequest();
+		root.finishRequest(r2);
+
+		// Only a COMPLETED compaction may push the edge, even with a committed summary.
+		expect(deriveSemanticEdges([eventsAt("root.jsonl")]).edges).toEqual([
+			{ source_request_id: r1, target_request_id: s1, type: "continuation" },
+			{ source_request_id: s1, target_request_id: r2, type: "continuation" },
+		]);
+	});
+
 	it("emits no compaction edge for a failed compaction and re-claims the pending continuation", () => {
 		const root = recorderAt("root.jsonl");
 		const r1 = root.startTurnRequest();
@@ -532,8 +573,8 @@ describe("wrapStreamFnWithSemanticEdges", () => {
 		expect(headers[MODEL_REQUEST_ID_HEADER]).toBe(recorder.lastTurnRequestId);
 	});
 
-	it("commits the request when its stream resolves and fails it on error or aborted", async () => {
-		const recorder = recorderIn("b.jsonl");
+	function outcomeHarness(name: string) {
+		const recorder = recorderIn(name);
 		const streams: Array<ReturnType<typeof createAssistantMessageEventStream>> = [];
 		const inner: StreamFn = () => {
 			const stream = createAssistantMessageEventStream();
@@ -541,18 +582,50 @@ describe("wrapStreamFnWithSemanticEdges", () => {
 			return stream;
 		};
 		const wrapped = wrapStreamFnWithSemanticEdges(inner, recorder);
+		const outcomes = () =>
+			readSemanticEdgeLedger(join(tempDir, name))
+				.filter((event) => event.type === "request_finished" || event.type === "request_failed")
+				.map((event) => event.type);
+		return { wrapped, streams, outcomes };
+	}
 
+	it("commits the request when its stream resolves with a stop", async () => {
+		const { wrapped, streams, outcomes } = outcomeHarness("stop.jsonl");
 		wrapped(model, context, undefined);
 		streams[0]!.push({ type: "done", reason: "stop", message: message("stop") as never });
 		await new Promise((resolve) => setImmediate(resolve));
+		expect(outcomes()).toEqual(["request_finished"]);
+	});
 
+	it("fails the request when its stream resolves with an error message", async () => {
+		const { wrapped, streams, outcomes } = outcomeHarness("error.jsonl");
 		wrapped(model, context, undefined);
-		streams[1]!.push({ type: "error", reason: "error", error: message("error") as never });
+		streams[0]!.push({ type: "error", reason: "error", error: message("error") as never });
 		await new Promise((resolve) => setImmediate(resolve));
+		expect(outcomes()).toEqual(["request_failed"]);
+	});
 
-		const events = readSemanticEdgeLedger(join(tempDir, "b.jsonl"));
-		const outcomes = events.filter((event) => event.type === "request_finished" || event.type === "request_failed");
-		expect(outcomes.map((event) => event.type)).toEqual(["request_finished", "request_failed"]);
+	it("fails the request when its stream resolves with an aborted message", async () => {
+		const { wrapped, streams, outcomes } = outcomeHarness("aborted.jsonl");
+		wrapped(model, context, undefined);
+		streams[0]!.push({ type: "error", reason: "aborted", error: message("aborted") as never });
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(outcomes()).toEqual(["request_failed"]);
+	});
+
+	it("fails the request when the inner stream function returns a rejected promise", async () => {
+		const recorder = recorderIn("rejected.jsonl");
+		const inner: StreamFn = async () => {
+			throw new Error("transport rejected");
+		};
+		const wrapped = wrapStreamFnWithSemanticEdges(inner, recorder);
+
+		await expect(wrapped(model, context, undefined)).rejects.toThrow("transport rejected");
+
+		const rejectedOutcomes = readSemanticEdgeLedger(join(tempDir, "rejected.jsonl"))
+			.filter((event) => event.type === "request_finished" || event.type === "request_failed")
+			.map((event) => event.type);
+		expect(rejectedOutcomes).toEqual(["request_failed"]);
 	});
 
 	it("fails the request when the inner stream function throws", () => {
