@@ -465,6 +465,13 @@ export class SettingsManager {
 			delete settings.telemetry;
 		}
 
+		if (
+			settings.markdown !== undefined &&
+			(typeof settings.markdown !== "object" || settings.markdown === null || Array.isArray(settings.markdown))
+		) {
+			delete settings.markdown;
+		}
+
 		return settings as Settings;
 	}
 
