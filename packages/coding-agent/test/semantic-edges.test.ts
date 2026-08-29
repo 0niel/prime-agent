@@ -45,7 +45,7 @@ describe("SemanticEdgeRecorder", () => {
 		const requestId = recorder.startTurnRequest();
 		expect(requestId).toMatch(/^[0-9a-f]{32}$/);
 		// Literal names: the wire contract must survive a renamed production constant.
-		expect(modelRequestHeaders(requestId)).toEqual({
+		expect(modelRequestHeaders(requestId ?? "")).toEqual({
 			"X-ACP-Model-Request-ID": requestId,
 			"Idempotency-Key": requestId,
 		});
@@ -227,6 +227,67 @@ describe("SemanticEdgeRecorder", () => {
 	it("rejects finishing an unknown compaction", () => {
 		const recorder = createRecorder();
 		expect(() => recorder.finishCompaction("ghost", "completed")).toThrow(/unknown semantic-edge compaction/);
+	});
+
+	it("disables itself permanently after the first failed append", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const recorder = createRecorder();
+			const first = recorder.startTurnRequest();
+			expect(first).toBeDefined();
+
+			// appendFileSync on a directory fails even when running as root.
+			const path = join(tempDir, "semantic-edges.jsonl");
+			rmSync(path);
+			mkdirSync(path);
+
+			expect(recorder.startTurnRequest()).toBeUndefined();
+			expect(warn).toHaveBeenCalledOnce();
+
+			// Every later write is a silent no-op: no throws, no more warnings.
+			expect(recorder.startTurnRequest()).toBeUndefined();
+			recorder.finishRequest(first);
+			recorder.failRequest(first);
+			const compaction = recorder.beginCompaction();
+			expect(recorder.startCompactionRequest(compaction.compactionId)).toBeUndefined();
+			recorder.finishCompaction(compaction.compactionId, "completed");
+			recorder.recordChildReturned("child", first);
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("does not advance commit state when the append fails", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const recorder = createRecorder();
+			const requestId = recorder.startTurnRequest();
+
+			const path = join(tempDir, "semantic-edges.jsonl");
+			rmSync(path);
+			mkdirSync(path);
+
+			recorder.finishRequest(requestId);
+			// The commit never reached the ledger, so it must not become claimable.
+			expect(recorder.lastCommittedRequestId).toBeUndefined();
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("degrades to disabled when the ledger is unreadable at construction", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const path = join(tempDir, "semantic-edges.jsonl");
+			mkdirSync(path);
+			const recorder = createRecorder();
+			expect(recorder.startTurnRequest()).toBeUndefined();
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("tolerates a torn (unterminated) final line and repairs it on the first append only", () => {
@@ -430,6 +491,35 @@ describe("deriveSemanticEdges", () => {
 			{ source_request_id: r1, target_request_id: sliceA, type: "continuation" },
 			{ source_request_id: r1, target_request_id: sliceB, type: "continuation" },
 			{ source_request_id: sliceB, target_request_id: r2, type: "compaction" },
+		]);
+	});
+
+	it("defers pending edges past compaction summaries to the post-compaction turn", () => {
+		const root = recorderAt("root.jsonl");
+		const r1 = root.startTurnRequest();
+		root.finishRequest(r1);
+		const child = recorderAt("child.jsonl", { parentSessionId: "root", spawnedByRequestId: r1 });
+		const c1 = child.startTurnRequest();
+		child.finishRequest(c1);
+		root.recordChildReturned("child", c1);
+
+		const compaction = root.beginCompaction();
+		const sliceA = root.startCompactionRequest(compaction.compactionId);
+		const sliceB = root.startCompactionRequest(compaction.compactionId);
+		root.finishRequest(sliceA);
+		root.finishRequest(sliceB);
+		root.finishCompaction(compaction.compactionId, "completed");
+		const r2 = root.startTurnRequest();
+		root.finishRequest(r2);
+
+		// The slices carry only their continuations; the pending subagent_return
+		// lands on the post-compaction turn, which actually consumes the result.
+		expect(deriveSemanticEdges([eventsAt("root.jsonl"), eventsAt("child.jsonl")]).edges).toEqual([
+			{ source_request_id: r1, target_request_id: sliceA, type: "continuation" },
+			{ source_request_id: r1, target_request_id: sliceB, type: "continuation" },
+			{ source_request_id: c1, target_request_id: r2, type: "subagent_return" },
+			{ source_request_id: sliceB, target_request_id: r2, type: "compaction" },
+			{ source_request_id: r1, target_request_id: c1, type: "subagent_call" },
 		]);
 	});
 
@@ -673,23 +763,42 @@ describe("wrapStreamFnWithSemanticEdges", () => {
 			.map((event) => event.type);
 		expect(rejectedOutcomes).toEqual(["request_failed"]);
 	});
-	it("survives a ledger write failure in the stream outcome observer", async () => {
-		const recorder = recorderIn("enospc.jsonl");
-		vi.spyOn(recorder, "finishRequest").mockImplementation(() => {
-			throw new Error("ENOSPC: no space left on device");
-		});
+	it("degrades to headerless calls when the ledger fails mid-flight", async () => {
+		const recorder = recorderIn("degrade.jsonl");
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		const unhandled: unknown[] = [];
 		const onUnhandled = (reason: unknown) => unhandled.push(reason);
 		process.on("unhandledRejection", onUnhandled);
 		try {
-			const stream = createAssistantMessageEventStream();
-			const wrapped = wrapStreamFnWithSemanticEdges(() => stream, recorder);
-			const returned = wrapped(model, context, undefined) as typeof stream;
-			stream.push({ type: "done", reason: "stop", message: message("stop") as never });
+			const captured: Array<Record<string, string> | undefined> = [];
+			const streams: Array<ReturnType<typeof createAssistantMessageEventStream>> = [];
+			const inner: StreamFn = (_model, _context, options) => {
+				captured.push(options?.headers);
+				const stream = createAssistantMessageEventStream();
+				streams.push(stream);
+				return stream;
+			};
+			const wrapped = wrapStreamFnWithSemanticEdges(inner, recorder);
+
+			const returned = wrapped(model, context, undefined) as ReturnType<typeof createAssistantMessageEventStream>;
+			expect(captured[0]?.[MODEL_REQUEST_ID_HEADER]).toBeDefined();
+
+			// The ledger breaks while the call is in flight; the outcome write disables the recorder.
+			rmSync(join(tempDir, "degrade.jsonl"));
+			mkdirSync(join(tempDir, "degrade.jsonl"));
+			streams[0]!.push({ type: "done", reason: "stop", message: message("stop") as never });
 
 			// The model call still resolves and the process never sees a rejection.
 			await expect(returned.result()).resolves.toMatchObject({ stopReason: "stop" });
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(unhandled).toEqual([]);
+			expect(warn).toHaveBeenCalledOnce();
+
+			// Later calls carry no request ID: their request_started can never be durable.
+			wrapped(model, context, undefined);
+			expect(captured[1]?.[MODEL_REQUEST_ID_HEADER]).toBeUndefined();
+			expect(captured[1]?.[IDEMPOTENCY_KEY_HEADER]).toBeUndefined();
+			streams[1]!.push({ type: "done", reason: "stop", message: message("stop") as never });
 			await new Promise((resolve) => setImmediate(resolve));
 			expect(unhandled).toEqual([]);
 			expect(warn).toHaveBeenCalledOnce();

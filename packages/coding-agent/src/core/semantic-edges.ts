@@ -15,6 +15,12 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
  * pending set and they attach to the next committed request in that session.
  * A request whose stream never completes (hard crash, torn tail) stays
  * in-flight and produces no edges.
+ *
+ * Divergence from nano-rlm: compaction summary requests claim no pending
+ * edges (and no spawn). nano-rlm's single summary request can claim safely;
+ * prime-agent's split turns run several racing slices, so pending edges would
+ * land on whichever slice started first — a dead end when a different slice
+ * commits last. Pending therefore defers to the post-compaction turn.
  */
 
 export const MODEL_REQUEST_ID_HEADER = "X-ACP-Model-Request-ID";
@@ -140,6 +146,7 @@ export class SemanticEdgeRecorder {
 	readonly sessionId: string;
 	private readonly _ledgerPath?: string;
 	private _pendingRepair?: { truncateToBytes: number } | { terminateLine: true };
+	private _disabled = false;
 	private _epoch = 0;
 	private _lastTurn?: { requestId: string; epoch: number; bodyHash?: string };
 	private _parkedRetry?: { requestId: string; epoch: number; bodyHash?: string };
@@ -155,7 +162,13 @@ export class SemanticEdgeRecorder {
 		this.sessionId = options.sessionId;
 		this._ledgerPath = options.ledgerPath;
 
-		const existing = this._loadExisting();
+		let existing: SemanticEdgeLedgerEvent[] = [];
+		try {
+			existing = this._loadExisting();
+		} catch (error) {
+			this._disable(error);
+			return;
+		}
 		const registered = existing.some(
 			(event) => event.type === "session_registered" && event.session_id === this.sessionId,
 		);
@@ -174,6 +187,17 @@ export class SemanticEdgeRecorder {
 		});
 	}
 
+	// Provenance is best-effort: the first ledger failure permanently disables all
+	// writes (one warning), and callers stop emitting request IDs on the wire so
+	// the ledger-before-wire invariant is preserved rather than weakened.
+	private _disable(error: unknown): void {
+		if (this._disabled) return;
+		this._disabled = true;
+		console.warn(
+			`semantic-edge ledger disabled at ${this._ledgerPath}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+
 	get lastTurnRequestId(): string | undefined {
 		return this._lastTurn?.requestId;
 	}
@@ -189,7 +213,7 @@ export class SemanticEdgeRecorder {
 	 * under one parked Idempotency-Key. A reused retry re-logs request_started
 	 * so the fold re-claims the failed attempt's returned pending edges.
 	 */
-	startTurnRequest(bodyHash?: string): string {
+	startTurnRequest(bodyHash?: string): string | undefined {
 		const parked = this._parkedRetry;
 		const requestId =
 			parked && parked.epoch === this._epoch && parked.bodyHash !== undefined && parked.bodyHash === bodyHash
@@ -198,11 +222,14 @@ export class SemanticEdgeRecorder {
 		if (requestId === parked?.requestId) {
 			this._parkedRetry = undefined;
 		}
-		this._append({
+		const recorded = this._append({
 			type: "request_started",
 			request_id: requestId,
 			session_id: this.sessionId,
 		});
+		if (!recorded) {
+			return undefined;
+		}
 		this._lastTurn = { requestId, epoch: this._epoch, bodyHash };
 		return requestId;
 	}
@@ -216,11 +243,13 @@ export class SemanticEdgeRecorder {
 		this._parkedRetry = undefined;
 	}
 
-	finishRequest(requestId: string): void {
+	finishRequest(requestId: string | undefined): void {
+		if (requestId === undefined) return;
 		this._append({ type: "request_finished", request_id: requestId });
 	}
 
-	failRequest(requestId: string): void {
+	failRequest(requestId: string | undefined): void {
+		if (requestId === undefined) return;
 		this._append({ type: "request_failed", request_id: requestId });
 	}
 
@@ -231,18 +260,19 @@ export class SemanticEdgeRecorder {
 	}
 
 	/** Mint the summary request for a wire compaction; extension-supplied summaries make no request. */
-	startCompactionRequest(compactionId: string): string {
+	startCompactionRequest(compactionId: string): string | undefined {
 		const requestId = mintId();
-		this._append({
+		const recorded = this._append({
 			type: "request_started",
 			request_id: requestId,
 			session_id: this.sessionId,
 			compaction_id: compactionId,
 		});
-		return requestId;
+		return recorded ? requestId : undefined;
 	}
 
 	finishCompaction(compactionId: string, status: CompactionStatus): void {
+		if (this._disabled) return;
 		if (!this._openCompactions.has(compactionId)) {
 			throw new Error(`unknown semantic-edge compaction: ${compactionId}`);
 		}
@@ -250,7 +280,8 @@ export class SemanticEdgeRecorder {
 	}
 
 	/** The parent claims a successfully returned child; failed or cancelled children never return. */
-	recordChildReturned(childSessionId: string, childLastCommittedRequestId: string): void {
+	recordChildReturned(childSessionId: string, childLastCommittedRequestId: string | undefined): void {
+		if (childLastCommittedRequestId === undefined) return;
 		this._append({
 			type: "child_returned",
 			session_id: this.sessionId,
@@ -302,22 +333,32 @@ export class SemanticEdgeRecorder {
 		return parsed.events;
 	}
 
-	private _append(event: SemanticEdgeLedgerEvent): void {
-		this._replay(event);
-		if (!this._ledgerPath) {
-			return;
+	// Durable append first, in-memory state second: a failed write must not leave
+	// commit state pointing at events that never reached the ledger.
+	private _append(event: SemanticEdgeLedgerEvent): boolean {
+		if (this._disabled) {
+			return false;
 		}
-		mkdirSync(dirname(this._ledgerPath), { recursive: true });
-		if (this._pendingRepair) {
-			if ("truncateToBytes" in this._pendingRepair) {
-				// Discard the torn tail line so it never becomes mid-file corruption.
-				truncateSync(this._ledgerPath, this._pendingRepair.truncateToBytes);
-			} else {
-				appendFileSync(this._ledgerPath, "\n");
+		if (this._ledgerPath) {
+			try {
+				mkdirSync(dirname(this._ledgerPath), { recursive: true });
+				if (this._pendingRepair) {
+					if ("truncateToBytes" in this._pendingRepair) {
+						// Discard the torn tail line so it never becomes mid-file corruption.
+						truncateSync(this._ledgerPath, this._pendingRepair.truncateToBytes);
+					} else {
+						appendFileSync(this._ledgerPath, "\n");
+					}
+					this._pendingRepair = undefined;
+				}
+				appendFileSync(this._ledgerPath, `${JSON.stringify(event)}\n`);
+			} catch (error) {
+				this._disable(error);
+				return false;
 			}
-			this._pendingRepair = undefined;
 		}
-		appendFileSync(this._ledgerPath, `${JSON.stringify(event)}\n`);
+		this._replay(event);
+		return true;
 	}
 }
 
@@ -373,7 +414,7 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 	const sessions = new Map<string, FoldSession>();
 	const inFlight = new Map<
 		string,
-		{ sessionId: string; inbound: Array<{ source: string; type: SemanticEdgeType }> }
+		{ sessionId: string; summary: boolean; inbound: Array<{ source: string; type: SemanticEdgeType }> }
 	>();
 	const compactions = new Map<string, { sessionId: string; summaryRequestIds: Set<string> }>();
 	const returnedChildren = new Set<string>();
@@ -402,17 +443,22 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 			}
 			case "request_started": {
 				const state = session(event.session_id);
-				const inbound = state.pending;
-				state.pending = [];
-				if (!state.spawnClaimed && state.spawnedByRequestId !== undefined) {
-					inbound.push({ source: state.spawnedByRequestId, type: "subagent_call" });
-					state.spawnClaimed = true;
+				const isSummary = event.compaction_id !== undefined;
+				// Summary slices claim no pending edges and no spawn: pending defers to
+				// the post-compaction turn, the request that actually consumes it.
+				const inbound = isSummary ? [] : state.pending;
+				if (!isSummary) {
+					state.pending = [];
+					if (!state.spawnClaimed && state.spawnedByRequestId !== undefined) {
+						inbound.push({ source: state.spawnedByRequestId, type: "subagent_call" });
+						state.spawnClaimed = true;
+					}
 				}
 				if (state.lastRequestId !== undefined && !inbound.some((edge) => edge.source === state.lastRequestId)) {
 					inbound.push({ source: state.lastRequestId, type: "continuation" });
 				}
-				inFlight.set(event.request_id, { sessionId: event.session_id, inbound });
-				if (event.compaction_id !== undefined) {
+				inFlight.set(event.request_id, { sessionId: event.session_id, summary: isSummary, inbound });
+				if (isSummary && event.compaction_id !== undefined) {
 					const compaction = compactions.get(event.compaction_id);
 					// A split-turn compaction sends several summary slices; all belong to it.
 					if (compaction && compaction.sessionId === event.session_id) {
@@ -443,8 +489,13 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 					break;
 				}
 				inFlight.delete(event.request_id);
-				const state = session(request.sessionId);
-				state.pending = [...request.inbound, ...state.pending];
+				// A failed summary slice returns nothing: it claimed nothing, and its
+				// continuation regenerates from the unchanged last commit (several
+				// failed slices would otherwise requeue duplicate continuations).
+				if (!request.summary) {
+					const state = session(request.sessionId);
+					state.pending = [...request.inbound, ...state.pending];
+				}
 				break;
 			}
 			case "compaction_begun":
@@ -487,38 +538,31 @@ export function unwrapSemanticEdgeStreamFn(streamFn: StreamFn): StreamFn {
 	return ((streamFn as { [SEMANTIC_INNER_STREAM_FN]?: StreamFn })[SEMANTIC_INNER_STREAM_FN] ?? streamFn) as StreamFn;
 }
 
-/** Provenance is best-effort: a ledger write failure must never crash or mask the model call. */
-function recordOutcomeSafely(write: () => void): void {
-	try {
-		write();
-	} catch (error) {
-		console.warn(`semantic-edge ledger write failed: ${error instanceof Error ? error.message : String(error)}`);
-	}
-}
-
 /**
  * Bind a stream function to one session's recorder. Re-wrapping an already
  * wrapped function rebinds the original, so a child session that inherits its
  * parent's streamFn attributes calls to its own ledger. request_started is
  * appended before the wire call; the request commits or fails when its stream
- * resolves (an error/aborted final message is a failure).
+ * resolves (an error/aborted final message is a failure). When the recorder is
+ * disabled (its ledger failed), calls carry no request ID at all.
  */
 export function wrapStreamFnWithSemanticEdges(streamFn: StreamFn, recorder: SemanticEdgeRecorder): StreamFn {
 	const inner = unwrapSemanticEdgeStreamFn(streamFn);
 	const wrapped: StreamFn = (model, context, options) => {
 		const requestId = recorder.startTurnRequest(hashTurnBody(model, context, options));
+		if (requestId === undefined) {
+			return inner(model, context, options);
+		}
 		const observe = (stream: Awaited<ReturnType<StreamFn>>) => {
 			void stream.result().then(
 				(message) => {
-					recordOutcomeSafely(() => {
-						if (message.stopReason === "error" || message.stopReason === "aborted") {
-							recorder.failRequest(requestId);
-						} else {
-							recorder.finishRequest(requestId);
-						}
-					});
+					if (message.stopReason === "error" || message.stopReason === "aborted") {
+						recorder.failRequest(requestId);
+					} else {
+						recorder.finishRequest(requestId);
+					}
 				},
-				() => recordOutcomeSafely(() => recorder.failRequest(requestId)),
+				() => recorder.failRequest(requestId),
 			);
 			return stream;
 		};
@@ -529,12 +573,12 @@ export function wrapStreamFnWithSemanticEdges(streamFn: StreamFn, recorder: Sema
 				headers: { ...options?.headers, ...modelRequestHeaders(requestId) },
 			});
 		} catch (error) {
-			recordOutcomeSafely(() => recorder.failRequest(requestId));
+			recorder.failRequest(requestId);
 			throw error;
 		}
 		if (result instanceof Promise) {
 			return result.then(observe, (error) => {
-				recordOutcomeSafely(() => recorder.failRequest(requestId));
+				recorder.failRequest(requestId);
 				throw error;
 			});
 		}

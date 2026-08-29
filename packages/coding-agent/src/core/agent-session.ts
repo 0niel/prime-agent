@@ -7516,19 +7516,22 @@ export class AgentSession {
 					call: (callHeaders: Record<string, string> | undefined) => Promise<T>,
 				): Promise<T> => {
 					const requestId = this._semanticEdges.startCompactionRequest(semanticCompaction.compactionId);
+					if (requestId === undefined) {
+						return call(headers);
+					}
 					let result: T;
 					try {
 						result = await call({ ...headers, ...modelRequestHeaders(requestId) });
 					} catch (error) {
-						try {
-							this._semanticEdges.failRequest(requestId);
-						} catch (ledgerError) {
-							// Keep the original summarization error; provenance is best-effort.
-							console.warn(`semantic-edge ledger write failed: ${String(ledgerError)}`);
-						}
+						this._semanticEdges.failRequest(requestId);
 						throw error;
 					}
-					this._semanticEdges.finishRequest(requestId);
+					// An aborted summary may be partial; it must not commit into the chain.
+					if (signal.aborted) {
+						this._semanticEdges.failRequest(requestId);
+					} else {
+						this._semanticEdges.finishRequest(requestId);
+					}
 					return result;
 				};
 				({ summary, firstKeptEntryId, tokensBefore, details } = await compact(
@@ -7564,15 +7567,7 @@ export class AgentSession {
 			if (!compactionRecorded) {
 				const cancelled =
 					error instanceof Error && (error.name === "AbortError" || error.message === "Compaction cancelled");
-				try {
-					this._semanticEdges.finishCompaction(
-						semanticCompaction.compactionId,
-						cancelled ? "cancelled" : "failed",
-					);
-				} catch (ledgerError) {
-					// Keep the original compaction error; provenance is best-effort.
-					console.warn(`semantic-edge ledger write failed: ${String(ledgerError)}`);
-				}
+				this._semanticEdges.finishCompaction(semanticCompaction.compactionId, cancelled ? "cancelled" : "failed");
 			}
 			throw error;
 		}

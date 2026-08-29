@@ -651,6 +651,55 @@ describe("AgentSession semantic edges", () => {
 		expect(finished).toEqual([expect.objectContaining({ status: "completed" })]);
 	});
 
+	it("keeps prompting and settling children when the session ledger becomes unwritable", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const { session: root, capturedHeaders } = createSession();
+			await root.prompt("first");
+			expect(capturedHeaders[0]?.[MODEL_REQUEST_ID_HEADER]).toBeDefined();
+
+			const artifactDir = root.sessionManager.getSessionArtifactDir();
+			if (!artifactDir) throw new Error("Missing session artifact dir");
+			const ledgerPath = join(artifactDir, SEMANTIC_EDGES_LEDGER_FILENAME);
+			rmSync(ledgerPath);
+			mkdirSync(ledgerPath);
+
+			// Prompts keep working, without request IDs on the wire.
+			await root.prompt("second");
+			expect(capturedHeaders[1]?.[MODEL_REQUEST_ID_HEADER]).toBeUndefined();
+			expect(warn).toHaveBeenCalledOnce();
+
+			// Child runs still settle normally; the parent's return claim is a no-op.
+			await root.runRlmChild("child task");
+			await waitForAsync(async () => (await root.listRlmSubagents()).subagents[0]?.status === "completed");
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("still compacts when the session ledger becomes unwritable", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const { session, sessionManager } = await createCompactionSession();
+			await session.prompt("one");
+			await session.prompt("two");
+
+			const artifactDir = sessionManager.getSessionArtifactDir();
+			if (!artifactDir) throw new Error("Missing session artifact dir");
+			const ledgerPath = join(artifactDir, SEMANTIC_EDGES_LEDGER_FILENAME);
+			rmSync(ledgerPath);
+			mkdirSync(ledgerPath);
+
+			const result = await session.compact();
+			expect(result.summary).toBe("summarized");
+			expect(sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
+			expect(warn).toHaveBeenCalledOnce();
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
 	it("propagates the original error when the completed-compaction ledger write fails", async () => {
 		const { session } = await createCompactionSession();
 		await session.prompt("one");
@@ -666,6 +715,53 @@ describe("AgentSession semantic edges", () => {
 		expect(finishCompaction).toHaveBeenCalledOnce();
 		expect(finishCompaction).toHaveBeenCalledWith(expect.any(String), "completed");
 		expect(ledgerFor(session).filter((event) => event.type === "compaction_finished")).toEqual([]);
+	});
+
+	it("fails the summary requests when compaction is aborted mid-summary", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { keepRecentTokens: 1 } },
+		});
+		harnesses.push(harness);
+		const ledgerPath = join(harness.sessionManager.getSessionArtifactDir() ?? "", SEMANTIC_EDGES_LEDGER_FILENAME);
+
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const preCompactionIds = startedRequestIds(readSemanticEdgeLedger(ledgerPath));
+
+		const abortingStep = () => {
+			harness.session.abortCompaction();
+			return fauxAssistantMessage("partial summary");
+		};
+		harness.setResponses([abortingStep, abortingStep]);
+		await expect(harness.session.compact()).rejects.toThrow("Compaction cancelled");
+
+		// Aborted summaries may be partial: they must never commit into the chain.
+		const events = readSemanticEdgeLedger(ledgerPath);
+		const summaryIds = startedRequestIds(events).filter((requestId) => !preCompactionIds.includes(requestId));
+		expect(summaryIds.length).toBeGreaterThanOrEqual(1);
+		const finished = events
+			.filter((event) => event.type === "request_finished")
+			.map((event) => (event.type === "request_finished" ? event.request_id : ""));
+		for (const summaryId of summaryIds) {
+			expect(finished).not.toContain(summaryId);
+		}
+		expect(events.filter((event) => event.type === "compaction_finished").at(-1)).toMatchObject({
+			status: "cancelled",
+		});
+
+		// The next turn continues from the PRE-compaction request.
+		harness.setResponses([fauxAssistantMessage("after")]);
+		await harness.session.prompt("after");
+		const finalEvents = readSemanticEdgeLedger(ledgerPath);
+		const afterId = startedRequestIds(finalEvents).at(-1);
+		const inboundEdges = deriveSemanticEdges([finalEvents]).edges.filter(
+			(edge) => edge.target_request_id === afterId,
+		);
+		expect(inboundEdges).toEqual([
+			{ source_request_id: preCompactionIds.at(-1), target_request_id: afterId, type: "continuation" },
+		]);
 	});
 
 	it("mints a distinct request identity for each split-turn summary call", async () => {
