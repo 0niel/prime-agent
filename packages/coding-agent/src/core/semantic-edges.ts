@@ -515,16 +515,31 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 				// The session's last commit must be one of the compaction's summary slices;
 				// an interrupted or extension-supplied compaction produces no edge.
 				if (state.lastRequestId !== undefined && compaction.summaryRequestIds.has(state.lastRequestId)) {
+					const slice = state.lastRequestId;
+					// nano's source-only suppression, applied at flush time: a pending edge
+					// from X replaces the slice's generated continuation from X, whatever
+					// the pending edge's type, so the flush can never emit a duplicate.
+					for (const source of new Set(state.pending.map((edge) => edge.source))) {
+						const generated = edges.findIndex(
+							(edge) =>
+								edge.source_request_id === source &&
+								edge.target_request_id === slice &&
+								edge.type === "continuation",
+						);
+						if (generated !== -1) {
+							edges.splice(generated, 1);
+						}
+					}
 					// Terminal flush: deliver deferred pending edges to the committed slice
 					// now, so they survive even when the session never runs another turn.
 					for (const pending of state.pending) {
 						edges.push({
 							source_request_id: pending.source,
-							target_request_id: state.lastRequestId,
+							target_request_id: slice,
 							type: pending.type,
 						});
 					}
-					state.pending = [{ source: state.lastRequestId, type: "compaction" }];
+					state.pending = [{ source: slice, type: "compaction" }];
 				}
 				break;
 			}

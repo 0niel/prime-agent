@@ -407,6 +407,16 @@ describe("deriveSemanticEdges", () => {
 		return readSemanticEdgeLedger(join(tempDir, name));
 	}
 
+	/** The verifiers consumer rejects duplicate (source, target, type) tuples. */
+	function expectUniqueEdges(edges: Array<{ source_request_id: string; target_request_id: string; type: string }>) {
+		const seen = new Set<string>();
+		for (const edge of edges) {
+			const identity = `${edge.source_request_id}->${edge.target_request_id}:${edge.type}`;
+			expect(seen.has(identity), `duplicate semantic edge: ${identity}`).toBe(false);
+			seen.add(identity);
+		}
+	}
+
 	it("links a committed turn chain with continuation edges", () => {
 		const root = recorderAt("root.jsonl");
 		const r1 = root.startTurnRequest();
@@ -515,7 +525,9 @@ describe("deriveSemanticEdges", () => {
 		// Slices carry only their continuations; the completed compaction flushes
 		// the pending subagent_return to its last-committed slice exactly once,
 		// and the post-compaction turn carries only the compaction edge.
-		expect(deriveSemanticEdges([eventsAt("root.jsonl"), eventsAt("child.jsonl")]).edges).toEqual([
+		const edges = deriveSemanticEdges([eventsAt("root.jsonl"), eventsAt("child.jsonl")]).edges;
+		expectUniqueEdges(edges);
+		expect(edges).toEqual([
 			{ source_request_id: r1, target_request_id: sliceA, type: "continuation" },
 			{ source_request_id: r1, target_request_id: sliceB, type: "continuation" },
 			{ source_request_id: c1, target_request_id: sliceB, type: "subagent_return" },
@@ -543,6 +555,47 @@ describe("deriveSemanticEdges", () => {
 			{ source_request_id: r1, target_request_id: s1, type: "continuation" },
 			{ source_request_id: c1, target_request_id: s1, type: "subagent_return" },
 			{ source_request_id: r1, target_request_id: c1, type: "subagent_call" },
+		]);
+	});
+
+	it("flushes a reclaimed continuation without duplicating the slice's own", () => {
+		const root = recorderAt("root.jsonl");
+		const r1 = root.startTurnRequest();
+		root.finishRequest(r1);
+		// r2 fails: its reclaimed continuation from r1 sits in pending.
+		const r2 = root.startTurnRequest();
+		root.failRequest(r2);
+
+		const compaction = root.beginCompaction();
+		const s1 = root.startCompactionRequest(compaction.compactionId);
+		root.finishRequest(s1);
+		root.finishCompaction(compaction.compactionId, "completed");
+
+		const edges = deriveSemanticEdges([eventsAt("root.jsonl")]).edges;
+		expectUniqueEdges(edges);
+		expect(edges).toEqual([{ source_request_id: r1, target_request_id: s1, type: "continuation" }]);
+	});
+
+	it("suppresses the generated continuation when a pending edge shares its source", () => {
+		const root = recorderAt("root.jsonl");
+		const r1 = root.startTurnRequest();
+		root.finishRequest(r1);
+		// Back-to-back compactions: the first one's compaction edge is still
+		// pending (sourced at s1) when the second summary generates s1 -> s2.
+		const first = root.beginCompaction();
+		const s1 = root.startCompactionRequest(first.compactionId);
+		root.finishRequest(s1);
+		root.finishCompaction(first.compactionId, "completed");
+		const second = root.beginCompaction();
+		const s2 = root.startCompactionRequest(second.compactionId);
+		root.finishRequest(s2);
+		root.finishCompaction(second.compactionId, "completed");
+
+		const edges = deriveSemanticEdges([eventsAt("root.jsonl")]).edges;
+		expectUniqueEdges(edges);
+		expect(edges).toEqual([
+			{ source_request_id: r1, target_request_id: s1, type: "continuation" },
+			{ source_request_id: s1, target_request_id: s2, type: "compaction" },
 		]);
 	});
 
