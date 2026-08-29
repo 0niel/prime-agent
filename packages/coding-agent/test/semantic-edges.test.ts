@@ -494,7 +494,7 @@ describe("deriveSemanticEdges", () => {
 		]);
 	});
 
-	it("defers pending edges past compaction summaries to the post-compaction turn", () => {
+	it("flushes pending edges once to the last-committed summary slice", () => {
 		const root = recorderAt("root.jsonl");
 		const r1 = root.startTurnRequest();
 		root.finishRequest(r1);
@@ -512,13 +512,36 @@ describe("deriveSemanticEdges", () => {
 		const r2 = root.startTurnRequest();
 		root.finishRequest(r2);
 
-		// The slices carry only their continuations; the pending subagent_return
-		// lands on the post-compaction turn, which actually consumes the result.
+		// Slices carry only their continuations; the completed compaction flushes
+		// the pending subagent_return to its last-committed slice exactly once,
+		// and the post-compaction turn carries only the compaction edge.
 		expect(deriveSemanticEdges([eventsAt("root.jsonl"), eventsAt("child.jsonl")]).edges).toEqual([
 			{ source_request_id: r1, target_request_id: sliceA, type: "continuation" },
 			{ source_request_id: r1, target_request_id: sliceB, type: "continuation" },
-			{ source_request_id: c1, target_request_id: r2, type: "subagent_return" },
+			{ source_request_id: c1, target_request_id: sliceB, type: "subagent_return" },
 			{ source_request_id: sliceB, target_request_id: r2, type: "compaction" },
+			{ source_request_id: r1, target_request_id: c1, type: "subagent_call" },
+		]);
+	});
+
+	it("keeps a pending return that a terminal completed compaction would otherwise strand", () => {
+		const root = recorderAt("root.jsonl");
+		const r1 = root.startTurnRequest();
+		root.finishRequest(r1);
+		const child = recorderAt("child.jsonl", { parentSessionId: "root", spawnedByRequestId: r1 });
+		const c1 = child.startTurnRequest();
+		child.finishRequest(c1);
+		root.recordChildReturned("child", c1);
+
+		// The completed compaction is the session's final activity: no post-turn exists.
+		const compaction = root.beginCompaction();
+		const s1 = root.startCompactionRequest(compaction.compactionId);
+		root.finishRequest(s1);
+		root.finishCompaction(compaction.compactionId, "completed");
+
+		expect(deriveSemanticEdges([eventsAt("root.jsonl"), eventsAt("child.jsonl")]).edges).toEqual([
+			{ source_request_id: r1, target_request_id: s1, type: "continuation" },
+			{ source_request_id: c1, target_request_id: s1, type: "subagent_return" },
 			{ source_request_id: r1, target_request_id: c1, type: "subagent_call" },
 		]);
 	});

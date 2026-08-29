@@ -20,7 +20,11 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
  * edges (and no spawn). nano-rlm's single summary request can claim safely;
  * prime-agent's split turns run several racing slices, so pending edges would
  * land on whichever slice started first — a dead end when a different slice
- * commits last. Pending therefore defers to the post-compaction turn.
+ * commits last. Pending therefore defers past summary slices; a COMPLETED
+ * compaction flushes it to its last-committed slice — the same request that
+ * sources the compaction edge — so pending always lands on a committed
+ * request even when the session never runs another turn. Failed or cancelled
+ * compactions leave pending for the next turn.
  */
 
 export const MODEL_REQUEST_ID_HEADER = "X-ACP-Model-Request-ID";
@@ -511,7 +515,16 @@ export function deriveSemanticEdges(ledgers: SemanticEdgeLedgerEvent[][]): { edg
 				// The session's last commit must be one of the compaction's summary slices;
 				// an interrupted or extension-supplied compaction produces no edge.
 				if (state.lastRequestId !== undefined && compaction.summaryRequestIds.has(state.lastRequestId)) {
-					state.pending.push({ source: state.lastRequestId, type: "compaction" });
+					// Terminal flush: deliver deferred pending edges to the committed slice
+					// now, so they survive even when the session never runs another turn.
+					for (const pending of state.pending) {
+						edges.push({
+							source_request_id: pending.source,
+							target_request_id: state.lastRequestId,
+							type: pending.type,
+						});
+					}
+					state.pending = [{ source: state.lastRequestId, type: "compaction" }];
 				}
 				break;
 			}
