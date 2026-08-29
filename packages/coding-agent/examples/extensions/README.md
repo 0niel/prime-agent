@@ -23,6 +23,7 @@ cp permission-gate.ts ~/.prime/agent/extensions/
 | `confirm-destructive.ts` | Confirms before destructive session actions (clear, switch, fork) |
 | `dirty-repo-guard.ts` | Prevents session changes with uncommitted git changes |
 | `sandbox/` | OS-level sandboxing using `@anthropic-ai/sandbox-runtime` with per-project config |
+| `aisuite/` | Loads AISuite-generated rules, skills, and hooks with an external-system read-only gate |
 
 ### Custom Tools
 
