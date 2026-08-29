@@ -4253,8 +4253,11 @@ describe("InteractiveMode goal status announcements", () => {
 describe("InteractiveMode tray goal label", () => {
 	type TrayUsage = { contextWindow: number; tokens: number | null; percent: number | null };
 	type TrayLabelHarness = {
-		heartbeats: AgentConnectionHeartbeat[];
+		heartbeatCatalog: AgentConnectionHeartbeat[];
+		subagentSnapshots: Map<string, never>;
 		connectionState: {
+			activeSessionId: string;
+			sessionId: string;
 			goal: GoalState;
 			heartbeat?: AgentCronJob | null;
 			contextUsage: TrayUsage | undefined;
@@ -4284,8 +4287,11 @@ describe("InteractiveMode tray goal label", () => {
 
 	test("shows active goals in the lower tray without an objective", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
-		fakeThis.heartbeats = [];
+		fakeThis.heartbeatCatalog = [];
+		fakeThis.subagentSnapshots = new Map<string, never>();
 		fakeThis.connectionState = {
+			activeSessionId: "active-1",
+			sessionId: "session-1",
 			goal: {
 				active: true,
 				status: "active",
@@ -4303,8 +4309,11 @@ describe("InteractiveMode tray goal label", () => {
 
 	test("combines active goals with token/context usage in one lower-tray label", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
-		fakeThis.heartbeats = [];
+		fakeThis.heartbeatCatalog = [];
+		fakeThis.subagentSnapshots = new Map<string, never>();
 		fakeThis.connectionState = {
+			activeSessionId: "active-1",
+			sessionId: "session-1",
 			goal: {
 				active: true,
 				status: "active",
@@ -4322,8 +4331,11 @@ describe("InteractiveMode tray goal label", () => {
 
 	test("combines active goals, active heartbeats, and context usage in one lower-tray label", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
-		fakeThis.heartbeats = [{ job: createHeartbeat("active") }];
+		fakeThis.heartbeatCatalog = [{ job: createHeartbeat("active") }];
+		fakeThis.subagentSnapshots = new Map<string, never>();
 		fakeThis.connectionState = {
+			activeSessionId: "active-1",
+			sessionId: "session-1",
 			goal: {
 				active: true,
 				status: "active",
@@ -4342,8 +4354,11 @@ describe("InteractiveMode tray goal label", () => {
 
 	test("omits the usage segment when token count is unknown", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
-		fakeThis.heartbeats = [];
+		fakeThis.heartbeatCatalog = [];
+		fakeThis.subagentSnapshots = new Map<string, never>();
 		fakeThis.connectionState = {
+			activeSessionId: "active-1",
+			sessionId: "session-1",
 			goal: {
 				active: true,
 				status: "active",
