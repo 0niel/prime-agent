@@ -228,8 +228,7 @@ export class AssistantMessageComponent extends Container {
 			`hide:${this.hideThinkingBlock}`,
 			`label:${this.hiddenThinkingLabel}`,
 			`expanded:${this.expanded}`,
-			// The Mermaid transform renders differently while streaming (no warning
-			// lines, "final" mode disabled), so the transition must rebuild.
+			// In the signature so the streaming->final transition rebuilds (mermaid renders differently).
 			`streaming:${this.isStreaming}`,
 			`stop:${message.stopReason ?? ""}`,
 			`error:${message.errorMessage ?? ""}`,
@@ -287,8 +286,6 @@ export class AssistantMessageComponent extends Container {
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
 				const mermaidTransform = this.mermaidTransform;
-				// Capture the streaming flag: a streaming-state change rebuilds (it is
-				// part of the signature), so the closure never goes stale.
 				const isStreaming = this.isStreaming;
 				const markdown = new Markdown(content.text.trim(), 1, 0, this.markdownTheme, undefined, {
 					transform:

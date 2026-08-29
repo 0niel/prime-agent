@@ -18,19 +18,11 @@ function isMermaid(token: Token): token is Token & { type: "code"; text: string;
 }
 
 function codeSpan(line: string): string {
-	// Encode each diagram row as inline code (` ... `) so Markdown preserves its spacing and
-	// box-drawing characters. Use a non-breaking space for blank rows because an
-	// empty code span has no visible height.
+	// Encode each diagram row as an inline code span so Markdown preserves spacing and
+	// box-drawing characters; blank rows need a non-breaking space to keep visible height.
 	const content = line || "\u00a0";
-	// CommonMark code spans use matching backtick delimiters, so choose one
-	// longer than any backtick run in the content (``hel`lo`` -> <code>hel`lo</code>).
-	// If the content starts or ends with a backtick, separating it from the
-	// delimiter with a space keeps that backtick as content; CommonMark removes
-	// the padding when rendering (`` `edge` `` -> <code>`edge`</code>).
-	// Mermaid labels can preserve backticks, for example:
-	//   `┌──────────────┐    ┌──────────────┐`
-	// ```│ plain ` tick ├───▶│ two `` ticks │```
-	//   `└──────────────┘    └──────────────┘`
+	// Per CommonMark, the delimiter must be longer than any backtick run in the content,
+	// and space padding keeps leading/trailing backticks as content (removed when rendering).
 	const longestBacktickRun = Math.max(0, ...Array.from(content.matchAll(/`+/g), (match) => match[0].length));
 	const fence = "`".repeat(longestBacktickRun + 1);
 	const padding = content.startsWith("`") || content.endsWith("`") ? " " : "";
