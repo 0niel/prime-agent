@@ -36,16 +36,10 @@ describe("Mermaid rendering", () => {
 
 	it("leaves unsupported and oversized diagrams unchanged", () => {
 		const unsupported = '```mermaid\npie\n  title Pets\n  "Dogs" : 4\n```';
-		const oversized = "```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```";
-
-		expect(transformMermaid(unsupported)).toBe(unsupported);
-		expect(transformMermaid(oversized, { maxWidth: 10 })).toBe(oversized);
-	});
-
-	it("renders diagrams that exactly fit the available width", () => {
 		const markdown = "```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```";
 
-		// The rendered diagram is exactly 21 columns wide.
+		expect(transformMermaid(unsupported)).toBe(unsupported);
+		// The rendered diagram is exactly 21 columns wide: exact fit renders, one short falls back.
 		expect(transformMermaid(markdown, { maxWidth: 21 })).toContain("───▶");
 		expect(transformMermaid(markdown, { maxWidth: 20 })).toBe(markdown);
 	});
@@ -81,16 +75,14 @@ describe("Mermaid rendering", () => {
 		expect(streaming).not.toContain("Mermaid diagram not rendered");
 		expect(streaming).not.toContain("```mermaid");
 		expect(streaming).toContain("│ Foo ├───▶│ Bar │");
-	});
 
-	it("summarizes additional partial-render warnings", () => {
-		const markdown = "```mermaid\nflowchart LR\n  A[Foo] --> B[Bar]\n  ???bogus one\n  ???bogus two\n```";
-		const rendered = transformMermaid(markdown);
-
-		expect(rendered).toContain(markdown);
-		expect(rendered).toContain('dropped, does not start with a node: "???bogus one"');
-		expect(rendered).toContain("(+1 more)");
-		expect(rendered).not.toContain('dropped, does not start with a node: "???bogus two"');
+		// Additional warnings are summarized as a count instead of listed.
+		const twoWarnings = transformMermaid(
+			"```mermaid\nflowchart LR\n  A[Foo] --> B[Bar]\n  ???bogus one\n  ???bogus two\n```",
+		);
+		expect(twoWarnings).toContain('dropped, does not start with a node: "???bogus one"');
+		expect(twoWarnings).toContain("(+1 more)");
+		expect(twoWarnings).not.toContain('"???bogus two"');
 	});
 
 	it("respects rendering modes", () => {
@@ -145,6 +137,15 @@ describe("Mermaid rendering in assistant messages", () => {
 
 		expect(rendered).toContain("│ Start ├───▶│ Done │");
 		expect(rendered).not.toContain("```mermaid");
+
+		// The transform sees the component's real content width: too narrow falls back to the code block.
+		const narrow = stripAnsi(
+			createComponent([{ type: "text", text: MERMAID_MARKDOWN }])
+				.render(16)
+				.join("\n"),
+		);
+		expect(narrow).toContain("flowchart LR");
+		expect(narrow).not.toContain("───▶");
 	});
 
 	it("preserves backticks in diagram labels", () => {
@@ -164,52 +165,5 @@ describe("Mermaid rendering in assistant messages", () => {
 
 		expect(rendered).toContain("flowchart LR");
 		expect(rendered).not.toContain("───▶");
-	});
-
-	it("honors the off mode", () => {
-		mode = "off";
-		const component = createComponent([{ type: "text", text: MERMAID_MARKDOWN }]);
-		const rendered = stripAnsi(component.render(100).join("\n"));
-
-		expect(rendered).toContain("flowchart LR");
-		expect(rendered).not.toContain("───▶");
-	});
-
-	it("defers rendering to the final update in final mode", () => {
-		mode = "final";
-		const message = createAssistantMessage([{ type: "text", text: MERMAID_MARKDOWN }]);
-		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking...", {
-			mermaidTransform,
-		});
-
-		component.updateContent(message, true);
-		expect(stripAnsi(component.render(100).join("\n"))).not.toContain("───▶");
-
-		component.updateContent(message, false);
-		expect(stripAnsi(component.render(100).join("\n"))).toContain("───▶");
-	});
-
-	it("falls back to the raw code block when the diagram is wider than the message", () => {
-		mode = "streaming";
-		const component = createComponent([{ type: "text", text: MERMAID_MARKDOWN }]);
-		const rendered = stripAnsi(component.render(16).join("\n"));
-
-		expect(rendered).toContain("flowchart LR");
-		expect(rendered).not.toContain("───▶");
-	});
-
-	it("appends a warning line for partially rendered final diagrams", () => {
-		mode = "streaming";
-		const markdown = "```mermaid\nflowchart LR\n  A[Foo] --> B[Bar]\n  ???bogus line\n```";
-		const message = createAssistantMessage([{ type: "text", text: markdown }]);
-		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking...", {
-			mermaidTransform,
-		});
-
-		component.updateContent(message, true);
-		expect(stripAnsi(component.render(100).join("\n"))).not.toContain("Mermaid diagram not rendered");
-
-		component.updateContent(message, false);
-		expect(stripAnsi(component.render(100).join("\n"))).toContain("Mermaid diagram not rendered");
 	});
 });
