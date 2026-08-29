@@ -42,6 +42,14 @@ describe("Mermaid rendering", () => {
 		expect(transformMermaid(oversized, { maxWidth: 10 })).toBe(oversized);
 	});
 
+	it("renders diagrams that exactly fit the available width", () => {
+		const markdown = "```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```";
+
+		// The rendered diagram is exactly 21 columns wide.
+		expect(transformMermaid(markdown, { maxWidth: 21 })).toContain("───▶");
+		expect(transformMermaid(markdown, { maxWidth: 20 })).toBe(markdown);
+	});
+
 	it("maps semantic spans through the theme", () => {
 		const fakeTheme = {
 			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
@@ -137,6 +145,16 @@ describe("Mermaid rendering in assistant messages", () => {
 
 		expect(rendered).toContain("│ Start ├───▶│ Done │");
 		expect(rendered).not.toContain("```mermaid");
+	});
+
+	it("preserves backticks in diagram labels", () => {
+		mode = "streaming";
+		const component = createComponent([
+			{ type: "text", text: '```mermaid\nflowchart LR\n  A["has ` tick"] --> B[Done]\n```' },
+		]);
+		const rendered = stripAnsi(component.render(100).join("\n"));
+
+		expect(rendered).toContain("│ has ` tick ├───▶│ Done │");
 	});
 
 	it("never transforms thinking blocks", () => {
