@@ -1,1 +1,1 @@
-- Added an AISuite extension example that loads generated rules, skills, hooks, and safety gates.
+- Added an AISuite extension example that loads generated rules, skills, hooks, and persistent safety gates.

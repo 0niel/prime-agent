@@ -4,11 +4,14 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	blockedCommandReason,
+	blockedToolReason,
 	extractRequestedSkills,
 	loadAisuiteProject,
 	parseHookDecision,
 	requestsExternalReadOnly,
 	resolveArtifactPath,
+	restoreAisuiteState,
+	runHookCommand,
 } from "../examples/extensions/aisuite/index.js";
 
 function fixture() {
@@ -41,6 +44,12 @@ function fixture() {
 			rules: [{ name: "eats", path: ".codex/config.toml", source: "rules/eats.md", broken: false }],
 			skills: [
 				{ name: "duty-cracker", path: ".agents/skills/duty-cracker", source: "skills/duty-cracker", broken: false },
+				{
+					name: "duty-cracker",
+					path: ".agents/skills/duty-cracker",
+					source: "another/source/duty-cracker",
+					broken: false,
+				},
 			],
 		}),
 	);
@@ -89,6 +98,60 @@ describe("AISuite extension", () => {
 		expect(blockedCommandReason(mutation, false)).toBeUndefined();
 		expect(blockedCommandReason('find / -name "YXPROAPPS-1"', false)).toContain("Full-filesystem");
 		expect(blockedCommandReason('find /Users/me/project -name "YXPROAPPS-1"', false)).toBeUndefined();
+		expect(
+			blockedCommandReason('await mcp.call_tool("tracker_mcp", "add_comment", { issue: "YXPROAPPS-1" })', true),
+		).toContain("read-only");
+		expect(blockedCommandReason('await tools.mcp__tracker__add_comment({ issue: "YXPROAPPS-1" })', true)).toContain(
+			"read-only",
+		);
+		expect(blockedCommandReason('await mcp.call_tool("tracker_mcp", "get_issue", {})', true)).toBeUndefined();
+		expect(blockedCommandReason('requests.patch("https://api.tracker.yandex.net/v3/issues/1")', true)).toContain(
+			"read-only",
+		);
+		expect(blockedCommandReason("curl https://api.tracker.yandex.net/v3/issues/1", true)).toBeUndefined();
+	});
+
+	it("blocks native external mutation tools while allowing reads", () => {
+		expect(blockedToolReason("mcp__tracker__add_comment", { issue: "YXPROAPPS-1" }, true)).toContain("read-only");
+		expect(blockedToolReason("mcp__tracker__get_issue", { issue: "YXPROAPPS-1" }, true)).toBeUndefined();
+		expect(blockedToolReason("mcp__tracker__add_comment", {}, false)).toBeUndefined();
+	});
+
+	it("restores the latest persisted safety and skill state", () => {
+		expect(
+			restoreAisuiteState([
+				{ type: "custom", customType: "aisuite-state", data: { readOnlyExternal: false, selectedSkills: [] } },
+				{
+					type: "custom",
+					customType: "aisuite-state",
+					data: { readOnlyExternal: true, selectedSkills: ["duty-cracker", "duty-cracker", "tracker"] },
+				},
+			]),
+		).toEqual({ readOnlyExternal: true, selectedSkills: ["duty-cracker", "tracker"] });
+		expect(restoreAisuiteState([])).toEqual({ readOnlyExternal: false, selectedSkills: [] });
+	});
+
+	it("ignores invalid prompt byte limits", () => {
+		const root = fixture();
+		mkdirSync(join(root, ".prime", "agent"), { recursive: true });
+		writeFileSync(join(root, ".prime", "agent", "aisuite.json"), JSON.stringify({ maxPromptBytes: -1 }));
+		expect(loadAisuiteProject(root, join(root, "agent-home"))?.config.maxPromptBytes).toBe(256 * 1024);
+		writeFileSync(
+			join(root, ".prime", "agent", "aisuite.json"),
+			JSON.stringify({ maxPromptBytes: 10 * 1024 * 1024 }),
+		);
+		expect(loadAisuiteProject(root, join(root, "agent-home"))?.config.maxPromptBytes).toBe(1024 * 1024);
+	});
+
+	it("terminates hooks that exceed the output limit", async () => {
+		const result = await runHookCommand(
+			{ type: "command", command: `node -e 'process.stdout.write("x".repeat(1100000))'` },
+			{ session_id: "test", cwd: tmpdir(), hook_event_name: "SessionStart" },
+			tmpdir(),
+		);
+		expect(result.exitCode).toBeNull();
+		expect(result.stderr).toContain("output exceeded 1 MiB");
+		expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThan(1024 * 1024 + 128);
 	});
 
 	it("parses Codex-compatible AISuite hook output", () => {

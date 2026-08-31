@@ -7,7 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
@@ -19,6 +19,10 @@ const MANIFEST_PATHS = [
 ] as const;
 const DEFAULT_HOOKS_PATH = ".codex/hooks.json";
 const DEFAULT_MAX_PROMPT_BYTES = 256 * 1024;
+const MAX_PROMPT_BYTES = 1024 * 1024;
+const MAX_HOOK_OUTPUT_BYTES = 1024 * 1024;
+const MAX_HOOK_CONTEXT_BYTES = 64 * 1024;
+const AISUITE_STATE_ENTRY = "aisuite-state";
 const DEFAULT_TOOLS = ["ipython", "bash", "edit"];
 const DEFAULT_DUTY_BUNDLE = [
 	"tracker",
@@ -50,7 +54,7 @@ interface ArtifactManifest {
 	skills?: ArtifactEntry[];
 }
 
-interface HookCommand {
+export interface HookCommand {
 	type: "command";
 	command: string;
 	timeout?: number;
@@ -77,7 +81,7 @@ export interface AisuiteProject {
 	config: Required<Omit<AisuiteConfig, "hooksFile">> & { hooksFile: string };
 }
 
-interface HookPayload {
+export interface HookPayload {
 	session_id: string;
 	cwd: string;
 	hook_event_name: string;
@@ -97,10 +101,16 @@ export interface HookDecision {
 	env?: Record<string, string>;
 }
 
-interface HookRunResult {
+export interface HookRunResult {
 	stdout: string;
 	stderr: string;
 	exitCode: number | null;
+	blockedReason?: string;
+}
+
+export interface AisuiteSessionState {
+	readOnlyExternal: boolean;
+	selectedSkills: string[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -159,7 +169,10 @@ function parseConfig(path: string): AisuiteConfig {
 		enabledTools: parseStringArray(raw.enabledTools),
 		eagerRules: typeof raw.eagerRules === "boolean" ? raw.eagerRules : undefined,
 		hooksFile: typeof raw.hooksFile === "string" ? raw.hooksFile : undefined,
-		maxPromptBytes: typeof raw.maxPromptBytes === "number" ? raw.maxPromptBytes : undefined,
+		maxPromptBytes:
+			typeof raw.maxPromptBytes === "number" && Number.isFinite(raw.maxPromptBytes) && raw.maxPromptBytes > 0
+				? Math.min(Math.floor(raw.maxPromptBytes), MAX_PROMPT_BYTES)
+				: undefined,
 		skillBundles,
 	};
 }
@@ -200,14 +213,15 @@ export function resolveArtifactPath(root: string, entry: ArtifactEntry): string 
 }
 
 function dedupeEntries(root: string, entries: ArtifactEntry[]): ArtifactEntry[] {
-	const seen = new Set<string>();
+	const seenPaths = new Set<string>();
+	const seenSources = new Set<string>();
 	return entries.filter((entry) => {
 		if (entry.broken) return false;
 		const path = resolveArtifactPath(root, entry);
 		if (!path) return false;
-		const key = entry.source ?? path;
-		if (seen.has(key)) return false;
-		seen.add(key);
+		if (seenPaths.has(path) || (entry.source !== undefined && seenSources.has(entry.source))) return false;
+		seenPaths.add(path);
+		if (entry.source !== undefined) seenSources.add(entry.source);
 		return true;
 	});
 }
@@ -279,11 +293,58 @@ export function blockedCommandReason(command: string, readOnlyExternal: boolean)
 
 	const trackerMutation =
 		/\btracker-cli\.sh\s+(?:status|create|update|comment(?:-update|-delete)?|link|remotelink-(?:add|remove)|attachment-upload|clone-meta|project-(?:create|update|comment)|portfolio-description-update)\b/i;
-	const trackerHttpMutation =
-		/\bcurl\b[^\n]*(?:-X|--request)\s*(?:POST|PUT|PATCH|DELETE)\b[^\n]*(?:st\.yandex-team\.ru|api\.tracker\.yandex\.net)/i;
-	const publishing = /\barc\s+pr\s+(?:publish|merge)\b|\bgh\s+pr\s+(?:comment|merge|review)\b/i;
-	if (trackerMutation.test(command) || trackerHttpMutation.test(command) || publishing.test(command)) {
+	const trackerHttpTarget = /(?:st\.yandex-team\.ru|api\.tracker\.yandex\.net)/i;
+	const curlMutation =
+		/\bcurl\b/i.test(command) &&
+		trackerHttpTarget.test(command) &&
+		(/(?:-X|--request)\s*(?:POST|PUT|PATCH|DELETE)\b/i.test(command) ||
+			/(?:^|\s)(?:-d|--data(?:-raw|-binary|-urlencode)?|-F|--form|-T|--upload-file)(?:\s|=)/im.test(command));
+	const pythonHttpMutation =
+		trackerHttpTarget.test(command) &&
+		(/\b(?:requests|httpx)\.(?:post|put|patch|delete)\s*\(/i.test(command) ||
+			/\bRequest\s*\([^)]*\bmethod\s*=\s*["'](?:POST|PUT|PATCH|DELETE)["']/is.test(command));
+	const normalized = command.replace(/[_./:-]+/g, " ");
+	const genericMcpMutation =
+		/\b(?:call tool|mcp)\b/i.test(normalized) &&
+		/\b(?:tracker|startrek|arcanum|wiki|experiments?|tariff|forms?)\b/i.test(normalized) &&
+		/\b(?:add|create|update|edit|delete|remove|transition|comment|reply|publish|merge|approve|resolve|close|reopen|move|link|attach|upload)\w*\b/i.test(
+			normalized,
+		);
+	const publishing =
+		/\barc\s+pr\s+(?:publish|merge|close|update|create|edit)\b|\bgh\s+(?:pr|issue)\s+(?:comment|merge|review|close|reopen|edit|create|delete)\b|\bgh\s+api\b[^\n]*(?:-X|--method)\s*(?:POST|PUT|PATCH|DELETE)\b/i;
+	if (
+		trackerMutation.test(command) ||
+		curlMutation ||
+		pythonHttpMutation ||
+		genericMcpMutation ||
+		publishing.test(command)
+	) {
 		return "External read-only mode is active: Tracker/review mutation was blocked.";
+	}
+	return undefined;
+}
+
+export function blockedToolReason(
+	toolName: string,
+	input: Record<string, unknown>,
+	readOnlyExternal: boolean,
+): string | undefined {
+	if (!readOnlyExternal) return undefined;
+	const selectors = [
+		toolName,
+		...(["server", "serverName", "name", "tool", "toolName", "tool_name", "action", "method"] as const).flatMap(
+			(key) => (typeof input[key] === "string" ? [input[key]] : []),
+		),
+	]
+		.join(" ")
+		.replace(/[_./:-]+/g, " ");
+	if (
+		/\b(?:tracker|startrek|arcanum|wiki|experiments?|tariff|forms?)\b/i.test(selectors) &&
+		/\b(?:add|create|update|edit|delete|remove|transition|comment|reply|publish|merge|approve|resolve|close|reopen|move|link|attach|upload)\w*\b/i.test(
+			selectors,
+		)
+	) {
+		return "External read-only mode is active: external-system mutation was blocked.";
 	}
 	return undefined;
 }
@@ -321,11 +382,13 @@ function matcherMatches(matcher: string | undefined, value: string): boolean {
 	}
 }
 
-function runHookCommand(hook: HookCommand, payload: HookPayload, cwd: string): Promise<HookRunResult> {
+export function runHookCommand(hook: HookCommand, payload: HookPayload, cwd: string): Promise<HookRunResult> {
 	return new Promise((resolveRun) => {
+		const detached = process.platform !== "win32";
 		const child = spawn("/bin/sh", ["-lc", hook.command], {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
+			detached,
 		});
 		let stdout = "";
 		let stderr = "";
@@ -336,19 +399,38 @@ function runHookCommand(hook: HookCommand, payload: HookPayload, cwd: string): P
 			clearTimeout(timer);
 			resolveRun({ stdout, stderr, exitCode });
 		};
+		const killProcessTree = () => {
+			if (detached && child.pid) {
+				try {
+					process.kill(-child.pid, "SIGKILL");
+					return;
+				} catch {
+					// Fall back to killing the shell when the process group is already gone.
+				}
+			}
+			child.kill("SIGKILL");
+		};
 		const timer = setTimeout(
 			() => {
-				child.kill("SIGKILL");
+				killProcessTree();
 				finish(null);
 			},
 			Math.max(1, hook.timeout ?? 3) * 1000,
 		);
-		child.stdout.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString();
-		});
-		child.stderr.on("data", (chunk: Buffer) => {
-			stderr += chunk.toString();
-		});
+		const appendOutput = (target: "stdout" | "stderr", chunk: Buffer) => {
+			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
+			const remaining = Math.max(0, MAX_HOOK_OUTPUT_BYTES - used);
+			const selected = chunk.subarray(0, remaining).toString();
+			if (target === "stdout") stdout += selected;
+			else stderr += selected;
+			if (chunk.byteLength > remaining) {
+				stderr += "\nAISuite hook output exceeded 1 MiB and was terminated.";
+				killProcessTree();
+				finish(null);
+			}
+		};
+		child.stdout.on("data", (chunk: Buffer) => appendOutput("stdout", chunk));
+		child.stderr.on("data", (chunk: Buffer) => appendOutput("stderr", chunk));
 		child.on("error", (error) => {
 			stderr += error.message;
 			finish(null);
@@ -356,6 +438,21 @@ function runHookCommand(hook: HookCommand, payload: HookPayload, cwd: string): P
 		child.on("close", finish);
 		child.stdin.end(JSON.stringify(payload));
 	});
+}
+
+export function restoreAisuiteState(entries: readonly unknown[]): AisuiteSessionState {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== AISUITE_STATE_ENTRY) continue;
+		if (!isRecord(entry.data)) break;
+		return {
+			readOnlyExternal: entry.data.readOnlyExternal === true,
+			selectedSkills: Array.isArray(entry.data.selectedSkills)
+				? [...new Set(entry.data.selectedSkills.filter((value): value is string => typeof value === "string"))]
+				: [],
+		};
+	}
+	return { readOnlyExternal: false, selectedSkills: [] };
 }
 
 export function parseHookDecision(stdout: string): HookDecision {
@@ -411,10 +508,21 @@ function readPromptResources(project: AisuiteProject, selectedSkills: Set<string
 	const sections: string[] = [];
 	const appendFile = (title: string, path: string) => {
 		if (bytesLeft <= 0) return;
-		const content = readFileSync(path, "utf8");
-		const selected = Buffer.from(content).subarray(0, bytesLeft).toString("utf8");
+		const file = openSync(path, "r");
+		const buffer = Buffer.allocUnsafe(bytesLeft);
+		let bytesRead = 0;
+		try {
+			while (bytesRead < buffer.byteLength) {
+				const count = readSync(file, buffer, bytesRead, buffer.byteLength - bytesRead, null);
+				if (count === 0) break;
+				bytesRead += count;
+			}
+		} finally {
+			closeSync(file);
+		}
+		const selected = buffer.subarray(0, bytesRead).toString("utf8");
 		sections.push(`## ${title}\n\n${selected}`);
-		bytesLeft -= Buffer.byteLength(selected);
+		bytesLeft -= bytesRead;
 	};
 
 	if (project.config.eagerRules) {
@@ -464,6 +572,14 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 	const selectedSkills = new Set<string>();
 	let hookContext = "";
 	let activeToolNames: string[] = [];
+	const persistState = () => {
+		pi.appendEntry(AISUITE_STATE_ENTRY, { readOnlyExternal, selectedSkills: [...selectedSkills] });
+	};
+	const executeHook = (hook: HookCommand, payload: HookPayload, cwd: string): Promise<HookRunResult> => {
+		const blockedReason = blockedCommandReason(hook.command, readOnlyExternal);
+		if (blockedReason) return Promise.resolve({ stdout: "", stderr: "", exitCode: null, blockedReason });
+		return runHookCommand(hook, payload, cwd);
+	};
 
 	const getProject = (cwd: string) => {
 		project ??= loadAisuiteProject(cwd);
@@ -484,6 +600,11 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		const current = getProject(ctx.cwd);
 		if (!current) return;
+		const restored = restoreAisuiteState(ctx.sessionManager.getEntries());
+		readOnlyExternal = restored.readOnlyExternal;
+		selectedSkills.clear();
+		for (const skill of restored.selectedSkills) selectedSkills.add(skill);
+		hookContext = "";
 
 		const available = new Set(pi.getAllTools().map((tool) => tool.name));
 		const active = new Set(pi.getActiveTools());
@@ -497,9 +618,16 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 			const source = event.reason === "resume" ? "resume" : "startup";
 			if (!matcherMatches(group.matcher, source)) continue;
 			for (const hook of group.hooks ?? []) {
-				const result = await runHookCommand(hook, { ...hookPayload(ctx, "SessionStart"), source }, current.root);
+				const result = await executeHook(hook, { ...hookPayload(ctx, "SessionStart"), source }, current.root);
+				if (result.blockedReason) {
+					notify(ctx, `SessionStart hook blocked: ${result.blockedReason}`, "warning");
+					continue;
+				}
 				const decision = parseHookDecision(result.stdout);
-				if (decision.additionalContext) hookContext += `\n${decision.additionalContext}`;
+				if (decision.additionalContext) {
+					const candidate = `${hookContext}\n${decision.additionalContext}`;
+					hookContext = Buffer.from(candidate).subarray(0, MAX_HOOK_CONTEXT_BYTES).toString("utf8");
+				}
 				for (const [key, value] of Object.entries(decision.env ?? {})) process.env[key] = value;
 				if (result.exitCode !== 0 && result.stderr)
 					notify(ctx, `SessionStart hook failed: ${result.stderr.trim()}`, "warning");
@@ -510,15 +638,22 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 	pi.on("input", async (event, ctx) => {
 		if (event.source === "extension") return { action: "continue" };
 		const current = getProject(ctx.cwd);
+		let changed = false;
 		if (current) {
 			for (const skill of extractRequestedSkills(
 				event.text,
 				current.skills.map((entry) => entry.name),
 			)) {
+				const previousSize = selectedSkills.size;
 				selectedSkills.add(skill);
+				changed ||= selectedSkills.size !== previousSize;
 			}
 		}
-		if (requestsExternalReadOnly(event.text)) readOnlyExternal = true;
+		if (requestsExternalReadOnly(event.text) && !readOnlyExternal) {
+			readOnlyExternal = true;
+			changed = true;
+		}
+		if (changed) persistState();
 		return { action: "continue" };
 	});
 
@@ -536,6 +671,8 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		const current = getProject(ctx.cwd);
+		const toolReason = blockedToolReason(event.toolName, event.input, readOnlyExternal);
+		if (toolReason) return { block: true, reason: toolReason };
 		const command = shellText(event);
 		if (command) {
 			const reason = blockedCommandReason(command, readOnlyExternal);
@@ -558,10 +695,20 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 					tool_input: runsShell && command !== undefined ? { ...event.input, command } : event.input,
 					tool_use_id: event.toolCallId,
 				};
-				const result = await runHookCommand(hook, payload, current.root);
+				const result = await executeHook(hook, payload, current.root);
+				if (result.blockedReason) return { block: true, reason: result.blockedReason };
 				const decision = parseHookDecision(result.stdout);
-				if (decision.updatedInput) Object.assign(event.input, decision.updatedInput);
 				if (decision.block) return { block: true, reason: decision.reason ?? "Blocked by AISuite hook" };
+				if (decision.updatedInput) {
+					if (runsShell && event.toolName === "ipython") {
+						return {
+							block: true,
+							reason:
+								"AISuite hook requested a shell-command rewrite inside ipython. Rerun the safe command explicitly so the rewritten input cannot be ignored.",
+						};
+					}
+					Object.assign(event.input, decision.updatedInput);
+				}
 				if (result.exitCode !== 0 && result.stderr)
 					notify(ctx, `PreToolUse hook failed: ${result.stderr.trim()}`, "warning");
 			}
@@ -576,7 +723,7 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 		for (const group of parseHookGroups(current.hooksPath, "PostToolUseFailure")) {
 			if (!matcherMatches(group.matcher, event.toolName)) continue;
 			for (const hook of group.hooks ?? []) {
-				await runHookCommand(
+				const result = await executeHook(
 					hook,
 					{
 						...hookPayload(ctx, "PostToolUseFailure"),
@@ -587,6 +734,8 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 					},
 					current.root,
 				);
+				if (result.blockedReason)
+					notify(ctx, `PostToolUseFailure hook blocked: ${result.blockedReason}`, "warning");
 			}
 		}
 		return undefined;
@@ -596,7 +745,10 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 		const current = getProject(ctx.cwd);
 		if (!current) return;
 		for (const group of parseHookGroups(current.hooksPath, "Stop")) {
-			for (const hook of group.hooks ?? []) await runHookCommand(hook, hookPayload(ctx, "Stop"), current.root);
+			for (const hook of group.hooks ?? []) {
+				const result = await executeHook(hook, hookPayload(ctx, "Stop"), current.root);
+				if (result.blockedReason) notify(ctx, `Stop hook blocked: ${result.blockedReason}`, "warning");
+			}
 		}
 	});
 
@@ -604,7 +756,10 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 		const current = getProject(ctx.cwd);
 		if (!current) return;
 		for (const group of parseHookGroups(current.hooksPath, "SessionEnd")) {
-			for (const hook of group.hooks ?? []) await runHookCommand(hook, hookPayload(ctx, "SessionEnd"), current.root);
+			for (const hook of group.hooks ?? []) {
+				const result = await executeHook(hook, hookPayload(ctx, "SessionEnd"), current.root);
+				if (result.blockedReason) notify(ctx, `SessionEnd hook blocked: ${result.blockedReason}`, "warning");
+			}
 		}
 	});
 
@@ -627,9 +782,13 @@ export default function aisuiteExtension(pi: ExtensionAPI) {
 		description: "Set external-system read-only mode: on, off, or status",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
-			if (action === "on") readOnlyExternal = true;
-			else if (action === "off") readOnlyExternal = false;
-			else if (action && action !== "status") {
+			if (action === "on" && !readOnlyExternal) {
+				readOnlyExternal = true;
+				persistState();
+			} else if (action === "off" && readOnlyExternal) {
+				readOnlyExternal = false;
+				persistState();
+			} else if (action && action !== "status") {
 				notify(ctx, "Usage: /aisuite-readonly on|off|status", "warning");
 				return;
 			}
