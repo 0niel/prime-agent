@@ -186,7 +186,7 @@ install_prime_agent() {
 	[[ -n "$prime_agent_bin" && -x "$prime_agent_bin" ]] || die "prime-agent was not found after installation"
 	prime_agent_bin="$(cd "$(dirname "$prime_agent_bin")" && pwd -P)/$(basename "$prime_agent_bin")"
 	local version
-	version="$("$prime_agent_bin" --version)"
+	version="$("$prime_agent_bin" --version 2>&1)"
 	log "Prime Agent: $version"
 }
 
@@ -430,14 +430,14 @@ install_launcher() {
 }
 
 run_smoke() {
-	"$launcher_path" --version >/dev/null
+	"$launcher_path" --version >/dev/null 2>&1
 	if [[ "$skip_live_smoke" == 1 ]]; then
 		log "live Eliza smoke skipped"
 		return
 	fi
 	log "running a no-session Eliza completion smoke"
 	local output
-	output="$(cd "$project_dir" && "$launcher_path" --no-session -p 'Do not call tools or access external systems. Reply with exactly ELIZA_INSTALL_OK.')"
+	output="$(cd "$project_dir" && PRIME_AGENT_TELEMETRY=0 "$launcher_path" --no-session -p 'Do not call tools or access external systems. Reply with exactly ELIZA_INSTALL_OK.')"
 	[[ "$output" == *"ELIZA_INSTALL_OK"* ]] || die "Eliza smoke failed: $output"
 	log "Eliza smoke: ELIZA_INSTALL_OK"
 }
