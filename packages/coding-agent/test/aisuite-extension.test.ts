@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -8,21 +8,40 @@ import {
 	loadAisuiteProject,
 	parseHookDecision,
 	requestsExternalReadOnly,
+	resolveArtifactPath,
 } from "../examples/extensions/aisuite/index.js";
 
 function fixture() {
 	const root = mkdtempSync(join(tmpdir(), "prime-aisuite-"));
 	mkdirSync(join(root, ".codeassistant", "rules"), { recursive: true });
+	mkdirSync(join(root, ".codeassistant", "skills", "duty-cracker"), { recursive: true });
 	mkdirSync(join(root, ".agents", "skills", "duty-cracker"), { recursive: true });
 	mkdirSync(join(root, ".codex"), { recursive: true });
 	mkdirSync(join(root, "nested", "package"), { recursive: true });
 	writeFileSync(join(root, ".codeassistant", "rules", "eats.md"), "Always verify evidence.\n");
 	writeFileSync(join(root, ".agents", "skills", "duty-cracker", "SKILL.md"), "# Duty cracker\n");
+	writeFileSync(join(root, ".codeassistant", "skills", "duty-cracker", "SKILL.md"), "# Duty cracker\n");
 	writeFileSync(
 		join(root, ".codeassistant", "aisuite_generated_artifacts.json"),
 		JSON.stringify({
 			rules: [{ name: "eats", path: ".codeassistant/rules/eats.md", source: "rules/eats.md", broken: false }],
-			skills: [{ name: "duty-cracker", path: ".agents/skills/duty-cracker", broken: false }],
+			skills: [
+				{
+					name: "duty-cracker",
+					path: ".codeassistant/skills/duty-cracker",
+					source: "skills/duty-cracker",
+					broken: false,
+				},
+			],
+		}),
+	);
+	writeFileSync(
+		join(root, ".codex", "aisuite_generated_artifacts.json"),
+		JSON.stringify({
+			rules: [{ name: "eats", path: ".codex/config.toml", source: "rules/eats.md", broken: false }],
+			skills: [
+				{ name: "duty-cracker", path: ".agents/skills/duty-cracker", source: "skills/duty-cracker", broken: false },
+			],
 		}),
 	);
 	writeFileSync(join(root, ".codex", "hooks.json"), JSON.stringify({ hooks: {} }));
@@ -36,7 +55,20 @@ describe("AISuite extension", () => {
 		expect(project?.root).toBe(root);
 		expect(project?.rules.map((rule) => rule.name)).toEqual(["eats"]);
 		expect(project?.skills.map((skill) => skill.name)).toEqual(["duty-cracker"]);
+		expect(project?.skills[0]?.path).toBe(".agents/skills/duty-cracker");
 		expect(project?.hooksPath).toBe(join(root, ".codex", "hooks.json"));
+	});
+
+	it("preserves generated skill symlink names", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-aisuite-symlink-"));
+		mkdirSync(join(root, "canonical", "intrasearch"), { recursive: true });
+		mkdirSync(join(root, ".agents", "skills"), { recursive: true });
+		const generatedPath = join(root, ".agents", "skills", "community-intrasearch");
+		symlinkSync(join(root, "canonical", "intrasearch"), generatedPath);
+
+		expect(
+			resolveArtifactPath(root, { name: "community-intrasearch", path: ".agents/skills/community-intrasearch" }),
+		).toBe(generatedPath);
 	});
 
 	it("detects explicitly requested skills", () => {

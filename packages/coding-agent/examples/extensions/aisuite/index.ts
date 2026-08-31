@@ -7,7 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
@@ -188,13 +188,13 @@ function findProjectRoot(cwd: string): string | undefined {
 	}
 }
 
-function resolveArtifactPath(root: string, entry: ArtifactEntry): string | undefined {
+export function resolveArtifactPath(root: string, entry: ArtifactEntry): string | undefined {
 	const candidates = [entry.path, entry.source].flatMap((path) => {
 		if (!path) return [];
 		return [isAbsolute(path) ? path : join(root, path)];
 	});
 	for (const candidate of candidates) {
-		if (existsSync(candidate)) return realpathSync(candidate);
+		if (existsSync(candidate)) return candidate;
 	}
 	return undefined;
 }
@@ -236,7 +236,7 @@ export function loadAisuiteProject(cwd: string, agentDir = defaultAgentDir()): A
 		),
 		skills: dedupeEntries(
 			root,
-			manifests.flatMap((manifest) => manifest.skills ?? []),
+			[...manifests].reverse().flatMap((manifest) => manifest.skills ?? []),
 		),
 		hooksPath: existsSync(hooksPath) ? hooksPath : undefined,
 		config,
