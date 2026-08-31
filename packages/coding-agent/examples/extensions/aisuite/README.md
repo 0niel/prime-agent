@@ -10,6 +10,20 @@ This extension makes an AISuite-generated project behave consistently in Prime A
 - persists selected skills and the external read-only gate across session resume;
 - blocks known Tracker, review, HTTP, and MCP mutation routes when the prompt asks for read-only work.
 
+## All-in-one installer
+
+The fork includes a macOS/Linux bootstrap that installs the stable Prime Agent binary, clones or safely fast-forwards the AISuite bridge branch, validates and regenerates project AISuite artifacts, configures Eliza models, creates `prime-agent-aisuite`, and runs a no-session live completion smoke:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/0niel/prime-agent/feat/aisuite-harness-integration/scripts/install-aisuite-eliza.sh \
+  | bash -s -- --project-dir "$HOME/arcadia/flutter/pro/yxpro/professions/eats"
+```
+
+When `ya` is installed, the recommended authentication mode resolves a fresh token at request time with `ya tool fetch-token -preset eliza`. Otherwise the installer asks for a token without echo and stores it in `~/.prime/agent/secrets/eliza-token` with mode `0600`; `models.json` stores only a shell lookup command. Use `--token-source prompt` to force manual entry.
+
+The installer is idempotent. It preserves unrelated custom providers, refuses to update a dirty or unexpected checkout, merges JSON atomically, and only fast-forwards the fork branch. Run with `--help` for non-interactive and skip options.
+
 Load it from the repository:
 
 ```bash

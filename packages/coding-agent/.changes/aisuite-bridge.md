@@ -1,1 +1,2 @@
 - Added an AISuite extension example that loads generated rules, skills, hooks, and persistent safety gates.
+- Added an all-in-one AISuite and Eliza installer with secret-safe authentication, fork updates, and live verification.
