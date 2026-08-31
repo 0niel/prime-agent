@@ -66,6 +66,13 @@ describe("AISuite extension", () => {
 		expect(project?.skills.map((skill) => skill.name)).toEqual(["duty-cracker"]);
 		expect(project?.skills[0]?.path).toBe(".agents/skills/duty-cracker");
 		expect(project?.hooksPath).toBe(join(root, ".codex", "hooks.json"));
+		expect(project?.config.skillBundles["eats-perf-profiler"]).toEqual([
+			"device-drive",
+			"perfetto-comparator",
+			"yxpro-perfetto-trace",
+			"prime-ast-index",
+			"arcadia-code-graph",
+		]);
 	});
 
 	it("preserves generated skill symlink names", () => {

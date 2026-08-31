@@ -36,6 +36,18 @@ Use `/aisuite-status` to verify discovery and `/aisuite-readonly on|off|status` 
 
 The read-only gate is defense in depth for supported tool routes, not an operating-system sandbox. Keep Prime Agent inside a restricted checkout and do not enable unreviewed tools or extensions when a hard write boundary is required.
 
+## Eats performance profiler
+
+The installer also creates a Prime-compatible adapter for the `eats-perf-profiler` autonomous loop from Arcanum PR 13755284. Once that skill is present in the generated AISuite artifacts, start a bounded run with:
+
+```bash
+prime-agent-perf-loop --max 3 --sleep 10
+```
+
+The adapter preserves the profiler's fresh-process-per-iteration design while translating its existing Claude runner contract into `prime-agent-aisuite --no-session -p`. It forces `/skill:eats-perf-profiler`, activates the bridge-level external write gate, limits active tools to `ipython,bash,edit`, disables Prime telemetry for the unattended process, and keeps the profiler's device lock, stop file, local journals, notifications, and dashboard unchanged.
+
+Prime Agent is not sandboxed. The adapter therefore refuses to run when the profiler disables auto-approval unless `PRIME_PERF_ALLOW_FULL_ACCESS=1` is set explicitly. Select another configured Eliza model with `PERF_AGENT_MODEL`; use `PRIME_PERF_PROVIDER` when the model belongs to a different provider.
+
 Optional configuration can be stored globally at `~/.prime/agent/extensions/aisuite.json` or in a project at `.prime/agent/aisuite.json`:
 
 ```json
@@ -45,7 +57,8 @@ Optional configuration can be stored globally at `~/.prime/agent/extensions/aisu
   "hooksFile": ".codex/hooks.json",
   "maxPromptBytes": 262144,
   "skillBundles": {
-    "duty-cracker": ["tracker", "community-intrasearch", "wiki", "monium"]
+    "duty-cracker": ["tracker", "community-intrasearch", "wiki", "monium"],
+    "eats-perf-profiler": ["device-drive", "perfetto-comparator", "yxpro-perfetto-trace"]
   }
 }
 ```

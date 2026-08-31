@@ -24,12 +24,27 @@ describe("AISuite Eliza installer", () => {
 		const branch = "installer-test";
 
 		mkdirSync(join(source, "packages", "coding-agent", "examples", "extensions", "aisuite"), { recursive: true });
+		mkdirSync(join(source, "scripts"), { recursive: true });
 		writeFileSync(
 			join(source, "packages", "coding-agent", "examples", "extensions", "aisuite", "index.ts"),
 			"export default function extension() {}\n",
 		);
+		for (const name of ["prime-agent-perf-runner.sh", "prime-agent-perf-loop.sh"]) {
+			const path = join(source, "scripts", name);
+			writeFileSync(path, "#!/usr/bin/env bash\nexit 0\n");
+			chmodSync(path, 0o755);
+		}
 		run("git", ["init", "-b", branch], source);
-		run("git", ["add", "packages/coding-agent/examples/extensions/aisuite/index.ts"], source);
+		run(
+			"git",
+			[
+				"add",
+				"packages/coding-agent/examples/extensions/aisuite/index.ts",
+				"scripts/prime-agent-perf-runner.sh",
+				"scripts/prime-agent-perf-loop.sh",
+			],
+			source,
+		);
 		run(
 			"git",
 			["-c", "user.name=Installer Test", "-c", "user.email=installer@example.test", "commit", "-m", "fixture"],
@@ -38,8 +53,13 @@ describe("AISuite Eliza installer", () => {
 
 		mkdirSync(join(project, ".codex"), { recursive: true });
 		mkdirSync(join(project, ".agents", "skills", "duty-cracker"), { recursive: true });
+		mkdirSync(join(project, ".agents", "skills", "eats-perf-profiler"), { recursive: true });
 		writeFileSync(join(project, ".codex", "aisuite_generated_artifacts.json"), '{"skills":[]}\n');
 		writeFileSync(join(project, ".agents", "skills", "duty-cracker", "SKILL.md"), "# Duty Cracker\n");
+		writeFileSync(
+			join(project, ".agents", "skills", "eats-perf-profiler", "SKILL.md"),
+			"# Eats performance profiler\n",
+		);
 		mkdirSync(agentDir, { recursive: true });
 		writeFileSync(
 			join(agentDir, "models.json"),
@@ -111,5 +131,12 @@ exit 0
 		expect(launcher).toContain("eliza-deepseek-internal");
 		expect(launcher).toContain(`PRIME_AGENT_CODING_AGENT_DIR=${realpathSync(agentDir)}`);
 		expect(dirname(launcherPath)).toBe(bin);
+
+		const perfRunnerPath = join(bin, "prime-agent-perf-runner");
+		const perfLoopPath = join(bin, "prime-agent-perf-loop");
+		expect(statSync(perfRunnerPath).mode & 0o111).not.toBe(0);
+		expect(statSync(perfLoopPath).mode & 0o111).not.toBe(0);
+		expect(readFileSync(perfRunnerPath, "utf8")).toContain("prime-agent-perf-runner.sh");
+		expect(readFileSync(perfLoopPath, "utf8")).toContain("prime-agent-perf-loop.sh");
 	});
 });

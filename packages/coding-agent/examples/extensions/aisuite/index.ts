@@ -41,6 +41,13 @@ const DEFAULT_DUTY_BUNDLE = [
 	"sandbox",
 	"abc",
 ];
+const DEFAULT_PERF_BUNDLE = [
+	"device-drive",
+	"perfetto-comparator",
+	"yxpro-perfetto-trace",
+	"prime-ast-index",
+	"arcadia-code-graph",
+];
 
 interface ArtifactEntry {
 	name: string;
@@ -185,6 +192,7 @@ function mergeConfig(globalConfig: AisuiteConfig, projectConfig: AisuiteConfig):
 		maxPromptBytes: projectConfig.maxPromptBytes ?? globalConfig.maxPromptBytes ?? DEFAULT_MAX_PROMPT_BYTES,
 		skillBundles: {
 			"duty-cracker": DEFAULT_DUTY_BUNDLE,
+			"eats-perf-profiler": DEFAULT_PERF_BUNDLE,
 			...(globalConfig.skillBundles ?? {}),
 			...(projectConfig.skillBundles ?? {}),
 		},

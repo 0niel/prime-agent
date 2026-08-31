@@ -219,12 +219,13 @@ has_aisuite_manifest() {
 		-f "${project_dir}/.codex/aisuite_generated_artifacts.json" ]]
 }
 
-find_duty_skill() {
+find_project_skill() {
+	local name="$1"
 	local candidate
 	for candidate in \
-		"${project_dir}/.agents/skills/duty-cracker" \
-		"${project_dir}/.claude/skills/duty-cracker" \
-		"${project_dir}/.codeassistant/skills/duty-cracker"; do
+		"${project_dir}/.agents/skills/${name}" \
+		"${project_dir}/.claude/skills/${name}" \
+		"${project_dir}/.codeassistant/skills/${name}"; do
 		if [[ -f "${candidate}/SKILL.md" ]]; then
 			printf '%s' "$candidate"
 			return 0
@@ -246,9 +247,15 @@ setup_aisuite() {
 	fi
 
 	has_aisuite_manifest || die "AISuite artifacts are missing in $project_dir; install ya and run: ya tool aisuite setup '$project_dir'"
-	duty_skill_dir="$(find_duty_skill || true)"
+	duty_skill_dir="$(find_project_skill duty-cracker || true)"
 	[[ -n "$duty_skill_dir" ]] || die "duty-cracker is not installed by the project preset; for Eats, use the pro/mobile/eats preset"
 	log "duty-cracker: $duty_skill_dir"
+	perf_skill_dir="$(find_project_skill eats-perf-profiler || true)"
+	if [[ -n "$perf_skill_dir" ]]; then
+		log "eats-perf-profiler: $perf_skill_dir"
+	else
+		log "eats-perf-profiler is not installed yet; the Prime runner will become available after the AISuite preset includes it"
+	fi
 }
 
 read_manual_token() {
@@ -429,6 +436,36 @@ install_launcher() {
 	esac
 }
 
+install_perf_launchers() {
+	local runner_source="${repo_dir}/scripts/prime-agent-perf-runner.sh"
+	local loop_source="${repo_dir}/scripts/prime-agent-perf-loop.sh"
+	[[ -x "$runner_source" && -x "$loop_source" ]] || die "Prime performance runner scripts are missing from the selected branch"
+
+	perf_runner_path="${bin_dir}/prime-agent-perf-runner"
+	local runner_temp
+	runner_temp="$(mktemp "${bin_dir}/.prime-agent-perf-runner.XXXXXX")"
+	{
+		printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' ''
+		printf 'export PRIME_PERF_PRIME_AGENT_BIN=%q\n' "$launcher_path"
+		printf 'exec %q "$@"\n' "$runner_source"
+	} >"$runner_temp"
+	chmod 755 "$runner_temp"
+	mv -f "$runner_temp" "$perf_runner_path"
+
+	perf_loop_path="${bin_dir}/prime-agent-perf-loop"
+	local loop_temp
+	loop_temp="$(mktemp "${bin_dir}/.prime-agent-perf-loop.XXXXXX")"
+	{
+		printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' ''
+		printf 'export PRIME_PERF_PROJECT_DIR=%q\n' "$project_dir"
+		printf 'export PRIME_PERF_RUNNER_BIN=%q\n' "$perf_runner_path"
+		printf 'exec %q "$@"\n' "$loop_source"
+	} >"$loop_temp"
+	chmod 755 "$loop_temp"
+	mv -f "$loop_temp" "$perf_loop_path"
+	log "performance loop: $perf_loop_path"
+}
+
 run_smoke() {
 	"$launcher_path" --version >/dev/null 2>&1
 	if [[ "$skip_live_smoke" == 1 ]]; then
@@ -447,6 +484,7 @@ checkout_fork
 setup_aisuite
 configure_models
 install_launcher
+install_perf_launchers
 run_smoke
 
 cat <<EOF
@@ -457,6 +495,10 @@ Installation complete.
   Fork:     $repo_dir
   Launcher: $launcher_path
   Skill:    $duty_skill_dir
+
+Performance profiling (after eats-perf-profiler is installed):
+
+  $(printf '%q' "$perf_loop_path") --max 3 --sleep 10
 
 Start the UI:
 
