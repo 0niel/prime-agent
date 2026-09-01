@@ -12,11 +12,11 @@ This extension makes an AISuite-generated project behave consistently in Prime A
 
 ## All-in-one installer
 
-The fork includes a macOS/Linux bootstrap that installs the stable Prime Agent binary, clones or safely fast-forwards the AISuite bridge branch, validates and regenerates project AISuite artifacts, configures Eliza models, creates `prime-agent-aisuite`, and runs a no-session live completion smoke:
+The fork includes a macOS/Linux bootstrap that installs the stable Prime Agent binary, clones or safely fast-forwards the AISuite bridge branch, updates AISuite, validates and generates the pinned `pro/mobile/eats` preset without personal junk overlays, configures Eliza models, creates `prime-agent-aisuite`, and runs a no-session live completion smoke:
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/0niel/prime-agent/4afbfdef5b516af37f6973421645b3fb14d0d775/scripts/install-aisuite-eliza.sh \
+  https://raw.githubusercontent.com/0niel/prime-agent/6cac2e471c3c4e75c1c9858312b1bca0b248cfec/scripts/install-aisuite-eliza.sh \
   | bash -s -- --project-dir "$HOME/arcadia/flutter/pro/yxpro/professions/eats"
 ```
 
