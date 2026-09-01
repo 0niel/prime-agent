@@ -267,7 +267,10 @@ update_aisuite_tool() {
 
 validate_aisuite_preset() {
 	log "validating AISuite preset $AISUITE_PRESET"
-	ya tool aisuite validate --preset "$AISUITE_PRESET"
+	(
+		cd "$project_dir"
+		ya tool aisuite validate --preset "$AISUITE_PRESET"
+	)
 }
 
 setup_aisuite() {
@@ -275,7 +278,10 @@ setup_aisuite() {
 		update_aisuite_tool
 		validate_aisuite_preset
 		log "generating AISuite rules, skills, commands, and hooks from $AISUITE_PRESET without personal junk"
-		ya tool aisuite setup --no-junk --preset "$AISUITE_PRESET" "$project_dir"
+		(
+			cd "$project_dir"
+			ya tool aisuite setup --no-junk --preset "$AISUITE_PRESET" "$project_dir"
+		)
 	elif [[ "$skip_aisuite_setup" == 0 ]]; then
 		log "ya is unavailable; reusing existing generated AISuite artifacts"
 	fi

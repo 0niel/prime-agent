@@ -119,11 +119,11 @@ case "$1" in
 	validate)
 		[[ -f "\${PRIME_AISUITE_TEST_UPDATE_MARKER:?}" ]] || exit 86
 		[[ "$2" == "--preset" && "$3" == "pro/mobile/eats" ]] || exit 85
-		printf '%s' "$3" > "\${PRIME_AISUITE_TEST_VALIDATION_MARKER:?}"
+		printf '%s\\n%s' "$PWD" "$3" > "\${PRIME_AISUITE_TEST_VALIDATION_MARKER:?}"
 		;;
 	setup)
 		[[ "$2" == "--no-junk" && "$3" == "--preset" && "$4" == "pro/mobile/eats" ]] || exit 84
-		printf '%s\\n' "$@" > "\${PRIME_AISUITE_TEST_SETUP_MARKER:?}"
+		printf '%s\\n' "$PWD" "$@" > "\${PRIME_AISUITE_TEST_SETUP_MARKER:?}"
 		;;
 	*) exit 87 ;;
 esac
@@ -156,8 +156,8 @@ esac
 			PRIME_AISUITE_SKIP_LIVE_SMOKE: "1",
 			PRIME_AISUITE_NON_INTERACTIVE: "1",
 		};
-		const first = execFileSync("bash", [installer], { cwd: project, env, encoding: "utf8" });
-		const second = execFileSync("bash", [installer], { cwd: project, env, encoding: "utf8" });
+		const first = execFileSync("bash", [installer], { cwd: home, env, encoding: "utf8" });
+		const second = execFileSync("bash", [installer], { cwd: home, env, encoding: "utf8" });
 
 		expect(first).toContain("Installation complete");
 		expect(first).toContain("official installer endpoint is unavailable");
@@ -165,9 +165,9 @@ esac
 		expect(second).toContain("Already up to date");
 		expect(readFileSync(fallbackMarker, "utf8")).toBe("https://releases.example.test");
 		expect(readFileSync(aisuiteUpdateMarker, "utf8")).toBe("updated");
-		expect(readFileSync(aisuiteValidationMarker, "utf8")).toBe("pro/mobile/eats");
+		expect(readFileSync(aisuiteValidationMarker, "utf8")).toBe(`${realpathSync(project)}\npro/mobile/eats`);
 		expect(readFileSync(aisuiteSetupMarker, "utf8")).toBe(
-			`setup\n--no-junk\n--preset\npro/mobile/eats\n${realpathSync(project)}\n`,
+			`${realpathSync(project)}\nsetup\n--no-junk\n--preset\npro/mobile/eats\n${realpathSync(project)}\n`,
 		);
 		expect(
 			readFileSync(
