@@ -71,7 +71,6 @@ cat > "${promptFile}"
 		writeFileSync(fakeRunner, "#!/usr/bin/env bash\nexit 0\n");
 		chmodSync(fakeRunner, 0o755);
 		writeFileSync(fakeRalph, '#!/usr/bin/env bash\nprintf "EATS_ROOT=%s\\n" "$EATS_ROOT"\nprintf "%s\\n" "$@"\n');
-		chmodSync(fakeRalph, 0o755);
 
 		const output = execFileSync("bash", [loop, "--max", "2", "--sleep", "0"], {
 			env: {
@@ -84,6 +83,38 @@ cat > "${promptFile}"
 		expect(output).toContain(`EATS_ROOT=${realpathSync(project)}`);
 		expect(output.split("\n")).toEqual(
 			expect.arrayContaining(["--runner", "claude", "--agent-bin", fakeRunner, "--max", "2", "--sleep", "0"]),
+		);
+	});
+
+	it("uses the native Prime runner when the generated skill supports it", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-perf-native-loop-"));
+		const project = join(root, "project");
+		const skill = join(project, ".agents", "skills", "eats-perf-profiler");
+		const fakeRalph = join(skill, "scripts", "ralph_perf.sh");
+		const fakePrime = join(root, "prime-agent-aisuite");
+		mkdirSync(join(skill, "scripts"), { recursive: true });
+		writeFileSync(fakePrime, "#!/usr/bin/env bash\nexit 0\n");
+		chmodSync(fakePrime, 0o755);
+		writeFileSync(
+			fakeRalph,
+			'#!/usr/bin/env bash\n# auto|claude|opencode|prime\nprintf "EATS_ROOT=%s\\n" "$EATS_ROOT"\nprintf "provider=%s\\n" "$PERF_PRIME_PROVIDER"\nprintf "model=%s\\n" "$PERF_AGENT_MODEL"\nprintf "%s\\n" "$@"\n',
+		);
+
+		const output = execFileSync("bash", [loop, "--max", "2", "--sleep", "0"], {
+			env: {
+				...process.env,
+				PRIME_PERF_PROJECT_DIR: project,
+				PRIME_PERF_PRIME_AGENT_BIN: fakePrime,
+				PRIME_PERF_PROVIDER: "eliza-deepseek-internal",
+				PRIME_PERF_MODEL: "deepseek-v4-flash",
+			},
+			encoding: "utf8",
+		});
+		expect(output).toContain(`EATS_ROOT=${realpathSync(project)}`);
+		expect(output).toContain("provider=eliza-deepseek-internal");
+		expect(output).toContain("model=deepseek-v4-flash");
+		expect(output.split("\n")).toEqual(
+			expect.arrayContaining(["--runner", "prime", "--agent-bin", fakePrime, "--max", "2", "--sleep", "0"]),
 		);
 	});
 });

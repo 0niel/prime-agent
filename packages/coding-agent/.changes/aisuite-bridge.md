@@ -1,3 +1,5 @@
 - Added an AISuite extension example that loads generated rules, skills, hooks, and persistent safety gates.
 - Added an all-in-one AISuite and Eliza installer with secret-safe authentication, fork updates, and live verification.
+- Fixed the performance loop to run AISuite-generated skill scripts without requiring executable bits.
+- Changed the performance loop to use the profiler's native Prime runner when available, with a legacy adapter fallback.
 - Added a guarded Prime Agent adapter for the Eats autonomous performance profiler loop.
