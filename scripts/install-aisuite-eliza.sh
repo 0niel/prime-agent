@@ -4,7 +4,8 @@ set -Eeuo pipefail
 
 readonly DEFAULT_REPO_URL="https://github.com/0niel/prime-agent.git"
 readonly DEFAULT_BRANCH="feat/aisuite-harness-integration"
-readonly PRIME_INSTALLER_URL="https://app.primeintellect.ai/prime-agent/install.sh"
+readonly DEFAULT_PRIME_INSTALLER_URL="https://app.primeintellect.ai/prime-agent/install.sh"
+readonly DEFAULT_PRIME_RELEASE_BASE_URL="https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev"
 
 repo_url="${PRIME_AISUITE_REPO_URL:-$DEFAULT_REPO_URL}"
 branch="${PRIME_AISUITE_BRANCH:-$DEFAULT_BRANCH}"
@@ -15,6 +16,8 @@ agent_dir="${PRIME_AISUITE_AGENT_DIR:-${HOME}/.prime/agent}"
 state_dir="${PRIME_AISUITE_STATE_DIR:-${HOME}/.local/share/prime-agent-aisuite}"
 token_source="${PRIME_AISUITE_TOKEN_SOURCE:-auto}"
 prime_agent_bin="${PRIME_AISUITE_PRIME_AGENT_BIN:-}"
+prime_installer_url="${PRIME_AISUITE_PRIME_INSTALLER_URL:-$DEFAULT_PRIME_INSTALLER_URL}"
+prime_release_base_url="${PRIME_AISUITE_PRIME_RELEASE_BASE_URL:-$DEFAULT_PRIME_RELEASE_BASE_URL}"
 node_bin=""
 auth_command=""
 skip_prime_install="${PRIME_AISUITE_SKIP_PRIME_INSTALL:-0}"
@@ -160,8 +163,16 @@ install_prime_agent() {
 		command -v curl >/dev/null 2>&1 || die "curl is required to install Prime Agent"
 		local installer="${temp_dir}/prime-agent-install.sh"
 		log "downloading the official stable Prime Agent installer"
-		curl --proto '=https' --tlsv1.2 -fsSL "$PRIME_INSTALLER_URL" -o "$installer"
-		PRIME_AGENT_INSTALLER_PLAIN=1 sh "$installer"
+		if curl --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 -fsSL \
+			"$prime_installer_url" -o "$installer" 2>"${temp_dir}/prime-installer-download.log"; then
+			PRIME_AGENT_INSTALLER_PLAIN=1 sh "$installer"
+		else
+			installer="${repo_dir}/install.sh"
+			[[ -f "$installer" && ! -L "$installer" ]] || die "trusted fallback installer is missing: $installer"
+			log "official installer endpoint is unavailable; using the checked-out installer with the release CDN"
+			PRIME_AGENT_DOWNLOAD_BASE_URL="$prime_release_base_url" \
+				PRIME_AGENT_INSTALLER_PLAIN=1 sh "$installer"
+		fi
 	fi
 
 	if [[ -z "$prime_agent_bin" ]]; then
@@ -479,8 +490,8 @@ run_smoke() {
 	log "Eliza smoke: ELIZA_INSTALL_OK"
 }
 
-install_prime_agent
 checkout_fork
+install_prime_agent
 setup_aisuite
 configure_models
 install_launcher

@@ -21,10 +21,13 @@ describe("AISuite Eliza installer", () => {
 		const agentDir = join(home, ".prime", "agent");
 		const checkout = join(root, "checkout");
 		const fakePrime = join(root, "fake-prime-agent");
+		const tools = join(root, "tools");
+		const fallbackMarker = join(root, "fallback-installer-used");
 		const branch = "installer-test";
 
 		mkdirSync(join(source, "packages", "coding-agent", "examples", "extensions", "aisuite"), { recursive: true });
 		mkdirSync(join(source, "scripts"), { recursive: true });
+		mkdirSync(tools, { recursive: true });
 		writeFileSync(
 			join(source, "packages", "coding-agent", "examples", "extensions", "aisuite", "index.ts"),
 			"export default function extension() {}\n",
@@ -34,6 +37,18 @@ describe("AISuite Eliza installer", () => {
 			writeFileSync(path, "#!/usr/bin/env bash\nexit 0\n");
 			chmodSync(path, 0o755);
 		}
+		const sourceInstaller = join(source, "install.sh");
+		writeFileSync(
+			sourceInstaller,
+			`#!/bin/sh
+set -eu
+printf '%s' "\${PRIME_AGENT_DOWNLOAD_BASE_URL:?}" > "\${PRIME_AISUITE_TEST_FALLBACK_MARKER:?}"
+`,
+		);
+		chmodSync(sourceInstaller, 0o755);
+		const fakeCurl = join(tools, "curl");
+		writeFileSync(fakeCurl, "#!/bin/sh\nexit 22\n");
+		chmodSync(fakeCurl, 0o755);
 		run("git", ["init", "-b", branch], source);
 		run(
 			"git",
@@ -42,6 +57,7 @@ describe("AISuite Eliza installer", () => {
 				"packages/coding-agent/examples/extensions/aisuite/index.ts",
 				"scripts/prime-agent-perf-runner.sh",
 				"scripts/prime-agent-perf-loop.sh",
+				"install.sh",
 			],
 			source,
 		);
@@ -84,6 +100,7 @@ exit 0
 		const env = {
 			...process.env,
 			HOME: home,
+			PATH: `${tools}:${process.env.PATH ?? ""}`,
 			ELIZA_API_TOKEN: "fixture-secret-token",
 			PRIME_AISUITE_REPO_URL: source,
 			PRIME_AISUITE_BRANCH: branch,
@@ -94,7 +111,10 @@ exit 0
 			PRIME_AISUITE_AGENT_DIR: agentDir,
 			PRIME_AISUITE_STATE_DIR: join(root, "state"),
 			PRIME_AISUITE_TOKEN_SOURCE: "prompt",
-			PRIME_AISUITE_SKIP_PRIME_INSTALL: "1",
+			PRIME_AISUITE_SKIP_PRIME_INSTALL: "0",
+			PRIME_AISUITE_PRIME_INSTALLER_URL: "https://installer.invalid/install.sh",
+			PRIME_AISUITE_PRIME_RELEASE_BASE_URL: "https://releases.example.test",
+			PRIME_AISUITE_TEST_FALLBACK_MARKER: fallbackMarker,
 			PRIME_AISUITE_SKIP_AISUITE_SETUP: "1",
 			PRIME_AISUITE_SKIP_LIVE_SMOKE: "1",
 			PRIME_AISUITE_NON_INTERACTIVE: "1",
@@ -103,7 +123,9 @@ exit 0
 		const second = execFileSync("bash", [installer], { cwd: project, env, encoding: "utf8" });
 
 		expect(first).toContain("Installation complete");
+		expect(first).toContain("official installer endpoint is unavailable");
 		expect(second).toContain("Already up to date");
+		expect(readFileSync(fallbackMarker, "utf8")).toBe("https://releases.example.test");
 		expect(
 			readFileSync(
 				join(checkout, "packages", "coding-agent", "examples", "extensions", "aisuite", "index.ts"),

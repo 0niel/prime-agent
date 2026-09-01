@@ -1,0 +1,1 @@
+- Fixed the AISuite Eliza installer to fall back to the checked-out Prime Agent installer when the official installer endpoint is unavailable.
