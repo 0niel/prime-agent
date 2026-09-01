@@ -245,6 +245,25 @@ find_project_skill() {
 	return 1
 }
 
+update_aisuite_tool() {
+	local primary_output alternate_output
+
+	log "updating AISuite tool"
+	if primary_output="$(ya tool aisuite --force-update --version 2>&1)"; then
+		[[ -z "$primary_output" ]] || printf '%s\n' "$primary_output"
+		return
+	fi
+
+	log "retrying AISuite update with alternate ya argument order"
+	if alternate_output="$(ya tool --force-update aisuite --version 2>&1)"; then
+		[[ -z "$alternate_output" ]] || printf '%s\n' "$alternate_output"
+		return
+	fi
+
+	printf '%s\n' "$primary_output" "$alternate_output" >&2
+	die "failed to update AISuite with either supported ya argument order"
+}
+
 validate_aisuite_config() {
 	local config_path="${project_dir}/aisuite.yaml"
 	local validation_output
@@ -267,6 +286,7 @@ validate_aisuite_config() {
 
 setup_aisuite() {
 	if [[ "$skip_aisuite_setup" == 0 && -x "$(command -v ya 2>/dev/null || true)" ]]; then
+		update_aisuite_tool
 		if [[ -f "${project_dir}/aisuite.yaml" ]]; then
 			validate_aisuite_config
 		fi

@@ -23,6 +23,7 @@ describe("AISuite Eliza installer", () => {
 		const fakePrime = join(root, "fake-prime-agent");
 		const tools = join(root, "tools");
 		const fallbackMarker = join(root, "fallback-installer-used");
+		const aisuiteUpdateMarker = join(root, "aisuite-update-used");
 		const aisuiteValidationMarker = join(root, "aisuite-validation-used");
 		const branch = "installer-test";
 
@@ -103,11 +104,19 @@ exit 0
 			fakeYa,
 			`#!/usr/bin/env bash
 set -euo pipefail
+if [[ "$1" == "tool" && "$2" == "aisuite" && "$3" == "--force-update" && "$4" == "--version" ]]; then
+	exit 64
+fi
+if [[ "$1" == "tool" && "$2" == "--force-update" && "$3" == "aisuite" && "$4" == "--version" ]]; then
+	printf 'aisuite, version test\\n'
+	printf 'updated' > "\${PRIME_AISUITE_TEST_UPDATE_MARKER:?}"
+	exit 0
+fi
 [[ "$1" == "tool" && "$2" == "aisuite" ]] || exit 90
 shift 2
 case "$1" in
 	validate)
-		if [[ "$2" == */aisuite.yaml ]]; then
+		if [[ ! -f "\${PRIME_AISUITE_TEST_UPDATE_MARKER:?}" && "$2" == */aisuite.yaml ]]; then
 			printf "Error: Invalid value for 'PATH...': Directory '%s' is a file.\\n" "$2" >&2
 			exit 2
 		fi
@@ -139,6 +148,7 @@ esac
 			PRIME_AISUITE_PRIME_INSTALLER_URL: "https://installer.invalid/install.sh",
 			PRIME_AISUITE_PRIME_RELEASE_BASE_URL: "https://releases.example.test",
 			PRIME_AISUITE_TEST_FALLBACK_MARKER: fallbackMarker,
+			PRIME_AISUITE_TEST_UPDATE_MARKER: aisuiteUpdateMarker,
 			PRIME_AISUITE_TEST_VALIDATION_MARKER: aisuiteValidationMarker,
 			PRIME_AISUITE_SKIP_AISUITE_SETUP: "0",
 			PRIME_AISUITE_SKIP_LIVE_SMOKE: "1",
@@ -149,10 +159,11 @@ esac
 
 		expect(first).toContain("Installation complete");
 		expect(first).toContain("official installer endpoint is unavailable");
-		expect(first).toContain("installed AISuite expects a project directory");
+		expect(first).toContain("retrying AISuite update with alternate ya argument order");
 		expect(second).toContain("Already up to date");
 		expect(readFileSync(fallbackMarker, "utf8")).toBe("https://releases.example.test");
-		expect(readFileSync(aisuiteValidationMarker, "utf8")).toBe(realpathSync(project));
+		expect(readFileSync(aisuiteUpdateMarker, "utf8")).toBe("updated");
+		expect(readFileSync(aisuiteValidationMarker, "utf8")).toBe(join(realpathSync(project), "aisuite.yaml"));
 		expect(
 			readFileSync(
 				join(checkout, "packages", "coding-agent", "examples", "extensions", "aisuite", "index.ts"),

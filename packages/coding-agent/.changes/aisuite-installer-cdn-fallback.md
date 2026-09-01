@@ -1,2 +1,3 @@
 - Fixed the AISuite Eliza installer to fall back to the checked-out Prime Agent installer when the official installer endpoint is unavailable.
 - Fixed installation with older AISuite versions whose `validate` command expects a project directory.
+- Fixed setup against current Arcadia presets by force-updating stale AISuite tool installations before validation.
