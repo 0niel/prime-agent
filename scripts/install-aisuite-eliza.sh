@@ -245,11 +245,30 @@ find_project_skill() {
 	return 1
 }
 
+validate_aisuite_config() {
+	local config_path="${project_dir}/aisuite.yaml"
+	local validation_output
+
+	log "validating $config_path"
+	if validation_output="$(ya tool aisuite validate "$config_path" 2>&1)"; then
+		[[ -z "$validation_output" ]] || printf '%s\n' "$validation_output"
+		return
+	fi
+
+	if [[ "$validation_output" == *"$config_path"* && "$validation_output" == *"is a file"* ]]; then
+		log "installed AISuite expects a project directory; retrying validation with $project_dir"
+		ya tool aisuite validate "$project_dir"
+		return
+	fi
+
+	printf '%s\n' "$validation_output" >&2
+	return 1
+}
+
 setup_aisuite() {
 	if [[ "$skip_aisuite_setup" == 0 && -x "$(command -v ya 2>/dev/null || true)" ]]; then
 		if [[ -f "${project_dir}/aisuite.yaml" ]]; then
-			log "validating ${project_dir}/aisuite.yaml"
-			ya tool aisuite validate "${project_dir}/aisuite.yaml"
+			validate_aisuite_config
 		fi
 		log "generating AISuite rules, skills, commands, and hooks"
 		ya tool aisuite setup "$project_dir"

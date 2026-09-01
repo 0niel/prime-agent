@@ -23,6 +23,7 @@ describe("AISuite Eliza installer", () => {
 		const fakePrime = join(root, "fake-prime-agent");
 		const tools = join(root, "tools");
 		const fallbackMarker = join(root, "fallback-installer-used");
+		const aisuiteValidationMarker = join(root, "aisuite-validation-used");
 		const branch = "installer-test";
 
 		mkdirSync(join(source, "packages", "coding-agent", "examples", "extensions", "aisuite"), { recursive: true });
@@ -70,6 +71,7 @@ printf '%s' "\${PRIME_AGENT_DOWNLOAD_BASE_URL:?}" > "\${PRIME_AISUITE_TEST_FALLB
 		mkdirSync(join(project, ".codex"), { recursive: true });
 		mkdirSync(join(project, ".agents", "skills", "duty-cracker"), { recursive: true });
 		mkdirSync(join(project, ".agents", "skills", "eats-perf-profiler"), { recursive: true });
+		writeFileSync(join(project, "aisuite.yaml"), "extends: []\n");
 		writeFileSync(join(project, ".codex", "aisuite_generated_artifacts.json"), '{"skills":[]}\n');
 		writeFileSync(join(project, ".agents", "skills", "duty-cracker", "SKILL.md"), "# Duty Cracker\n");
 		writeFileSync(
@@ -96,6 +98,28 @@ exit 0
 `,
 		);
 		chmodSync(fakePrime, 0o755);
+		const fakeYa = join(tools, "ya");
+		writeFileSync(
+			fakeYa,
+			`#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == "tool" && "$2" == "aisuite" ]] || exit 90
+shift 2
+case "$1" in
+	validate)
+		if [[ "$2" == */aisuite.yaml ]]; then
+			printf "Error: Invalid value for 'PATH...': Directory '%s' is a file.\\n" "$2" >&2
+			exit 2
+		fi
+		printf '%s' "$2" > "\${PRIME_AISUITE_TEST_VALIDATION_MARKER:?}"
+		;;
+	setup)
+		;;
+	*) exit 87 ;;
+esac
+`,
+		);
+		chmodSync(fakeYa, 0o755);
 
 		const env = {
 			...process.env,
@@ -115,7 +139,8 @@ exit 0
 			PRIME_AISUITE_PRIME_INSTALLER_URL: "https://installer.invalid/install.sh",
 			PRIME_AISUITE_PRIME_RELEASE_BASE_URL: "https://releases.example.test",
 			PRIME_AISUITE_TEST_FALLBACK_MARKER: fallbackMarker,
-			PRIME_AISUITE_SKIP_AISUITE_SETUP: "1",
+			PRIME_AISUITE_TEST_VALIDATION_MARKER: aisuiteValidationMarker,
+			PRIME_AISUITE_SKIP_AISUITE_SETUP: "0",
 			PRIME_AISUITE_SKIP_LIVE_SMOKE: "1",
 			PRIME_AISUITE_NON_INTERACTIVE: "1",
 		};
@@ -124,8 +149,10 @@ exit 0
 
 		expect(first).toContain("Installation complete");
 		expect(first).toContain("official installer endpoint is unavailable");
+		expect(first).toContain("installed AISuite expects a project directory");
 		expect(second).toContain("Already up to date");
 		expect(readFileSync(fallbackMarker, "utf8")).toBe("https://releases.example.test");
+		expect(readFileSync(aisuiteValidationMarker, "utf8")).toBe(realpathSync(project));
 		expect(
 			readFileSync(
 				join(checkout, "packages", "coding-agent", "examples", "extensions", "aisuite", "index.ts"),
