@@ -6,6 +6,7 @@ readonly DEFAULT_REPO_URL="https://github.com/0niel/prime-agent.git"
 readonly DEFAULT_BRANCH="feat/aisuite-harness-integration"
 readonly DEFAULT_PRIME_INSTALLER_URL="https://app.primeintellect.ai/prime-agent/install.sh"
 readonly DEFAULT_PRIME_RELEASE_BASE_URL="https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev"
+readonly AISUITE_PRESET="pro/mobile/eats"
 
 repo_url="${PRIME_AISUITE_REPO_URL:-$DEFAULT_REPO_URL}"
 branch="${PRIME_AISUITE_BRANCH:-$DEFAULT_BRANCH}"
@@ -264,39 +265,22 @@ update_aisuite_tool() {
 	die "failed to update AISuite with either supported ya argument order"
 }
 
-validate_aisuite_config() {
-	local config_path="${project_dir}/aisuite.yaml"
-	local validation_output
-
-	log "validating $config_path"
-	if validation_output="$(ya tool aisuite validate "$config_path" 2>&1)"; then
-		[[ -z "$validation_output" ]] || printf '%s\n' "$validation_output"
-		return
-	fi
-
-	if [[ "$validation_output" == *"$config_path"* && "$validation_output" == *"is a file"* ]]; then
-		log "installed AISuite expects a project directory; retrying validation with $project_dir"
-		ya tool aisuite validate "$project_dir"
-		return
-	fi
-
-	printf '%s\n' "$validation_output" >&2
-	return 1
+validate_aisuite_preset() {
+	log "validating AISuite preset $AISUITE_PRESET"
+	ya tool aisuite validate --preset "$AISUITE_PRESET"
 }
 
 setup_aisuite() {
 	if [[ "$skip_aisuite_setup" == 0 && -x "$(command -v ya 2>/dev/null || true)" ]]; then
 		update_aisuite_tool
-		if [[ -f "${project_dir}/aisuite.yaml" ]]; then
-			validate_aisuite_config
-		fi
-		log "generating AISuite rules, skills, commands, and hooks"
-		ya tool aisuite setup "$project_dir"
+		validate_aisuite_preset
+		log "generating AISuite rules, skills, commands, and hooks from $AISUITE_PRESET without personal junk"
+		ya tool aisuite setup --no-junk --preset "$AISUITE_PRESET" "$project_dir"
 	elif [[ "$skip_aisuite_setup" == 0 ]]; then
 		log "ya is unavailable; reusing existing generated AISuite artifacts"
 	fi
 
-	has_aisuite_manifest || die "AISuite artifacts are missing in $project_dir; install ya and run: ya tool aisuite setup '$project_dir'"
+	has_aisuite_manifest || die "AISuite artifacts are missing in $project_dir; install ya and run: ya tool aisuite setup --no-junk --preset '$AISUITE_PRESET' '$project_dir'"
 	duty_skill_dir="$(find_project_skill duty-cracker || true)"
 	[[ -n "$duty_skill_dir" ]] || die "duty-cracker is not installed by the project preset; for Eats, use the pro/mobile/eats preset"
 	log "duty-cracker: $duty_skill_dir"

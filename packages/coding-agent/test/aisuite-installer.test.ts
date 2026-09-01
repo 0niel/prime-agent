@@ -25,6 +25,7 @@ describe("AISuite Eliza installer", () => {
 		const fallbackMarker = join(root, "fallback-installer-used");
 		const aisuiteUpdateMarker = join(root, "aisuite-update-used");
 		const aisuiteValidationMarker = join(root, "aisuite-validation-used");
+		const aisuiteSetupMarker = join(root, "aisuite-setup-used");
 		const branch = "installer-test";
 
 		mkdirSync(join(source, "packages", "coding-agent", "examples", "extensions", "aisuite"), { recursive: true });
@@ -116,13 +117,13 @@ fi
 shift 2
 case "$1" in
 	validate)
-		if [[ ! -f "\${PRIME_AISUITE_TEST_UPDATE_MARKER:?}" && "$2" == */aisuite.yaml ]]; then
-			printf "Error: Invalid value for 'PATH...': Directory '%s' is a file.\\n" "$2" >&2
-			exit 2
-		fi
-		printf '%s' "$2" > "\${PRIME_AISUITE_TEST_VALIDATION_MARKER:?}"
+		[[ -f "\${PRIME_AISUITE_TEST_UPDATE_MARKER:?}" ]] || exit 86
+		[[ "$2" == "--preset" && "$3" == "pro/mobile/eats" ]] || exit 85
+		printf '%s' "$3" > "\${PRIME_AISUITE_TEST_VALIDATION_MARKER:?}"
 		;;
 	setup)
+		[[ "$2" == "--no-junk" && "$3" == "--preset" && "$4" == "pro/mobile/eats" ]] || exit 84
+		printf '%s\\n' "$@" > "\${PRIME_AISUITE_TEST_SETUP_MARKER:?}"
 		;;
 	*) exit 87 ;;
 esac
@@ -150,6 +151,7 @@ esac
 			PRIME_AISUITE_TEST_FALLBACK_MARKER: fallbackMarker,
 			PRIME_AISUITE_TEST_UPDATE_MARKER: aisuiteUpdateMarker,
 			PRIME_AISUITE_TEST_VALIDATION_MARKER: aisuiteValidationMarker,
+			PRIME_AISUITE_TEST_SETUP_MARKER: aisuiteSetupMarker,
 			PRIME_AISUITE_SKIP_AISUITE_SETUP: "0",
 			PRIME_AISUITE_SKIP_LIVE_SMOKE: "1",
 			PRIME_AISUITE_NON_INTERACTIVE: "1",
@@ -163,7 +165,10 @@ esac
 		expect(second).toContain("Already up to date");
 		expect(readFileSync(fallbackMarker, "utf8")).toBe("https://releases.example.test");
 		expect(readFileSync(aisuiteUpdateMarker, "utf8")).toBe("updated");
-		expect(readFileSync(aisuiteValidationMarker, "utf8")).toBe(join(realpathSync(project), "aisuite.yaml"));
+		expect(readFileSync(aisuiteValidationMarker, "utf8")).toBe("pro/mobile/eats");
+		expect(readFileSync(aisuiteSetupMarker, "utf8")).toBe(
+			`setup\n--no-junk\n--preset\npro/mobile/eats\n${realpathSync(project)}\n`,
+		);
 		expect(
 			readFileSync(
 				join(checkout, "packages", "coding-agent", "examples", "extensions", "aisuite", "index.ts"),
