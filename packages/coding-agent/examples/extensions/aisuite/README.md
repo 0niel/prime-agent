@@ -16,7 +16,7 @@ The fork includes a macOS/Linux bootstrap that installs the stable Prime Agent b
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/0niel/prime-agent/6cac2e471c3c4e75c1c9858312b1bca0b248cfec/scripts/install-aisuite-eliza.sh \
+  https://raw.githubusercontent.com/0niel/prime-agent/48d4b5d60fd4a60026ea7d9a0a0271e423753681/scripts/install-aisuite-eliza.sh \
   | bash -s -- --project-dir "$HOME/arcadia/flutter/pro/yxpro/professions/eats"
 ```
 
