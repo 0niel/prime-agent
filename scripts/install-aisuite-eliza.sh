@@ -2,6 +2,10 @@
 
 set -Eeuo pipefail
 
+if ! pwd -P >/dev/null 2>&1; then
+	cd "${HOME:-/}" 2>/dev/null || cd /
+fi
+
 readonly DEFAULT_REPO_URL="https://github.com/0niel/prime-agent.git"
 readonly DEFAULT_BRANCH="feat/aisuite-harness-integration"
 readonly DEFAULT_PRIME_INSTALLER_URL="https://app.primeintellect.ai/prime-agent/install.sh"
@@ -159,23 +163,7 @@ mkdir "$lock_dir" 2>/dev/null || die "another AISuite installer is already runni
 
 temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/prime-aisuite-install.XXXXXX")"
 
-install_prime_agent() {
-	if [[ "$skip_prime_install" == 0 ]]; then
-		command -v curl >/dev/null 2>&1 || die "curl is required to install Prime Agent"
-		local installer="${temp_dir}/prime-agent-install.sh"
-		log "downloading the official stable Prime Agent installer"
-		if curl --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 -fsSL \
-			"$prime_installer_url" -o "$installer" 2>"${temp_dir}/prime-installer-download.log"; then
-			PRIME_AGENT_INSTALLER_PLAIN=1 sh "$installer"
-		else
-			installer="${repo_dir}/install.sh"
-			[[ -f "$installer" && ! -L "$installer" ]] || die "trusted fallback installer is missing: $installer"
-			log "official installer endpoint is unavailable; using the checked-out installer with the release CDN"
-			PRIME_AGENT_DOWNLOAD_BASE_URL="$prime_release_base_url" \
-				PRIME_AGENT_INSTALLER_PLAIN=1 sh "$installer"
-		fi
-	fi
-
+resolve_prime_agent_bin() {
 	if [[ -z "$prime_agent_bin" ]]; then
 		prime_agent_bin="$(command -v prime-agent 2>/dev/null || true)"
 	fi
@@ -195,6 +183,29 @@ install_prime_agent() {
 			prime_agent_bin="$npm_bin"
 		fi
 	fi
+}
+
+install_prime_agent() {
+	resolve_prime_agent_bin
+	if [[ "$skip_prime_install" == 0 && -z "$prime_agent_bin" ]]; then
+		command -v curl >/dev/null 2>&1 || die "curl is required to install Prime Agent"
+		local installer="${temp_dir}/prime-agent-install.sh"
+		log "downloading the official stable Prime Agent installer"
+		if curl --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 -fsSL \
+			"$prime_installer_url" -o "$installer" 2>"${temp_dir}/prime-installer-download.log"; then
+			PRIME_AGENT_INSTALLER_PLAIN=1 sh "$installer"
+		else
+			installer="${repo_dir}/install.sh"
+			[[ -f "$installer" && ! -L "$installer" ]] || die "trusted fallback installer is missing: $installer"
+			log "official installer endpoint is unavailable; using the checked-out installer with the release CDN"
+			PRIME_AGENT_DOWNLOAD_BASE_URL="$prime_release_base_url" \
+				PRIME_AGENT_INSTALLER_PLAIN=1 sh "$installer"
+		fi
+		resolve_prime_agent_bin
+	elif [[ "$skip_prime_install" == 0 ]]; then
+		log "using existing Prime Agent: $prime_agent_bin"
+	fi
+
 	[[ -n "$prime_agent_bin" && -x "$prime_agent_bin" ]] || die "prime-agent was not found after installation"
 	prime_agent_bin="$(cd "$(dirname "$prime_agent_bin")" && pwd -P)/$(basename "$prime_agent_bin")"
 	local version
@@ -323,6 +334,21 @@ read_manual_token() {
 	auth_command="!cat $(shell_quote "$token_path")"
 }
 
+restore_ssh_auth_sock() {
+	[[ -n "${SSH_AUTH_SOCK:-}" ]] && return
+	local candidate=""
+	if command -v launchctl >/dev/null 2>&1; then
+		candidate="$(launchctl getenv SSH_AUTH_SOCK 2>/dev/null || true)"
+	fi
+	if [[ ! -S "$candidate" && -S "${HOME}/.skotty/sock/default.sock" ]]; then
+		candidate="${HOME}/.skotty/sock/default.sock"
+	fi
+	if [[ -S "$candidate" ]]; then
+		export SSH_AUTH_SOCK="$candidate"
+		log "restored the SSH agent socket for ya authentication"
+	fi
+}
+
 choose_auth_command() {
 	local ya_bin=""
 	ya_bin="$(command -v ya 2>/dev/null || true)"
@@ -345,7 +371,11 @@ choose_auth_command() {
 
 	if [[ "$token_source" == ya ]]; then
 		[[ -n "$ya_bin" ]] || die "ya is required for --token-source ya"
-		auth_command="!$(shell_quote "$ya_bin") tool fetch-token -preset eliza"
+		restore_ssh_auth_sock
+		log "preparing the automatically refreshed Eliza token"
+		(cd "$project_dir" && "$ya_bin" tool fetch-token -preset eliza >/dev/null) ||
+			die "failed to obtain an Eliza token from ya"
+		auth_command="!cd $(shell_quote "$project_dir") && $(shell_quote "$ya_bin") tool fetch-token -preset eliza"
 	else
 		read_manual_token
 	fi

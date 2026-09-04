@@ -3,3 +3,7 @@
 - Fixed setup against current Arcadia presets by force-updating stale AISuite tool installations before validation.
 - Fixed Eats setup to pin the `pro/mobile/eats` preset and exclude conflicting personal junk overlays.
 - Fixed installer runs started outside Arcadia by resolving AISuite commands from the configured project directory.
+- Fixed startup from terminals whose previous working directory was removed or unmounted.
+- Fixed repeated installs to reuse an existing Prime Agent binary instead of writing to a system npm prefix.
+- Preflighted command-backed Eliza authentication from the configured Arcadia project so a cold `ya fetch-token` does not exhaust Prime Agent's command timeout or depend on the launch directory.
+- Restored the Skotty or launchd SSH agent socket when shell initialization starts from a removed directory.

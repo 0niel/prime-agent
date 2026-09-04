@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -11,6 +20,16 @@ function run(command: string, args: string[], cwd: string) {
 	return execFileSync(command, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
+function runInstallerFromDeletedDirectory(installer: string, env: NodeJS.ProcessEnv, root: string, suffix: string) {
+	const deletedCwd = join(root, `deleted-cwd-${suffix}`);
+	mkdirSync(deletedCwd);
+	return execFileSync("bash", ["-c", 'rmdir "$PWD" && exec /bin/bash "$PRIME_AISUITE_TEST_INSTALLER"'], {
+		cwd: deletedCwd,
+		env: { ...env, PRIME_AISUITE_TEST_INSTALLER: installer },
+		encoding: "utf8",
+	});
+}
+
 describe("AISuite Eliza installer", () => {
 	it("clones the bridge and writes secret-safe idempotent configuration", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-aisuite-installer-"));
@@ -20,12 +39,13 @@ describe("AISuite Eliza installer", () => {
 		const bin = join(root, "bin");
 		const agentDir = join(home, ".prime", "agent");
 		const checkout = join(root, "checkout");
-		const fakePrime = join(root, "fake-prime-agent");
+		const fakePrime = join(home, ".local", "bin", "prime-agent");
 		const tools = join(root, "tools");
 		const fallbackMarker = join(root, "fallback-installer-used");
 		const aisuiteUpdateMarker = join(root, "aisuite-update-used");
 		const aisuiteValidationMarker = join(root, "aisuite-validation-used");
 		const aisuiteSetupMarker = join(root, "aisuite-setup-used");
+		const tokenFetchMarker = join(root, "token-fetch-used");
 		const branch = "installer-test";
 
 		mkdirSync(join(source, "packages", "coding-agent", "examples", "extensions", "aisuite"), { recursive: true });
@@ -46,6 +66,20 @@ describe("AISuite Eliza installer", () => {
 			`#!/bin/sh
 set -eu
 printf '%s' "\${PRIME_AGENT_DOWNLOAD_BASE_URL:?}" > "\${PRIME_AISUITE_TEST_FALLBACK_MARKER:?}"
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/prime-agent" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -z "\${ELIZA_API_TOKEN:-}" ]] || exit 91
+for arg in "$@"; do
+	if [[ "$arg" == "--version" ]]; then
+		echo "prime-agent vtest"
+		exit 0
+	fi
+done
+exit 0
+EOF
+chmod 755 "$HOME/.local/bin/prime-agent"
 `,
 		);
 		chmodSync(sourceInstaller, 0o755);
@@ -85,21 +119,7 @@ printf '%s' "\${PRIME_AGENT_DOWNLOAD_BASE_URL:?}" > "\${PRIME_AISUITE_TEST_FALLB
 			join(agentDir, "models.json"),
 			JSON.stringify({ providers: { existing: { baseUrl: "http://localhost" } } }),
 		);
-		writeFileSync(
-			fakePrime,
-			`#!/usr/bin/env bash
-set -euo pipefail
-[[ -z "\${ELIZA_API_TOKEN:-}" ]] || exit 91
-for arg in "$@"; do
-	if [[ "$arg" == "--version" ]]; then
-		echo "prime-agent vtest"
-		exit 0
-	fi
-done
-exit 0
-`,
-		);
-		chmodSync(fakePrime, 0o755);
+		symlinkSync(process.execPath, join(tools, "node"));
 		const fakeYa = join(tools, "ya");
 		writeFileSync(
 			fakeYa,
@@ -107,6 +127,11 @@ exit 0
 set -euo pipefail
 if [[ "$1" == "tool" && "$2" == "aisuite" && "$3" == "--force-update" && "$4" == "--version" ]]; then
 	exit 64
+fi
+if [[ "$1" == "tool" && "$2" == "fetch-token" && "$3" == "-preset" && "$4" == "eliza" ]]; then
+	printf 'used' > "\${PRIME_AISUITE_TEST_TOKEN_FETCH_MARKER:?}"
+	printf 'fixture-ya-token\n'
+	exit 0
 fi
 if [[ "$1" == "tool" && "$2" == "--force-update" && "$3" == "aisuite" && "$4" == "--version" ]]; then
 	printf 'aisuite, version test\\n'
@@ -134,14 +159,13 @@ esac
 		const env = {
 			...process.env,
 			HOME: home,
-			PATH: `${tools}:${process.env.PATH ?? ""}`,
+			PATH: `${tools}:/usr/bin:/bin`,
 			ELIZA_API_TOKEN: "fixture-secret-token",
 			PRIME_AISUITE_REPO_URL: source,
 			PRIME_AISUITE_BRANCH: branch,
 			PRIME_AISUITE_REPO_DIR: checkout,
 			PRIME_AISUITE_PROJECT_DIR: project,
 			PRIME_AISUITE_BIN_DIR: bin,
-			PRIME_AISUITE_PRIME_AGENT_BIN: fakePrime,
 			PRIME_AISUITE_AGENT_DIR: agentDir,
 			PRIME_AISUITE_STATE_DIR: join(root, "state"),
 			PRIME_AISUITE_TOKEN_SOURCE: "prompt",
@@ -152,17 +176,19 @@ esac
 			PRIME_AISUITE_TEST_UPDATE_MARKER: aisuiteUpdateMarker,
 			PRIME_AISUITE_TEST_VALIDATION_MARKER: aisuiteValidationMarker,
 			PRIME_AISUITE_TEST_SETUP_MARKER: aisuiteSetupMarker,
+			PRIME_AISUITE_TEST_TOKEN_FETCH_MARKER: tokenFetchMarker,
 			PRIME_AISUITE_SKIP_AISUITE_SETUP: "0",
 			PRIME_AISUITE_SKIP_LIVE_SMOKE: "1",
 			PRIME_AISUITE_NON_INTERACTIVE: "1",
 		};
-		const first = execFileSync("bash", [installer], { cwd: home, env, encoding: "utf8" });
-		const second = execFileSync("bash", [installer], { cwd: home, env, encoding: "utf8" });
+		const first = runInstallerFromDeletedDirectory(installer, env, root, "first");
+		const second = runInstallerFromDeletedDirectory(installer, env, root, "second");
 
 		expect(first).toContain("Installation complete");
 		expect(first).toContain("official installer endpoint is unavailable");
 		expect(first).toContain("retrying AISuite update with alternate ya argument order");
 		expect(second).toContain("Already up to date");
+		expect(second).toContain(`using existing Prime Agent: ${fakePrime}`);
 		expect(readFileSync(fallbackMarker, "utf8")).toBe("https://releases.example.test");
 		expect(readFileSync(aisuiteUpdateMarker, "utf8")).toBe("updated");
 		expect(readFileSync(aisuiteValidationMarker, "utf8")).toBe(`${realpathSync(project)}\npro/mobile/eats`);
@@ -203,5 +229,20 @@ esac
 		expect(statSync(perfLoopPath).mode & 0o111).not.toBe(0);
 		expect(readFileSync(perfRunnerPath, "utf8")).toContain("prime-agent-perf-runner.sh");
 		expect(readFileSync(perfLoopPath, "utf8")).toContain("prime-agent-perf-loop.sh");
+
+		const yaAuthRun = runInstallerFromDeletedDirectory(
+			installer,
+			{ ...env, ELIZA_API_TOKEN: "", PRIME_AISUITE_TOKEN_SOURCE: "ya" },
+			root,
+			"ya-auth",
+		);
+		expect(yaAuthRun).toContain("preparing the automatically refreshed Eliza token");
+		expect(readFileSync(tokenFetchMarker, "utf8")).toBe("used");
+		const yaModels = JSON.parse(readFileSync(join(agentDir, "models.json"), "utf8")) as {
+			providers: Record<string, { apiKey?: string }>;
+		};
+		expect(yaModels.providers["eliza-deepseek-internal"]?.apiKey).toBe(
+			`!cd '${realpathSync(project)}' && '${fakeYa}' tool fetch-token -preset eliza`,
+		);
 	});
 });
