@@ -16,13 +16,13 @@ The fork includes a macOS/Linux bootstrap that installs the stable Prime Agent b
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/0niel/prime-agent/48d4b5d60fd4a60026ea7d9a0a0271e423753681/scripts/install-aisuite-eliza.sh \
+  https://raw.githubusercontent.com/0niel/prime-agent/faed935317ff3b27ead5ba0368b675b1a7423222/scripts/install-aisuite-eliza.sh \
   | bash -s -- --project-dir "$HOME/arcadia/flutter/pro/yxpro/professions/eats"
 ```
 
 When `ya` is installed, the recommended authentication mode resolves a fresh token at request time with `ya tool fetch-token -preset eliza`. Otherwise the installer asks for a token without echo and stores it in `~/.prime/agent/secrets/eliza-token` with mode `0600`; `models.json` stores only a shell lookup command. Use `--token-source prompt` to force manual entry.
 
-The installer is idempotent. It preserves unrelated custom providers, refuses to update a dirty or unexpected checkout, merges JSON atomically, and only fast-forwards the fork branch. Run with `--help` for non-interactive and skip options.
+The installer is idempotent. It reuses an existing user-local Prime Agent binary, recovers from removed working directories, preserves unrelated custom providers, refuses to update a dirty or unexpected checkout, merges JSON atomically, and only fast-forwards the fork branch. Run with `--help` for non-interactive and skip options.
 
 Load it from the repository:
 
